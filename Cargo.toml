@@ -1,0 +1,37 @@
+[package]
+name = "embeddings-fast"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cpu"]
+# CubeCL/LLVM CPU backend. Disabled for cross-builds: cubecl-llvm links a prebuilt
+# host-architecture LLVM bundle (fails to link for aarch64). The `flex` backend is
+# always available.
+cpu = ["burn/cpu", "burn/autotune", "burn/fusion"]
+
+[dependencies]
+burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "flex",
+    "rayon",
+    "simd",
+    "store",
+] }
+burn-store = { version = "=0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "safetensors",
+    "memmap",
+] }
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+base64 = "0.22"
+
+[profile.release]
+opt-level = 3
+debug = false

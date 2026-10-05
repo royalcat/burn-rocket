@@ -1,0 +1,684 @@
+# rock-5b-plus inference backends — experiments (2026-09/10)
+
+Results log for the on-board LLM / embedding backend experiments (Vulkan, NPU,
+LiteRT). Service and host changes are documented in `AGENTS.md`; this file keeps the
+experiment detail out of the main doc. The one integrated result is the patched
+ik_llama.cpp embedding server from §6; everything else stayed experimental.
+
+## TL;DR
+
+| Experiment | Verdict |
+| --- | --- |
+| llama.cpp CPU (`llama-swap`) | **Production until 2026-10-02** — EmbeddingGemma + Gemma 4 E2B on cpuset 4-7; superseded by the embedding-only `qwen3-embedding` stack (§6) |
+| ik_llama.cpp + `qwen3-embedding` (patched) | **Integrated 2026-10-02** — `lm_head` skipped in embeddings mode; 32k context at ~3 GiB UB buffer, 3.6k-token embedding 33.7 s vs 110-116 s stock (§6b) |
+| llama.cpp Vulkan (panvk / Mali-G610) | Dead — `ErrorOutOfDeviceMemory` on decode; all knobs/quants/Mesa exhausted |
+| ggml-rocket NPU backend (llama.cpp) | Rejected as production backend — streaming slower than CPU at 200/600 MHz; residency re-test (§2b) found a winning E2B config, not integrated |
+| LiteRT-LM (Gemma 4 E2B/E4B `.litertlm`) | ~3× CPU prefill win but judged not useful → not integrated; GPU and NPU paths dead |
+| EmbeddingGemma on LiteRT (`.tflite`) | Not interchangeable with llama.cpp vectors (cosine 0.92-0.94); keep llama.cpp |
+
+## Host
+
+- Rock 5B+ (RK3588): 4×A55 @1.8 GHz + 4×A76 @2.4 GHz, 15.4 GiB RAM, eMMC root +
+  `/mnt/nvme` (Docker volumes live there, see `AGENTS.md`).
+- Kernel `7.1.8-edge-rockchip64` (Armbian edge); mainline `rocket` NPU driver
+  (`/dev/accel/accel0`, 3 cores, boots at 200 MHz); Mali-G610 GPU (panvk Vulkan).
+- Production models until 2026-10-02 (`llama-swap`, LAN port 9292, cpuset 4-7, `-t 4`):
+  `embeddinggemma` (Q8_0, ctx 2048) and `gemma-4-e2b-it` (Q4_0, ctx 32768), resident
+  routing group, TTL 1 h. Since 2026-10-02 the stack is embedding-only — `qwen3-embedding`
+  (Q8_0, ctx 32768, q8_0 KV) on a patched ik_llama.cpp server — see §6.
+
+## Baselines (production llama-swap, pinned 4×A76)
+
+- Historical baselines (EmbeddingGemma, pre-2026-10-02):
+- embeddinggemma Q8_0: 203-token input 0.72-0.83 s; 1203-token 3.6 s; hot small ~0.03 s.
+- gemma-4-e2b-it (thinking model): prefill ~38-39 tk/s (596-token prompt),
+  decode 6.3-6.5 tk/s.
+- Gemma 4 E4B CPU reference (QAT Q4_0, benchmark only): 2266-token prefill 86 s
+  (~27 tk/s), decode ~4-5 tk/s.
+
+## 1. Vulkan (llama.cpp) — dead
+
+- Image `ghcr.io/ggml-org/llama.cpp:server-vulkan` (b11277, arm64) lists
+  `Vulkan0: Mali-G610 MC4` and loads the model, but inference fails with
+  `vk::CommandBuffer::end: ErrorOutOfDeviceMemory` (HTTP 500) on decode; `-fa off`
+  rescues tiny inputs only.
+- Exhausted: FA on/off, batch/ubatch sizes, `GGML_VK_*` knobs (async, fusion,
+  descriptor reuse, host-visible vidmem, force-max-alloc, nodes-per-submit,
+  prefer-host-memory, sysmem fallback), quant variants (Q8_0, Q4_0-QAT, F16),
+  container Mesa 26.0.8 and host Mesa 26.1.6 bind-mounted, kernels 7.1.0 and 7.1.8.
+- Control: causal models (SmolLM2-135M) decode fine on the same setup — the failure
+  is specific to EmbeddingGemma's op shapes on panvk.
+
+## 2. NPU attempt 1 — ggml-rocket (llama.cpp backend `.so`)
+
+- Built `rocket-userspace` + `ggml-rocket` (DL backend) on rock; ran on the stock
+  200 MHz driver and later at 600 MHz using the out-of-tree `gregordinary/patches`
+  module (17-patch series for 7.1.x; `insmod` only, rollback = `rmmod` or reboot).
+- Offload works: F16 and (with the runtime `--no-repack` flag) quantized MUL_MATs
+  reach the NPU (all `[GRAPH]` splits matmul-named).
+- Results (pinned 4×A76, `-t 4`):
+  - embeddinggemma Q8_0 at 600 MHz: 1203-token 6.4-8.1 s vs CPU 5.5-7.1 s (parity at
+    best); at 200 MHz slower.
+  - Gemma 4 E2B Q4_0, 716-token: NPU-600 prefill 24.0-24.8 s vs CPU 18.2-18.5 s;
+    decode parity.
+  - Gemma 4 E4B QAT Q4_0: 2266-token NPU 128.5 s vs CPU 88.0 s; 716-token 45-48 s vs
+    26-28 s; CPU-seconds higher on the NPU, not lower.
+  - Per-run weight dequantization cost on the streaming NPU path: 10.9 s (E2B), 43-45 s
+    (E4B). The resident-quant cache is a separate, larger win — see §2b.
+  - `--no-repack` penalizes the CPU path when offload declines: ~1.7× embedding,
+    ~2.7× E2B prefill.
+- Verdict: rejected as production backend at the time (streaming slower than CPU at both
+  clocks, total CPU work not reduced). The follow-up residency re-test (§2b) found one
+  configuration that does beat the CPU on E2B — `ROCKET_QUANT_RESIDENT` + `-ub 2048` — but
+  it is not integrated. Stock module and kernel headers restored (NPU back at 200 MHz).
+  Build artifacts kept in `/root/npu-poc`.
+
+## 2b. NPU residency re-test (2026-10-01) — the cache fits, and wins at -ub 2048
+
+Follow-up to §2: `ROCKET_QUANT_RESIDENT` with an explicit budget and reserve override,
+re-measured on E2B Q4_0 (716-token prompt, cpuset 4-7, `-t 4`, stock 200 MHz module,
+2-4 reps/arm, quiet board).
+
+- **Footprint: 3553 MB for 275 weights, 100 % resident** — not the ~10 GB whole-model
+  fp16 image. Only ~1.88 B of E2B's 5.05 B params are offered to the backend as 2D
+  matmul weights at this prompt size (1877 M dequant elements/request), so the earlier
+  "never fits" conclusion was wrong. One-time ingest ≈ +17 s wall / +27 cpu·s; ~3.55 GB
+  held while the server is warm (`-c 32768`: MemAvailable settles ≈ 3.8-4.0 GB).
+- **At `-b 2048 -ub 2048` residency beats the CPU baseline**: 18.1-18.4 s / 32-34 cpu·s
+  vs CPU stock 19.6-20.1 s / 74-76 cpu·s (−7 % wall, −56 % CPU) and vs NPU streaming
+  24.4-25.1 s / 51-54 cpu·s (−25 % wall). `weight_dequant` drops from 8.5 s/2 reps to
+  0.2 s/4 reps.
+- **At the production flags (default `-ub 512`) the win evaporates**: 24.0-24.5 s /
+  63.5-63.7 cpu·s. The 716-token prompt splits 512+204 and the trailing 204-token
+  micro-batch is below `ROCKET_MIN_M_QUANT` (512), so it runs on the CPU — with
+  `--no-repack`, ~2.5× slower than the stock CPU path (measured 48.3-51.0 s vs
+  19.6-20.1 s prefill). Fix: add `-ub 2048` (whole prompt in one micro-batch), or the
+  backend-side small-M gate change below.
+- Clock does not matter at this operating point: streaming prefill at stock 200 MHz
+  (23.0-23.9 s) ≈ the 600 MHz PoC (23.2-24.2 s).
+- E4B still does not fit (~15.8 GB fp16 resident); EmbeddingGemma parity unchanged.
+
+Backend patches prototyped off this (see `ggml-rocket` branches, not integrated):
+
+- **Fused NEON Q4_0/Q8_0 → fp16 dequant** (`rocket_weight_to_fp16`): the generic path
+  runs ggml's scalar dequantizer into a K-float scratch and then converts to fp16; the
+  fused kernels decode straight into fp16 lanes (same integer math, same RNE). Standalone
+  bit-exactness gate: `test-rocket-dequant-fused.cpp` — 10,026,816 elements checked,
+  0 mismatches. Measured on the streaming path (`-b 2048 -ub 2048`, 3 reps): 19.9-20.7 s
+  / 38.8-40.1 cpu·s vs 23.6-25.5 s / 50.4-55.2 cpu·s for the reference .so;
+  `weight_dequant` 12696 → 3250 ms (3.9×), and because dequant sits on the critical
+  path the saving lands almost fully in wall time (fused streaming ≈ CPU-stock wall at
+  ~half the CPU).
+- **Resident-aware min-M gate** (`supports_op` + `ggml_backend_rocket_mul_mat_prepacked`):
+  an already-resident quantized weight has no per-micro-batch dequant left to amortize,
+  so it is claimed down to `rocket_min_m()` and a small M is padded up to the canonical
+  resident tiling instead of re-streaming — removes the `-ub 512` regression at the
+  backend level. Residency state is tracked in a process-wide ledger (supports_op is a
+  device method with no context handle, same as the MoE pre-flight). Measured at the
+  production flags (default `-ub 512`, `-c 32768`, 3 reps): 20.4-20.5 s / 36.7-37.7 cpu·s
+  vs 24.0-24.5 s / 63.5-63.7 cpu·s for the reference .so — recovers most of the
+  `-ub 2048` win without changing server flags (100 % resident, 0 below-tiling
+  fallbacks).
+- **Integrated A/B stack** (host-only compose, not Komodo; pinned llama-swap image +
+  gate `.so` + `ROCKET_QUANT_RESIDENT=4096`, `-b 2048 -ub 2048 --no-repack`): steady
+  716-token requests 18.7-19.1 s / 35.1-35.7 cpu·s (first request 37.4 s / 59.4 cpu·s
+  incl. model load and ingest) vs 24.0-24.5 s / 63.5-63.7 cpu·s for the
+  production-flags reference — −22 % wall, −45 % CPU; warm memory 11.1 GB used /
+  4.7 GB available (4.8 GB shared, resident BOs).
+- **Komodo stack `llama-swap-rocket`** (server `rock-5b-plus`): the NPU-resident
+  llama-swap, **promoted to production on 2026-10-01** — it now publishes 9292 and the
+  CPU `llama-swap` stack is stopped (rollback: stop `llama-swap-rocket`, start
+  `llama-swap`). The gate `.so` is bind-mounted from `/opt/rocket/libggml-rocket.so` —
+  a deliberate exception to the self-sufficient-stack rule, since the backend is
+  board-specific. Shares the `llama-swap_models` volume (external); E2B runs
+  `-b 2048 -ub 2048 --no-repack` with `ROCKET_QUANT_RESIDENT=4096`. Verified through
+  Komodo before promotion: 17.9-18.8 s / 33.8-35.4 cpu·s steady. After promotion
+  (716-token E2B): 19.2-19.3 s / 34.7-35.5 cpu·s vs 19.2-19.4 s / 73-73.4 cpu·s for the
+  CPU stack — wall parity at half the CPU; first request pays ~17 s ingest.
+  **Superseded on 2026-10-02**: E2B, the NPU backend and the `.so`/device/residency
+  plumbing were removed; the stack now serves only `qwen3-embedding` — see §6.
+
+Data: `run12`-`run17` and the patch benchmarks on `rock-5b-plus` (`/root/npu-poc/`;
+A/B stack files in `/root/rocket-ab/`).
+
+## 3. NPU attempt 2 — tflite-rocket / LiteRT
+
+- `tflite-rocket` is a **TFLite-interpreter external delegate** (conv/detection
+  focused; `FULLY_CONNECTED` NPU route only opt-in via `fc_npu=1` for GEMM-shaped
+  prefill, M==1 GEMV stays host). It cannot plug into LiteRT-LM.
+- LiteRT-LM's NPU backend uses LiteRT vendor dispatch plugins — no Linux support at
+  all; Gemma 4 `.litertlm` NPU variants ship only for Qualcomm, Google Tensor and
+  Intel silicon. There is no mainline-Rockchip path.
+- Verdict: NPU acceleration via the intended LiteRT runtime is not available without
+  writing a Rocket dispatch plugin (major project; the per-op overheads measured in
+  experiment 2 would still apply).
+
+## 4. LiteRT-LM (intended runtime) — CPU real, GPU/NPU dead
+
+- `litert-lm` 0.17.1 installed via pipx; Gemma 4 E2B (2.59 GB) and E4B (3.66 GB)
+  `.litertlm` downloaded from `litert-community`.
+- CPU benchmark (512 prefill / 128 decode, 3-run avg):
+
+  | Model / config | Prefill | Decode | TTFT |
+  | --- | --- | --- | --- |
+  | E2B, pinned 4×A76 | 117.7 tk/s | 8.2 tk/s | 4.5 s |
+  | E2B, all 8 cores | 102.4 tk/s | 8.7 tk/s | 5.3 s |
+  | E4B, pinned 4×A76 | 46.2 tk/s | 3.95 tk/s | 11.3 s |
+
+  → ~3× faster prefill and +25-30% decode vs llama.cpp for E2B; ~1.6× prefill for E4B.
+- GPU (Vulkan/panvk): E2B `-gpu` variant aborts (Dawn requires
+  `maxImageDimension3D >= 2048`, panvk is smaller) and E4B `-gpu` needs a 160 MB
+  storage-buffer binding vs panvk's 128 MB max — both fail, 0 tk/s.
+- `litert-lm serve` verified working: OpenAI-compatible on port 9379
+  (`/v1/models`, `/v1/chat/completions`, `/v1/embeddings`); the LiteRT E2B is a
+  non-thinking model (no `reasoning_content`, unlike the GGUF E2B in llama-swap).
+- Verdict: speed is real but **still too slow to be useful for OpenViking** — not
+  integrated. OpenViking's VLM/query planner stay on the external OpenCode Zen
+  backend (token lives in the `openviking` Komodo stack config); embeddings stay
+  local in `llama-swap`.
+
+## 5. EmbeddingGemma on LiteRT
+
+- Official gated `litert-community/embeddinggemma-300m` `.tflite` exports
+  (seq256/512/1024/2048, mixed int4/int8, 768-dim) plus community `.litertlm`
+  conversions; vendor NPU variants exist (Tensor/MediaTek/Qualcomm) — not for Rockchip.
+- Preprocessing per the official sample: BOS + text + EOS + pad to sequence length.
+- Speed (pinned 4×A76): seq256 0.24 s, seq512 0.65 s, seq2048 6.2 s — constant per
+  variant regardless of input length; shorter variants silently truncate. llama.cpp:
+  0.72-0.83 s (200 tok), 3.6 s (1200 tok).
+- Quality: cosine vs llama.cpp vectors 0.92-0.94 (same model, different quant/runtime
+  numerics) — switching would require re-embedding OpenViking's whole store.
+- Verdict: not an upgrade; keep llama.cpp for embeddings.
+
+## 6. Embedding migration to Qwen3-Embedding, E2B removal (2026-10-02)
+
+Trigger: OpenViking session-commit extractions kept failing with
+`input (3332 tokens) is too large to process. increase the physical batch size
+(current batch size: 2048)` — at least five commits failed on 2026-10-01/02 with
+2,288-3,416-token inputs. EmbeddingGemma's window is 2,048 tokens and OpenViking's
+`embedding.max_input_tokens` default was 4,096. Replacement:
+`Qwen/Qwen3-Embedding-0.6B-GGUF` Q8_0 — 32k native context, 1,024-dim output,
+`--pooling last` required, MTEB multilingual 64.3 vs ~61 for EmbeddingGemma. The 0.6B
+size is the only one that fits the board.
+
+E2B was removed in the same change: OpenViking's VLM/query planner are remote
+(OpenCode Zen), so `llama-swap-rocket` is now an embedding-only CPU stack. The NPU
+backend `.so`, `/dev/accel/accel0` binding, `ROCKET_QUANT_RESIDENT*` envs and
+`--no-repack` are gone; `/opt/rocket` is no longer a stack dependency.
+
+**Non-obvious memory ceiling.** b11277's qwen3 graph builds the `lm_head` even in
+embeddings mode (`src/models/qwen3.cpp` has no `!cparams.embeddings` guard; the Llama
+arch uses `if constexpr (!embed)`, master still lacks it for qwen3). The compute buffer
+therefore reserves roughly `n_vocab x n_ubatch x 4 B` ≈ 0.55 MiB/token at Qwen3's
+151,669 vocab: `-ub 32768` reserves ~21 GiB, `-ub 10240` ~6.2 GiB. Because llama-server
+rejects embedding inputs longer than `-ub` (`slot.can_split() == false`), the practical
+context ceiling is this buffer. With E2B gone, the board can afford:
+
+- Stock ceiling: `-c 8192 -b 8192 -ub 8192 -np 1 -ctk q8_0 -ctv q8_0 -t 4` (~7.5 GiB
+  peak after a 7.5k-token request; `-ctv q8_0` forces flash attention on); `-ub 10240`
+  peaked ~9.1 GiB and was killed by the test's 9 GiB cgroup cap. 16k/32k are out of
+  reach on stock mainline.
+- OpenViking side: `dimension: 1024`, `max_input_tokens: 7600` initially, `30000` with
+  the patched 32k server (§6b).
+
+Measured (4x A76, cpuset 4-7, `-t 4`, one slot, 1024-dim, L2-normalized):
+
+| Input | Wall | Container peak |
+| --- | --- | --- |
+| short (few tokens) | 0.45 s | — |
+| 3,633 tokens | 110-116 s | — |
+| ~7.5k tokens | 596 s | 7.54 GiB |
+
+Migration mechanics (worth reusing): OpenViking refuses to boot when the configured
+dimension differs from the stored collection (`EmbeddingRebuildRequiredError`), so the
+old 768-dim `data/vectordb` was copied aside inside the volume
+(`vectordb.bak-embeddinggemma-20261002`, 55 MB) and the collection deleted; the server
+recreated an empty 1,024-dim collection; `ov reindex <uri> --mode vectors_only` then
+re-embedded the workspace records (the pre-migration store held 1,939; no VLM calls).
+The `openviking` image was pinned to the running digest
+(`ghcr.io/volcengine/openviking@sha256:f52ab2c3`) for the migration. Gotchas: `--sudo` (root key) cannot reindex tenant data in `api_key`
+auth mode — use the normal account key; `viking://agent` is not a supported reindex
+root (`viking://agent/skills` is); concurrent session commits can hold the
+`viking://user` lock, so run `viking://resources` first.
+
+### 6b. ik_llama.cpp patched server (integrated 2026-10-02)
+
+`ik_llama.cpp` (ikawrakow fork) was the way out: it has the same unconditional
+`lm_head`, but a small patch removes it and its CPU server is also much faster on this
+board (~3.3×) — its repacked quantized matmuls win big on A76 even though the IQK
+AVX2/AVX-512 kernels don't apply on ARM.
+
+Patch (`src/graphs/build_qwen3.cpp`, dense `build_qwen3` only): when
+`cparams.embeddings`, stop at the final norm and keep the `result_norm` graph name so
+`append_pooling()` still finds it; the vocab-sized `lm_head` projection and its compute
+buffer are skipped. Non-embedding decoding is untouched. Review clone on the dev host:
+`~/projects/ik_llama.cpp`, branch `embeddings-skip-lm-head` (commit 226733ec) — kept
+for an upstream PR. (The same waste exists in every arch that ends in `build_output()`
+under `--embeddings`, e.g. `build_qwen3vl`; the dense-qwen3 patch is the minimal fix.)
+
+A/B verification (dev host, x86_64, Qwen3-Embedding-0.6B Q8_0; patched vs unpatched
+main 5bf8f0fe, same model and inputs):
+
+| batch | unpatched buffer | patched buffer |
+| --- | --- | --- |
+| 8192 | 4867.8 MiB | 384.1 MiB |
+| 16384 | 9991.6 MiB | 1024.3 MiB |
+| 32768 | 21007.1 MiB | 3072.5 MiB |
+
+- ~3.4k-token embedding: **outputs bit-identical** (`maxabsdiff 0.0`, cosine 1.0),
+  6.9 s vs 9.7 s unpatched (lm_head skipped).
+- ~28k tokens at batch 32768: rc=0 in 261 s (host); 1254.6 s via `llama-server` on the
+  board (`-t 4`), peak container RSS 3.62 GiB.
+- Non-embedding generation (Qwen3-0.6B, same dense arch): byte-identical output.
+- Harness on the dev host: `/tmp/opencode/ik-embed-test/{run-test.sh,compare_emb.py,results.md}`
+  (~1.3 GB of models/outputs — scratch, not in the repo).
+
+Board measurements (4x A76, cpuset 4-7, `-t 4`, 32768 ctx, q8_0 KV, one slot):
+
+| Input | Stock mainline | Patched ik_llama |
+| --- | --- | --- |
+| short | 0.45 s | 0.12 s |
+| 3,633 tokens | 110-116 s | 33.7 s |
+| 22-item corpus (short inputs) | — | 43.7 s |
+| ~28k tokens | impossible (~21 GiB buffer) | 1254.6 s, 3.62 GiB peak |
+
+**Quant warning (do not reuse).** Community quants of this model are broken:
+`Mungert/Qwen3-Embedding-0.6B-GGUF` IQ4_XS and Q4_K_M produced garbage embeddings —
+mean cosine ~0.52 against Q8 with worst items ~0.2, on **both** ik_llama and mainline
+b11277 — while Q8 is self-consistent. The official repo ships only Q8_0/F16 for a
+reason; use those only. The quants were also not faster (Q4_K_M 33.7 s vs Q8 33.7 s at
+3.6k tokens), so there is no upside anyway.
+
+Production integration: patched build from `/root/ikllama-build` (source + `build.sh`;
+binary `build/bin/llama-server` sha256 `28143b959b145f4a...`, RUNPATH patched to
+`/opt/llama-ik/lib`, mounted read-only into `llama-swap-rocket` at `/opt/llama-ik` —
+a deliberate board-specific exception to the self-sufficient-stack rule, like
+`/opt/rocket` before it). Model from a stable hardlink inside the models volume
+(`qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf`). Server args: `--embedding --pooling
+last -c 32768 -b 32768 -ub 32768 -np 1 -ctk q8_0 -ctv q8_0 -t 4`; idle container
+~1.96 GiB. OpenViking `max_input_tokens` raised to 30000 and the store was rebuilt from
+the workspace with the final runtime: the bulk landed on 2026-10-02/03 (~2.1k vectors
+in the new 1,024-dim int8 flat index), while a tail of session-memory embedding jobs
+was still draining on 2026-10-03 (~64 pending + 11 processing at 02:50 +04, falling)
+after earlier `Request timed out` errors and circuit-breaker re-enqueues on long
+inputs — verify the queue empties before trusting full coverage.
+
+**Upstream status (2026-10-03).** Nothing was submitted. Mainline llama.cpp:
+`~/projects/llama.cpp`, branch `qwen3-skip-lm-head-embeddings` (per-arch commits for
+qwen3/qwen3moe/qwen3next) is verified bit-identical against an unpatched build
+(compute buffer 4,899.9 → 544.2 MiB at ubatch 8192; RSS 10.70 → 3.46 GiB; a
+9,601-token input is rejected at 8192 and served at 32768), but held back because open
+PR #27715 already carries the identical qwen3 guard plus the `output_reserve()`
+`has_logits` change, and merged #24913 (`lfm2.cpp`) is the same pattern. ik_llama.cpp:
+a PR/issue search found no equivalent fix and no `cparams.embeddings` graph guard in
+any arch on `main`; the fork already skips the host logits buffer for embeddings
+(`src/llama.cpp:6893`, unless MTP is active) but still builds the projection, so an
+upstream guard there must keep MTP/nextn working (`embeddings && !has_mtp`).
+
+## 7. qwen3-burn as an embedding runtime — rejected (2026-10-02)
+
+Bench of `holg/qwen3-burn` (`6c0ff331`, 2026-02-22), a Rust/Burn Qwen3 implementation, as
+a possible replacement for llama.cpp for embeddings. It is numerically faithful — 22-item
+corpus cosine 0.9990 mean vs the mainline Q8 reference — but loses on every operational
+axis:
+
+- Speed: on the dev host (x86_64, 32 threads) a 2,852-token embedding took 44.5 s
+  (46.8 s with 4 threads — no parallel speedup), versus 33.7 s for a similar input on
+  the board's 4-thread `ik_llama` server; 5,702 tokens took 199.6 s.
+- Context: attention materializes dense `[1, 16, seq, seq]` score tensors; a 22k-token
+  input aborted allocating ~29.4 GiB in one tensor and 28k would need ~50 GB — the 32k
+  context that motivated the migration is unreachable.
+- Memory: the NdArray backend cannot store BF16, so F32 weights alone are ~2.4 GB;
+  measured RSS 4.9-8.1 GB vs ~2-3.6 GB for the whole `llama-server`.
+- Integration: no HTTP server, OpenAI-compatible API, batching, GGUF or quantization;
+  all of that (plus an embedding path — none ships upstream) would have to be written.
+
+Benchmark ran from a scratch clone (`/tmp/opencode/qwen3-burn`): dropped
+`candle`/`candle-metal` dev-deps (they pull `objc2` on Linux), added `examples/embed.rs`
+(final norm + last-token pooling, `vocab_size = 151669`), F32-converted weights.
+Full tables and harness: `/tmp/opencode/qwen3-burn-models/RESULTS.md`.
+
+## Host leftovers on rock-5b-plus (optional cleanup)
+
+- `litert-lm` pipx install (`/root/.local/bin/litert-lm`) + `/root/.litert-lm`
+  (~17 GB: HF downloads, imported E2B copy, compiled caches).
+- `/root/litert-emb` venv (ai-edge-litert, sentencepiece); `/root/emb-lite`
+  (tflite models, probe/bench scripts, result JSONs).
+- `/root/npu-poc` (~356 MB: rocket-userspace, ggml-rocket build, patches,
+  `rocket-npu600.ko`) and `/tmp/npu-poc` logs (~7 MB). The residency re-test (§2b) added
+  `run12`-`run17` scripts/logs, two patched build trees (`ggml-rocket-fused`,
+  `ggml-rocket-gate`), and `/root/rocket-ab` (A/B llama-swap prototype). The stock
+  `drm/rocket_accel.h` was reinstalled to `/usr/include/drm/` to build the patched trees
+  (the cleanup below should remove it again if the trees go).
+- `/opt/rocket/libggml-rocket.so` (737,768 B, sha256 `bd600cde501d...`) — the gate
+  backend the `llama-swap-rocket` Komodo stack used to bind-mount. Since 2026-10-02 the
+  stack is embedding-only CPU and no longer mounts it, so `/opt/rocket` can be deleted
+  with the rest.
+- Broken quants from the §6b experiment: `Qwen3-Embedding-0.6B-iq4_xs.gguf` and
+  `-q4_k_m.gguf` in the `llama-swap_models` volume (`qwen3-quants/`, 762 MB) — safe to
+  delete (the Q8 hardlink next to them is production).
+- Not leftovers, keep: `/opt/llama-ik` (production patched `llama-server` + its libs)
+  and `/root/ikllama-build` (source + `build.sh` used to rebuild it; the review clone
+  lives on the dev host at `~/projects/ik_llama.cpp`).
+- Cleanup: `pipx uninstall litert-lm && rm -rf /root/.litert-lm /root/litert-emb
+  /root/emb-lite` and `rm -rf /root/npu-poc /tmp/npu-poc /opt/rocket`. No production
+  service depends on any of it anymore (checked 2026-10-02).
+
+## References
+
+- NPU stack: `github.com/gregordinary/{ggml-rocket,tflite-rocket,rocket-userspace,patches}`
+- LiteRT-LM: `github.com/google-ai-edge/LiteRT-LM`; models: `huggingface.co/litert-community`
+- EmbeddingGemma LiteRT: `huggingface.co/litert-community/embeddinggemma-300m`
+# ik_llama.cpp: llama.cpp fork with better CPU performance
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+## TL;DR
+
+This repository started as a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) in June of 2024 and was last synced with upstream in August of 2024. Compared to mainline `llama.cpp`, it offers additional SOTA quantization types and, in many cases, better performance. Various features related to LLM inference appeared here first before becoming available in llama.cpp. MLA, quant repacking, fused delta-net (known in `llama.cpp as "Gated Delta Net" - GDN), tensor parallel, MTP, DFlash, to just name a few.
+
+>[!IMPORTANT]
+>If you are running hybrid CPU/GPU inference for MoE models with all or some experts left on the CPU, **do not use -rtr** unless you know what you are doing. The `-rtr` option causes all tensors left in RAM to be repacked to row-interleaved format while loading the model. As not all quantization types have a CUDA implementation, this will result in matrix multiplications with these tensors to be **always done on the CPU**, even when it would have been much better to offload the computation to the GPU, typically resulting in lower prompt processing speed. Most notably, k-quants (`K2_K, Q3_K, Q4_K, Q5_K, Q6_K`) do not have CUDA row-interleaved implementation.
+
+>[!NOTE]
+>The only fully functional and performant compute backends are CPU (`AVX2` or better, `ARM_NEON` or better) and CUDA (Turing or newer). 
+>Please do not enter issues related to ROCm, Vulkan, Metal, old Nvidia GPUs, `AVX` CPUs, etc. They will not get resolved unless you roll up your sleeves and help bring your favorite backend up to speed. With the current regular contributors this project simply does not have the bandwidth to work on all backends available in `llama.cpp`.
+ 
+>[!IMPORTANT]
+>Do not use quantized models from Unsloth that have `_XL` in their name. These are likely to not work with `ik_llama.cpp`.
+>
+>The above has caused some stir, so to clarify: the Unsloth `_XL` models that are likely to not work are those that contain `f16` tensors (which is never a good idea in the first place). All others are fine.
+
+>[!NOTE]
+>Some users have reported issues with graph parallel (a.k.a. split mode `graph`) and partial GPU offload (using `--cpu-moe` or `--n-cpu-moe` or tensor overrides). If you are using/want to use split mode graph and observe gibberish/incoherent responses, try adding `-cuda graphs=0` to your command line.
+
+## Quickstart
+
+### Prerequisites
+
+```
+git clone https://github.com/ikawrakow/ik_llama.cpp
+
+cd ik_llama.cpp
+```
+
+On Debian/Ubuntu Linux, install the required packages (if using another Linux distro, you need to find the corresponding packages and adapt):
+
+```
+apt-get update && apt-get install build-essential git libcurl4-openssl-dev curl libgomp1 cmake
+```
+
+### Build for CPU
+
+```
+cmake -B build -DGGML_NATIVE=ON
+
+cmake --build build --config Release -j$(nproc)
+```
+
+For AVX-512-capable CPUs (AMD Zen4 / Intel Sapphire Rapids+), see
+[`docs/build.md`](docs/build.md) section "CPU build flags for AVX-512" for the
+additional flags that activate the IQK quantized GEMM kernels (the
+`HAVE_FANCY_SIMD` path). Without those flags, a vanilla `Release` build
+silently falls back to the AVX2 path on this hardware.
+
+### Build for GPU
+
+Install Nvidia Drivers and [CUDA Toolkit](https://developer.nvidia.com/cuda/toolkit).
+
+```
+cmake -B build -DGGML_NATIVE=ON -DGGML_CUDA=ON
+
+cmake --build build --config Release -j$(nproc)
+```
+### Step-by-step instructions for a case of a successful Windows build
+https://github.com/ikawrakow/ik_llama.cpp/blob/main/docs/build.md
+
+### Run
+
+Download `.gguf` model files (e.g. [bartowski/Qwen_Qwen3-0.6B-IQ4_NL.gguf](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/blob/main/Qwen_Qwen3-0.6B-IQ4_NL.gguf)) to your favorite directory (e.g. `/my_local_files/gguf`).
+
+Start the server with one of the commands (CPU or GPU):
+
+```
+./build/bin/llama-server --model /my_local_files/gguf/Qwen_Qwen3-0.6B-IQ4_NL.gguf --ctx-size 4096
+```
+
+```
+./build/bin/llama-server --model /my_local_files/gguf/Qwen_Qwen3-0.6B-IQ4_NL.gguf --ctx-size 4096 -ngl 999
+```
+
+That's all! Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in Browser and start chatting, or use the available API endpoins in your program/harness.
+
+### Run in Docker or Podman
+
+Pull one of the available images from `ghcr.io`. [View all tags](https://github.com/ikawrakow/ik_llama.cpp/pkgs/container/ik-llama-cpp/versions?filters%5Bversion_type%5D=tagged)
+
+```bash
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cpu-swap
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cpu-server
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cpu-full
+
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cu12-swap
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cu12-server
+docker pull ghcr.io/ikawrakow/ik-llama-cpp:cu12-full
+```
+
+Check [Step by step guide](./docker/README.md) for image customization and other details.
+
+### [Common parameters and options](./docs/parameters.md)
+
+## Latest News
+
+
+### Model Support
+
+LlaMA-3-Nemotron [PR 377](https://github.com/ikawrakow/ik_llama.cpp/pull/377), Qwen3 [PR 355](https://github.com/ikawrakow/ik_llama.cpp/pull/355), GLM-4 [PR 344](https://github.com/ikawrakow/ik_llama.cpp/pull/344), Command-A [PR 341](https://github.com/ikawrakow/ik_llama.cpp/pull/341), bitnet-b1.58-2B-4T [PR 337](https://github.com/ikawrakow/ik_llama.cpp/pull/337), LLaMA-4 [PR 321](https://github.com/ikawrakow/ik_llama.cpp/pull/321), Gemma3 [PR 276](https://github.com/ikawrakow/ik_llama.cpp/pull/276),  DeepSeek-V3 [PR 176](https://github.com/ikawrakow/ik_llama.cpp/pull/176), Kimi-2 [PR 609](https://github.com/ikawrakow/ik_llama.cpp/pull/609), dots.llm1 [PR 573](https://github.com/ikawrakow/ik_llama.cpp/pull/573), Hunyuan [PR 565](https://github.com/ikawrakow/ik_llama.cpp/pull/565), GLM-4.5 [PR 668](https://github.com/ikawrakow/ik_llama.cpp/pull/668) (4.5/4.6/4.7/AIR), Ernie 4.5 MOE and 0.3B [PR 759](https://github.com/ikawrakow/ik_llama.cpp/pull/759), grok-2 [PR 782](https://github.com/ikawrakow/ik_llama.cpp/pull/782), Ling/Ring (Bailing-MoE2) [PR 833](https://github.com/ikawrakow/ik_llama.cpp/pull/833), Qwen3-VL [PR 883](https://github.com/ikawrakow/ik_llama.cpp/pull/883), SmolLM3 [PR 934](https://github.com/ikawrakow/ik_llama.cpp/pull/934), GigaChat3 [PR 995](https://github.com/ikawrakow/ik_llama.cpp/pull/995), ministral3 [PR 1030](https://github.com/ikawrakow/ik_llama.cpp/pull/1030), Mimo-V2-Flash [PR 1096](https://github.com/ikawrakow/ik_llama.cpp/pull/1096), GLM-4.7-Flash [PR 1168](https://github.com/ikawrakow/ik_llama.cpp/pull/1168), Seed-OSS [PR 1218](https://github.com/ikawrakow/ik_llama.cpp/pull/1218), Step-3.5-Flash [PR 1231](https://github.com/ikawrakow/ik_llama.cpp/pull/1231), GLM-5 [PR 1268](https://github.com/ikawrakow/ik_llama.cpp/pull/1268), Qwen3-Next [PR 1266](https://github.com/ikawrakow/ik_llama.cpp/pull/1266), Qwen3.5-MoE [PR 1288](https://github.com/ikawrakow/ik_llama.cpp/pull/1288) and dense Qwen-3.5 [1326](https://github.com/ikawrakow/ik_llama.cpp/pull/1326), Mistral 4 [PR 1450](https://github.com/ikawrakow/ik_llama.cpp/pull/1450), Bonsai 1-bit [PR 1570](https://github.com/ikawrakow/ik_llama.cpp/pull/1570), Gemma4 [PR 1581](https://github.com/ikawrakow/ik_llama.cpp/pull/1581) including assistant, Mimo-2.5 [PR 1723](https://github.com/ikawrakow/ik_llama.cpp/pull/1723), JetBrains Mellum2 [PR 1919](https://github.com/ikawrakow/ik_llama.cpp/pull/1919), Poolside Laguna XS.2 [PR 1911](https://github.com/ikawrakow/ik_llama.cpp/pull/1911), Cohere2-MoE North Mini Code [PR 1945](https://github.com/ikawrakow/ik_llama.cpp/pull/1945), MiniMax-M3 [PR 1963](https://github.com/ikawrakow/ik_llama.cpp/pull/1963), Laguna M.1 [PR 2003](https://github.com/ikawrakow/ik_llama.cpp/pull/2003), OpenPangu [#2065](https://github.com/ikawrakow/ik_llama.cpp/pull/2065), DeepSeek-V4 [PR 2165](https://github.com/ikawrakow/ik_llama.cpp/pull/2165), Muse-Glimmer [PR 2293](https://github.com/ikawrakow/ik_llama.cpp/pull/2293), Ling-3.0 [PR 2295](https://github.com/ikawrakow/ik_llama.cpp/pull/2295), DSpark [PR 2304](https://github.com/ikawrakow/ik_llama.cpp/pull/2304), Qwen-3.8-Flash-Next [PR 2365](https://github.com/ikawrakow/ik_llama.cpp/pull/2365), GLM-5.3-Flash [PR 2376](https://github.com/ikawrakow/ik_llama.cpp/pull/2376), DeepSeek-V4-Flash-Vision-Exp [PR 2431](https://github.com/ikawrakow/ik_llama.cpp/pull/2431), K2-Horizon [PR 2435](https://github.com/ikawrakow/ik_llama.cpp/pull/2435) and [PR 2466](https://github.com/ikawrakow/ik_llama.cpp/pull/2466), LFM2.5 [PR 2382](https://github.com/ikawrakow/ik_llama.cpp/pull/2382) and LFM2-MoE [PR 2530](https://github.com/ikawrakow/ik_llama.cpp/pull/2530), MiniCPM5 [PR 2447](https://github.com/ikawrakow/ik_llama.cpp/pull/2447), DeepSeek-V4.1 [PR 2455](https://github.com/ikawrakow/ik_llama.cpp/pull/2455) with vision [PR 2545](https://github.com/ikawrakow/ik_llama.cpp/pull/2545))
+
+### Quantization
+
+#### Quantization additions
+
+##### Trellis quants (`IQ1_KT`, `IQ2_KT`, `IQ3_KT`, `IQ4_KT`)
+
+Information and the original CUDA implementation in [PR 113](https://github.com/ikawrakow/ik_llama.cpp/pull/113). Additional implementations: Metal [PR 475](https://github.com/ikawrakow/ik_llama.cpp/pull/475), Neon [PR 471](https://github.com/ikawrakow/ik_llama.cpp/pull/471), CPU [PR 441](https://github.com/ikawrakow/ik_llama.cpp/pull/441). `IQ1_KT` was added more recently in [PR 616](https://github.com/ikawrakow/ik_llama.cpp/pull/616). Note: these are base on a novel, integer-base trellis, which allows to achieve reasonable CPU performance, see [PR 529](https://github.com/ikawrakow/ik_llama.cpp/pull/529) and PRs quoted there for details.
+
+##### IQK quants
+
+Information can be found in [Discussion 8](https://github.com/ikawrakow/ik_llama.cpp/discussions/8).
+
+Initial implementations (Zen4, AVX2, NEON): `IQ5_KS_R4` [PR 426](https://github.com/ikawrakow/ik_llama.cpp/pull/426), `IQ5_KS` [PR 422](https://github.com/ikawrakow/ik_llama.cpp/pull/422), `IQ4_KS_R4` [PR 150](https://github.com/ikawrakow/ik_llama.cpp/pull/150), `IQ5_K_R4` [PR 149](https://github.com/ikawrakow/ik_llama.cpp/pull/149), `IQ2_K_R4` [PR 146](https://github.com/ikawrakow/ik_llama.cpp/pull/146), `IQ3_K_R4` [PR 145](https://github.com/ikawrakow/ik_llama.cpp/pull/145), `IQ4_K_R4` [PR 138](https://github.com/ikawrakow/ik_llama.cpp/pull/138), `IQ4_KSS` [PR 89](https://github.com/ikawrakow/ik_llama.cpp/pull/89), `IQ2_KS` [PR 85](https://github.com/ikawrakow/ik_llama.cpp/pull/85), `IQ4_KS` [PR 83](https://github.com/ikawrakow/ik_llama.cpp/pull/83), `IQ6_K` [PR 14](https://github.com/ikawrakow/ik_llama.cpp/pull/14), `IQ2_K, IQ3_K and IQ5_K` [PR 7](https://github.com/ikawrakow/ik_llama.cpp/pull/7), `IQ4_K` [PR 6](https://github.com/ikawrakow/ik_llama.cpp/pull/6)
+
+Cuda implementations:  `IQ4_KS_R4` and `IQ5_KS_R4` [PR 493](https://github.com/ikawrakow/ik_llama.cpp/pull/493), `IQ1_S_R4` [PR 492](https://github.com/ikawrakow/ik_llama.cpp/pull/492), `IQ1_M_R4` [PR 494](https://github.com/ikawrakow/ik_llama.cpp/pull/494). `IQ4_KS_R4` and `IQ5_KS_R4` [PR 462](https://github.com/ikawrakow/ik_llama.cpp/pull/462), `IQ2_K_R4`, `IQ3_K_R4`, `IQ4_K_R4`, `IQ5_K_R4` [PR 461](https://github.com/ikawrakow/ik_llama.cpp/pull/461), `IQ4_K, IQ5_K, IQ6_K` [PR 417](https://github.com/ikawrakow/ik_llama.cpp/pull/417), `IQ2_KS, IQ2_K, IQ3_K` [PR 418](https://github.com/ikawrakow/ik_llama.cpp/pull/417)
+
+`IQ2_KL` is a more recent addition in [PR 602](https://github.com/ikawrakow/ik_llama.cpp/pull/602)
+
+`IQ4_KS_R16` 16-row interleaved `IQ4_KS` [PR 2480](https://github.com/ikawrakow/ik_llama.cpp/pull/2480), [PR 2526](https://github.com/ikawrakow/ik_llama.cpp/pull/2526)
+
+##### Bitnet, Bonsai, Ternary
+
+`IQ1_BN`, `IQ2_BN` [PR 44](https://github.com/ikawrakow/ik_llama.cpp/pull/44)
+
+`Q1_0_G128_R8` [PR 2541](https://github.com/ikawrakow/ik_llama.cpp/pull/2541)
+
+##### Hadamard transforms for K-cache
+
+CPU [PR 1033](https://github.com/ikawrakow/ik_llama.cpp/pull/1033) and CUDA [PR 1034](https://github.com/ikawrakow/ik_llama.cpp/pull/1034)
+
+##### Hadamard transforms for V-cache
+
+[PR 1527](https://github.com/ikawrakow/ik_llama.cpp/pull/1527)
+
+##### MXFP4 as used in gpt-oss models
+
+Implemented for Zen4, AVX2, ARM_NEON, Metal, CUDA [PR 682](https://github.com/ikawrakow/ik_llama.cpp/pull/682) 
+
+#### Quantization improvements
+
+* `IQ1_M` [PR 327](https://github.com/ikawrakow/ik_llama.cpp/pull/327), `IQ2_XS` [PR 312](https://github.com/ikawrakow/ik_llama.cpp/pull/312), `Q2_K, Q4_K, Q5_K, Q4_1, Q5_1` [PR 302](https://github.com/ikawrakow/ik_llama.cpp/pull/302), `Q4_0, Q5_0, Q6_0, Q3_K, Q6_K, IQ4_XS, IQ4_NL` [PR 295](https://github.com/ikawrakow/ik_llama.cpp/pull/295)
+* Low perplexity `Q4_0` KV cache [PR 1547](https://github.com/ikawrakow/ik_llama.cpp/pull/1547) [PR 1556](https://github.com/ikawrakow/ik_llama.cpp/pull/1556)
+* MTP: option to use re-quantized output tensor `--mtp-requantize-output-tensor new_type` [PR 1809](https://github.com/ikawrakow/ik_llama.cpp/pull/1809)
+
+#### Quantization performance improvements 
+
+* Much faster CPU prompt processing for all non-interleaved quants. Initial idea in [PR 515](https://github.com/ikawrakow/ik_llama.cpp/pull/515) and [PR 531](https://github.com/ikawrakow/ik_llama.cpp/pull/531), with many follow up PRs to apply to all quantization types for the 3 supported CPU platforms.
+* All quantization types now have quantized matrix multiplication CUDA kernels, see [PR 557](https://github.com/ikawrakow/ik_llama.cpp/pull/515) and several others
+* Faster CPU prompt processing for Trellis quants and MoE models. [PR 488](https://github.com/ikawrakow/ik_llama.cpp/pull/488)
+* Trellis quants: faster CPU prompt processing [PR 482](https://github.com/ikawrakow/ik_llama.cpp/pull/482).
+* Minor (~2%) `iq2_ks` TG performance improvement on CUDA [PR 468](https://github.com/ikawrakow/ik_llama.cpp/pull/468)
+* Faster `IQ3_KT` and `IQ4_KT` [PR 453](https://github.com/ikawrakow/ik_llama.cpp/pull/453)
+* Zen4: Faster PP for `IQ2_KS, IQ4_KS, IQ5_KS` [PR 428](https://github.com/ikawrakow/ik_llama.cpp/pull/428)
+* Fast GEMM/GEMV for `IQ1_S` [PR 212](https://github.com/ikawrakow/ik_llama.cpp/pull/212)
+* AVX-VNNI optimizations [PR 1446](https://github.com/ikawrakow/ik_llama.cpp/pull/1446) [PR 1455](https://github.com/ikawrakow/ik_llama.cpp/pull/1455) [PR 1467](https://github.com/ikawrakow/ik_llama.cpp/pull/1467) [PR 1474](https://github.com/ikawrakow/ik_llama.cpp/pull/1474) [PR 1482](https://github.com/ikawrakow/ik_llama.cpp/pull/1482)
+
+### Features
+
+* New split mode "graph" for multi GPU setups [PR 1022](https://github.com/ikawrakow/ik_llama.cpp/pull/1022)
+* Fused delta-net for Qwen3-Next and Qwen3.5-MoE [PR 1315](https://github.com/ikawrakow/ik_llama.cpp/pull/1315) [PR 1333](https://github.com/ikawrakow/ik_llama.cpp/pull/1333) [PR 1362](https://github.com/ikawrakow/ik_llama.cpp/pull/1362) [PR 1373](https://github.com/ikawrakow/ik_llama.cpp/pull/1373)
+* Hadamard transforms for K-cache and V-cache [PR 1033](https://github.com/ikawrakow/ik_llama.cpp/pull/1033) [PR 1034](https://github.com/ikawrakow/ik_llama.cpp/pull/1034) [PR 1527](https://github.com/ikawrakow/ik_llama.cpp/pull/1527)
+* Auto-fit offloaded tensors to available VRAM (MoE and dense models) [PR 1501](https://github.com/ikawrakow/ik_llama.cpp/pull/1501) [PR 1504](https://github.com/ikawrakow/ik_llama.cpp/pull/1504), allows per GPU fit margin [PR 1872](https://github.com/ikawrakow/ik_llama.cpp/pull/1872)
+* Checkpoints for recurrent models [PR 1310](https://github.com/ikawrakow/ik_llama.cpp/pull/1310) [PR 1398](https://github.com/ikawrakow/ik_llama.cpp/pull/1398)
+* MTP decoding support for popular models like GLM-4.x MoE [1270](https://github.com/ikawrakow/ik_llama.cpp/pull/1270), Qwen 3.5/3.6 [1698](https://github.com/ikawrakow/ik_llama.cpp/pull/1698) [1745](https://github.com/ikawrakow/ik_llama.cpp/pull/1745), Gemma 4 [1744](https://github.com/ikawrakow/ik_llama.cpp/pull/1744), GLM 5 [1890](https://github.com/ikawrakow/ik_llama.cpp/pull/1890), Step 3.7 [2250](https://github.com/ikawrakow/ik_llama.cpp/pull/2250), Qwen 3.8 [2369](https://github.com/ikawrakow/ik_llama.cpp/pull/2369) (incl. standalone MTP heads via `-md`)
+* Self speculative decoding, ngram [PR 1261](https://github.com/ikawrakow/ik_llama.cpp/pull/1261), suffix [PR 1646](https://github.com/ikawrakow/ik_llama.cpp/pull/1646)
+* DFlash initial support [PR 1970](https://github.com/ikawrakow/ik_llama.cpp/pull/1970)
+* DSpark initial support [PR 2280](https://github.com/ikawrakow/ik_llama.cpp/pull/2280)
+* GLM-DSA architecture indexer cache
+* GLM-5.2 vision hack [PR 2283](https://github.com/ikawrakow/ik_llama.cpp/pull/2283)
+* String ban function for all completions [PR 1185](https://github.com/ikawrakow/ik_llama.cpp/pull/1185) [PR 1243](https://github.com/ikawrakow/ik_llama.cpp/pull/1243)
+* Expiring Logit Bias [PR 1731](https://github.com/ikawrakow/ik_llama.cpp/pull/1731)
+* OpenAI `/v1/responses` API endpoint [PR 1184](https://github.com/ikawrakow/ik_llama.cpp/pull/1184)
+* Function call support [PR 628](https://github.com/ikawrakow/ik_llama.cpp/pull/628)
+* jinja template support [PR 677](https://github.com/ikawrakow/ik_llama.cpp/pull/677)
+* Webui: New Features for Conversations, Settings, and Chat Messages [PR 618](https://github.com/ikawrakow/ik_llama.cpp/pull/618), MCP [PR 1904](https://github.com/ikawrakow/ik_llama.cpp/pull/1904)
+* On-demand tensor reload [PR 1989](https://github.com/ikawrakow/ik_llama.cpp/pull/1989)
+* Dynamic control vector management endpoints [PR 1223](https://github.com/ikawrakow/ik_llama.cpp/pull/1223)
+* Legacy quants conversion schemes in `convert_hf_to_gguf.py` [PR 449](https://github.com/ikawrakow/ik_llama.cpp/pull/449), `Q6_0` in [PR 483](https://github.com/ikawrakow/ik_llama.cpp/pull/483)
+* Adaptive-P Sampler [PR 1100](https://github.com/ikawrakow/ik_llama.cpp/pull/1100) implemented as designed by it's author; supported on Webui
+* Multi-modal Vision support in `llama-mtmd-cli` [PR 798](https://github.com/ikawrakow/ik_llama.cpp/pull/798) and in `llama-server` [PR 901](https://github.com/ikawrakow/ik_llama.cpp/pull/901)
+* mikupad as an alternative WebUI [PR 558](https://github.com/ikawrakow/ik_llama.cpp/pull/558)
+* June 8 2025: Webui updated (legacy still available when `--path ./examples/server/public_legacy` is passed) [PR 481](https://github.com/ikawrakow/ik_llama.cpp/pull/481)
+* June 8 2025: RPC improvements [PR 480](https://github.com/ikawrakow/ik_llama.cpp/pull/480)
+* June 7 2025: Add an endpoint that lists all the saved prompt caches to server [PR 502](https://github.com/ikawrakow/ik_llama.cpp/pull/502)
+* June 6 2025: Make prompt cache saving and restoring MLA aware [PR 497](https://github.com/ikawrakow/ik_llama.cpp/pull/497)
+* June 3 2025: Added samplers, XTC [PR 486](https://github.com/ikawrakow/ik_llama.cpp/pull/486), top-n σ [PR 489](https://github.com/ikawrakow/ik_llama.cpp/pull/489).
+* May 22 2025: Refactor `iqk_mul_mat.cpp` which speeds up compilation time significantly. [PR 435](https://github.com/ikawrakow/ik_llama.cpp/pull/435)
+* May 17 2025: Option to enable or disable the CPU FA kernels [PR 429](https://github.com/ikawrakow/ik_llama.cpp/pull/429).
+* May 12 2025: User can now control if/which operations with tensors held in RAM are offloaded to the GPU. See [PR 405](https://github.com/ikawrakow/ik_llama.cpp/pull/405) 
+* May 12 2025: Compatibility issues with mainline `llama.cpp` GGUFs for DeepSeek models with MLA enabled were resolved in [PR 394](https://github.com/ikawrakow/ik_llama.cpp/pull/394). The lower prompt processing performance resulting from using `llama.cpp`-style MLA GGUFs was recovered in [PR 409](https://github.com/ikawrakow/ik_llama.cpp/pull/409).
+* April 21 2025: ik_llama.cpp builds and runs successfully on Android (using termux), see [PR 336](https://github.com/ikawrakow/ik_llama.cpp/pull/336)
+* March 1 2025: Smart Expert Reduction for faster DeepSeek inference [PR 239](https://github.com/ikawrakow/ik_llama.cpp/pull/239) 
+* Feb 25 2025: Tensor overrides for better control where model weights are stored (GPU or CPU) [PR 232](https://github.com/ikawrakow/ik_llama.cpp/pull/232)
+* Feb 23 2025: `sweep-bench` - better performance benchmarking [PR 225](https://github.com/ikawrakow/ik_llama.cpp/pull/225)
+* Feb 19 2025: `Q8_KV` - new type for 8-bit KV-cache quantization [PR 208](https://github.com/ikawrakow/ik_llama.cpp/pull/208)
+* March 7 2025: Custom quantization mixes using regular expressions [PR 244](https://github.com/ikawrakow/ik_llama.cpp/pull/244)
+
+### Performance improvements
+
+* Better GPU offload strategy for MoE models when using hybrid HPU/CPU inference, see [PR 520](https://github.com/ikawrakow/ik_llama.cpp/pull/520)
+* Much faster rng sampling [PR 1187](https://github.com/ikawrakow/ik_llama.cpp/pull/1187)
+* May 13 2025: Better CPU FA performance for DeepSeek-Lite. [PR 410](https://github.com/ikawrakow/ik_llama.cpp/pull/410)
+* May 11 2025: Slightly faster flash attention for DeepSeek models on CUDA, along with extending compatibility to Touring or newer GPUs. [PR 408](https://github.com/ikawrakow/ik_llama.cpp/pull/408)
+* May 4 2025: Significant token generation performance improvement on CUDA with Flash Attention for GQA models. For details and benchmarks. [PR 370](https://github.com/ikawrakow/ik_llama.cpp/pull/370) 
+* April 17 2025: Better CPU Flash Attention token generation performance. [PR 332](https://github.com/ikawrakow/ik_llama.cpp/pull/332)
+* April 3 2025: Much faster MoE implementation on Metal. [PR 307](https://github.com/ikawrakow/ik_llama.cpp/pull/307) 
+* March 25 2025: Better MoE performance on CUDA [PR 283](https://github.com/ikawrakow/ik_llama.cpp/pull/283)
+* March 23 2025: Better batched processing speed for DeepSeek models [PR 282](https://github.com/ikawrakow/ik_llama.cpp/pull/282)
+* March 18 2025: Reduce compute buffer size [PR 237](https://github.com/ikawrakow/ik_llama.cpp/pull/237)
+* March 10 2025: Better TG performance for MoE models on CUDA [PR 248](https://github.com/ikawrakow/ik_llama.cpp/pull/248)
+* Feb 23 2025: Fused FFN ops for faster MoE inference [PR 229](https://github.com/ikawrakow/ik_llama.cpp/pull/229)
+
+### Flash-MLA
+
+* May 7 2025: 🚀 FlashMLA-3 for DeepSeek models on CUDA. [PR 386](https://github.com/ikawrakow/ik_llama.cpp/pull/386). Caveat: Ampere or newer Nvidia GPU required
+* March 21 2025: 🚀 FlashMLA-3: fastest CPU-only inference for DeepSeek models [PR 273](https://github.com/ikawrakow/ik_llama.cpp/pull/273)
+* March 17 2025: 🚀 FlashMLA-2 performance improvements [PR 253](https://github.com/ikawrakow/ik_llama.cpp/pull/253)
+* March 12 2025: Allow `Q8_0` KV cache with FlashMLA-2 on CUDA [PR 265](https://github.com/ikawrakow/ik_llama.cpp/pull/265)
+* March 9 2025: 🚀 FlashMLA on CUDA [PR 247](https://github.com/ikawrakow/ik_llama.cpp/pull/247)
+* March 8 2025: 🚀 Faster FlashMLA CPU implementation [PR 243](https://github.com/ikawrakow/ik_llama.cpp/pull/243)
+* March 3 2025: 🚀 Introducing FlashMLA - MLA with Flash Attention [PR 240](https://github.com/ikawrakow/ik_llama.cpp/pull/240)
+* Feb 27 2025: MLA without transposed cache [PR 235](https://github.com/ikawrakow/ik_llama.cpp/pull/235)
+* Feb 13 2025: Allow `Q8_0` quantized cache with MLA [PR 206](https://github.com/ikawrakow/ik_llama.cpp/pull/206)
+* Feb 11 2025: 🚀 Flash Attention support for DeepSeek models [PR 200](https://github.com/ikawrakow/ik_llama.cpp/pull/200)
+* Feb 9 2025: 🚀 MLA for DeepSeek models [PR 188](https://github.com/ikawrakow/ik_llama.cpp/pull/188)
+
+### Fixes
+
+* Fix bug in MMVQ kernel [PR 446](https://github.com/ikawrakow/ik_llama.cpp/pull/446)
+* Fix AVX2 implementation of `IQ4_K, IQ4_KS, IQ5_K, IQ6_K` [PR 427](https://github.com/ikawrakow/ik_llama.cpp/pull/427) 
+* Fix standard attention on the CPU [PR 421](https://github.com/ikawrakow/ik_llama.cpp/pull/421) 
+* Fix imatrix calculation for MLA models [PR 411](https://github.com/ikawrakow/ik_llama.cpp/pull/411)
+* Fix new CUDA FA on Touring [PR 413](https://github.com/ikawrakow/ik_llama.cpp/pull/413)
+* Fix SER. CPU: [PR 415](https://github.com/ikawrakow/ik_llama.cpp/pull/415) CUDA: [PR 416](https://github.com/ikawrakow/ik_llama.cpp/pull/416)
+
+## Resources
+
+There is no single point of reference describing all new `ik_llama.cpp` features. Pull requests often contain detailed information, so browsing the PRs is often the best way to learn about new features and how to use them. In addition
+* [The Wiki page](https://github.com/ikawrakow/ik_llama.cpp/wiki) has performance comparisons to mainline `llama.cpp`
+* [This guide](https://github.com/ikawrakow/ik_llama.cpp/discussions/258) is a good place to start if you came here because of DeepSeek models
+* [This discussion](https://github.com/ikawrakow/ik_llama.cpp/discussions/266) is about running DeepSeek-V3/R1 on a 16 x 3090 setup
+* [This discussion](https://github.com/ikawrakow/ik_llama.cpp/discussions/8) describes the new quantization types available in `ik_llama.cpp`
+
+## Testing
+
+### Function Calls Tests
+
+To run the function calls test suite:
+
+```bash
+cd build
+cmake --build . --target test-function-calls
+./bin/test-function-calls
+```
+
+The test suite covers parser functionality, streaming, error handling, content cleaning, and server integration. All tests should pass to ensure production readiness.
+
+## Contributing
+
+Contributions in form of pull requests, issue submissions (bug reports, feature requests), or general discussions, are welcome.
+
+## License
+
+- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+- [server](examples/server/README.md)
+- [GBNF grammars](grammars/README.md)
+
+#### Development documentation
+
+- [How to build](docs/build.md)
+- [Running on Docker](docs/docker.md)
+- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
+- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
+
+#### Seminal papers and background on the models
+
+If your issue is with model generation quality, then please at least scan the following links and papers to understand the limitations of LLaMA models. This is especially important when choosing an appropriate model size and appreciating both the significant and subtle differences between LLaMA models and ChatGPT:
+- LLaMA:
+    - [Introducing LLaMA: A foundational, 65-billion-parameter large language model](https://ai.facebook.com/blog/large-language-model-llama-meta-ai/)
+    - [LLaMA: Open and Efficient Foundation Language Models](https://arxiv.org/abs/2302.13971)
+- GPT-3
+    - [Language Models are Few-Shot Learners](https://arxiv.org/abs/2005.14165)
+- GPT-3.5 / InstructGPT / ChatGPT:
+    - [Aligning language models to follow instructions](https://openai.com/research/instruction-following)
+    - [Training language models to follow instructions with human feedback](https://arxiv.org/abs/2203.02155)
+
+## Completions
+Command-line completion is available for some environments.
+
+#### Bash Completion
+```bash
+$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
+$ source ~/.llama-completion.bash
+```
+Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
+automatically. For example:
+```console
+$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+```
+
+## Dependencies
+
+- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
+- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
+- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
+- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
+- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
