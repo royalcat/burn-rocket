@@ -22,6 +22,13 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
 - 30k-token inputs work on the CPU path (fused flash attention, 52.4 tok/s at 32 dev
   threads); 30k with `--npu` is not yet measured. The OpenAI-compatible server is
   implemented and smoke-tested.
+- **Serving robustness** (2026-10-05, log §12): a forward panic no longer poisons the server
+  or wedges it (catch_unwind + poison recovery), `/health`/`/v1/models` never take the model
+  lock, raw-token inputs are capped at `--max-tokens`, NPU failures panic with a typed
+  `OpFailure` payload (NOMEM -> 503, shape/tiling -> 500, device -> log + `exit(1)` for a
+  container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192, 0
+  disables). Board-verified for robustness only; long-context attention and performance are
+  unchanged/deferred.
 - Not done: int8 GEMM (the only lever that would close the speed gap; flex lacks it, and
   burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and board
   service deployment. The OpenViking entity
@@ -34,10 +41,10 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
 |---|---|
 | `src/main.rs` | CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`) and CPU projection loading for the NPU build (`load_cpu_projections`) |
 | `src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
-| `src/server.rs` | axum OpenAI-compatible `/v1/embeddings` |
+| `src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment (`catch_unwind` + poison recovery), typed NPU-error mapping, `--max-tokens` enforcement |
 | `crates/burn-rocket/` | FFI to `librocketnpu` (RocketCtx/RocketWeight/RocketStream/RocketFaCtx, `pack_weight_seg`, `flash_attn`, `examples/probe.rs`) plus `src/ext.rs`: the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
-| `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix |
+| `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness |
 
 ## Rebuild + deploy to the board
 
@@ -102,6 +109,10 @@ stage counters in `src/model.rs` (`stage_stats`).
 - The board binary at `/root/embeddings-fast/embeddings-fast` is the post-refactor build
   from this repo (sha256 `05c38e18dfe57501…`). Later that evening the user reported the
   board busy with another workload: re-run the A/B only on an idle board.
+- `/root/embeddings-fast/embeddings-fast-robust` is the robustness-round test binary
+  (log §12.2): run as a second instance on port 8393 (production container untouched,
+  `taskset -c 0-3`); poison recovery, tokio starvation, input caps and chunked matmul are
+  verified there. It is not the deployed service build.
 
 ## NPU offload (`--npu`, aarch64)
 
@@ -122,6 +133,13 @@ stage counters in `src/model.rs` (`stage_stats`).
   wall, ~40% more CPU). `--npu` requires `--dtype f32` and excludes `--quant q8`.
 - Resident weights are packed for the M>=256 tiling; requests with fewer rows are padded
   to 256 rows (the extra rows are ignored on readback). One pack serves all lengths.
+- Failures panic with a structured `OpFailure { error, m, k, n }` payload (detail logged by
+  `op_failure` before the panic). `serve` maps `ROCKET_E_NOMEM` -> 503, shape/tiling -> 500,
+  device/unsupported -> log + `exit(1)` for a supervisor restart. Matmuls chunk above
+  `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, 0 disables) so the per-call input-BO
+  scratch stays bounded; rows are independent, so chunking is bit-identical.
+- Failures/logs aside, a panic in an op can no longer poison the server's model lock
+  (poison recovery + `catch_unwind` in `src/server.rs`, log §12).
 - Board: the 600 MHz patched module (`insmod /root/npu-poc/rocket-patched-600/rocket-npu600.ko
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
   stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
@@ -145,8 +163,10 @@ stage counters in `src/model.rs` (`stage_stats`).
 - Attention trade-off: `rocket_flash_attn_fp16_ctx` brings the full score matrix
   host-side for the causal mask + softmax, so at 2-7k tokens it is about as fast as
   flex's fused flash kernel (within ~1 s) while using far less CPU. `ROCKET_FA_TILE_KV`
-  (tiled path) is *worse* at 3.6k (96.9 s vs 79.5 s); it engages automatically >8k keys.
-  The mask + head-major f16 scratch are cached per sequence length in the crate's engine
+  (tiled path, opt-in — 0 is the default) engages above `ROCKET_FA_TILE_MIN_KV` (8192) and
+  is *worse* at 3.6k (96.9 s vs 79.5 s); it bounds the score scratch but not the `[n][n]`
+  mask, and NPU attention OOMs the board at ~30k (deployment finding). The mask +
+  head-major f16 scratch are cached per sequence length in the crate's engine
   (`ext::FaState`).
 - Safetensors keys in `model.safetensors` have **no `model.` prefix**
   (`layers.0.self_attn.q_proj.weight`, `embed_tokens.weight`); the loader reads the
@@ -217,8 +237,12 @@ stage counters in `src/model.rs` (`stage_stats`).
   none; the candidates are the `burn-cpu` (CubeCL/LLVM) backend (CPU quantized matmul
   unverified, cannot cross-compile — would need a native build + JIT on the board) or a
   custom int8 microkernel (upstream contribution).
-- Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev threads) and
-  re-check `ROCKET_FA_TILE_KV` above 8k keys, where the tiled path engages by default.
+- Long-context NPU attention: the `[n][n]` mask + host score matrices OOM at ~30k. The
+  library's `ROCKET_FA_TILE_KV` bounds the score scratch but not the mask and loses on
+  speed; the candidate is app-side bounded-causal query blocking (per-block `[C, q1]`
+  mask, prefix keys, ~half the causal MACs). Deferred from the robustness round; board
+  work required.
+- Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev threads).
 - Board service: run `serve --npu --max-tokens 30000` under a supervisor, and decide
   whether the CPU-relief mode should be the default there (it is now).
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak in
@@ -237,6 +261,20 @@ $B embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.
 # server smoke test
 $B serve --backend flex --dtype f32 --quant q8 --port 8383 &
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"hi"}'
+# robustness: a panicking forward (invalid token id) must 500 and leave the server alive
+curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
+curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"still alive"}'
+```
+
+On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):
+
+```sh
+cd /root/embeddings-fast
+ROCKET_MATMUL_CHUNK_M=0 ./embeddings-fast-robust embed --backend flex --dtype f32 --npu \
+  --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e0.json
+ROCKET_MATMUL_CHUNK_M=1024 ./embeddings-fast-robust embed --backend flex --dtype f32 --npu \
+  --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e1.json
+python3 -c "import json,math;a=json.load(open('/tmp/e0.json'));b=json.load(open('/tmp/e1.json'));d=sum(x*y for x,y in zip(a,b));na=math.sqrt(sum(x*x for x in a));nb=math.sqrt(sum(x*x for x in b));print('cosine',d/(na*nb))"
 ```
 
 On the board (after the cross-build + scp above; the NPU-enabled binary):

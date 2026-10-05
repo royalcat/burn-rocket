@@ -505,3 +505,53 @@ Numerics (82 tokens, `data/one_64.txt` vs the production Q8 reference
 `data/ref1_64.json`): `--npu` 0.999365, `--quant q8` 0.999280 (771 MiB resident on the
 board), f32 0.999375 — the extension-ops path reproduces the old NPU numbers exactly.
 Server smoke test (`serve --npu`, `/v1/embeddings`) passes.
+
+## 12. Serving robustness round (deployment findings; 2026-10-05)
+
+The OpenViking deployment agent hit four failure modes in `serve`; this round fixed the
+robustness ones (attention memory work deferred):
+
+1. **Panic -> poison -> wedge.** A forward panic (e.g. NPU `ROCKET_CREATE_BO` ENOMEM) unwound
+   while the server's `Inner` mutex was held; every later request then panicked on
+   `lock().unwrap()`. `burn-rocket`'s engine mutex already recovered from poisoning
+   (`PoisonError::into_inner`); the server now recovers too, and the blocking compute is
+   wrapped in `catch_unwind`, so a panic becomes a 500 (`server_error`) for that request
+   only.
+2. **Oversized M.** `matmul` is split into fixed row chunks (`ROCKET_MATMUL_CHUNK_M`, default
+   8192, 0 disables) so the ~200 MB of input BOs a 30k-row activation needed is bounded per
+   call. Rows are independent, so results are unchanged (bit-identical, below).
+3. **tokio starvation.** Immutable settings (`model_name`, caps, attention options) moved out
+   of the mutex; `/v1/models` and request routing never take the lock, and the only
+   acquisition happens inside `spawn_blocking`, so a long forward cannot starve `/health`.
+4. **Raw-token inputs** bypassed `--max-tokens`; they now 400 when over the cap. Text inputs
+   keep the existing truncation.
+
+NPU failures now panic with a structured `OpFailure { error, m, k, n }` payload (`lib.rs`)
+that the server maps: `ROCKET_E_NOMEM` -> 503 ("retry"), `E_SHAPE`/`E_TILING` -> 500, and
+device/unsupported errors log + `exit(1)` so the container restarts a clean engine.
+
+### 12.1 Dev-host verification (`--backend flex --quant q8`)
+
+- `cargo test`: poison recovery, panic-to-500 mapping, handler-error passthrough.
+- `/health` + `/v1/models` answered in 0.2-0.4 ms while a 2,919-token embed ran (15.2 s).
+- `{"input":[999999999]}` panics in the flex gather -> 500
+  (`index 999999999 out of bounds...`); the next request returned 200 (poison recovery
+  end-to-end).
+- Over-cap raw tokens -> 400, empty input -> 400, bad `encoding_format` -> 400.
+
+### 12.2 Board verification (robustness only; production container untouched)
+
+Second instance on port 8393 (`--npu --npu-attn cpu --max-tokens 8192`, pinned to the A55s),
+run while the OpenViking stack was live:
+
+- invalid token id -> 500, next request 200, server alive.
+- 9,000 raw tokens -> 400 (over the 8192 cap).
+- 3,646-token text: 218.8 s wall, `/health` + `/v1/models` at 0.7-4 ms throughout.
+- two concurrent embeds serialize on the model lock; both 200.
+- chunked matmul, 1,300-token input: `ROCKET_MATMUL_CHUNK_M=0` vs `=1024` -> cosine
+  1.00000000, max abs diff 0.0 (timing within noise).
+- test binary left at `/root/embeddings-fast/embeddings-fast-robust`; the test server was
+  stopped and the production container stayed healthy.
+
+Not in this round: the `--npu-attn npu` long-context OOM (n² mask + host score matrices;
+the library's tiled escape hatch is the candidate) and any performance measurement.

@@ -27,7 +27,7 @@ use burn::backend::{Backend, Dispatch, Flex, TensorMetadata, backend_extension};
 use burn::tensor::{DType, Tensor, TensorData};
 use half::f16;
 
-use crate::{Error, RocketCtx, RocketFaCtx, RocketWeight, pad_rows};
+use crate::{Error, OpFailure, RocketCtx, RocketFaCtx, RocketWeight, pad_rows};
 
 /// The Flex backend's float primitive, the concrete type the ops execute on.
 type FlexTensor = FloatTensor<Flex>;
@@ -125,6 +125,35 @@ const PACK_M: usize = 512;
 /// Padding floor for the M dimension: resident weights are packed for the
 /// M >= 256 tiling and cannot serve smaller matmuls directly.
 const MIN_M: usize = 256;
+
+/// Row chunks above this size are split into separate NPU matmuls: the per-call
+/// scratch grows with M and a ~30k-row activation needs ~200 MB of input BOs,
+/// enough to fail with `ROCKET_E_NOMEM` under memory pressure. Rows are
+/// independent, so chunking changes no result. `ROCKET_MATMUL_CHUNK_M` overrides
+/// the default (0 disables chunking).
+const MATMUL_CHUNK_M: usize = 8192;
+
+fn matmul_chunk_m() -> usize {
+    static OVERRIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("ROCKET_MATMUL_CHUNK_M")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MATMUL_CHUNK_M)
+    })
+}
+
+/// Abort the current op with a structured payload: the default panic hook would
+/// print a bare `Box<dyn Any>`, so log the detail first.
+fn op_failure(op: &'static str, rc: i32, m: usize, k: usize, n: usize) -> ! {
+    eprintln!("burn-rocket: {op} failed: rc={rc} m={m} k={k} n={n}");
+    std::panic::panic_any(OpFailure {
+        error: Error { op, rc },
+        m,
+        k,
+        n,
+    })
+}
 
 struct Resident {
     weight: RocketWeight,
@@ -263,7 +292,7 @@ fn pack_one(t: FlexTensor, what: &str) -> u64 {
         let weight = e
             .ctx
             .pack_weight(PACK_M, k, n, &b)
-            .unwrap_or_else(|err| panic!("NPU weight pack failed ({what}): {err}"));
+            .unwrap_or_else(|err| op_failure("rocket_weights_pack", err.rc, PACK_M, k, n));
         let id = e.next_id;
         e.next_id += 1;
         e.weights.insert(id, Resident { weight, k, n });
@@ -280,21 +309,15 @@ fn pack_many(parts: Vec<(usize, usize, Vec<f16>)>, what: &str) -> u64 {
         "{what}: all parts must share K"
     );
     let bufs: Vec<&[f16]> = parts.iter().map(|(_, _, b)| b.as_slice()).collect();
+    let n: usize = parts.iter().map(|(_, n, _)| *n).sum();
     with_engine(|e| {
         let weight = e
             .ctx
             .pack_weight_seg(PACK_M, k, &bufs)
-            .unwrap_or_else(|err| panic!("NPU fused weight pack failed ({what}): {err}"));
+            .unwrap_or_else(|err| op_failure("rocket_weights_pack_seg", err.rc, PACK_M, k, n));
         let id = e.next_id;
         e.next_id += 1;
-        e.weights.insert(
-            id,
-            Resident {
-                weight,
-                k,
-                n: parts.iter().map(|(_, n, _)| n).sum(),
-            },
-        );
+        e.weights.insert(id, Resident { weight, k, n });
         id
     })
 }
@@ -304,11 +327,7 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
     assert!(dims.len() >= 2, "NPU matmul needs at least [M, K]");
     let k = dims[dims.len() - 1];
     let m: usize = dims[..dims.len() - 1].iter().product();
-    assert_eq!(
-        x.dtype(),
-        DType::F32,
-        "the NPU path needs f32 activations"
-    );
+    assert_eq!(x.dtype(), DType::F32, "the NPU path needs f32 activations");
     let values: Vec<f32> = x
         .into_data()
         .try_to_vec()
@@ -316,6 +335,7 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
 
     let t_conv = Instant::now();
     let a16 = f32_to_f16_par(&values);
+    T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
     with_engine(|e| {
         let r = e
@@ -323,31 +343,46 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
             .get(&id)
             .unwrap_or_else(|| panic!("NPU weight id {id} is not packed"));
         assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
+        let n = r.n;
+        let chunk_m = matmul_chunk_m();
 
-        // Small requests are padded up to the smallest resident-weight tiling;
-        // the extra rows are ignored on readback.
-        let padded_m = (m.div_ceil(4) * 4).max(MIN_M);
-        let a16 = if padded_m == m {
-            a16
-        } else {
-            pad_rows(&a16, m, k, padded_m)
-        };
-        let mut c16 = vec![f16::ZERO; padded_m * r.n];
-        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Rows are independent, so M is safe to split: full chunks are matmul'd
+        // at their exact size (bounded NPU scratch), the tail keeps the old
+        // small-request padding (extra rows are ignored on readback).
+        let mut c32: Vec<f32> = Vec::with_capacity(m * n);
+        let mut off = 0;
+        while off < m {
+            let rows = if chunk_m == 0 {
+                m - off
+            } else {
+                (m - off).min(chunk_m)
+            };
+            let padded_m = (rows.div_ceil(4) * 4).max(MIN_M);
+            let src = &a16[off * k..(off + rows) * k];
 
-        let t_npu = Instant::now();
-        e.ctx
-            .matmul_prepacked(padded_m, k, r.n, &a16, &mut c16, &r.weight)
-            .unwrap_or_else(|err| panic!("NPU matmul failed (weight id {id}): {err}"));
-        T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
-        NPU_CALLS.fetch_add(1, Ordering::Relaxed);
+            let t_conv = Instant::now();
+            let padded = (padded_m != rows).then(|| pad_rows(src, rows, k, padded_m));
+            let a: &[f16] = padded.as_deref().unwrap_or(src);
+            let mut c16 = vec![f16::ZERO; padded_m * n];
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        let t_conv = Instant::now();
-        let c32 = f16_to_f32_par(&c16[..m * r.n]);
-        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let t_npu = Instant::now();
+            e.ctx
+                .matmul_prepacked(padded_m, k, n, a, &mut c16, &r.weight)
+                .unwrap_or_else(|err| {
+                    op_failure("rocket_matmul_fp16_prepacked", err.rc, rows, k, n)
+                });
+            T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+            NPU_CALLS.fetch_add(1, Ordering::Relaxed);
+
+            let t_conv = Instant::now();
+            c32.extend(f16_to_f32_par(&c16[..rows * n]));
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+            off += rows;
+        }
 
         let mut out_dims = dims;
-        *out_dims.last_mut().unwrap() = r.n;
+        *out_dims.last_mut().unwrap() = n;
         FlexTensor::from_data(TensorData::new(c32, out_dims))
     })
 }
@@ -365,11 +400,7 @@ fn attention_impl(
     is_causal: bool,
 ) -> FlexTensor {
     let q_dims: Vec<usize> = q.shape().into();
-    assert_eq!(
-        q_dims.len(),
-        3,
-        "NPU attention input must be [1, S, H*D]"
-    );
+    assert_eq!(q_dims.len(), 3, "NPU attention input must be [1, S, H*D]");
     let (b, n) = (q_dims[0], q_dims[1]);
     assert_eq!(b, 1, "the NPU attention path supports batch size 1");
     assert_eq!(
@@ -409,7 +440,7 @@ fn attention_impl(
         };
         if recreate {
             let fa = RocketFaCtx::new(e.threads)
-                .unwrap_or_else(|err| panic!("NPU attention context creation failed: {err}"));
+                .unwrap_or_else(|err| op_failure("rocket_fa_ctx_create", err.rc, n, n, head_dim));
             e.fa = Some(FaState {
                 fa,
                 n_head,
@@ -465,7 +496,7 @@ fn attention_impl(
             mask,
             out,
         )
-        .unwrap_or_else(|err| panic!("NPU attention failed: {err}"));
+        .unwrap_or_else(|err| op_failure("rocket_flash_attn_fp16_ctx", err.rc, n, n, head_dim));
         T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
         NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -507,7 +538,10 @@ pub fn pack3(a: Tensor<2>, b: Tensor<2>, c: Tensor<2>) -> WeightId {
 
 /// `x[.., M, K] @ w[N, K]^T -> [.., M, N]` on the NPU.
 pub fn matmul<const D: usize>(x: Tensor<D>, w: &WeightId) -> Tensor<D> {
-    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_matmul(x.into_dispatch(), w.0))
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_matmul(
+        x.into_dispatch(),
+        w.0,
+    ))
 }
 
 /// Masked grouped-query attention on the NPU, for `[1, S, H*D]` queries and
@@ -587,14 +621,16 @@ fn build_causal_mask(n: usize) -> Vec<f16> {
 fn fill_heads(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {
     use rayon::prelude::*;
     let hd = heads * d;
-    dst.par_chunks_mut(n * d).enumerate().for_each(|(hi, dst_h)| {
-        for (s, dst_row) in dst_h.chunks_mut(d).enumerate() {
-            let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
-            for (o, &x) in dst_row.iter_mut().zip(src_row) {
-                *o = f16::from_f32(x);
+    dst.par_chunks_mut(n * d)
+        .enumerate()
+        .for_each(|(hi, dst_h)| {
+            for (s, dst_row) in dst_h.chunks_mut(d).enumerate() {
+                let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
+                for (o, &x) in dst_row.iter_mut().zip(src_row) {
+                    *o = f16::from_f32(x);
+                }
             }
-        }
-    });
+        });
 }
 
 /// `src` is `[n, heads*d]` row-major; writes the per-head transpose
@@ -602,14 +638,16 @@ fn fill_heads(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {
 fn fill_heads_transposed(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {
     use rayon::prelude::*;
     let hd = heads * d;
-    dst.par_chunks_mut(d * n).enumerate().for_each(|(hi, dst_h)| {
-        for s in 0..n {
-            let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
-            for (di, &x) in src_row.iter().enumerate() {
-                dst_h[di * n + s] = f16::from_f32(x);
+    dst.par_chunks_mut(d * n)
+        .enumerate()
+        .for_each(|(hi, dst_h)| {
+            for s in 0..n {
+                let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
+                for (di, &x) in src_row.iter().enumerate() {
+                    dst_h[di * n + s] = f16::from_f32(x);
+                }
             }
-        }
-    });
+        });
 }
 
 /// `src` is `[heads][n][d]`; returns `[n, heads*d]` row-major f32.

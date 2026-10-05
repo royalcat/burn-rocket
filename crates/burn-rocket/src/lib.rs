@@ -34,9 +34,7 @@ pub mod ffi;
 pub mod ext;
 
 #[cfg(feature = "npu")]
-pub use ext::{
-    Stats, WeightId, attention, init, matmul, pack, pack2, pack3, stats, stats_reset,
-};
+pub use ext::{Stats, WeightId, attention, init, matmul, pack, pack2, pack3, stats, stats_reset};
 
 pub use half;
 use half::f16;
@@ -70,6 +68,19 @@ impl Error {
     pub fn is_fallback(&self) -> bool {
         self.rc == ffi::ROCKET_E_TILING
     }
+}
+
+/// Panic payload of a failed extension op: the raw [`Error`] plus the shape the
+/// call used, so a host (e.g. the serving layer) can map failures to responses
+/// instead of parsing panic strings. For matmuls `m`/`k`/`n` are the GEMM
+/// shape; for attention `m` is the token count, `k` the KV length and `n` the
+/// head dim; mirrors and packs report the packed shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpFailure {
+    pub error: Error,
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
 }
 
 fn check(op: &'static str, rc: i32) -> Result<(), Error> {

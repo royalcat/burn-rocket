@@ -197,8 +197,10 @@ tokenizer ids and embeddings match the x86 build exactly (cosine 1.0).
   The embedding table is kept in f16 (flex's bf16 gather is broken; f16 is exact for
   bf16-sourced values in range). `libc::malloc_trim` releases the freed f32 pages.
 - **Server** (`src/server.rs`): axum, `/v1/embeddings` (string, string list, token ids,
-  base64), `/v1/models`, `/health`; requests are serialized through a mutex because the
-  flex backend already uses rayon internally.
+  base64), `/v1/models`, `/health`; requests are serialized on the model (the flex backend
+  and NPU engine are already serialized), but `/health` and `/v1/models` never take that
+  lock, and a panicking forward is contained (500) instead of poisoning the server. Raw
+  token ids over `--max-tokens` are rejected; text is truncated as before.
 
 ## Notes
 
