@@ -179,6 +179,47 @@ impl RocketCtx {
         })
     }
 
+    /// Pack several weights that share one input activation into a single resident
+    /// weight, concatenated along N: `C[:, sum(Ns)] = A * [B0; B1; ...]^T`.
+    /// Each `parts[i]` is `[Ns[i], K]` row-major fp16; the total `N` is their sum.
+    pub fn pack_weight_seg(
+        &self,
+        m: usize,
+        k: usize,
+        parts: &[&[f16]],
+    ) -> Result<RocketWeight, Error> {
+        let ns: Vec<i32> = parts.iter().map(|p| (p.len() / k) as i32).collect();
+        let n: usize = ns.iter().map(|&x| x as usize).sum();
+        let ptrs: Vec<*const ffi::F16> = parts
+            .iter()
+            .map(|p| {
+                assert_eq!(p.len() % k, 0, "each segment must be [Ns, K]");
+                p.as_ptr() as *const ffi::F16
+            })
+            .collect();
+        let w = unsafe {
+            ffi::rocket_weights_pack_seg(
+                self.inner.ctx,
+                m as i32,
+                k as i32,
+                n as i32,
+                ptrs.as_ptr(),
+                ns.as_ptr(),
+                parts.len() as i32,
+            )
+        };
+        if w.is_null() {
+            return Err(Error {
+                op: "rocket_weights_pack_seg",
+                rc: ffi::ROCKET_E_SHAPE,
+            });
+        }
+        Ok(RocketWeight {
+            w,
+            ctx: self.inner.clone(),
+        })
+    }
+
     /// `C[M, N] = A[M, K] * B[N, K]^T` with a resident weight.
     ///
     /// `a` is `[M, K]` and `c` is `[M, N]`, both row-major fp16. `m` may differ

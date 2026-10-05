@@ -418,8 +418,8 @@ Board numbers (3,633 tokens, cores 4-7, 4 threads, Q8 CPU baseline vs `--npu`):
 | mode | wall | speed | CPU-seconds |
 |---|---|---|---|
 | CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
-| `--npu --npu-attn cpu` | 80.1 s | 45.3 tok/s | 484 (-29%) |
-| `--npu` (NPU attention, default) | 81.3 s | 44.7 tok/s | **351 (-48%)** |
+| `--npu --npu-attn cpu` | 78.7 s | 46.2 tok/s | 488 (-28%) |
+| `--npu` (NPU attention, default) | 79.5 s | 45.7 tok/s | **344 (-49%)** |
 
 Instrumented breakdown of the 81.4 s run: attention stage 64.8 s, MLP 16.0 s, norms 0.6 s;
 NPU matmuls 11.1 s, f32<->f16 conversions 9.7 s — i.e. after the projections moved to the
@@ -443,6 +443,11 @@ scatter back to `[1, s, h*d]` run on rayon.
   attention modes converged (90.1 -> 81.3 s for NPU attention).
 - Forced tiled attention (`ROCKET_FA_TILE_KV=2048 ROCKET_FA_TILE_MIN_KV=1024`) is worse
   at 3.6k tokens (96.9 s) — the default materialized path stays.
+- Fused weights: q|k|v and gate|up are packed as one resident weight each
+  (`rocket_weights_pack_seg`, concatenated along N) so the layer runs 4 matmuls instead
+  of 7 — one A-pack and one conversion of the shared input per group. 196 tensors become
+  112 resident weights; the per-run call count drops 224 -> 140 and the wall ~2%
+  (81.3 -> 79.5 s with NPU attention, 80.1 -> 78.7 s with CPU attention).
 
 Trade-off: at 2-7k tokens the host score round-trip + softmax costs about as much as
 flex's fused flash kernel; with the glue optimized the two modes are within ~1 s of each

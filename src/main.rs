@@ -312,7 +312,7 @@ fn load_npu_projections(
     t0: Instant,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     use crate::model::Proj;
-    use crate::npu::{NpuAttention, NpuModel, NpuRef, ProjKind};
+    use crate::npu::{FusedGroup, NpuAttention, NpuModel, NpuRef, ProjKind};
     use burn_store::ModuleStore;
     use std::sync::Arc;
 
@@ -320,27 +320,73 @@ fn load_npu_projections(
     let t_npu = Instant::now();
     let mut npu = Arc::new(NpuModel::new(cfg.num_hidden_layers, npu_threads)?);
     let mut bytes = 0usize;
-    let mut packed = Vec::new();
+
+    /// Read one projection weight from the store as `(k, n, [n, k] fp16)`.
+    fn read_weight(
+        store: &mut SafetensorsStore,
+        layer: usize,
+        kind: ProjKind,
+    ) -> Result<(usize, usize, Vec<burn_rocket::half::f16>)> {
+        let key = format!("layers.{layer}.{}", kind.key());
+        let tensor = store
+            .get_tensor(&key)?
+            .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
+        let data = burn_store::bridge::to_data(tensor)?; // [out, in] = [N, K]
+        let [n, k] = data.shape.dims::<2>();
+        let values: Vec<f32> = data.convert_dtype(DType::F32).try_to_vec()?;
+        Ok((k, n, burn_rocket::f32_to_f16(&values)))
+    }
+
+    let mut singles: Vec<(usize, ProjKind)> = Vec::new();
+    let mut fused: Vec<(usize, FusedGroup, usize)> = Vec::new();
     for layer in 0..cfg.num_hidden_layers {
-        for kind in ProjKind::ALL {
-            let key = format!("layers.{layer}.{}", kind.key());
-            let tensor = store
-                .get_tensor(&key)?
-                .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
-            let data = burn_store::bridge::to_data(tensor)?; // [out, in] = [N, K]
-            let [n, k] = data.shape.dims::<2>();
-            let values: Vec<f32> = data.convert_dtype(DType::F32).try_to_vec()?;
-            let b = burn_rocket::f32_to_f16(&values);
-            bytes += values.len() * 2;
+        // o and down keep individual resident weights.
+        for kind in [ProjKind::O, ProjKind::Down] {
+            let (k, n, b) = read_weight(&mut store, layer, kind)?;
+            bytes += b.len() * 2;
             Arc::get_mut(&mut npu)
                 .expect("sole owner while packing")
                 .pack(layer, kind, k, n, &b)?;
-            packed.push((layer, kind));
+            singles.push((layer, kind));
+        }
+        // q|k|v and gate|up are packed as one resident weight each (one matmul,
+        // one A-pack per group).
+        let groups: [(FusedGroup, &[ProjKind]); 2] = [
+            (FusedGroup::Qkv, &[ProjKind::Q, ProjKind::K, ProjKind::V]),
+            (FusedGroup::GateUp, &[ProjKind::Gate, ProjKind::Up]),
+        ];
+        for (group, kinds) in groups {
+            let mut parts = Vec::new();
+            let mut k = 0usize;
+            let mut total_n = 0usize;
+            for &kind in kinds {
+                let (kk, n, b) = read_weight(&mut store, layer, kind)?;
+                if k == 0 {
+                    k = kk;
+                }
+                assert_eq!(k, kk, "fused group members must share K");
+                bytes += b.len() * 2;
+                total_n += n;
+                parts.push((kind, b));
+            }
+            Arc::get_mut(&mut npu)
+                .expect("sole owner while packing")
+                .pack_fused(layer, group, k, &parts)?;
+            fused.push((layer, group, total_n));
         }
     }
-    for (layer, kind) in packed {
+    // Assign the handles only after all packing is done (each handle clones the Arc,
+    // so packing must finish while the context is uniquely owned).
+    for (layer, kind) in singles {
         *model.projection_mut(layer, kind) =
             Proj::Npu(NpuRef::new(Arc::clone(&npu), layer, kind));
+    }
+    for (layer, group, total_n) in fused {
+        model.set_fused_handle(
+            layer,
+            group,
+            crate::npu::FusedRef::new(Arc::clone(&npu), layer, group, total_n),
+        );
     }
     if npu_attn {
         let attn = Arc::new(NpuAttention::new(
@@ -354,7 +400,7 @@ fn load_npu_projections(
     }
     model.embed_table_to_f16();
     println!(
-        "NPU: packed {} projections ({:.2} GiB fp16, {} threads) in {:.2}s; \
+        "NPU: packed {} projections into resident fp16 weights ({:.2} GiB, {} threads) in {:.2}s; \
          model ready in {:.2}s (resident {:.0} MiB anon)",
         cfg.num_hidden_layers * ProjKind::ALL.len(),
         bytes as f64 / (1u64 << 30) as f64,

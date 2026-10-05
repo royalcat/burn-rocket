@@ -66,6 +66,17 @@ unsafe extern "C" {
         b: *const F16,
     ) -> *mut RocketWeightsOpaque;
     pub fn rocket_weights_free(ctx: *mut RocketCtxOpaque, w: *mut RocketWeightsOpaque);
+    /// Pack several weights sharing one input as one resident weight, concatenated
+    /// along N (segmented; the caller does not materialize the concatenation).
+    pub fn rocket_weights_pack_seg(
+        ctx: *mut RocketCtxOpaque,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        bs: *const *const F16,
+        ns: *const c_int,
+        nseg: c_int,
+    ) -> *mut RocketWeightsOpaque;
     pub fn rocket_matmul_fp16_prepacked(
         ctx: *mut RocketCtxOpaque,
         m: c_int,

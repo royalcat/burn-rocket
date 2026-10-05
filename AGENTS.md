@@ -58,9 +58,14 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
   stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
   `/root/npu-poc/rocket-userspace` (it is GPL-3.0-or-later).
 - Measured (3,633 tok, 4 threads, cores 4-7, 2 reps): CPU-only 99.9 s / 677 CPU-s;
-  `--npu --npu-attn cpu` 80.1 s / 484 CPU-s; `--npu` (NPU attention, default) 81.3 s /
-  351 CPU-s. The aarch64 build sets `target-feature=+fp16` (hardware FCVT; RK3588 is
+  `--npu --npu-attn cpu` 78.7 s / 488 CPU-s; `--npu` (NPU attention, default) 79.5 s /
+  344 CPU-s. The aarch64 build sets `target-feature=+fp16` (hardware FCVT; RK3588 is
   ARMv8.2) and the NPU glue (f32<->f16, head-major gather/scatter) is rayon-parallel.
+- q|k|v and gate|up are packed as one segmented resident weight each
+  (`pack_weight_seg`, concatenated along N): 196 tensors -> 112 resident weights, 4
+  matmuls per layer, one input conversion per group. Loader packs everything first and
+  assigns handles after (each handle clones the model Arc; `Arc::get_mut` needs the sole
+  owner during packing).
 
 ## Stack notes
 

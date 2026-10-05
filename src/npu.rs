@@ -93,6 +93,31 @@ struct Slot {
 unsafe impl Send for NpuModel {}
 unsafe impl Sync for NpuModel {}
 
+/// Projection groups that share one input activation and can run as one matmul
+/// (their weights are packed concatenated along N).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedGroup {
+    Qkv = 0,
+    GateUp = 1,
+}
+
+impl FusedGroup {
+    pub const COUNT: usize = 2;
+
+    #[inline]
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+struct FusedSlot {
+    weight: RocketWeight,
+    k: usize,
+    /// `(kind, output-column offset, n)` in concatenation order.
+    parts: Vec<(ProjKind, usize, usize)>,
+    total_n: usize,
+}
+
 /// One NPU context holding the resident weights of the whole model.
 ///
 /// Not `Send`/`Sync` (`librocketnpu` contexts are single-threaded); the server
@@ -100,17 +125,54 @@ unsafe impl Sync for NpuModel {}
 pub struct NpuModel {
     ctx: RocketCtx,
     slots: Vec<Option<Slot>>,
+    fused: Vec<Option<FusedSlot>>,
     n_layers: usize,
 }
 
 impl NpuModel {
-    pub fn new(n_layers: usize, nthreads: usize) -> anyhow::Result<Self> {        let ctx = RocketCtx::new(nthreads)
+    pub fn new(n_layers: usize, nthreads: usize) -> anyhow::Result<Self> {
+        let ctx = RocketCtx::new(nthreads)
             .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
         Ok(Self {
             ctx,
             slots: (0..n_layers * ProjKind::ALL.len()).map(|_| None).collect(),
+            fused: (0..n_layers * FusedGroup::COUNT).map(|_| None).collect(),
             n_layers,
         })
+    }
+
+    /// Pack several weights that share one input into one resident weight
+    /// (concatenated along N). `parts` are `(kind, [n, k] row-major fp16)` in
+    /// output-column order.
+    pub fn pack_fused(
+        &mut self,
+        layer: usize,
+        group: FusedGroup,
+        k: usize,
+        parts: &[(ProjKind, Vec<f16>)],
+    ) -> anyhow::Result<()> {
+        assert!(layer < self.n_layers);
+        let bufs: Vec<&[f16]> = parts.iter().map(|(_, b)| b.as_slice()).collect();
+        let weight = self.ctx.pack_weight_seg(512, k, &bufs).map_err(|e| {
+            anyhow::anyhow!("NPU fused weight pack failed (layer {layer}, {group:?}): {e}")
+        })?;
+        let mut offset = 0usize;
+        let metas: Vec<(ProjKind, usize, usize)> = parts
+            .iter()
+            .map(|(kind, b)| {
+                let n = b.len() / k;
+                let meta = (*kind, offset, n);
+                offset += n;
+                meta
+            })
+            .collect();
+        self.fused[layer * FusedGroup::COUNT + group.index()] = Some(FusedSlot {
+            weight,
+            k,
+            parts: metas,
+            total_n: offset,
+        });
+        Ok(())
     }
 
     /// Pack a `[n, k]` row-major fp16 weight (HF layout `[out, in]`, no transpose)
@@ -136,13 +198,27 @@ impl NpuModel {
 
     /// `x` is `[1, m, k]` f32; returns `[1, m, n]` f32.
     pub fn forward(&self, layer: usize, kind: ProjKind, x: Tensor<3>) -> Tensor<3> {
-        let [b, m, k] = x.dims();
-        assert_eq!(b, 1, "the NPU path supports batch size 1");
         let slot = self.slots[layer * ProjKind::ALL.len() + kind.index()]
             .as_ref()
             .unwrap_or_else(|| panic!("NPU weight not packed (layer {layer}, {kind:?})"));
-        assert_eq!(k, slot.k, "activation K mismatch for {kind:?}");
-        let n = slot.n;
+        assert_eq!(x.dims()[2], slot.k, "activation K mismatch for {kind:?}");
+        self.run(&slot.weight, slot.k, slot.n, x, &format!("{kind:?}"))
+    }
+
+    /// Fused group forward: one matmul over the concatenated weights, returns
+    /// `[1, m, total_n]` (split with `FusedRef::part`).
+    pub fn forward_fused(&self, layer: usize, group: FusedGroup, x: Tensor<3>) -> Tensor<3> {
+        let slot = self.fused[layer * FusedGroup::COUNT + group.index()]
+            .as_ref()
+            .unwrap_or_else(|| panic!("NPU fused weight not packed (layer {layer}, {group:?})"));
+        assert_eq!(x.dims()[2], slot.k, "activation K mismatch for {group:?}");
+        self.run(&slot.weight, slot.k, slot.total_n, x, &format!("{group:?}"))
+    }
+
+    /// Shared matmul path: f32 -> f16 (rayon), pad M, NPU call, f16 -> f32.
+    fn run(&self, weight: &RocketWeight, k: usize, n: usize, x: Tensor<3>, what: &str) -> Tensor<3> {
+        let [b, m, _] = x.dims();
+        assert_eq!(b, 1, "the NPU path supports batch size 1");
 
         let t_conv = Instant::now();
         let device = x.device();
@@ -166,8 +242,8 @@ impl NpuModel {
 
         let t_npu = Instant::now();
         self.ctx
-            .matmul_prepacked(padded_m, k, n, &a16, &mut c16, &slot.weight)
-            .unwrap_or_else(|e| panic!("NPU matmul failed (layer {layer}, {kind:?}): {e}"));
+            .matmul_prepacked(padded_m, k, n, &a16, &mut c16, weight)
+            .unwrap_or_else(|e| panic!("NPU matmul failed ({what}): {e}"));
         T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
         NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -180,6 +256,57 @@ impl NpuModel {
 
     pub fn n_layers(&self) -> usize {
         self.n_layers
+    }
+}
+
+/// A handle to one fused projection group (q|k|v or gate|up): the weights are one
+/// resident NPU matmul, the output is concatenated along N.
+#[derive(Clone)]
+pub struct FusedRef {
+    model: Arc<NpuModel>,
+    layer: usize,
+    group: FusedGroup,
+    parts: Vec<(ProjKind, usize, usize)>,
+    total_n: usize,
+}
+
+impl std::fmt::Debug for FusedRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FusedRef(layer={}, {:?}, n={})", self.layer, self.group, self.total_n)
+    }
+}
+
+impl FusedRef {
+    pub fn new(model: Arc<NpuModel>, layer: usize, group: FusedGroup, total_n: usize) -> Self {
+        let parts = model.fused[layer * FusedGroup::COUNT + group.index()]
+            .as_ref()
+            .map(|s| s.parts.clone())
+            .unwrap_or_default();
+        Self {
+            model,
+            layer,
+            group,
+            parts,
+            total_n,
+        }
+    }
+
+    #[inline]
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        self.model.forward_fused(self.layer, self.group, x)
+    }
+
+    /// `(column offset, n)` of one member within the fused output.
+    pub fn part(&self, kind: ProjKind) -> (usize, usize) {
+        self.parts
+            .iter()
+            .find(|(k, _, _)| *k == kind)
+            .map(|(_, o, n)| (*o, *n))
+            .unwrap_or_else(|| panic!("{kind:?} is not part of this fused group"))
+    }
+
+    pub fn total_n(&self) -> usize {
+        self.total_n
     }
 }
 

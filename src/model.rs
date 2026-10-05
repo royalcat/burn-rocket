@@ -169,6 +169,22 @@ impl Qwen3Embedding {
         }
     }
 
+    /// Install a fused projection-group handle on one layer (`--npu` mode).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn set_fused_handle(
+        &mut self,
+        layer: usize,
+        group: crate::npu::FusedGroup,
+        handle: FusedHandle,
+    ) {
+        use crate::npu::FusedGroup as G;
+        let l = &mut self.layers[layer];
+        match group {
+            G::Qkv => l.self_attn.qkv_fused = Some(handle),
+            G::GateUp => l.mlp.gateup_fused = Some(handle),
+        }
+    }
+
     /// Mutable access to one projection (used by the loader).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn projection_mut(
@@ -332,6 +348,12 @@ pub type NpuAttnHandle = std::sync::Arc<crate::npu::NpuAttention>;
 #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
 pub type NpuAttnHandle = ();
 
+/// Handle to a fused NPU projection group (q|k|v, gate|up).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub type FusedHandle = crate::npu::FusedRef;
+#[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+pub type FusedHandle = ();
+
 #[derive(Module, Debug)]
 struct Qwen3Attention {
     #[module(skip)]
@@ -345,6 +367,9 @@ struct Qwen3Attention {
     /// Set in `--npu` mode: attention runs on the RK3588 NPU.
     #[module(skip)]
     npu_attn: Option<NpuAttnHandle>,
+    /// Set in `--npu` mode: q|k|v packed as one resident weight (one matmul).
+    #[module(skip)]
+    qkv_fused: Option<FusedHandle>,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     n_heads: usize,
@@ -362,6 +387,7 @@ impl Qwen3Attention {
             v_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
             o_proj: Proj::stub(q_dim, cfg.hidden_size, device),
             npu_attn: None,
+            qkv_fused: None,
             q_norm: RmsNormConfig::new(cfg.head_dim)
                 .with_epsilon(cfg.rms_norm_eps)
                 .init(device),
@@ -383,6 +409,23 @@ impl Qwen3Attention {
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let [b, s, _] = x.dims();
         let (h, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
+
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if let Some(fused) = &self.qkv_fused {
+            // One matmul for q|k|v; the output is split along N.
+            use crate::npu::ProjKind as K;
+            let qkv = fused.forward(x);
+            let (qo, qn) = fused.part(K::Q);
+            let (ko, kn) = fused.part(K::K);
+            let (vo, vn) = fused.part(K::V);
+            assert_eq!((qn, kn, vn), (h * d, kv * d, kv * d), "fused qkv widths");
+            let q = qkv.clone().slice(s![.., .., qo..qo + qn]).reshape([b, s, h, d]);
+            let k = qkv.clone().slice(s![.., .., ko..ko + kn]).reshape([b, s, kv, d]);
+            let v = qkv.slice(s![.., .., vo..vo + vn]).reshape([b, s, kv, d]);
+            let q = rope.apply(self.q_norm.forward(q), 0);
+            let k = rope.apply(self.k_norm.forward(k), 0);
+            return (q, k, v);
+        }
 
         let q = self.q_proj.forward(x.clone(), quantized).reshape([b, s, h, d]);
         let k = self.k_proj.forward(x.clone(), quantized).reshape([b, s, kv, d]);
@@ -550,6 +593,9 @@ struct Qwen3Mlp {
     up_proj: Proj,
     #[module(skip)]
     down_proj: Proj,
+    /// Set in `--npu` mode: gate|up packed as one resident weight.
+    #[module(skip)]
+    gateup_fused: Option<FusedHandle>,
 }
 
 impl Qwen3Mlp {
@@ -558,10 +604,21 @@ impl Qwen3Mlp {
             gate_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
             up_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
             down_proj: Proj::stub(cfg.intermediate_size, cfg.hidden_size, device),
+            gateup_fused: None,
         }
     }
 
     fn forward(&self, x: Tensor<3>, quantized: bool) -> Tensor<3> {
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if let Some(fused) = &self.gateup_fused {
+            use crate::npu::ProjKind as K;
+            let gu = fused.forward(x);
+            let (go, gn) = fused.part(K::Gate);
+            let (uo, un) = fused.part(K::Up);
+            let gate = gu.clone().slice(s![.., .., go..go + gn]);
+            let up = gu.slice(s![.., .., uo..uo + un]);
+            return self.down_proj.forward(silu(gate) * up, quantized);
+        }
         let gate = self.gate_proj.forward(x.clone(), quantized);
         let up = self.up_proj.forward(x, quantized);
         self.down_proj.forward(silu(gate) * up, quantized)

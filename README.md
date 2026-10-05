@@ -92,15 +92,15 @@ The projection matmuls (and optionally attention) can run on the RK3588 NPU thro
 mainline `rocket` driver, via a new `crates/burn-rocket` crate that wraps `librocketnpu`
 (gregordinary/rocket-userspace). Build with `--features npu` (aarch64) and
 `ROCKETNPU_DIR=<dir with librocketnpu.a>`; the crate is aarch64-only and links the static
-archive. Weights are **pack-and-drop**: all 196 projections are packed straight into
-resident fp16 NPU buffers (0.82 GiB) and the CPU keeps only an f16 embedding table
-(**298 MiB resident**).
+archive. Weights are **pack-and-drop**: all 196 projections are packed straight into resident
+fp16 NPU buffers (0.82 GiB; q|k|v and gate|up are each one segmented weight, so a layer
+is 4 matmuls) and the CPU keeps only an f16 embedding table (**298 MiB resident**).
 
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
 | CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
-| `--npu --npu-attn cpu` | 80.1 s | 45.3 tok/s | 484 (-29%) |
-| `--npu` (NPU attention, default) | 81.3 s | 44.7 tok/s | **351 (-48%)** |
+| `--npu --npu-attn cpu` | 78.7 s | 46.2 tok/s | 488 (-28%) |
+| `--npu` (NPU attention, default) | 79.5 s | 45.7 tok/s | **344 (-49%)** |
 
 - `--npu-attn npu` (default) offloads attention too: it frees ~130 more CPU-seconds for
   about the same wall time as `--npu-attn cpu` (the library brings the score matrix
