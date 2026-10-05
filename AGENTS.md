@@ -57,9 +57,10 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
   stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
   `/root/npu-poc/rocket-userspace` (it is GPL-3.0-or-later).
-- Measured (3,633 tok, 4 threads, cores 4-7): CPU-only 99.9 s / 677 CPU-s; `--npu`
-  81.4 s / 472 CPU-s; `--npu` + NPU attention 90.1 s / 360 CPU-s. Attention is the
-  remaining flex cost (64.8 s of the 81.4 s with CPU attention).
+- Measured (3,633 tok, 4 threads, cores 4-7, 2 reps): CPU-only 99.9 s / 677 CPU-s;
+  `--npu --npu-attn cpu` 80.1 s / 484 CPU-s; `--npu` (NPU attention, default) 81.3 s /
+  351 CPU-s. The aarch64 build sets `target-feature=+fp16` (hardware FCVT; RK3588 is
+  ARMv8.2) and the NPU glue (f32<->f16, head-major gather/scatter) is rayon-parallel.
 
 ## Stack notes
 

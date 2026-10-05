@@ -145,9 +145,10 @@ impl NpuModel {
         let n = slot.n;
 
         let t_conv = Instant::now();
-        let data = x.to_data();
+        let device = x.device();
+        let data = x.into_data();
         let v: Vec<f32> = data.try_to_vec().expect("f32 activations");
-        let a16 = burn_rocket::f32_to_f16(&v);
+        let a16 = f32_to_f16_par(&v);
 
         // The resident weight is packed for the M >= 256 tiling (Mt is capped there and
         // the layout is M-independent). Small requests are padded up to 256 rows so they
@@ -171,8 +172,8 @@ impl NpuModel {
         NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
         let t_conv = Instant::now();
-        let c32: Vec<f32> = c16[..m * n].iter().map(|x| x.to_f32()).collect();
-        let out = Tensor::<3>::from_data(TensorData::new(c32, [1, m, n]), &x.device());
+        let c32 = f16_to_f32_par(&c16[..m * n]);
+        let out = Tensor::<3>::from_data(TensorData::new(c32, [1, m, n]), &device);
         T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
     }
@@ -261,23 +262,60 @@ impl NpuAttention {
             st.v = vec![f16::ZERO; kv * d * n];
             st.out = vec![f16::ZERO; h * n * d];
         }
+        let t_conv = Instant::now();
         let AttnState { mask, q, k, v, out, .. } = &mut *st;
         fill_heads(&qv, n, h, d, q);
         fill_heads(&kvv, n, kv, d, k);
         fill_heads_transposed(&vvv, n, kv, d, v);
+        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
+        let t_npu = Instant::now();
         self.fa
             .flash_attn(n, n, d, d, h, kv, self.scale, q, k, v, Some(mask), out)
             .unwrap_or_else(|e| panic!("NPU attention failed: {e}"));
+        T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+        NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
+        let t_conv = Instant::now();
         let o = unpack_heads(out, n, h, d);
-        Tensor::<3>::from_data(TensorData::new(o, [1, n, h * d]), &device)
+        let res = Tensor::<3>::from_data(TensorData::new(o, [1, n, h * d]), &device);
+        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+        res
     }
 }
 
-/// Causal additive mask: `mask[t][j] = 0` for `j <= t`, `-inf` otherwise.
-fn build_causal_mask(n: usize) -> Vec<f16> {
+/// Parallel f32 -> f16 conversion (rayon; chunked to keep it SIMD-friendly).
+fn f32_to_f16_par(src: &[f32]) -> Vec<f16> {
     use rayon::prelude::*;
+    const CHUNK: usize = 8192;
+    let mut out = vec![f16::ZERO; src.len()];
+    out.par_chunks_mut(CHUNK)
+        .zip(src.par_chunks(CHUNK))
+        .for_each(|(o, s)| {
+            for (d, &x) in o.iter_mut().zip(s) {
+                *d = f16::from_f32(x);
+            }
+        });
+    out
+}
+
+/// Parallel f16 -> f32 conversion.
+fn f16_to_f32_par(src: &[f16]) -> Vec<f32> {
+    use rayon::prelude::*;
+    const CHUNK: usize = 8192;
+    let mut out = vec![0f32; src.len()];
+    out.par_chunks_mut(CHUNK)
+        .zip(src.par_chunks(CHUNK))
+        .for_each(|(o, s)| {
+            for (d, &x) in o.iter_mut().zip(s) {
+                *d = x.to_f32();
+            }
+        });
+    out
+}
+
+/// Causal additive mask: `mask[t][j] = 0` for `j <= t`, `-inf` otherwise.
+fn build_causal_mask(n: usize) -> Vec<f16> {    use rayon::prelude::*;
     let mut mask = vec![f16::ZERO; n * n];
     mask.par_chunks_mut(n).enumerate().for_each(|(t, row)| {
         for m in row[t + 1..].iter_mut() {

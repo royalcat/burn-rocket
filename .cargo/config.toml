@@ -1,2 +1,5 @@
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+# RK3588 (Cortex-A76/A55) implements ARMv8.2-FP16: enable the hardware half-float
+# conversions (half/rocket f16 paths use FCVT instead of the software fallback).
+rustflags = ["-C", "target-feature=+fp16"]

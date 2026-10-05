@@ -99,13 +99,13 @@ resident fp16 NPU buffers (0.82 GiB) and the CPU keeps only an f16 embedding tab
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
 | CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
-| `--npu` (projections on NPU) | 81.4 s | 44.6 tok/s | 472 (-30%) |
-| `--npu --npu-attn npu` (default) | 90.1 s | 40.3 tok/s | **360 (-47%)** |
+| `--npu --npu-attn cpu` | 80.1 s | 45.3 tok/s | 484 (-29%) |
+| `--npu` (NPU attention, default) | 81.3 s | 44.7 tok/s | **351 (-48%)** |
 
-- `--npu-attn npu` (default) offloads attention too: more CPU freed, ~10% slower wall
-  (the library brings the score matrix host-side for the causal mask + softmax, which
-  costs more than flex's fused flash kernel at these lengths). `--npu-attn cpu` selects
-  the faster-wall configuration.
+- `--npu-attn npu` (default) offloads attention too: it frees ~130 more CPU-seconds for
+  about the same wall time as `--npu-attn cpu` (the library brings the score matrix
+  host-side for the causal mask + softmax). `--npu-attn cpu` is the slightly faster-wall
+  alternative.
 - Numerics: cosine 0.999381 vs the production Q8_0 reference (unchanged from the CPU
   paths); the NPU attention run is 0.999997 vs the CPU-attention NPU run.
 - Requirements: the 600 MHz-patched `rocket` module on the board

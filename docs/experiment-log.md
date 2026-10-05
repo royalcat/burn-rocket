@@ -418,8 +418,8 @@ Board numbers (3,633 tokens, cores 4-7, 4 threads, Q8 CPU baseline vs `--npu`):
 | mode | wall | speed | CPU-seconds |
 |---|---|---|---|
 | CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
-| `--npu` (projections) | 81.4 s | 44.6 tok/s | 472 (-30%) |
-| `--npu` + NPU attention | 90.1 s | 40.3 tok/s | **360 (-47%)** |
+| `--npu --npu-attn cpu` | 80.1 s | 45.3 tok/s | 484 (-29%) |
+| `--npu` (NPU attention, default) | 81.3 s | 44.7 tok/s | **351 (-48%)** |
 
 Instrumented breakdown of the 81.4 s run: attention stage 64.8 s, MLP 16.0 s, norms 0.6 s;
 NPU matmuls 11.1 s, f32<->f16 conversions 9.7 s — i.e. after the projections moved to the
@@ -436,12 +436,18 @@ scatter back to `[1, s, h*d]` run on rayon.
 
 - Numerics: cosine 0.999381 vs the production Q8 reference (0.999380 with CPU attention);
   0.999997 vs the CPU-attention NPU run.
-- 6,501 tokens: 248.9 s / 26.1 tok/s (vs 234.1 s with CPU attention).
+- Glue optimization: `-C target-feature=+fp16` (RK3588 A76/A55 have ARMv8.2-FP16, so
+  `half` uses FCVT instead of the software conversion), rayon-parallel f32<->f16
+  conversion, `into_data` instead of `to_data` (one less copy) and rayon-parallel
+  head-major gather/scatter. Conversion wall time halved (9.2 -> 4.5 s) and the two
+  attention modes converged (90.1 -> 81.3 s for NPU attention).
+- Forced tiled attention (`ROCKET_FA_TILE_KV=2048 ROCKET_FA_TILE_MIN_KV=1024`) is worse
+  at 3.6k tokens (96.9 s) — the default materialized path stays.
 
-Trade-off: at 2-7k tokens the host score round-trip + softmax costs more than flex's fused
-flash kernel, so NPU attention is ~10% slower wall but frees another ~110 CPU-seconds
-(-47% vs CPU-only overall). Per the CPU-relief goal it is the default; `--npu-attn cpu`
-selects the faster-wall configuration.
+Trade-off: at 2-7k tokens the host score round-trip + softmax costs about as much as
+flex's fused flash kernel; with the glue optimized the two modes are within ~1 s of each
+other on wall, and NPU attention frees ~130 CPU-seconds more (-48% vs CPU-only overall).
+Per the CPU-relief goal it is the default; `--npu-attn cpu` is the alternative.
 
 Operational notes: the 600 MHz patched module stays loaded on the board (contained;
 reboot restores the stock 200 MHz in-tree module). The NPU deployment needs
