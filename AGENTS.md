@@ -82,8 +82,9 @@ The NPU counters live in `src/npu.rs` (`npu_stats`), the stage counters in
   command line and kills the session).
 - Measured verdict, CPU path (4 threads, 3,633 tokens): production 46.7 s (77.8 tok/s) vs
   ours 106.2 s (34.2 tok/s) — **target ≥50 tok/s is not met on the board**; production is
-  2.28× faster. (The NPU path below reaches 45.7 tok/s at -49% CPU.) Our single-core is 35% of the A76 f32 peak and flex's unary/binary ops have no
-  rayon, so scaling caps at ~3×; flex has no int8 GEMM. f16 does not help (36.1 tok/s).
+  2.28× faster. (The NPU path below reaches 45.7 tok/s at -49% CPU.) Our single-core is
+  35% of the A76 f32 peak and flex's unary/binary ops have no rayon, so scaling caps at
+  ~3×; flex has no int8 GEMM. f16 does not help (36.1 tok/s).
 - RAM: low-RAM mode is 771 MiB resident on the board vs ~4 GB for the production server;
   the Q8 dequant tax is ~7 s per forward on A76 (single-threaded scalar).
 - Numerics: board cosines match the dev host (0.99928 at 82 tokens vs the unquantized
