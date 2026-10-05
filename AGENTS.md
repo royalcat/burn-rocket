@@ -29,6 +29,13 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
   container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192, 0
   disables). Board-verified for robustness only; long-context attention and performance are
   unchanged/deferred.
+- **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
+  + Burn's wgpu backend was measured with `src/bin/wgpu_probe.rs`. Only the WGSL path works
+  (CubeCL's SPIR-V shaders segfault panvk's compiler); the best attention throughput is
+  **34 GF/s at seq 1024** (gate was >=200-300), the real qkv shape trips the panthor
+  job watchdog (device lost), and the tuner OOMs at seq 512/1024. Fixed-strategy kernels
+  are 3.8 GF/s. The flex+NPU configuration remains the fastest; the GPU lever is closed
+  until CubeCL/panvk improve.
 - Not done: int8 GEMM (the only lever that would close the speed gap; flex lacks it, and
   burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and board
   service deployment. The OpenViking entity
@@ -42,6 +49,7 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
 | `src/main.rs` | CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`) and CPU projection loading for the NPU build (`load_cpu_projections`) |
 | `src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
 | `src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment (`catch_unwind` + poison recovery), typed NPU-error mapping, `--max-tokens` enforcement |
+| `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features): device init, smoke ops, GEMM + attention throughput, Flex-vs-GPU cosine. See "Vulkan GPU probe" below |
 | `crates/burn-rocket/` | FFI to `librocketnpu` (RocketCtx/RocketWeight/RocketStream/RocketFaCtx, `pack_weight_seg`, `flash_attn`, `examples/probe.rs`) plus `src/ext.rs`: the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
 | `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness |
@@ -174,6 +182,26 @@ stage counters in `src/model.rs` (`stage_stats`).
 - Reverting the board NPU clock: `rmmod rocket && modprobe rocket` (or reboot) restores
   the stock 200 MHz in-tree module; nothing in `/lib/modules` was modified.
 
+## Vulkan GPU probe (closed, negative; log §13)
+
+- The board's GPU is reachable only through **Mesa panvk** (armbian 26.8.3 trixie, Mesa
+  26.1.6 backports; Vendor `libmali` needs the vendor kernel, rusticl exposes no device).
+  `vulkaninfo` shows Vulkan 1.4.354 on `Mali-G610 MC4` with all features CubeCL needs.
+- Probe: `src/bin/wgpu_probe.rs`, built with the `gpu-wgsl` (+ optional `gpu-autotune`)
+  cargo feature. `gpu-spirv` (burn's `vulkan` feature, CubeCL's SPIR-V compiler) segfaults
+  inside `libvulkan_panfrost.so` at the first shader compile — use `gpu-wgsl`.
+- Build with **`cargo zigbuild --target aarch64-unknown-linux-gnu.2.41`**: the plain GNU
+  cross toolchain links against glibc 2.44 while the board has 2.41 (the wgpu tree pulls
+  libm symbols at 2.43/2.44). Then scp the binary; run from `/root/embeddings-fast`.
+- Measured: fixed-strategy GEMM 3.8 GF/s, autotuned GEMM 79 GF/s (1024³), f16 causal
+  attention 34 GF/s at seq 1024 (4.3 GF/s at 256). The real qkv GEMM shape trips the
+  panthor job watchdog (>4.6 s dispatches die; device lost, `dmesg` "job timeout");
+  the attention tuner OOMs at seq 512/1024 despite a 6.1 GiB heap budget. Mesa's shader
+  cache makes repeat runs fast, but first compiles are tens of seconds.
+- Verdict: no profit vs flex+NPU (attention needs >=200-300 GF/s to move the needle).
+  Do not re-open without a faster CubeCL/panvk stack; the watchdog alone forbids the
+  long-context dispatches this workload needs.
+
 ## Stack notes
 
 - `burn = "=0.22.0-pre.4"`, `burn-store = "=0.22.0-pre.4"`; `flex` backend is the primary
@@ -237,6 +265,10 @@ stage counters in `src/model.rs` (`stage_stats`).
   none; the candidates are the `burn-cpu` (CubeCL/LLVM) backend (CPU quantized matmul
   unverified, cannot cross-compile — would need a native build + JIT on the board) or a
   custom int8 microkernel (upstream contribution).
+- **Vulkan/GPU path is closed** (log §13): measured 3.8-79 GF/s with CubeCL on panvk,
+  panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
+  dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
+  stack.
 - Long-context NPU attention: the `[n][n]` mask + host score matrices OOM at ~30k. The
   library's `ROCKET_FA_TILE_KV` bounds the score scratch but not the mask and loses on
   speed; the candidate is app-side bounded-causal query blocking (per-block `[C, q1]`
@@ -292,6 +324,17 @@ taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --tokens 3633 
 # CPU modes of the same NPU binary (projections are loaded explicitly there)
 ./embeddings-fast embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
 ./embeddings-fast embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
+```
+
+Vulkan/wgpu GPU probe (separate binary; built with
+`cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 --no-default-features --features gpu-wgsl,gpu-autotune --bin wgpu_probe`;
+see "Vulkan GPU probe" in this file for the verdict):
+
+```sh
+# attention throughput at the model's head layout (autotune runs once, ~20-80 s)
+./wgpu_probe --skip-gemm --skip-check --attn-dtype f16 --seq 1024 --reps 2
+# GEMM throughput (fixed shapes/args: --m --n --k --device igpu|cpu)
+./wgpu_probe --skip-attn --skip-check --gemm-dtype f16 --m 1024 --n 1024 --k 1024
 ```
 
 Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencode/`

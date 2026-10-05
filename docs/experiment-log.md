@@ -555,3 +555,51 @@ run while the OpenViking stack was live:
 
 Not in this round: the `--npu-attn npu` long-context OOM (n² mask + host score matrices;
 the library's tiled escape hatch is the candidate) and any performance measurement.
+
+## 13. Vulkan (wgpu) GPU probe — negative result (2026-10-06)
+
+Question: the board's Mali-G610 is idle, its stack is finally usable (Mesa 26.1.6 panvk
+reports Vulkan 1.4.354, `bufferDeviceAddress`, `vulkanMemoryModel`, `shaderFloat16` +
+16-bit storage, `shaderInt8` + integer dot product, 4 GB storage-buffer range, an 11.6 GiB
+heap with 6.1 GiB budget) and CubeCL's `wgpu` device requirements are all met. Could a
+Burn wgpu backend + NPU (eventually a hybrid `--attn wgpu`) beat flex+NPU, whose
+attention stage is 54-65 s of the ~81 s wall at 3,633 tokens?
+
+Instrument: `src/bin/wgpu_probe.rs` (device init, step-by-step smoke ops, GEMM at the
+model's shapes, causal f16 attention, Flex-vs-GPU cosine check), behind the
+`gpu`/`gpu-spirv`/`gpu-wgsl`/`gpu-autotune` features. Build note: the host cross toolchain
+links against glibc 2.44 but the board has 2.41 (the wgpu tree pulls libm symbols
+versioned 2.43/2.44), so probe builds use
+`cargo zigbuild --target aarch64-unknown-linux-gnu.2.41`. Mesa's on-disk shader cache
+makes repeat runs fast; the first compile of a kernel is tens of seconds.
+
+| test (f16 unless noted) | result |
+|---|---|
+| from_data / cast / add (256²) | 5-25 ms each |
+| GEMM 1024³, fixed strategy (no autotune) | 3.8 GF/s |
+| GEMM 2048³, fixed strategy | 3.8 GF/s (4.56 s/call, survives) |
+| GEMM 1024³, autotuned | 79 GF/s (after ~80 s tuning) |
+| attention 256, autotuned | 4.3 GF/s |
+| attention 1024, autotuned | 34 GF/s (0.253 s/call) |
+| real qkv GEMM shape (3636x5120x1024), both modes | panthor job timeout -> device lost |
+
+Failure modes:
+- **SPIR-V path** (`gpu-spirv` = burn's `vulkan` feature): SIGSEGV inside
+  `libvulkan_panfrost.so` at the first shader/pipeline compile (gdb backtrace: frames in
+  libvulkan_panfrost; the null-dispatch class the Armbian LiteRT write-up hit). Only the
+  WGSL path (`gpu-wgsl`) runs.
+- **panthor job timeout**: one dispatch of the real qkv GEMM (38.6 GFLOP at 3.8 GF/s)
+  trips the driver watchdog and loses the device. The limit here is >4.6 s (2048³
+  survived) and <~10 s — the blog's "1 s" figure is not what this kernel enforces.
+- **Autotuner OOM**: `wgpu error: Out of Memory` at seq 512/1024 despite a 6.1 GiB
+  budget (reproducible, once per fresh process; the fallback candidate's score-matrix
+  allocations are the likely trigger).
+- Tuning costs 20-80 s per new shape, while the *fixed* (non-autotuned) kernels are 20x
+  slower than the tuned ones — both extremes are unattractive.
+
+Verdict: **no profit today**. The gate was >=200-300 GF/s on attention shapes to beat the
+current 54-65 s attention; the best measured is 34 GF/s and the model's real shape kills
+the device. Even an optimistic extrapolation leaves the wall at today's level, with panvk
+instability, a watchdog that forbids the long dispatches 3.6k+ tokens need, and no path to
+30k context. The NPU stays the only practical accelerator; this lever reopens if CubeCL's
+panvk support, Mesa's compiler, or the panthor watchdog improve.

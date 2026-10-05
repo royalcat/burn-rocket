@@ -14,6 +14,22 @@ default = ["cpu"]
 cpu = ["burn/cpu", "burn/autotune", "burn/fusion"]
 # RK3588 NPU offload via librocketnpu (aarch64 only; see crates/burn-rocket).
 npu = ["dep:burn-rocket", "burn-rocket/npu"]
+# GPU (CubeCL/wgpu) backend; the Rock 5B+ reaches it through Mesa panvk.
+# `gpu-spirv` uses CubeCL's SPIR-V compiler (burn's `vulkan` feature), `gpu-wgsl`
+# the WGSL one (naga). panvk's own compiler segfaults on CubeCL SPIR-V shaders,
+# so `gpu-wgsl` is the working path on the board.
+# `gpu-autotune` adds CubeCL's runtime kernel autotuning: it benchmarks kernel
+# candidates per shape, and a slow candidate can trip the panthor job watchdog,
+# so it is opt-in.
+gpu = []
+gpu-spirv = ["gpu", "burn/vulkan"]
+gpu-wgsl = ["gpu", "burn/webgpu"]
+gpu-autotune = ["burn/autotune"]
+
+[[bin]]
+name = "wgpu_probe"
+path = "src/bin/wgpu_probe.rs"
+required-features = ["gpu"]
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 burn-rocket = { path = "crates/burn-rocket", optional = true }
