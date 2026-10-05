@@ -89,8 +89,10 @@ with 4 threads, identical text:
 ## NPU offload (RK3588 `rocket` driver, `--npu`)
 
 The projection matmuls (and optionally attention) can run on the RK3588 NPU through the
-mainline `rocket` driver, via a new `crates/burn-rocket` crate that wraps `librocketnpu`
-(gregordinary/rocket-userspace). Build with `--features npu` (aarch64) and
+mainline `rocket` driver, via the `crates/burn-rocket` crate that wraps `librocketnpu`
+(gregordinary/rocket-userspace) and exposes the operations as a Burn **backend
+extension** (`#[backend_extension(Flex)]`; the model calls `burn_rocket::matmul` /
+`burn_rocket::attention`). Build with `--features npu` (aarch64) and
 `ROCKETNPU_DIR=<dir with librocketnpu.a>`; the crate is aarch64-only and links the static
 archive. Weights are **pack-and-drop**: all 196 projections are packed straight into resident
 fp16 NPU buffers (0.82 GiB; q|k|v and gate|up are each one segmented weight, so a layer
@@ -98,20 +100,25 @@ is 4 matmuls) and the CPU keeps only an f16 embedding table (**298 MiB resident*
 
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
-| CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
-| `--npu --npu-attn cpu` | 78.7 s | 46.2 tok/s | 488 (-28%) |
-| `--npu` (NPU attention, default) | 79.5 s | 45.7 tok/s | **344 (-49%)** |
+| CPU-only (f32) | 100.1 s | 36.3 tok/s | 622 |
+| `--npu --npu-attn cpu` | 86.9 s | 41.8 tok/s | 409 (-34%) |
+| `--npu` (NPU attention, default) | 80.8 s | 45.0 tok/s | **302 (-51%)** |
 
-- `--npu-attn npu` (default) offloads attention too: it frees ~130 more CPU-seconds for
+Re-verified after the backend-extension refactor (`docs/experiment-log.md` §11); the
+earlier CPU-only row (99.9 s / 677 CPU-s) ran with uninitialized projections because of a
+loading bug fixed there — wall time is unaffected (GEMM cost is data-independent), but the
+fixed path is the one worth comparing against.
+
+- `--npu-attn npu` (default) offloads attention too: it frees ~100 more CPU-seconds for
   about the same wall time as `--npu-attn cpu` (the library brings the score matrix
   host-side for the causal mask + softmax). `--npu-attn cpu` is the slightly faster-wall
   alternative.
-- Numerics: cosine 0.999381 vs the production Q8_0 reference (unchanged from the CPU
-  paths); the NPU attention run is 0.999997 vs the CPU-attention NPU run.
+- Numerics: cosine 0.999365 vs the production Q8_0 reference (CPU f32 0.999375, q8
+  0.999280); the NPU attention run is 0.999997 vs the CPU-attention NPU run.
 - Requirements: the 600 MHz-patched `rocket` module on the board
   (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`, contained; reboot reverts to the
   stock 200 MHz module). At the stock clock everything still works, ~2-3x slower.
-- See `docs/experiment-log.md` §10 for the shape sweep, breakdown and trade-offs.
+- See `docs/experiment-log.md` §10-11 for the shape sweep, breakdown and trade-offs.
 
 ### Memory
 

@@ -11,9 +11,14 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
   than the production `ik_llama.cpp` int8 server on the board (34.2 vs 77.8 tok/s at
   3,633 tokens). Production stays on `ik_llama.cpp`; flex has no int8 GEMM.
 - **NPU path** (`--npu`, RK3588 `rocket` driver via `crates/burn-rocket`): projections and
-  attention on the NPU. 45.7 tok/s and **-49% CPU-seconds** vs the CPU-only path at 3,633
-  tokens, 298 MiB CPU-resident. Wall is ~20% better than CPU-only but still below
-  production; its value is freeing CPU for other board services.
+  attention on the NPU, exposed as Burn *backend-extension* ops
+  (`#[backend_extension(Flex)]`, log §11). 45 tok/s and **-51% CPU-seconds** vs the
+  CPU-only path at 3,633 tokens, 298 MiB CPU-resident. Wall is ~20% better than CPU-only
+  but still below production; its value is freeing CPU for other board services.
+- The refactor surfaced a pre-existing bug: the projection fields were `#[module(skip)]`
+  in every build, so the store and the q8 mapper had not touched them since the NPU
+  commit. Fixed (log §11.1): dev-host cosine 0.9994 (f32) / 0.9993 (q8), board q8 is
+  771 MiB resident again.
 - 30k-token inputs work on the CPU path (fused flash attention, 52.4 tok/s at 32 dev
   threads); 30k with `--npu` is not yet measured. The OpenAI-compatible server is
   implemented and smoke-tested.
@@ -27,13 +32,12 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
 
 | path | contents |
 |---|---|
-| `src/main.rs` | CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing |
-| `src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu`, stage timers |
-| `src/npu.rs` | aarch64+npu only: `NpuModel` (resident weights), `NpuRef`, `NpuAttention`, `FusedRef`, NPU/convert timers |
+| `src/main.rs` | CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`) and CPU projection loading for the NPU build (`load_cpu_projections`) |
+| `src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
 | `src/server.rs` | axum OpenAI-compatible `/v1/embeddings` |
-| `crates/burn-rocket/` | FFI to `librocketnpu`: RocketCtx/RocketWeight/RocketStream/RocketFaCtx, `pack_weight_seg`, `flash_attn`, `examples/probe.rs` |
+| `crates/burn-rocket/` | FFI to `librocketnpu` (RocketCtx/RocketWeight/RocketStream/RocketFaCtx, `pack_weight_seg`, `flash_attn`, `examples/probe.rs`) plus `src/ext.rs`: the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
-| `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU |
+| `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix |
 
 ## Rebuild + deploy to the board
 
@@ -51,8 +55,8 @@ The binary is self-contained (`librocketnpu` is statically linked); the model li
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
-The NPU counters live in `src/npu.rs` (`npu_stats`), the stage counters in
-`src/model.rs` (`stage_stats`).
+The NPU counters live in `crates/burn-rocket/src/ext.rs` (`burn_rocket::stats`), the
+stage counters in `src/model.rs` (`stage_stats`).
 
 ## Environment facts
 
@@ -95,13 +99,23 @@ The NPU counters live in `src/npu.rs` (`npu_stats`), the stage counters in
 - The deployed binary as of 2026-10-05 is the NPU-enabled build and the board is running
   the 600 MHz patched `rocket` module (revert: `rmmod rocket && modprobe rocket`, or
   reboot). `--npu` runs need no extra setup beyond that.
+- The board binary at `/root/embeddings-fast/embeddings-fast` is the post-refactor build
+  from this repo (sha256 `05c38e18dfe57501…`). Later that evening the user reported the
+  board busy with another workload: re-run the A/B only on an idle board.
 
 ## NPU offload (`--npu`, aarch64)
 
-- `crates/burn-rocket` = FFI to `librocketnpu` (rocket-userspace). Build the app with
-  `--no-default-features --features npu`; the crate links `vendor/rocketnpu/librocketnpu.a`
-  (override with `ROCKETNPU_DIR`, e.g. `/root/npu-poc/rocket-userspace/build` on the board).
-  aarch64 only: the dep is target-gated in Cargo.toml.
+- `crates/burn-rocket` = FFI to `librocketnpu` (rocket-userspace) plus the `RocketOps`
+  Burn backend extension. Build the app with `--no-default-features --features npu`; the
+  crate's `npu` feature implies `flex` (required because Burn's `#[backend_extension(Flex)]`
+  reads `feature = "flex"` in the consuming crate) and links
+  `vendor/rocketnpu/librocketnpu.a` (override with `ROCKETNPU_DIR`, e.g.
+  `/root/npu-poc/rocket-userspace/build` on the board). aarch64 only: the dep is
+  target-gated in Cargo.toml.
+- Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
+  `WeightId`s), `matmul` and `attention` — the app's model calls these directly; `src/npu.rs`
+  no longer exists. All ops share one global engine behind a mutex (the FFI contexts are
+  not thread-safe), so NPU calls serialize.
 - `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
   f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
   attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (within ~1 s on
@@ -112,20 +126,28 @@ The NPU counters live in `src/npu.rs` (`npu_stats`), the stage counters in
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
   stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
   `/root/npu-poc/rocket-userspace` (it is GPL-3.0-or-later).
-- Measured (3,633 tok, 4 threads, cores 4-7, 2 reps): CPU-only 99.9 s / 677 CPU-s;
-  `--npu --npu-attn cpu` 78.7 s / 488 CPU-s; `--npu` (NPU attention, default) 79.5 s /
-  344 CPU-s. The aarch64 build sets `target-feature=+fp16` (hardware FCVT; RK3588 is
-  ARMv8.2) and the NPU glue (f32<->f16, head-major gather/scatter) is rayon-parallel.
+- Measured (3,633 tok, 4 threads, cores 4-7): CPU-only 100.1 s / 622 CPU-s;
+  `--npu --npu-attn cpu` 86.9 s / 409 CPU-s; `--npu` (NPU attention, default) 80.8 s /
+  302 CPU-s — re-verified after the extension-ops refactor (log §11; the pre-refactor
+  numbers were 99.9/78.7/79.5 s and 677/488/344 CPU-s). The aarch64 build sets
+  `target-feature=+fp16` (hardware FCVT; RK3588 is ARMv8.2) and the NPU glue (f32<->f16,
+  head-major gather/scatter) is rayon-parallel.
 - q|k|v and gate|up are packed as one segmented resident weight each
   (`pack_weight_seg`, concatenated along N): 196 tensors -> 112 resident weights, 4
-  matmuls per layer, one input conversion per group. Loader packs everything first and
-  assigns handles after (each handle clones the model Arc; `Arc::get_mut` needs the sole
-  owner during packing).
+  matmuls per layer, one input conversion per group. The loader packs each weight straight
+  from the store and drops the host copy (`pack-and-drop`); the old Arc/handle-assignment
+  dance is gone.
+- Projection fields are `#[cfg_attr(npu, module(skip))]` so the store never materializes
+  CPU copies in the NPU build. For that build's CPU modes (`--quant q8`, no `--npu`),
+  `load_cpu_projections` loads the same tensors explicitly (with the PyTorch `[out,in]` ->
+  Burn `[in,out]` transpose) and quantizes them in q8 mode; the non-NPU build loads them
+  through the store as usual (`Proj` implements `Module` transparently).
 - Attention trade-off: `rocket_flash_attn_fp16_ctx` brings the full score matrix
   host-side for the causal mask + softmax, so at 2-7k tokens it is about as fast as
   flex's fused flash kernel (within ~1 s) while using far less CPU. `ROCKET_FA_TILE_KV`
   (tiled path) is *worse* at 3.6k (96.9 s vs 79.5 s); it engages automatically >8k keys.
-  The mask + head-major f16 scratch are cached per sequence length in `NpuAttention`.
+  The mask + head-major f16 scratch are cached per sequence length in the crate's engine
+  (`ext::FaState`).
 - Safetensors keys in `model.safetensors` have **no `model.` prefix**
   (`layers.0.self_attn.q_proj.weight`, `embed_tokens.weight`); the loader reads the
   projection tensors by that key after `load_from` has taken the rest.
@@ -168,6 +190,21 @@ The NPU counters live in `src/npu.rs` (`npu_stats`), the stage counters in
     lengths (70.2 vs 45.5 tok/s at 3.6k on the dev host).
   - `perf` shows the forward is GEMM-bound at ~98% of the flex f32 microbenchmark peak;
     further speedups need a faster GEMM (int8), not more attention tuning.
+- **Burn backend extensions** (the sanctioned out-of-tree op hook; there is no way to
+  register a custom `Backend` — `DispatchTensorKind`/`DispatchDevice` are closed enums,
+  so a wrapper around `Flex` is not expressible on 0.22-pre.4):
+  - `#[backend_extension(Flex)]` routes through `Dispatch`; `burn/extension` must be on,
+    and the catalog cfg is read in the *consuming* crate, so `burn-rocket` must keep a
+    cargo feature named exactly `flex` (`npu = ["flex"]`).
+  - Extension args may be owned/borrowed tensor primitives, `#[extension_type]` values or
+    plain `Clone+Send+Sync+'static` args — **no `Vec`/`Option` of tensors**, which is why
+    the fused packing is `pack2`/`pack3`. Plain `u64` returns pass through untouched. An
+    op with no tensor argument cannot select a backend, hence no `release` op.
+  - The impl exists only for `Flex`: an op call with a `cpu`/CubeCL tensor panics on the
+    dispatch side ("wrong backend"), and an autodiff context panics too (no backward is
+    generated) — the ops are inference-only.
+  - The one global engine serializes calls (the FFI contexts are not thread-safe), so NPU
+    ops from several threads queue up rather than race.
 - Cross-compile: `.cargo/config.toml` sets `aarch64-linux-gnu-gcc` for
   `aarch64-unknown-linux-gnu`; artifacts land in
   `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/`. Build with
@@ -207,11 +244,16 @@ On the board (after the cross-build + scp above; the NPU-enabled binary):
 ```sh
 ssh root@rock-5b-plus.lan
 cd /root/embeddings-fast
-# speed / CPU-relief A/B (2 reps; watch the stages + npu breakdown lines and `time`)
+# speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
+# lines and `time`). Only meaningful on an idle board.
 taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
 taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
+taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --tokens 3633 --reps 1
 # numerics vs the production reference (copy the JSON back and compare cosines)
-./embeddings-fast embed --backend flex --dtype f32 --npu --text "Hello world, this is a test." --out /tmp/npu_short.json
+./embeddings-fast embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
+# CPU modes of the same NPU binary (projections are loaded explicitly there)
+./embeddings-fast embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
+./embeddings-fast embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
 ```
 
 Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencode/`

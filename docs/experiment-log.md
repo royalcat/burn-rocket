@@ -457,3 +457,51 @@ Per the CPU-relief goal it is the default; `--npu-attn cpu` is the alternative.
 Operational notes: the 600 MHz patched module stays loaded on the board (contained;
 reboot restores the stock 200 MHz in-tree module). The NPU deployment needs
 `--features npu` (aarch64) and `ROCKETNPU_DIR` pointing at `librocketnpu.a`.
+
+## 11. NPU ops as a Burn backend extension + CPU-loading fix (board re-verified)
+
+### 11.1 Refactor
+
+The NPU runtime moved out of the app into `crates/burn-rocket` as a Burn *backend
+extension* (`#[backend_extension(Flex)]`, the out-of-tree op hook of
+0.22.0-pre.4): the `RocketOps` trait declares `rocket_pack/pack2/pack3` (weights ->
+resident handles), `rocket_matmul` and `rocket_attention`; the safe wrappers `pack`,
+`pack2`, `pack3`, `matmul`, `attention` take ordinary `Tensor`s and do the
+`into_dispatch`/`from_dispatch` plumbing, so `src/model.rs` calls
+`burn_rocket::matmul` / `burn_rocket::attention` directly and `src/npu.rs` is gone.
+Handles are plain `u64`-backed `WeightId`s (no `ExtensionType` plumbing needed; an op
+without a tensor input cannot select a backend, so there is no `release`). One global
+engine (NPU context + resident weights + attention scratch) sits behind a mutex;
+`burn_rocket::init(threads)` must be called once. Flex's catalog cfg is read in the
+*consuming* crate, hence the crate's `flex` feature (`npu = ["flex"]` links
+`librocketnpu`); `build.rs` emits the link flags only for `npu` builds.
+
+Fixed at the same time: since the NPU commit the projection fields were
+`#[module(skip)]` in *all* builds, so `load_from` never loaded them and the q8 mapper
+never quantized them — every CPU path had been running on uninitialized weights
+(cosine 0.027) since commit 4229434. `Proj` now has a transparent `Module` impl and
+the skip is `#[cfg_attr(npu, module(skip))]`; the NPU build (where the fields must
+stay skipped to keep pack-and-drop) loads the projections explicitly for its CPU
+modes (`load_cpu_projections`, including the PyTorch `[out,in]` -> Burn `[in,out]`
+transpose). Dev-host cosines after the fix: f32 0.999375, q8 0.999280 (82 tokens), q8
+resident 776 MiB.
+
+### 11.2 Board re-validation (same commands, 600 MHz rocket module)
+
+3,633 tokens, cores 4-7, 4 threads, 1 warmup + 1 measured run (`time`):
+
+| mode | wall | CPU-seconds | pre-refactor log |
+|---|---|---|---|
+| CPU-only | 100.1 s | 622 | 99.9 s / 677 |
+| `--npu --npu-attn cpu` | 86.9 s | 409 | 78.7 s / 488 |
+| `--npu` (NPU attention, default) | 80.8 s | 302 | 79.5 s / 344 |
+
+CPU relief is preserved (`--npu` is -51% CPU-seconds vs CPU-only); the walls are within
+board noise of the pre-refactor numbers. The NPU-attention run: 280 calls, npu 128.8 s,
+convert 10.7 s for 2 forwards. (The pre-refactor CPU-only row ran on uninitialized
+projections; wall time is unaffected because GEMM cost does not depend on the values.)
+
+Numerics (82 tokens, `data/one_64.txt` vs the production Q8 reference
+`data/ref1_64.json`): `--npu` 0.999365, `--quant q8` 0.999280 (771 MiB resident on the
+board), f32 0.999375 — the extension-ops path reproduces the old NPU numbers exactly.
+Server smoke test (`serve --npu`, `/v1/embeddings`) passes.
