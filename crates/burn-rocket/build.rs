@@ -12,6 +12,12 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ROCKETNPU_DIR");
 
+    // Only `npu` builds actually call into librocketnpu; the extension code
+    // (`flex` without `npu`) is checked but never linked against it.
+    if std::env::var_os("CARGO_FEATURE_NPU").is_none() {
+        return;
+    }
+
     let dir: PathBuf = match std::env::var_os("ROCKETNPU_DIR") {
         Some(dir) => PathBuf::from(dir),
         None => {

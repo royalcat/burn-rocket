@@ -1,16 +1,24 @@
 //! RK3588 NPU offload for Burn models, through the mainline `rocket` driver.
 //!
-//! This crate is a thin safe wrapper around `librocketnpu`
+//! This crate wraps `librocketnpu`
 //! (<https://github.com/gregordinary/rocket-userspace>), the userspace driver for
 //! the mainline `rocket` DRM-accel driver. It exposes the fp16 resident-weight
-//! matmul (`C[M,N] = A[M,K] * B[N,K]^T`) that Burn models use to offload their
-//! projections; everything else stays on the CPU backend.
+//! matmul (`C[M,N] = A[M,K] * B[N,K]^T`) and masked GQA attention that Burn models
+//! use to offload their projections and attention; everything else stays on the
+//! CPU backend.
+//!
+//! On the `Flex` backend the operations are also exposed as Burn **backend
+//! extensions** (`crate::ext`, feature `npu`): the [`ext::RocketOps`] trait is
+//! routed through Burn's `Dispatch`, and the ordinary-`Tensor` helpers
+//! [`pack`](ext::pack), [`pack2`](ext::pack2), [`pack3`](ext::pack3),
+//! [`matmul`](ext::matmul) and [`attention`](ext::attention) wrap the dispatch
+//! plumbing. Call [`ext::init`] once before using them.
 //!
 //! aarch64-only: it links `librocketnpu.a` (see `build.rs` and `ROCKETNPU_DIR`).
 //!
 //! Handles are **not** `Send`/`Sync`: `rocket_ctx` mutates shared per-shape
-//! scratch every call and is documented as not thread-safe. Use one context per
-//! concurrent caller.
+//! scratch every call and is documented as not thread-safe. The extension ops
+//! serialize access through one global engine.
 //!
 //! ```
 //! # #[cfg(target_arch = "aarch64")] {
@@ -20,6 +28,15 @@
 //! ```
 
 pub mod ffi;
+
+/// Burn backend-extension ops (`#[backend_extension(Flex)]`); NPU builds only.
+#[cfg(feature = "npu")]
+pub mod ext;
+
+#[cfg(feature = "npu")]
+pub use ext::{
+    Stats, WeightId, attention, init, matmul, pack, pack2, pack3, stats, stats_reset,
+};
 
 pub use half;
 use half::f16;
@@ -355,6 +372,7 @@ impl RocketFaCtx {
         n_head: usize,
         n_kv_heads: usize,
         scale: f32,
+        softcap: f32,
         q: &[f16],
         k: &[f16],
         v: &[f16],
@@ -378,7 +396,7 @@ impl RocketFaCtx {
                 n_head as i32,
                 n_kv_heads as i32,
                 scale,
-                0.0,
+                softcap,
                 q.as_ptr() as *const ffi::F16,
                 k.as_ptr() as *const ffi::F16,
                 v.as_ptr() as *const ffi::F16,

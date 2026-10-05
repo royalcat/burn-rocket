@@ -4,7 +4,10 @@
 //! decoder-only transformer, pre-norm, GQA (16 q heads / 8 kv heads), head_dim 128,
 //! QK-RMSNorm, RoPE theta 1e6, SwiGLU MLP, final RMSNorm, last-token pooling.
 
-use burn::module::{Module, Param, ParamId};
+use burn::module::{
+    Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper, ModuleVisitor,
+    Param, ParamId,
+};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::activation::silu;
@@ -34,6 +37,54 @@ pub fn stage_stats_reset() {
     T_ATTN_US.store(0, Ordering::Relaxed);
     T_MLP_US.store(0, Ordering::Relaxed);
     T_NORM_US.store(0, Ordering::Relaxed);
+}
+
+/// Which projection of a transformer layer (loader + `Proj` handles).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjKind {
+    Q = 0,
+    K = 1,
+    V = 2,
+    O = 3,
+    Gate = 4,
+    Up = 5,
+    Down = 6,
+}
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+impl ProjKind {
+    pub const ALL: [ProjKind; 7] = [
+        Self::Q,
+        Self::K,
+        Self::V,
+        Self::O,
+        Self::Gate,
+        Self::Up,
+        Self::Down,
+    ];
+
+    /// Safetensors key suffix within `model.layers.{i}`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Q => "self_attn.q_proj.weight",
+            Self::K => "self_attn.k_proj.weight",
+            Self::V => "self_attn.v_proj.weight",
+            Self::O => "self_attn.o_proj.weight",
+            Self::Gate => "mlp.gate_proj.weight",
+            Self::Up => "mlp.up_proj.weight",
+            Self::Down => "mlp.down_proj.weight",
+        }
+    }
+}
+
+/// Projection groups that share one input activation and run as one NPU matmul
+/// (their weights are packed concatenated along N).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedGroup {
+    Qkv = 0,
+    GateUp = 1,
 }
 
 /// Model hyper-parameters, deserialized from the HF `config.json`.
@@ -159,49 +210,41 @@ impl Qwen3Embedding {
         }
     }
 
-    /// Mutable access to one projection (used by the loader).
+    /// Enable/disable NPU attention on every layer (`--npu` mode).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    /// Install the NPU attention handle on every layer (`--npu` mode).
-    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    pub fn set_npu_attn(&mut self, attn: Option<NpuAttnHandle>) {
+    pub fn set_npu_attn(&mut self, on: bool) {
         for layer in &mut self.layers {
-            layer.self_attn.npu_attn = attn.clone();
+            layer.self_attn.npu_attn = on;
         }
     }
 
-    /// Install a fused projection-group handle on one layer (`--npu` mode).
+    /// Install a fused projection-group weight on one layer (`--npu` mode).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn set_fused_handle(
         &mut self,
         layer: usize,
-        group: crate::npu::FusedGroup,
-        handle: FusedHandle,
+        group: FusedGroup,
+        id: burn_rocket::WeightId,
     ) {
-        use crate::npu::FusedGroup as G;
         let l = &mut self.layers[layer];
         match group {
-            G::Qkv => l.self_attn.qkv_fused = Some(handle),
-            G::GateUp => l.mlp.gateup_fused = Some(handle),
+            FusedGroup::Qkv => l.self_attn.qkv_fused = Some(id),
+            FusedGroup::GateUp => l.mlp.gateup_fused = Some(id),
         }
     }
 
     /// Mutable access to one projection (used by the loader).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    pub fn projection_mut(
-        &mut self,
-        layer: usize,
-        kind: crate::npu::ProjKind,
-    ) -> &mut Proj {
-        use crate::npu::ProjKind as K;
+    pub fn projection_mut(&mut self, layer: usize, kind: ProjKind) -> &mut Proj {
         let l = &mut self.layers[layer];
         match kind {
-            K::Q => &mut l.self_attn.q_proj,
-            K::K => &mut l.self_attn.k_proj,
-            K::V => &mut l.self_attn.v_proj,
-            K::O => &mut l.self_attn.o_proj,
-            K::Gate => &mut l.mlp.gate_proj,
-            K::Up => &mut l.mlp.up_proj,
-            K::Down => &mut l.mlp.down_proj,
+            ProjKind::Q => &mut l.self_attn.q_proj,
+            ProjKind::K => &mut l.self_attn.k_proj,
+            ProjKind::V => &mut l.self_attn.v_proj,
+            ProjKind::O => &mut l.self_attn.o_proj,
+            ProjKind::Gate => &mut l.mlp.gate_proj,
+            ProjKind::Up => &mut l.mlp.up_proj,
+            ProjKind::Down => &mut l.mlp.down_proj,
         }
     }
 
@@ -308,16 +351,92 @@ impl Qwen3Layer {
 
 /// A projection weight: a regular CPU `Linear`, or (with `--npu`) a handle to a
 /// weight resident on the RK3588 NPU. The NPU variant holds no CPU-side weights.
+///
+/// `Proj` is a transparent module wrapper: on the CPU path the store loads (and
+/// `--quant q8` quantizes) the inner `Linear` under the usual `..._proj.weight`
+/// key; in the NPU build the fields are `#[module(skip)]` and the weights are
+/// packed straight from the store instead.
 #[derive(Debug, Clone)]
 pub enum Proj {
     Cpu(Linear),
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    Npu(crate::npu::NpuRef),
+    Npu(burn_rocket::WeightId),
 }
 
+impl Module for Proj {
+    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
+        match self {
+            Proj::Cpu(l) => l.visit(visitor),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(_) => {}
+        }
+    }
+
+    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.map(mapper)),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(id),
+        }
+    }
+
+    fn to_device(self, device: &Device) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.to_device(device)),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(id),
+        }
+    }
+
+    fn fork(self, device: &Device) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.fork(device)),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(id),
+        }
+    }
+
+    fn collect_devices(&self, devices: Devices) -> Devices {
+        match self {
+            Proj::Cpu(l) => l.collect_devices(devices),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(_) => devices,
+        }
+    }
+
+    fn valid(&self) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.valid()),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(*id),
+        }
+    }
+
+    fn train(self) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.train()),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(id),
+        }
+    }
+}
+
+impl ModuleDisplayDefault for Proj {
+    fn content(&self, content: Content) -> Option<Content> {
+        match self {
+            Proj::Cpu(l) => ModuleDisplayDefault::content(l, content),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Some(content.add_formatted(&format!("WeightId({})", id.id()))),
+        }
+    }
+}
+
+impl ModuleDisplay for Proj {}
+
 impl Proj {
-    /// A CPU linear whose weight is uninitialized (not yet allocated); the loader
-    /// fills it in. `#[module(skip)]` means the store never touches it.
+    /// A CPU linear whose weight is uninitialized until the store loads it (or
+    /// the NPU loader replaces the whole `Proj`). In the NPU build the projection
+    /// fields are `#[module(skip)]`, so only the NPU loader touches them.
     pub fn stub(input: usize, output: usize, device: &Device) -> Self {
         Proj::Cpu(Linear {
             weight: Param::uninitialized(
@@ -336,40 +455,29 @@ impl Proj {
         match self {
             Proj::Cpu(l) => linear_forward(l, x, quantized),
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(r) => r.forward(x),
+            Proj::Npu(id) => burn_rocket::matmul(x, id),
         }
     }
 }
 
-/// NPU attention handle: a shared `NpuAttention` on aarch64+npu builds, `()` otherwise
-/// (the field exists in both cases so the module layout is stable).
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub type NpuAttnHandle = std::sync::Arc<crate::npu::NpuAttention>;
-#[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-pub type NpuAttnHandle = ();
-
-/// Handle to a fused NPU projection group (q|k|v, gate|up).
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub type FusedHandle = crate::npu::FusedRef;
-#[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-pub type FusedHandle = ();
-
 #[derive(Module, Debug)]
 struct Qwen3Attention {
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     q_proj: Proj,
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     k_proj: Proj,
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     v_proj: Proj,
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     o_proj: Proj,
     /// Set in `--npu` mode: attention runs on the RK3588 NPU.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     #[module(skip)]
-    npu_attn: Option<NpuAttnHandle>,
+    npu_attn: bool,
     /// Set in `--npu` mode: q|k|v packed as one resident weight (one matmul).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     #[module(skip)]
-    qkv_fused: Option<FusedHandle>,
+    qkv_fused: Option<burn_rocket::WeightId>,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     n_heads: usize,
@@ -386,7 +494,9 @@ impl Qwen3Attention {
             k_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
             v_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
             o_proj: Proj::stub(q_dim, cfg.hidden_size, device),
-            npu_attn: None,
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            npu_attn: false,
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
             qkv_fused: None,
             q_norm: RmsNormConfig::new(cfg.head_dim)
                 .with_epsilon(cfg.rms_norm_eps)
@@ -411,17 +521,20 @@ impl Qwen3Attention {
         let (h, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if let Some(fused) = &self.qkv_fused {
-            // One matmul for q|k|v; the output is split along N.
-            use crate::npu::ProjKind as K;
-            let qkv = fused.forward(x);
-            let (qo, qn) = fused.part(K::Q);
-            let (ko, kn) = fused.part(K::K);
-            let (vo, vn) = fused.part(K::V);
-            assert_eq!((qn, kn, vn), (h * d, kv * d, kv * d), "fused qkv widths");
-            let q = qkv.clone().slice(s![.., .., qo..qo + qn]).reshape([b, s, h, d]);
-            let k = qkv.clone().slice(s![.., .., ko..ko + kn]).reshape([b, s, kv, d]);
-            let v = qkv.slice(s![.., .., vo..vo + vn]).reshape([b, s, kv, d]);
+        if let Some(id) = &self.qkv_fused {
+            // One NPU matmul for q|k|v; the output is split along N (Q, K, V order).
+            let qw = h * d;
+            let kw = kv * d;
+            let vw = kv * d;
+            let qkv = burn_rocket::matmul(x, id);
+            let q = qkv.clone().slice(s![.., .., 0..qw]).reshape([b, s, h, d]);
+            let k = qkv
+                .clone()
+                .slice(s![.., .., qw..qw + kw])
+                .reshape([b, s, kv, d]);
+            let v = qkv
+                .slice(s![.., .., qw + kw..qw + kw + vw])
+                .reshape([b, s, kv, d]);
             let q = rope.apply(self.q_norm.forward(q), 0);
             let k = rope.apply(self.k_norm.forward(k), 0);
             return (q, k, v);
@@ -455,14 +568,20 @@ impl Qwen3Attention {
         let (q, k, v) = self.project(x, rope, quantized);
 
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if let Some(npu) = &self.npu_attn {
-            // NPU attention takes the [1, S, heads*D] layout directly (head-major f16
-            // buffers are prepared inside).
+        if self.npu_attn {
+            // NPU attention takes the [1, S, heads*D] layout directly (the
+            // head-major f16 buffers and the causal mask are prepared inside).
             let kv = self.n_kv_heads;
-            let o = npu.forward(
+            let o = burn_rocket::attention(
                 q.reshape([b, s, h * d]),
                 k.reshape([b, s, kv * d]),
                 v.reshape([b, s, kv * d]),
+                h,
+                kv,
+                d,
+                1.0 / (d as f64).sqrt(),
+                None,
+                true,
             );
             return self.o_proj.forward(o, quantized);
         }
@@ -587,15 +706,17 @@ impl Qwen3Attention {
 
 #[derive(Module, Debug)]
 struct Qwen3Mlp {
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     gate_proj: Proj,
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     up_proj: Proj,
-    #[module(skip)]
+    #[cfg_attr(all(feature = "npu", target_arch = "aarch64"), module(skip))]
     down_proj: Proj,
     /// Set in `--npu` mode: gate|up packed as one resident weight.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     #[module(skip)]
-    gateup_fused: Option<FusedHandle>,
+    gateup_fused: Option<burn_rocket::WeightId>,
+    intermediate_size: usize,
 }
 
 impl Qwen3Mlp {
@@ -604,19 +725,20 @@ impl Qwen3Mlp {
             gate_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
             up_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
             down_proj: Proj::stub(cfg.intermediate_size, cfg.hidden_size, device),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
             gateup_fused: None,
+            intermediate_size: cfg.intermediate_size,
         }
     }
 
     fn forward(&self, x: Tensor<3>, quantized: bool) -> Tensor<3> {
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if let Some(fused) = &self.gateup_fused {
-            use crate::npu::ProjKind as K;
-            let gu = fused.forward(x);
-            let (go, gn) = fused.part(K::Gate);
-            let (uo, un) = fused.part(K::Up);
-            let gate = gu.clone().slice(s![.., .., go..go + gn]);
-            let up = gu.slice(s![.., .., uo..uo + un]);
+        if let Some(id) = &self.gateup_fused {
+            // One NPU matmul for gate|up; the output is split in half along N.
+            let n = self.intermediate_size;
+            let gu = burn_rocket::matmul(x, id);
+            let gate = gu.clone().slice(s![.., .., 0..n]);
+            let up = gu.slice(s![.., .., n..2 * n]);
             return self.down_proj.forward(silu(gate) * up, quantized);
         }
         let gate = self.gate_proj.forward(x.clone(), quantized);

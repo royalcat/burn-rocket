@@ -5,7 +5,21 @@ edition = "2024"
 description = "RK3588 NPU offload (mainline `rocket` driver) via librocketnpu"
 license = "GPL-3.0-or-later"
 
+[features]
+default = []
+# Burn's `#[backend_extension(Flex)]` catalog cfg is evaluated in this crate, so
+# the feature selecting the `Flex` backend must be named exactly `flex`.
+flex = ["dep:burn", "dep:rayon"]
+# The NPU extension ops (`crate::ext`); links librocketnpu (see build.rs).
+npu = ["flex"]
+
 [dependencies]
 libc = "0.2"
 half = "2"
 thiserror = "2"
+rayon = { version = "1", optional = true }
+burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "flex",
+    "extension",
+], optional = true }

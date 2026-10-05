@@ -1,5 +1,4 @@
 mod model;
-mod npu;
 mod server;
 
 use std::path::{Path, PathBuf};
@@ -179,7 +178,7 @@ fn load_model(
     device: &Device,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
-    let _ = npu_threads; // only used by the aarch64+npu build
+    let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
     if dtype == DType::BF16 {
         bail!("--dtype bf16 is broken in burn-flex 0.22.0-pre.4 (bf16 embedding gather panics); use f32 (or f16 for a smaller model)");
     }
@@ -224,6 +223,10 @@ fn load_model(
     if npu {
         bail!("--npu requires an aarch64 build with --features npu");
     }
+    // NPU builds skip the projection fields in the module tree (the NPU loader
+    // packs them straight from the store); load them here for the CPU paths.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    load_cpu_projections(&mut model, &cfg, model_dir, dtype, quant_q8, device)?;
     if quant_q8 {
         if dtype != DType::F32 {
             bail!("--quant q8 needs --dtype f32 (Q8-resident weights are dequantized to f32 on the fly)");
@@ -298,6 +301,74 @@ fn load_model(
     Ok((model, cfg))
 }
 
+/// Read one projection weight from the store as f32 `[n, k]` data.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn read_projection(
+    store: &mut SafetensorsStore,
+    layer: usize,
+    kind: model::ProjKind,
+) -> Result<(usize, usize, TensorData)> {
+    use burn_store::ModuleStore;
+    let key = format!("layers.{layer}.{}", kind.key());
+    let tensor = store
+        .get_tensor(&key)?
+        .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
+    let data = burn_store::bridge::to_data(tensor)?.convert_dtype(DType::F32);
+    let [n, k] = data.shape.dims::<2>();
+    Ok((k, n, data))
+}
+
+/// In NPU builds the projection fields are `#[module(skip)]` (the NPU loader packs
+/// them straight from the store), so CPU-mode runs must load them explicitly.
+/// With `quant_q8` the weights are quantized on the fly, matching the low-RAM mode
+/// of the non-NPU build.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn load_cpu_projections(
+    model: &mut Qwen3Embedding,
+    cfg: &Qwen3Config,
+    model_dir: &Path,
+    dtype: DType,
+    quant_q8: bool,
+    device: &Device,
+) -> Result<()> {
+    use crate::model::{Proj, ProjKind};
+    use burn::module::Param;
+    use burn::tensor::quantization::{
+        Calibration, QuantScheme, QuantValue, ScaleDtype, compute_q_params, compute_range,
+    };
+
+    let t0 = Instant::now();
+    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
+    let scheme = QuantScheme::default()
+        .with_value(QuantValue::Q8S)
+        .per_block([32], ScaleDtype::F16);
+    for layer in 0..cfg.num_hidden_layers {
+        for kind in ProjKind::ALL {
+            let (_, _, data) = read_projection(&mut store, layer, kind)?;
+            // The store holds PyTorch `[out, in]`; Burn's `Linear` wants `[in, out]`.
+            let t = Tensor::<2>::from_data(data, device).swap_dims(0, 1);
+            let t = if quant_q8 {
+                let range = compute_range(&scheme, &t, &Calibration::MinMax);
+                let qparams = compute_q_params(&scheme, range);
+                t.quantize(&scheme, qparams)
+            } else {
+                t.cast(dtype)
+            };
+            match model.projection_mut(layer, kind) {
+                Proj::Cpu(lin) => lin.weight = Param::from_tensor(t),
+                Proj::Npu(_) => unreachable!("projections are CPU-resident at load time"),
+            }
+        }
+    }
+    println!(
+        "loaded {} projection weights{} in {:.2}s",
+        cfg.num_hidden_layers * ProjKind::ALL.len(),
+        if quant_q8 { " (Q8-resident)" } else { "" },
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Pack every projection weight straight into resident NPU buffers (fp16, HF
 /// `[out, in]` = `[N, K]` layout, no transpose) and keep only an f16 embedding
 /// table on the CPU. Pack-and-drop: the CPU never holds projection weights.
@@ -308,46 +379,35 @@ fn load_npu_projections(
     model_dir: &Path,
     npu_threads: usize,
     npu_attn: bool,
-    _device: &Device,
+    device: &Device,
     t0: Instant,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
-    use crate::model::Proj;
-    use crate::npu::{FusedGroup, NpuAttention, NpuModel, NpuRef, ProjKind};
-    use burn_store::ModuleStore;
-    use std::sync::Arc;
+    use crate::model::{FusedGroup, Proj, ProjKind};
+
+    burn_rocket::init(npu_threads)
+        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
 
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
     let t_npu = Instant::now();
-    let mut npu = Arc::new(NpuModel::new(cfg.num_hidden_layers, npu_threads)?);
     let mut bytes = 0usize;
 
-    /// Read one projection weight from the store as `(k, n, [n, k] fp16)`.
-    fn read_weight(
-        store: &mut SafetensorsStore,
-        layer: usize,
-        kind: ProjKind,
-    ) -> Result<(usize, usize, Vec<burn_rocket::half::f16>)> {
-        let key = format!("layers.{layer}.{}", kind.key());
-        let tensor = store
-            .get_tensor(&key)?
-            .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
-        let data = burn_store::bridge::to_data(tensor)?; // [out, in] = [N, K]
-        let [n, k] = data.shape.dims::<2>();
-        let values: Vec<f32> = data.convert_dtype(DType::F32).try_to_vec()?;
-        Ok((k, n, burn_rocket::f32_to_f16(&values)))
+    /// One `pack2`/`pack3` call for the group's parts (output-column order).
+    fn pack_group(parts: Vec<Tensor<2>>) -> burn_rocket::WeightId {
+        let mut it = parts.into_iter();
+        match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c), None) => burn_rocket::pack3(a, b, c),
+            (Some(a), Some(b), None, None) => burn_rocket::pack2(a, b),
+            _ => unreachable!("fused groups have 2 or 3 members"),
+        }
     }
 
-    let mut singles: Vec<(usize, ProjKind)> = Vec::new();
-    let mut fused: Vec<(usize, FusedGroup, usize)> = Vec::new();
     for layer in 0..cfg.num_hidden_layers {
         // o and down keep individual resident weights.
         for kind in [ProjKind::O, ProjKind::Down] {
-            let (k, n, b) = read_weight(&mut store, layer, kind)?;
-            bytes += b.len() * 2;
-            Arc::get_mut(&mut npu)
-                .expect("sole owner while packing")
-                .pack(layer, kind, k, n, &b)?;
-            singles.push((layer, kind));
+            let (k, n, data) = read_projection(&mut store, layer, kind)?;
+            bytes += k * n * 2;
+            let id = burn_rocket::pack(Tensor::<2>::from_data(data, device));
+            *model.projection_mut(layer, kind) = Proj::Npu(id);
         }
         // q|k|v and gate|up are packed as one resident weight each (one matmul,
         // one A-pack per group).
@@ -358,44 +418,20 @@ fn load_npu_projections(
         for (group, kinds) in groups {
             let mut parts = Vec::new();
             let mut k = 0usize;
-            let mut total_n = 0usize;
             for &kind in kinds {
-                let (kk, n, b) = read_weight(&mut store, layer, kind)?;
+                let (kk, n, data) = read_projection(&mut store, layer, kind)?;
                 if k == 0 {
                     k = kk;
                 }
                 assert_eq!(k, kk, "fused group members must share K");
-                bytes += b.len() * 2;
-                total_n += n;
-                parts.push((kind, b));
+                bytes += kk * n * 2;
+                parts.push(Tensor::<2>::from_data(data, device));
             }
-            Arc::get_mut(&mut npu)
-                .expect("sole owner while packing")
-                .pack_fused(layer, group, k, &parts)?;
-            fused.push((layer, group, total_n));
+            model.set_fused_handle(layer, group, pack_group(parts));
         }
     }
-    // Assign the handles only after all packing is done (each handle clones the Arc,
-    // so packing must finish while the context is uniquely owned).
-    for (layer, kind) in singles {
-        *model.projection_mut(layer, kind) =
-            Proj::Npu(NpuRef::new(Arc::clone(&npu), layer, kind));
-    }
-    for (layer, group, total_n) in fused {
-        model.set_fused_handle(
-            layer,
-            group,
-            crate::npu::FusedRef::new(Arc::clone(&npu), layer, group, total_n),
-        );
-    }
     if npu_attn {
-        let attn = Arc::new(NpuAttention::new(
-            npu_threads,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        )?);
-        model.set_npu_attn(Some(attn));
+        model.set_npu_attn(true);
         println!("NPU: attention offload enabled (n_head=16, n_kv=8, head_dim=128)");
     }
     model.embed_table_to_f16();
@@ -449,7 +485,7 @@ fn run_bench(args: &Args) -> Result<()> {
     crate::model::stage_stats_reset();
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if args.npu {
-        crate::npu::npu_stats_reset();
+        burn_rocket::stats_reset();
     }
     let mut times = Vec::new();
     for i in 0..=args.reps {
@@ -483,11 +519,14 @@ fn run_bench(args: &Args) -> Result<()> {
     }
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if args.npu {
-        let (conv, npu, calls) = crate::npu::npu_stats();
+        let s = burn_rocket::stats();
         println!(
-            "npu breakdown over all runs: {calls} calls, convert {conv:.2}s, npu {npu:.2}s, \
+            "npu breakdown over all runs: {} calls, convert {:.2}s, npu {:.2}s, \
              flex+overhead {:.2}s",
-            times.iter().sum::<f64>() - conv - npu
+            s.calls,
+            s.convert_s,
+            s.npu_s,
+            times.iter().sum::<f64>() - s.convert_s - s.npu_s
         );
     }
     Ok(())

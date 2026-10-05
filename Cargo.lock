@@ -969,8 +969,10 @@ dependencies = [
 name = "burn-rocket"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "half",
  "libc",
+ "rayon",
  "thiserror 2.0.21",
 ]
 
@@ -2538,7 +2540,6 @@ dependencies = [
  "burn-rocket",
  "burn-store",
  "libc",
- "rayon",
  "serde",
  "serde_json",
  "tokenizers",
