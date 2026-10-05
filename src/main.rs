@@ -1,4 +1,5 @@
 mod model;
+mod npu;
 mod server;
 
 use std::path::{Path, PathBuf};
@@ -41,6 +42,8 @@ struct Args {
     k: usize,
     transb: bool,
     quant_q8: bool,
+    npu: bool,
+    npu_threads: usize,
     attn_fused: bool,
     key_block: usize,
     port: u16,
@@ -69,6 +72,8 @@ impl Args {
             k: 1024,
             transb: false,
             quant_q8: false,
+            npu: false,
+            npu_threads: 5,
             attn_fused: true,
             key_block: 256,
             port: 8383,
@@ -103,6 +108,8 @@ impl Args {
                     "q8" => args.quant_q8 = true,
                     other => bail!("unsupported quant '{other}' (expected none|q8)"),
                 },
+                "--npu" => args.npu = true,
+                "--npu-threads" => args.npu_threads = value()?.parse()?,
                 "--port" => args.port = value()?.parse()?,
                 "--key-block" => args.key_block = value()?.parse()?,
                 "--attn" => {
@@ -157,9 +164,12 @@ fn load_model(
     model_dir: &Path,
     dtype: DType,
     quant_q8: bool,
+    npu: bool,
+    npu_threads: usize,
     device: &Device,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
+    let _ = npu_threads; // only used by the aarch64+npu build
     if dtype == DType::BF16 {
         bail!("--dtype bf16 is broken in burn-flex 0.22.0-pre.4 (bf16 embedding gather panics); use f32 (or f16 for a smaller model)");
     }
@@ -190,6 +200,20 @@ fn load_model(
         t0.elapsed().as_secs_f64()
     );
     drop(store);
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu {
+        if dtype != DType::F32 {
+            bail!("--npu needs --dtype f32 (NPU activations are f32 on the CPU side)");
+        }
+        if quant_q8 {
+            bail!("--npu packs its own fp16 weights; --quant q8 is not applicable");
+        }
+        return load_npu_projections(model, cfg, model_dir, npu_threads, device, t0);
+    }
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    if npu {
+        bail!("--npu requires an aarch64 build with --features npu");
+    }
     if quant_q8 {
         if dtype != DType::F32 {
             bail!("--quant q8 needs --dtype f32 (Q8-resident weights are dequantized to f32 on the fly)");
@@ -264,6 +288,63 @@ fn load_model(
     Ok((model, cfg))
 }
 
+/// Pack every projection weight straight into resident NPU buffers (fp16, HF
+/// `[out, in]` = `[N, K]` layout, no transpose) and keep only an f16 embedding
+/// table on the CPU. Pack-and-drop: the CPU never holds projection weights.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn load_npu_projections(
+    mut model: Qwen3Embedding,
+    cfg: Qwen3Config,
+    model_dir: &Path,
+    npu_threads: usize,
+    _device: &Device,
+    t0: Instant,
+) -> Result<(Qwen3Embedding, Qwen3Config)> {
+    use crate::model::Proj;
+    use crate::npu::{NpuModel, NpuRef, ProjKind};
+    use burn_store::ModuleStore;
+    use std::sync::Arc;
+
+    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
+    let t_npu = Instant::now();
+    let mut npu = Arc::new(NpuModel::new(cfg.num_hidden_layers, npu_threads)?);
+    let mut bytes = 0usize;
+    let mut packed = Vec::new();
+    for layer in 0..cfg.num_hidden_layers {
+        for kind in ProjKind::ALL {
+            let key = format!("layers.{layer}.{}", kind.key());
+            let tensor = store
+                .get_tensor(&key)?
+                .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
+            let data = burn_store::bridge::to_data(tensor)?; // [out, in] = [N, K]
+            let [n, k] = data.shape.dims::<2>();
+            let values: Vec<f32> = data.convert_dtype(DType::F32).try_to_vec()?;
+            let b = burn_rocket::f32_to_f16(&values);
+            bytes += values.len() * 2;
+            Arc::get_mut(&mut npu)
+                .expect("sole owner while packing")
+                .pack(layer, kind, k, n, &b)?;
+            packed.push((layer, kind));
+        }
+    }
+    for (layer, kind) in packed {
+        *model.projection_mut(layer, kind) =
+            Proj::Npu(NpuRef::new(Arc::clone(&npu), layer, kind));
+    }
+    model.embed_table_to_f16();
+    println!(
+        "NPU: packed {} projections ({:.2} GiB fp16, {} threads) in {:.2}s; \
+         model ready in {:.2}s (resident {:.0} MiB anon)",
+        cfg.num_hidden_layers * ProjKind::ALL.len(),
+        bytes as f64 / (1u64 << 30) as f64,
+        npu_threads,
+        t_npu.elapsed().as_secs_f64(),
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok((model, cfg))
+}
+
 fn tokenize(args: &Args) -> Result<Vec<u32>> {
     let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
@@ -280,7 +361,14 @@ fn tokenize(args: &Args) -> Result<Vec<u32>> {
 
 fn run_bench(args: &Args) -> Result<()> {
     let device = device(args)?;
-    let (model, cfg) = load_model(&args.model_dir, args.dtype, args.quant_q8, &device)?;
+    let (model, cfg) = load_model(
+        &args.model_dir,
+        args.dtype,
+        args.quant_q8,
+        args.npu,
+        args.npu_threads,
+        &device,
+    )?;
     let ids = tokenize(args)?;
     let n = ids.len();
     if n == 0 {
@@ -379,7 +467,14 @@ fn run_tokenize(args: &Args) -> Result<()> {
 
 fn run_serve(args: &Args) -> Result<()> {
     let device = device(args)?;
-    let (model, cfg) = load_model(&args.model_dir, args.dtype, args.quant_q8, &device)?;
+    let (model, cfg) = load_model(
+        &args.model_dir,
+        args.dtype,
+        args.quant_q8,
+        args.npu,
+        args.npu_threads,
+        &device,
+    )?;
     let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     server::serve(
@@ -400,7 +495,14 @@ fn run_serve(args: &Args) -> Result<()> {
 
 fn run_embed(args: &Args) -> Result<()> {
     let device = device(args)?;
-    let (model, cfg) = load_model(&args.model_dir, args.dtype, args.quant_q8, &device)?;
+    let (model, cfg) = load_model(
+        &args.model_dir,
+        args.dtype,
+        args.quant_q8,
+        args.npu,
+        args.npu_threads,
+        &device,
+    )?;
     let ids = tokenize(args)?;
     let n = ids.len();
     let ids_i64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();

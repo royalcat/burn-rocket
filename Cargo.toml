@@ -3,12 +3,20 @@ name = "embeddings-fast"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/burn-rocket"]
+
 [features]
 default = ["cpu"]
 # CubeCL/LLVM CPU backend. Disabled for cross-builds: cubecl-llvm links a prebuilt
 # host-architecture LLVM bundle (fails to link for aarch64). The `flex` backend is
 # always available.
 cpu = ["burn/cpu", "burn/autotune", "burn/fusion"]
+# RK3588 NPU offload via librocketnpu (aarch64 only; see crates/burn-rocket).
+npu = ["dep:burn-rocket"]
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+burn-rocket = { path = "crates/burn-rocket", optional = true }
 
 [dependencies]
 burn = { version = "=0.22.0-pre.4", default-features = false, features = [

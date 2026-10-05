@@ -4,10 +4,8 @@
 //! decoder-only transformer, pre-norm, GQA (16 q heads / 8 kv heads), head_dim 128,
 //! QK-RMSNorm, RoPE theta 1e6, SwiGLU MLP, final RMSNorm, last-token pooling.
 
-use burn::module::Module;
-use burn::nn::{
-    Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig,
-};
+use burn::module::{Module, Param, ParamId};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::activation::silu;
 use burn::tensor::module::attention;
@@ -121,6 +119,42 @@ impl Qwen3Embedding {
         self.quantized = quantized;
     }
 
+    /// Keep only an f16 copy of the token-embedding table (NPU mode; the gathered rows
+    /// are cast back to f32 per forward). Releases the freed f32 pages to the OS.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn embed_table_to_f16(&mut self) {
+        self.embed_tokens.weight = self
+            .embed_tokens
+            .weight
+            .clone()
+            .map(|tensor| tensor.cast(DType::F16));
+        self.set_quantized(true);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
+    /// Mutable access to one projection (used by the loader).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn projection_mut(
+        &mut self,
+        layer: usize,
+        kind: crate::npu::ProjKind,
+    ) -> &mut Proj {
+        use crate::npu::ProjKind as K;
+        let l = &mut self.layers[layer];
+        match kind {
+            K::Q => &mut l.self_attn.q_proj,
+            K::K => &mut l.self_attn.k_proj,
+            K::V => &mut l.self_attn.v_proj,
+            K::O => &mut l.self_attn.o_proj,
+            K::Gate => &mut l.mlp.gate_proj,
+            K::Up => &mut l.mlp.up_proj,
+            K::Down => &mut l.mlp.down_proj,
+        }
+    }
+
     pub fn hidden_size(&self) -> usize {
         let [_, d] = self.embed_tokens.weight.shape().dims();
         d
@@ -210,12 +244,51 @@ impl Qwen3Layer {
     }
 }
 
+/// A projection weight: a regular CPU `Linear`, or (with `--npu`) a handle to a
+/// weight resident on the RK3588 NPU. The NPU variant holds no CPU-side weights.
+#[derive(Debug, Clone)]
+pub enum Proj {
+    Cpu(Linear),
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    Npu(crate::npu::NpuRef),
+}
+
+impl Proj {
+    /// A CPU linear whose weight is uninitialized (not yet allocated); the loader
+    /// fills it in. `#[module(skip)]` means the store never touches it.
+    pub fn stub(input: usize, output: usize, device: &Device) -> Self {
+        Proj::Cpu(Linear {
+            weight: Param::uninitialized(
+                ParamId::new(),
+                move |device, _| Tensor::zeros([input, output], device),
+                device.clone(),
+                false,
+                Shape::new([input, output]),
+            ),
+            bias: None,
+        })
+    }
+
+    #[inline]
+    pub fn forward(&self, x: Tensor<3>, quantized: bool) -> Tensor<3> {
+        match self {
+            Proj::Cpu(l) => linear_forward(l, x, quantized),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(r) => r.forward(x),
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 struct Qwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    #[module(skip)]
+    q_proj: Proj,
+    #[module(skip)]
+    k_proj: Proj,
+    #[module(skip)]
+    v_proj: Proj,
+    #[module(skip)]
+    o_proj: Proj,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     n_heads: usize,
@@ -228,18 +301,10 @@ impl Qwen3Attention {
         let q_dim = cfg.num_attention_heads * cfg.head_dim;
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         Self {
-            q_proj: LinearConfig::new(cfg.hidden_size, q_dim)
-                .with_bias(false)
-                .init(device),
-            k_proj: LinearConfig::new(cfg.hidden_size, kv_dim)
-                .with_bias(false)
-                .init(device),
-            v_proj: LinearConfig::new(cfg.hidden_size, kv_dim)
-                .with_bias(false)
-                .init(device),
-            o_proj: LinearConfig::new(q_dim, cfg.hidden_size)
-                .with_bias(false)
-                .init(device),
+            q_proj: Proj::stub(cfg.hidden_size, q_dim, device),
+            k_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
+            v_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
+            o_proj: Proj::stub(q_dim, cfg.hidden_size, device),
             q_norm: RmsNormConfig::new(cfg.head_dim)
                 .with_epsilon(cfg.rms_norm_eps)
                 .init(device),
@@ -262,9 +327,9 @@ impl Qwen3Attention {
         let [b, s, _] = x.dims();
         let (h, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
 
-        let q = linear_forward(&self.q_proj, x.clone(), quantized).reshape([b, s, h, d]);
-        let k = linear_forward(&self.k_proj, x.clone(), quantized).reshape([b, s, kv, d]);
-        let v = linear_forward(&self.v_proj, x, quantized).reshape([b, s, kv, d]);
+        let q = self.q_proj.forward(x.clone(), quantized).reshape([b, s, h, d]);
+        let k = self.k_proj.forward(x.clone(), quantized).reshape([b, s, kv, d]);
+        let v = self.v_proj.forward(x, quantized).reshape([b, s, kv, d]);
 
         let q = rope.apply(self.q_norm.forward(q), 0);
         let k = rope.apply(self.k_norm.forward(k), 0);
@@ -312,7 +377,7 @@ impl Qwen3Attention {
         };
 
         let o = o.swap_dims(1, 2).reshape([b, s, h * d]);
-        linear_forward(&self.o_proj, o, quantized)
+        self.o_proj.forward(o, quantized)
     }
 
     /// Blocked causal attention with an online softmax, expressed with plain tensor ops.
@@ -411,29 +476,26 @@ impl Qwen3Attention {
 
 #[derive(Module, Debug)]
 struct Qwen3Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    #[module(skip)]
+    gate_proj: Proj,
+    #[module(skip)]
+    up_proj: Proj,
+    #[module(skip)]
+    down_proj: Proj,
 }
 
 impl Qwen3Mlp {
     fn new(cfg: &Qwen3Config, device: &Device) -> Self {
         Self {
-            gate_proj: LinearConfig::new(cfg.hidden_size, cfg.intermediate_size)
-                .with_bias(false)
-                .init(device),
-            up_proj: LinearConfig::new(cfg.hidden_size, cfg.intermediate_size)
-                .with_bias(false)
-                .init(device),
-            down_proj: LinearConfig::new(cfg.intermediate_size, cfg.hidden_size)
-                .with_bias(false)
-                .init(device),
+            gate_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
+            up_proj: Proj::stub(cfg.hidden_size, cfg.intermediate_size, device),
+            down_proj: Proj::stub(cfg.intermediate_size, cfg.hidden_size, device),
         }
     }
 
     fn forward(&self, x: Tensor<3>, quantized: bool) -> Tensor<3> {
-        let gate = linear_forward(&self.gate_proj, x.clone(), quantized);
-        let up = linear_forward(&self.up_proj, x, quantized);
-        linear_forward(&self.down_proj, silu(gate) * up, quantized)
+        let gate = self.gate_proj.forward(x.clone(), quantized);
+        let up = self.up_proj.forward(x, quantized);
+        self.down_proj.forward(silu(gate) * up, quantized)
     }
 }
