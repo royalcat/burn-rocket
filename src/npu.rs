@@ -14,6 +14,30 @@ use burn::tensor::TensorData;
 use burn_rocket::half::f16;
 use burn_rocket::{RocketCtx, RocketWeight};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+// Wall-time instrumentation (microseconds) for the NPU path: our f32<->f16
+// conversion work vs the library call (host pack + NPU wait).
+static T_CONVERT_US: AtomicU64 = AtomicU64::new(0);
+static T_NPU_US: AtomicU64 = AtomicU64::new(0);
+static NPU_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// `(convert_s, npu_s, calls)` accumulated since the last reset.
+pub fn npu_stats() -> (f64, f64, u64) {
+    (
+        T_CONVERT_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_NPU_US.load(Ordering::Relaxed) as f64 / 1e6,
+        NPU_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+/// Reset the NPU wall-time counters.
+pub fn npu_stats_reset() {
+    T_CONVERT_US.store(0, Ordering::Relaxed);
+    T_NPU_US.store(0, Ordering::Relaxed);
+    NPU_CALLS.store(0, Ordering::Relaxed);
+}
 
 /// Which projection of a transformer layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +144,7 @@ impl NpuModel {
         assert_eq!(k, slot.k, "activation K mismatch for {kind:?}");
         let n = slot.n;
 
+        let t_conv = Instant::now();
         let data = x.to_data();
         let v: Vec<f32> = data.try_to_vec().expect("f32 activations");
         let a16 = burn_rocket::f32_to_f16(&v);
@@ -135,19 +160,176 @@ impl NpuModel {
         } else {
             burn_rocket::pad_rows(&a16, m, k, padded_m)
         };
-
         let mut c16 = vec![f16::ZERO; padded_m * n];
+        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t_npu = Instant::now();
         self.ctx
             .matmul_prepacked(padded_m, k, n, &a16, &mut c16, &slot.weight)
             .unwrap_or_else(|e| panic!("NPU matmul failed (layer {layer}, {kind:?}): {e}"));
+        T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+        NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
+        let t_conv = Instant::now();
         let c32: Vec<f32> = c16[..m * n].iter().map(|x| x.to_f32()).collect();
-        Tensor::<3>::from_data(TensorData::new(c32, [1, m, n]), &x.device())
+        let out = Tensor::<3>::from_data(TensorData::new(c32, [1, m, n]), &x.device());
+        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+        out
     }
 
     pub fn n_layers(&self) -> usize {
         self.n_layers
     }
+}
+
+/// NPU attention (`rocket_flash_attn_fp16_ctx`): NPU QK/PV with a causal additive
+/// mask, host softmax inside the library. One persistent fa context per process;
+/// mask + scratch are cached per sequence length.
+pub struct NpuAttention {
+    fa: burn_rocket::RocketFaCtx,
+    n_head: usize,
+    n_kv: usize,
+    head_dim: usize,
+    scale: f32,
+    state: std::sync::Mutex<AttnState>,
+}
+
+struct AttnState {
+    n: usize,
+    mask: Vec<f16>, // [n][n] additive: 0 for j<=t, -inf otherwise
+    q: Vec<f16>,    // [n_head][n][head_dim]
+    k: Vec<f16>,    // [n_kv][n][head_dim]
+    v: Vec<f16>,    // [n_kv][head_dim][n]  (per-head transposed)
+    out: Vec<f16>,  // [n_head][n][head_dim]
+}
+
+// SAFETY: as for `NpuModel`: the fa context is not thread-safe, but this handle is only
+// used from one thread at a time (requests are serialized). Burn's `Module` trait
+// requires its containers to be `Send + Sync`.
+unsafe impl Send for NpuAttention {}
+unsafe impl Sync for NpuAttention {}
+
+impl std::fmt::Debug for NpuAttention {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NpuAttention(n_head={}, n_kv={}, head_dim={})",
+            self.n_head, self.n_kv, self.head_dim
+        )
+    }
+}
+
+impl NpuAttention {
+    pub fn new(nthreads: usize, n_head: usize, n_kv: usize, head_dim: usize) -> anyhow::Result<Self> {        let fa = burn_rocket::RocketFaCtx::new(nthreads)
+            .map_err(|e| anyhow::anyhow!("NPU attention context creation failed: {e}"))?;
+        Ok(Self {
+            fa,
+            n_head,
+            n_kv,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            state: std::sync::Mutex::new(AttnState {
+                n: 0,
+                mask: Vec::new(),
+                q: Vec::new(),
+                k: Vec::new(),
+                v: Vec::new(),
+                out: Vec::new(),
+            }),
+        })
+    }
+
+    /// `q` `[1, n, n_head*d]`, `k`/`v` `[1, n, n_kv*d]` (f32, RoPE + QK-norm applied).
+    /// Returns `[1, n, n_head*d]` f32 for `o_proj`.
+    pub fn forward(&self, q: Tensor<3>, k: Tensor<3>, v: Tensor<3>) -> Tensor<3> {
+        let [b, n, hd] = q.dims();
+        assert_eq!(b, 1, "the NPU attention path supports batch size 1");
+        let (h, kv, d) = (self.n_head, self.n_kv, self.head_dim);
+        assert_eq!(hd, h * d, "q width must be n_head*head_dim");
+        let device = q.device();
+
+        let qv: Vec<f32> = q.to_data().try_to_vec().expect("f32 q");
+        let kvv: Vec<f32> = k.to_data().try_to_vec().expect("f32 k");
+        let vvv: Vec<f32> = v.to_data().try_to_vec().expect("f32 v");
+
+        let mut st = self.state.lock().expect("attn state");
+        if st.n != n {
+            st.n = n;
+            st.mask = build_causal_mask(n);
+            st.q = vec![f16::ZERO; h * n * d];
+            st.k = vec![f16::ZERO; kv * n * d];
+            st.v = vec![f16::ZERO; kv * d * n];
+            st.out = vec![f16::ZERO; h * n * d];
+        }
+        let AttnState { mask, q, k, v, out, .. } = &mut *st;
+        fill_heads(&qv, n, h, d, q);
+        fill_heads(&kvv, n, kv, d, k);
+        fill_heads_transposed(&vvv, n, kv, d, v);
+
+        self.fa
+            .flash_attn(n, n, d, d, h, kv, self.scale, q, k, v, Some(mask), out)
+            .unwrap_or_else(|e| panic!("NPU attention failed: {e}"));
+
+        let o = unpack_heads(out, n, h, d);
+        Tensor::<3>::from_data(TensorData::new(o, [1, n, h * d]), &device)
+    }
+}
+
+/// Causal additive mask: `mask[t][j] = 0` for `j <= t`, `-inf` otherwise.
+fn build_causal_mask(n: usize) -> Vec<f16> {
+    use rayon::prelude::*;
+    let mut mask = vec![f16::ZERO; n * n];
+    mask.par_chunks_mut(n).enumerate().for_each(|(t, row)| {
+        for m in row[t + 1..].iter_mut() {
+            *m = f16::NEG_INFINITY;
+        }
+    });
+    mask
+}
+
+/// `src` is `[n, heads*d]` row-major; writes `dst[head][n][d]`.
+fn fill_heads(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {
+    use rayon::prelude::*;
+    let hd = heads * d;
+    dst.par_chunks_mut(n * d).enumerate().for_each(|(hi, dst_h)| {
+        for (s, dst_row) in dst_h.chunks_mut(d).enumerate() {
+            let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
+            for (o, &x) in dst_row.iter_mut().zip(src_row) {
+                *o = f16::from_f32(x);
+            }
+        }
+    });
+}
+
+/// `src` is `[n, heads*d]` row-major; writes the per-head transpose `dst[head][d][n]`
+/// (the AV B-operand layout).
+fn fill_heads_transposed(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {
+    use rayon::prelude::*;
+    let hd = heads * d;
+    dst.par_chunks_mut(d * n).enumerate().for_each(|(hi, dst_h)| {
+        for s in 0..n {
+            let src_row = &src[s * hd + hi * d..s * hd + hi * d + d];
+            for (di, &x) in src_row.iter().enumerate() {
+                dst_h[di * n + s] = f16::from_f32(x);
+            }
+        }
+    });
+}
+
+/// `src` is `[heads][n][d]`; returns `[n, heads*d]` row-major f32.
+fn unpack_heads(src: &[f16], n: usize, heads: usize, d: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let hd = heads * d;
+    let mut dst = vec![0f32; n * hd];
+    dst.par_chunks_mut(hd).enumerate().for_each(|(s, row)| {
+        for hi in 0..heads {
+            let src_row = &src[hi * n * d + s * d..hi * n * d + s * d + d];
+            for (o, &x) in row[hi * d..hi * d + d].iter_mut().zip(src_row) {
+                *o = x.to_f32();
+            }
+        }
+    });
+    dst
 }
 
 /// A handle to one packed projection, stored in the model's `Proj` fields.

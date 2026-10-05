@@ -274,6 +274,87 @@ impl Drop for RocketStream {
     }
 }
 
+/// Persistent context for masked grouped-query attention on the NPU
+/// (`rocket_flash_attn_fp16_ctx`): worker fds and per-head scratch stay resident
+/// across calls. Not `Send`/`Sync`.
+pub struct RocketFaCtx {
+    c: *mut ffi::RocketFaCtxOpaque,
+}
+
+impl RocketFaCtx {
+    /// Create with `nthreads` workers (clamped by the library to `[1, min(8, n_head)]`).
+    pub fn new(nthreads: usize) -> Result<Self, Error> {
+        let c = unsafe { ffi::rocket_fa_ctx_create(nthreads as i32) };
+        if c.is_null() {
+            return Err(Error {
+                op: "rocket_fa_ctx_create",
+                rc: ffi::ROCKET_E_DEVICE,
+            });
+        }
+        Ok(Self { c })
+    }
+
+    /// Masked GQA attention: `softmax(scale * Q K^T + mask) V`.
+    ///
+    /// Layouts (fp16, head-major):
+    /// - `q`: `[n_head][n_tokens][head_dim]`
+    /// - `k`: `[n_kv_heads][n_kv][head_dim]`
+    /// - `v`: `[n_kv_heads][dv][n_kv]` (per-head transposed: the AV B-operand)
+    /// - `mask`: `[n_tokens][n_kv]` additive (`-inf` masks), or `None` for unmasked
+    /// - `out`: `[n_head][n_tokens][dv]`
+    ///
+    /// `n_head` must be a multiple of `n_kv_heads`, `head_dim % 32 == 0`, `dv % 16 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn(
+        &self,
+        n_tokens: usize,
+        n_kv: usize,
+        head_dim: usize,
+        dv: usize,
+        n_head: usize,
+        n_kv_heads: usize,
+        scale: f32,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        mask: Option<&[f16]>,
+        out: &mut [f16],
+    ) -> Result<(), Error> {
+        assert_eq!(q.len(), n_head * n_tokens * head_dim);
+        assert_eq!(k.len(), n_kv_heads * n_kv * head_dim);
+        assert_eq!(v.len(), n_kv_heads * dv * n_kv);
+        assert_eq!(out.len(), n_head * n_tokens * dv);
+        if let Some(m) = mask {
+            assert_eq!(m.len(), n_tokens * n_kv);
+        }
+        let rc = unsafe {
+            ffi::rocket_flash_attn_fp16_ctx(
+                self.c,
+                n_tokens as i32,
+                n_kv as i32,
+                head_dim as i32,
+                dv as i32,
+                n_head as i32,
+                n_kv_heads as i32,
+                scale,
+                0.0,
+                q.as_ptr() as *const ffi::F16,
+                k.as_ptr() as *const ffi::F16,
+                v.as_ptr() as *const ffi::F16,
+                mask.map_or(std::ptr::null(), |m| m.as_ptr() as *const ffi::F16),
+                out.as_mut_ptr() as *mut ffi::F16,
+            )
+        };
+        check("rocket_flash_attn_fp16_ctx", rc)
+    }
+}
+
+impl Drop for RocketFaCtx {
+    fn drop(&mut self) {
+        unsafe { ffi::rocket_fa_ctx_free(self.c) }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // f32 <-> f16 helpers
 // ---------------------------------------------------------------------------

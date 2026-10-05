@@ -88,4 +88,31 @@ unsafe extern "C" {
         b: *const F16,
         c: *mut F16,
     ) -> c_int;
+
+    // Masked grouped-query attention (LLM prefill): NPU QK/PV, additive mask,
+    // host softmax inside the library.
+    pub fn rocket_fa_ctx_create(nthreads: c_int) -> *mut RocketFaCtxOpaque;
+    pub fn rocket_fa_ctx_free(c: *mut RocketFaCtxOpaque);
+    #[allow(clippy::too_many_arguments)]
+    pub fn rocket_flash_attn_fp16_ctx(
+        c: *mut RocketFaCtxOpaque,
+        n_tokens: c_int,
+        n_kv: c_int,
+        head_dim: c_int,
+        dv: c_int,
+        n_head: c_int,
+        n_kv_heads: c_int,
+        scale: f32,
+        softcap: f32,
+        q: *const F16,
+        k: *const F16,
+        v: *const F16,
+        mask: *const F16,
+        out: *mut F16,
+    ) -> c_int;
+}
+
+#[repr(C)]
+pub struct RocketFaCtxOpaque {
+    _private: [u8; 0],
 }

@@ -2538,6 +2538,7 @@ dependencies = [
  "burn-rocket",
  "burn-store",
  "libc",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",

@@ -360,3 +360,89 @@ gap would require int8 GEMM, which flex lacks; the only candidate is the `burn-c
 (CubeCL/LLVM) backend, whose CPU quantized matmul is unverified and which cannot be
 cross-compiled (host-arch LLVM bundle), so it would need a native build and JIT compile on
 the board.
+
+## 10. NPU offload (`burn-rocket`, 2026-10-05)
+
+Goal: move the model's projection matmuls to the RK3588 NPU through the mainline `rocket`
+driver, freeing CPU time for other board services (the ≥50 tok/s wall target is relaxed
+for this path). Stack: `librocketnpu` (gregordinary/rocket-userspace) wrapped by a new
+`crates/burn-rocket` crate; the Burn model calls it through a `Proj::Npu` variant
+(`--npu`, pack-and-drop: no CPU-side projection weights).
+
+### 10.1 M0 — baseline measurements (600 MHz, resident weights, M=3636)
+
+The stock `rocket` module boots the NPU at 200 MHz; the patched
+`/root/npu-poc/rocket-patched-600/rocket-npu600.ko` (`rmmod` + `insmod
+rocket_npu_clk_hz=600000000`) raises it to 600 MHz under load (verified via
+`scmi_clk_npu`; reboot reverts). Measured with `matmul_stream_vs_prepacked_rocket`
+(20 iterations, T=5; ms/call includes host A-pack and C de-tile):
+
+| shape | KACC=0 prepacked | KACC=1 prepacked | KACC=1 stream |
+|---|---|---|---|
+| q [3636,1024]x[3072,1024]^T | 81.1 ms (282 GF/s) | **69.1 ms (331 GF/s)** | 70.3 |
+| k [3636,1024]x[1024,1024]^T | 44.8 (170) | **32.6 (234)** | 33.2 |
+| o [3636,2048]x[1024,2048]^T | 76.7 (199) | **61.2 (249)** | 64.2 |
+| down [3636,3072]x[1024,3072]^T | 100.0 (229) | **93.6 (244)** | 94.8 |
+| q|k|v fused [3636,1024]x[5120,1024]^T | 125.1 (305) | **99.2 (384)** | 105.5 |
+| gate|up fused [3636,1024]x[6144,1024]^T | 146.8 (312) | **119.8 (382)** | 133.6 |
+
+- On-NPU K-accumulation (`ROCKET_KACC=1`) is always faster (up to 40% on k), and resident
+  weights win by ~2-12% (most on the fused shapes). Fusing weights along N (q|k|v,
+  gate|up) is the most efficient form (382-384 GF/s vs 234-331 for the small-N singles).
+- All runs verify max_abs=0 vs a CPU reference. CPU cost is ~60-80 ms user per call
+  (host pack/de-tile across the library's worker threads).
+- Full-model projection estimate from these numbers: 4 calls per layer (qkv-fused, o,
+  gateup-fused, down) ≈ 374 ms → **~10.5 s for all 28 layers** at 600 MHz, vs ~70 s of
+  CPU GEMM at 4 threads.
+- For reference, the one-shot `_mt` entry is slower (108-142 ms for q) and does not use
+  resident weights.
+
+### 10.2 M1 — integration
+
+`crates/burn-rocket` is an FFI wrapper over `librocketnpu` (RocketCtx/RocketWeight/
+RocketStream/RocketFaCtx; `build.rs` links the static archive, `ROCKETNPU_DIR` overrides
+the vendored copy). `src/npu.rs` holds `NpuModel` (one context + 28x7 resident weights)
+and `NpuAttention` (persistent attention context + per-length scratch). The model's
+projections became `Proj::Cpu(Linear) | Proj::Npu(NpuRef)` with `#[module(skip)]`, loaded
+manually so the store never materializes CPU copies (pack-and-drop).
+
+Loading (`--npu`): 114 tensors through `load_from` (norms + embedding table), then the 196
+projection tensors are read from the same safetensors store, converted to f16 and packed
+into resident NPU buffers (**0.82 GiB**, HF `[out,in]` = `[N,K]`, no transpose). The
+embedding table is converted to f16 and `malloc_trim` releases the f32 pages: **298 MiB
+CPU-resident**. The resident weights are packed for the `M >= 256` tiling (M-independent
+there); requests with fewer rows are padded up to 256 so one pack serves every length.
+
+Board numbers (3,633 tokens, cores 4-7, 4 threads, Q8 CPU baseline vs `--npu`):
+
+| mode | wall | speed | CPU-seconds |
+|---|---|---|---|
+| CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
+| `--npu` (projections) | 81.4 s | 44.6 tok/s | 472 (-30%) |
+| `--npu` + NPU attention | 90.1 s | 40.3 tok/s | **360 (-47%)** |
+
+Instrumented breakdown of the 81.4 s run: attention stage 64.8 s, MLP 16.0 s, norms 0.6 s;
+NPU matmuls 11.1 s, f32<->f16 conversions 9.7 s — i.e. after the projections moved to the
+NPU, the flex attention kernel was 80% of the forward.
+
+### 10.3 Attention on the NPU (`--npu-attn npu`, default)
+
+`rocket_flash_attn_fp16_ctx` computes masked GQA attention (native 16/8 heads, additive
+causal mask, per-head QK/PV on the NPU; the score matrix is brought host-side for the mask
++ softmax, which is the library's design). `NpuAttention` keeps the fa context and the
+`[n][n]` causal mask plus head-major f16 scratch cached per sequence length; the f32->f16
+gather (Q `[n_head][n][d]`, K `[n_kv][n][d]`, V transposed `[n_kv][d][n]`) and the output
+scatter back to `[1, s, h*d]` run on rayon.
+
+- Numerics: cosine 0.999381 vs the production Q8 reference (0.999380 with CPU attention);
+  0.999997 vs the CPU-attention NPU run.
+- 6,501 tokens: 248.9 s / 26.1 tok/s (vs 234.1 s with CPU attention).
+
+Trade-off: at 2-7k tokens the host score round-trip + softmax costs more than flex's fused
+flash kernel, so NPU attention is ~10% slower wall but frees another ~110 CPU-seconds
+(-47% vs CPU-only overall). Per the CPU-relief goal it is the default; `--npu-attn cpu`
+selects the faster-wall configuration.
+
+Operational notes: the 600 MHz patched module stays loaded on the board (contained;
+reboot restores the stock 200 MHz in-tree module). The NPU deployment needs
+`--features npu` (aarch64) and `ROCKETNPU_DIR` pointing at `librocketnpu.a`.

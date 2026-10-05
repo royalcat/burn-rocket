@@ -41,6 +41,26 @@ Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
 - The `data/true3633.txt` file on the board is a true 3,633-token input (built by byte
   truncation + token count check); `one_3633.txt` is 6,501 tokens despite the name.
 
+## NPU offload (`--npu`, aarch64)
+
+- `crates/burn-rocket` = FFI to `librocketnpu` (rocket-userspace). Build the app with
+  `--no-default-features --features npu`; the crate links `vendor/rocketnpu/librocketnpu.a`
+  (override with `ROCKETNPU_DIR`, e.g. `/root/npu-poc/rocket-userspace/build` on the board).
+  aarch64 only: the dep is target-gated in Cargo.toml.
+- `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
+  f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
+  attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (faster wall,
+  less CPU relief). `--npu` requires `--dtype f32` and excludes `--quant q8`.
+- Resident weights are packed for the M>=256 tiling; requests with fewer rows are padded
+  to 256 rows (the extra rows are ignored on readback). One pack serves all lengths.
+- Board: the 600 MHz patched module (`insmod /root/npu-poc/rocket-patched-600/rocket-npu600.ko
+  rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
+  stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
+  `/root/npu-poc/rocket-userspace` (it is GPL-3.0-or-later).
+- Measured (3,633 tok, 4 threads, cores 4-7): CPU-only 99.9 s / 677 CPU-s; `--npu`
+  81.4 s / 472 CPU-s; `--npu` + NPU attention 90.1 s / 360 CPU-s. Attention is the
+  remaining flex cost (64.8 s of the 81.4 s with CPU attention).
+
 ## Stack notes
 
 - `burn = "=0.22.0-pre.4"`, `burn-store = "=0.22.0-pre.4"`; `flex` backend is the primary

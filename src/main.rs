@@ -44,6 +44,7 @@ struct Args {
     quant_q8: bool,
     npu: bool,
     npu_threads: usize,
+    npu_attn: bool,
     attn_fused: bool,
     key_block: usize,
     port: u16,
@@ -74,6 +75,7 @@ impl Args {
             quant_q8: false,
             npu: false,
             npu_threads: 5,
+            npu_attn: true,
             attn_fused: true,
             key_block: 256,
             port: 8383,
@@ -110,6 +112,13 @@ impl Args {
                 },
                 "--npu" => args.npu = true,
                 "--npu-threads" => args.npu_threads = value()?.parse()?,
+                "--npu-attn" => {
+                    args.npu_attn = match value()?.as_str() {
+                        "npu" => true,
+                        "cpu" => false,
+                        other => bail!("--npu-attn must be npu|cpu, got {other}"),
+                    }
+                }
                 "--port" => args.port = value()?.parse()?,
                 "--key-block" => args.key_block = value()?.parse()?,
                 "--attn" => {
@@ -166,6 +175,7 @@ fn load_model(
     quant_q8: bool,
     npu: bool,
     npu_threads: usize,
+    npu_attn: bool,
     device: &Device,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
@@ -208,7 +218,7 @@ fn load_model(
         if quant_q8 {
             bail!("--npu packs its own fp16 weights; --quant q8 is not applicable");
         }
-        return load_npu_projections(model, cfg, model_dir, npu_threads, device, t0);
+        return load_npu_projections(model, cfg, model_dir, npu_threads, npu_attn, device, t0);
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if npu {
@@ -297,11 +307,12 @@ fn load_npu_projections(
     cfg: Qwen3Config,
     model_dir: &Path,
     npu_threads: usize,
+    npu_attn: bool,
     _device: &Device,
     t0: Instant,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     use crate::model::Proj;
-    use crate::npu::{NpuModel, NpuRef, ProjKind};
+    use crate::npu::{NpuAttention, NpuModel, NpuRef, ProjKind};
     use burn_store::ModuleStore;
     use std::sync::Arc;
 
@@ -330,6 +341,16 @@ fn load_npu_projections(
     for (layer, kind) in packed {
         *model.projection_mut(layer, kind) =
             Proj::Npu(NpuRef::new(Arc::clone(&npu), layer, kind));
+    }
+    if npu_attn {
+        let attn = Arc::new(NpuAttention::new(
+            npu_threads,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )?);
+        model.set_npu_attn(Some(attn));
+        println!("NPU: attention offload enabled (n_head=16, n_kv=8, head_dim=128)");
     }
     model.embed_table_to_f16();
     println!(
@@ -367,6 +388,7 @@ fn run_bench(args: &Args) -> Result<()> {
         args.quant_q8,
         args.npu,
         args.npu_threads,
+        args.npu_attn,
         &device,
     )?;
     let ids = tokenize(args)?;
@@ -378,6 +400,11 @@ fn run_bench(args: &Args) -> Result<()> {
     let input = Tensor::<2, Int>::from_data(TensorData::new(ids_i64, [1, n]), &device);
     let rope = RopeCache::new(n, cfg.head_dim, cfg.rope_theta, args.dtype, &device);
 
+    crate::model::stage_stats_reset();
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if args.npu {
+        crate::npu::npu_stats_reset();
+    }
     let mut times = Vec::new();
     for i in 0..=args.reps {
         let t0 = Instant::now();
@@ -404,6 +431,19 @@ fn run_bench(args: &Args) -> Result<()> {
         args.dtype,
         n as f64 / best
     );
+    {
+        let (attn, mlp, norms) = crate::model::stage_stats();
+        println!("stages over all runs: attention {attn:.2}s, mlp {mlp:.2}s, norms {norms:.2}s");
+    }
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if args.npu {
+        let (conv, npu, calls) = crate::npu::npu_stats();
+        println!(
+            "npu breakdown over all runs: {calls} calls, convert {conv:.2}s, npu {npu:.2}s, \
+             flex+overhead {:.2}s",
+            times.iter().sum::<f64>() - conv - npu
+        );
+    }
     Ok(())
 }
 
@@ -473,6 +513,7 @@ fn run_serve(args: &Args) -> Result<()> {
         args.quant_q8,
         args.npu,
         args.npu_threads,
+        args.npu_attn,
         &device,
     )?;
     let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
@@ -501,6 +542,7 @@ fn run_embed(args: &Args) -> Result<()> {
         args.quant_q8,
         args.npu,
         args.npu_threads,
+        args.npu_attn,
         &device,
     )?;
     let ids = tokenize(args)?;

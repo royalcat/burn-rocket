@@ -86,6 +86,33 @@ with 4 threads, identical text:
 - Verdict: production stays on `ik_llama.cpp`; see `docs/experiment-log.md` §9 for the
   full analysis. Closing the gap needs int8 GEMM, which flex lacks.
 
+## NPU offload (RK3588 `rocket` driver, `--npu`)
+
+The projection matmuls (and optionally attention) can run on the RK3588 NPU through the
+mainline `rocket` driver, via a new `crates/burn-rocket` crate that wraps `librocketnpu`
+(gregordinary/rocket-userspace). Build with `--features npu` (aarch64) and
+`ROCKETNPU_DIR=<dir with librocketnpu.a>`; the crate is aarch64-only and links the static
+archive. Weights are **pack-and-drop**: all 196 projections are packed straight into
+resident fp16 NPU buffers (0.82 GiB) and the CPU keeps only an f16 embedding table
+(**298 MiB resident**).
+
+| Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
+|---|---|---|---|
+| CPU-only (`--quant q8`) | 99.9 s | 36.4 tok/s | 677 |
+| `--npu` (projections on NPU) | 81.4 s | 44.6 tok/s | 472 (-30%) |
+| `--npu --npu-attn npu` (default) | 90.1 s | 40.3 tok/s | **360 (-47%)** |
+
+- `--npu-attn npu` (default) offloads attention too: more CPU freed, ~10% slower wall
+  (the library brings the score matrix host-side for the causal mask + softmax, which
+  costs more than flex's fused flash kernel at these lengths). `--npu-attn cpu` selects
+  the faster-wall configuration.
+- Numerics: cosine 0.999381 vs the production Q8_0 reference (unchanged from the CPU
+  paths); the NPU attention run is 0.999997 vs the CPU-attention NPU run.
+- Requirements: the 600 MHz-patched `rocket` module on the board
+  (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`, contained; reboot reverts to the
+  stock 200 MHz module). At the stock clock everything still works, ~2-3x slower.
+- See `docs/experiment-log.md` §10 for the shape sweep, breakdown and trade-offs.
+
 ### Memory
 
 `--quant q8` keeps the projection weights Q8_0-quantized in memory and dequantizes each

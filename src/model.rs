@@ -11,6 +11,30 @@ use burn::tensor::activation::silu;
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{DType, Int, TensorData, s};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+// Stage wall-time instrumentation (microseconds): attention (projections + attention
+// kernel), MLP (projections + activations) and the norms. Three atomic adds per layer.
+static T_ATTN_US: AtomicU64 = AtomicU64::new(0);
+static T_MLP_US: AtomicU64 = AtomicU64::new(0);
+static T_NORM_US: AtomicU64 = AtomicU64::new(0);
+
+/// `(attention_s, mlp_s, norms_s)` accumulated since the last reset.
+pub fn stage_stats() -> (f64, f64, f64) {
+    (
+        T_ATTN_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_MLP_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_NORM_US.load(Ordering::Relaxed) as f64 / 1e6,
+    )
+}
+
+/// Reset the stage timers.
+pub fn stage_stats_reset() {
+    T_ATTN_US.store(0, Ordering::Relaxed);
+    T_MLP_US.store(0, Ordering::Relaxed);
+    T_NORM_US.store(0, Ordering::Relaxed);
+}
 
 /// Model hyper-parameters, deserialized from the HF `config.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -137,6 +161,16 @@ impl Qwen3Embedding {
 
     /// Mutable access to one projection (used by the loader).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    /// Install the NPU attention handle on every layer (`--npu` mode).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn set_npu_attn(&mut self, attn: Option<NpuAttnHandle>) {
+        for layer in &mut self.layers {
+            layer.self_attn.npu_attn = attn.clone();
+        }
+    }
+
+    /// Mutable access to one projection (used by the loader).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn projection_mut(
         &mut self,
         layer: usize,
@@ -232,15 +266,27 @@ impl Qwen3Layer {
         fused: bool,
         quantized: bool,
     ) -> Tensor<3> {
+        let t = Instant::now();
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
         let h = self
             .self_attn
             .forward(h, rope, attn_chunk, key_block, fused, quantized)
             + residual;
+        T_ATTN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
         let residual = h.clone();
         let h = self.post_attention_layernorm.forward(h);
-        self.mlp.forward(h, quantized) + residual
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
+        let out = self.mlp.forward(h, quantized) + residual;
+        T_MLP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        out
     }
 }
 
@@ -279,6 +325,13 @@ impl Proj {
     }
 }
 
+/// NPU attention handle: a shared `NpuAttention` on aarch64+npu builds, `()` otherwise
+/// (the field exists in both cases so the module layout is stable).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub type NpuAttnHandle = std::sync::Arc<crate::npu::NpuAttention>;
+#[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+pub type NpuAttnHandle = ();
+
 #[derive(Module, Debug)]
 struct Qwen3Attention {
     #[module(skip)]
@@ -289,6 +342,9 @@ struct Qwen3Attention {
     v_proj: Proj,
     #[module(skip)]
     o_proj: Proj,
+    /// Set in `--npu` mode: attention runs on the RK3588 NPU.
+    #[module(skip)]
+    npu_attn: Option<NpuAttnHandle>,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     n_heads: usize,
@@ -305,6 +361,7 @@ impl Qwen3Attention {
             k_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
             v_proj: Proj::stub(cfg.hidden_size, kv_dim, device),
             o_proj: Proj::stub(q_dim, cfg.hidden_size, device),
+            npu_attn: None,
             q_norm: RmsNormConfig::new(cfg.head_dim)
                 .with_epsilon(cfg.rms_norm_eps)
                 .init(device),
@@ -317,7 +374,7 @@ impl Qwen3Attention {
         }
     }
 
-    /// Projections + QK-norm + RoPE. Returns q `[B, H, S, D]`, k/v `[B, KV, S, D]`.
+    /// Projections + QK-norm + RoPE. Returns q `[B, S, H, D]`, k/v `[B, S, KV, D]`.
     fn project(
         &self,
         x: Tensor<3>,
@@ -334,16 +391,13 @@ impl Qwen3Attention {
         let q = rope.apply(self.q_norm.forward(q), 0);
         let k = rope.apply(self.k_norm.forward(k), 0);
 
-        (
-            q.swap_dims(1, 2), // [B, H, S, D]
-            k.swap_dims(1, 2), // [B, KV, S, D]
-            v.swap_dims(1, 2),
-        )
+        (q, k, v)
     }
 
-    /// `fused`: use the backend's fused attention kernel (`burn::tensor::module::attention`;
-    /// flex selects a tiled flash-attention path for long sequences). Otherwise use the
-    /// tensor-op blocked online-softmax fallback.
+    /// Attention: `npu_attn` (RK3588 NPU, `--npu`) when set; otherwise `fused` selects
+    /// the backend's fused kernel (`burn::tensor::module::attention`; flex uses a tiled
+    /// flash-attention path for long sequences) and `blocked` the tensor-op online-softmax
+    /// fallback.
     fn forward(
         &self,
         x: Tensor<3>,
@@ -357,6 +411,20 @@ impl Qwen3Attention {
         let (h, d) = (self.n_heads, self.head_dim);
         let (q, k, v) = self.project(x, rope, quantized);
 
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if let Some(npu) = &self.npu_attn {
+            // NPU attention takes the [1, S, heads*D] layout directly (head-major f16
+            // buffers are prepared inside).
+            let kv = self.n_kv_heads;
+            let o = npu.forward(
+                q.reshape([b, s, h * d]),
+                k.reshape([b, s, kv * d]),
+                v.reshape([b, s, kv * d]),
+            );
+            return self.o_proj.forward(o, quantized);
+        }
+
+        let (q, k, v) = (q.swap_dims(1, 2), k.swap_dims(1, 2), v.swap_dims(1, 2));
         let o = if fused {
             // GQA is handled natively (16 query heads, 8 kv heads); causal masking is
             // applied inside the kernel.
