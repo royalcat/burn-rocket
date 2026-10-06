@@ -6,7 +6,7 @@ description = "RK3588 NPU offload (mainline `rocket` driver) via librocketnpu"
 license = "GPL-3.0-or-later"
 
 [workspace]
-members = ["examples/qwen3-embeddings"]
+members = ["examples/rocket-inference"]
 
 [features]
 default = []

@@ -5028,23 +5028,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen3-embeddings"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "burn",
- "burn-rocket",
- "burn-store",
- "libc",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
-]
-
-[[package]]
 name = "r-efi"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5405,6 +5388,23 @@ checksum = "18bd8a37d17a58532776dcdf6041ce64929adca78e8489d5cacbafe99229d3e1"
 dependencies = [
  "bytemuck",
  "byteorder",
+]
+
+[[package]]
+name = "rocket-inference"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "burn",
+ "burn-rocket",
+ "burn-store",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "tokio",
 ]
 
 [[package]]

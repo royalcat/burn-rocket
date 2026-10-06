@@ -3,19 +3,21 @@
 `burn-rocket` is the main crate: RK3588 NPU offload for Burn models — an FFI wrapper
 over `librocketnpu` plus the `RocketOps` Burn backend extension (projections and
 attention on the mainline `rocket` driver). The Qwen3-Embedding-0.6B inference app is
-an example of it, at `examples/qwen3-embeddings/`. Read `README.md` (library) and
-`examples/qwen3-embeddings/README.md` (app) first; measurements live in
-`examples/qwen3-embeddings/docs/experiment-log.md`.
+an example of it, at `examples/rocket-inference/`. Read `README.md` (library) and
+`examples/rocket-inference/README.md` (app) first; measurements live in
+`examples/rocket-inference/docs/experiment-log.md`.
 
 The repo was inverted on 2026-10-06 with no functional changes (commits `8c7eabb`
 structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
-`examples/qwen3-embeddings/`, the former `crates/burn-rocket` became the root package.
+`examples/rocket-inference/` (renamed from `examples/qwen3-embeddings/` on 2026-10-06 when it
+gained the Qwen3.5 intent-model server), the former `crates/burn-rocket` became the root
+package.
 The inversion is verified on the dev host: `cargo check -p burn-rocket` (plain / `flex` /
-`npu`) and `-p qwen3-embeddings` (default `cpu` and `--no-default-features`), aarch64
+`npu`) and `-p rocket-inference` (default `cpu` and `--no-default-features`), aarch64
 cross-builds of the example (`--features npu`) and of `--example probe`, plus a tokenize +
 q8 embed smoke run. The git remote is still `embeddings-fast.git`. Board artifacts
 deployed before that date live under `/root/embeddings-fast/`; new deploys go to
-`/root/qwen3-embeddings/`.
+`/root/rocket-inference/`.
 
 ## Status (2026-10-06)
 
@@ -59,7 +61,7 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
   (9.29 s, 1.57 GB anon) but its f16 LM head changes near-ties. `--pure-npu` (no CPU
   copies) runs decode on the NPU too: 1.5 tok/s, 1.29 GB anon.
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
-  + Burn's wgpu backend was measured with `examples/qwen3-embeddings/src/bin/wgpu_probe.rs`.
+  + Burn's wgpu backend was measured with `examples/rocket-inference/src/bin/wgpu_probe.rs`.
   Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
   attention throughput is **34 GF/s at seq 1024** (gate was >=200-300), the real qkv shape
   trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
@@ -78,17 +80,17 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`) |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
-| `examples/qwen3-embeddings/Cargo.toml` | workspace member `qwen3-embeddings`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/qwen3-embeddings/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`), intent model loading |
-| `examples/qwen3-embeddings/src/model.rs` | Qwen3-Embedding model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
-| `examples/qwen3-embeddings/src/intent_model.rs` | Qwen3.5-0.8B text model: chunked/recurrent gated delta rule, gated full attention, caches, greedy generation |
-| `examples/qwen3-embeddings/src/intent_loader.rs` | intent weight loading (`model.language_model.*`, vision skipped) + NPU pack-and-drop (fused groups, f16 CPU decode copies) |
-| `examples/qwen3-embeddings/src/ollama.rs` | Ollama-compatible intent API (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`) |
-| `examples/qwen3-embeddings/src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment, typed NPU-error mapping, `--max-tokens` enforcement |
-| `examples/qwen3-embeddings/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
-| `examples/qwen3-embeddings/data/` | bench/embedding fixtures (`bench_text.txt`) |
-| `examples/qwen3-embeddings/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
-| `examples/qwen3-embeddings/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
+| `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
+| `examples/rocket-inference/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`), intent model loading |
+| `examples/rocket-inference/src/model.rs` | Qwen3-Embedding model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
+| `examples/rocket-inference/src/intent_model.rs` | Qwen3.5-0.8B text model: chunked/recurrent gated delta rule, gated full attention, caches, greedy generation |
+| `examples/rocket-inference/src/intent_loader.rs` | intent weight loading (`model.language_model.*`, vision skipped) + NPU pack-and-drop (fused groups, f16 CPU decode copies) |
+| `examples/rocket-inference/src/ollama.rs` | Ollama-compatible intent API (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`) |
+| `examples/rocket-inference/src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment, typed NPU-error mapping, `--max-tokens` enforcement |
+| `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
+| `examples/rocket-inference/data/` | bench/embedding fixtures (`bench_text.txt`) |
+| `examples/rocket-inference/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
+| `examples/rocket-inference/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
@@ -96,27 +98,27 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 
 ```sh
 # NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
-cargo build --release -p qwen3-embeddings --target aarch64-unknown-linux-gnu \
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
-ssh root@rock-5b-plus.lan 'mkdir -p /root/qwen3-embeddings'
-scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/qwen3-embeddings \
-    root@rock-5b-plus.lan:/root/qwen3-embeddings/
+ssh root@rock-5b-plus.lan 'mkdir -p /root/rocket-inference'
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rocket-inference \
+    root@rock-5b-plus.lan:/root/rocket-inference/
 # the bench needs data/ relative to the deploy dir
-scp -r examples/qwen3-embeddings/data root@rock-5b-plus.lan:/root/qwen3-embeddings/
+scp -r examples/rocket-inference/data root@rock-5b-plus.lan:/root/rocket-inference/
 # CPU-only build: drop --features npu (binary name is the same)
 ```
 
 The binary is self-contained (`librocketnpu` is statically linked); the model lives at
 `/root/models/qwen3-embedding-0.6b/` on the board. On the board run from
-`/root/qwen3-embeddings` (the bench uses the relative `data/bench_text.txt`).
+`/root/rocket-inference` (the bench uses the relative `data/bench_text.txt`).
 
 Library-only builds: `cargo check -p burn-rocket --features npu` compiles the extension
 on any host (no linking); `cargo build --release -p burn-rocket --features npu --target
 aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the FFI probe.
 
-Container image: `examples/qwen3-embeddings/docker/build.sh [git-ref]` stages the tree,
+Container image: `examples/rocket-inference/docker/build.sh [git-ref]` stages the tree,
 builds the aarch64 image on the board and pushes
-`git.kmsign.org/royalcat/qwen3-embeddings:<sha>`. It needs
+`git.kmsign.org/royalcat/rocket-inference:<sha>`. It needs
 `vendor/rocketnpu/librocketnpu.a` (or `VENDOR_SRC`) and registry credentials on the
 control host; run it from anywhere in the repo.
 
@@ -143,7 +145,7 @@ example's `src/model.rs` (`stage_stats`).
 ## Board deployment (2026-10-05)
 
 - Deployed: `/root/embeddings-fast/` (pre-inversion dir; binary + `data/`) and
-  `/root/models/qwen3-embedding-0.6b/`. New deploys go to `/root/qwen3-embeddings/`;
+  `/root/models/qwen3-embedding-0.6b/`. New deploys go to `/root/rocket-inference/`;
   the old directory is left in place. Run from the deploy dir (the bench uses the
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
@@ -182,7 +184,7 @@ example's `src/model.rs` (`stage_stats`).
   `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and links
   `vendor/rocketnpu/librocketnpu.a` (override with `ROCKETNPU_DIR`, e.g.
   `/root/npu-poc/rocket-userspace/build` on the board). aarch64 only: the dep is
-  target-gated in `examples/qwen3-embeddings/Cargo.toml`.
+  target-gated in `examples/rocket-inference/Cargo.toml`.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
   one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
@@ -238,14 +240,14 @@ example's `src/model.rs` (`stage_stats`).
 - The board's GPU is reachable only through **Mesa panvk** (armbian 26.8.3 trixie, Mesa
   26.1.6 backports; Vendor `libmali` needs the vendor kernel, rusticl exposes no device).
   `vulkaninfo` shows Vulkan 1.4.354 on `Mali-G610 MC4` with all features CubeCL needs.
-- Probe: `examples/qwen3-embeddings/src/bin/wgpu_probe.rs`, built with the `gpu-wgsl`
+- Probe: `examples/rocket-inference/src/bin/wgpu_probe.rs`, built with the `gpu-wgsl`
   (+ optional `gpu-autotune`) cargo feature. `gpu-spirv` (burn's `vulkan` feature,
   CubeCL's SPIR-V compiler) segfaults inside `libvulkan_panfrost.so` at the first shader
   compile — use `gpu-wgsl`.
 - Build with **`cargo zigbuild --target aarch64-unknown-linux-gnu.2.41`**: the plain GNU
   cross toolchain links against glibc 2.44 while the board has 2.41 (the wgpu tree pulls
   libm symbols at 2.43/2.44). Then scp the binary; run it from the deploy dir
-  (`/root/qwen3-embeddings`).
+  (`/root/rocket-inference`).
 - Measured: fixed-strategy GEMM 3.8 GF/s, autotuned GEMM 79 GF/s (1024³), f16 causal
   attention 34 GF/s at seq 1024 (4.3 GF/s at 256). The real qkv GEMM shape trips the
   panthor job watchdog (>4.6 s dispatches die; device lost, `dmesg` "job timeout");
@@ -342,11 +344,11 @@ example's `src/model.rs` (`stage_stats`).
 ## Verification commands
 
 ```sh
-B=$CARGO_TARGET_DIR/release/qwen3-embeddings
+B=$CARGO_TARGET_DIR/release/rocket-inference
 # library compile checks (npu needs aarch64 only for linking)
 cargo check -p burn-rocket --features npu
 # single-core speed gate (blocked path is the single-core record); run from
-# examples/qwen3-embeddings
+# examples/rocket-inference
 taskset -c 2 cargo run --release -- bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
 # multi-threaded / long-input (fused default)
 cargo run --release -- bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
@@ -363,10 +365,10 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):
 
 ```sh
-cd /root/qwen3-embeddings
-ROCKET_MATMUL_CHUNK_M=0 ./qwen3-embeddings embed --backend flex --dtype f32 --npu \
+cd /root/rocket-inference
+ROCKET_MATMUL_CHUNK_M=0 ./rocket-inference embed --backend flex --dtype f32 --npu \
   --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e0.json
-ROCKET_MATMUL_CHUNK_M=1024 ./qwen3-embeddings embed --backend flex --dtype f32 --npu \
+ROCKET_MATMUL_CHUNK_M=1024 ./rocket-inference embed --backend flex --dtype f32 --npu \
   --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e1.json
 python3 -c "import json,math;a=json.load(open('/tmp/e0.json'));b=json.load(open('/tmp/e1.json'));d=sum(x*y for x,y in zip(a,b));na=math.sqrt(sum(x*x for x in a));nb=math.sqrt(sum(x*x for x in b));print('cosine',d/(na*nb))"
 ```
@@ -375,21 +377,21 @@ On the board (after the cross-build + scp above; the NPU-enabled binary):
 
 ```sh
 ssh root@rock-5b-plus.lan
-cd /root/qwen3-embeddings
+cd /root/rocket-inference
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
-taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
-taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
-taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --tokens 3633 --reps 1
+taskset -c 4-7 ./rocket-inference bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
+taskset -c 4-7 ./rocket-inference bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
+taskset -c 4-7 ./rocket-inference bench --backend flex --dtype f32 --tokens 3633 --reps 1
 # numerics vs the production reference (copy the JSON back and compare cosines)
-./qwen3-embeddings embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
+./rocket-inference embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
 # CPU modes of the same NPU binary (projections are loaded explicitly there)
-./qwen3-embeddings embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
-./qwen3-embeddings embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
+./rocket-inference embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
+./rocket-inference embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
 ```
 
 Vulkan/wgpu GPU probe (separate binary; built with
-`cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 -p qwen3-embeddings --no-default-features --features gpu-wgsl,gpu-autotune --bin wgpu_probe`;
+`cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 -p rocket-inference --no-default-features --features gpu-wgsl,gpu-autotune --bin wgpu_probe`;
 see "Vulkan GPU probe" in this file for the verdict):
 
 ```sh
@@ -402,5 +404,5 @@ see "Vulkan GPU probe" in this file for the verdict):
 Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencode/`
 (`ref_causal.json`, `ref1_{64,512,3633}.json`, `one_{64,512,3633}.txt`) and partially on
 the board in `/root/embeddings-fast/data/` (historical) and under
-`examples/qwen3-embeddings/data/`. Regenerate them with the `llama-embedding` invocation
+`examples/rocket-inference/data/`. Regenerate them with the `llama-embedding` invocation
 in "Environment facts" if missing.

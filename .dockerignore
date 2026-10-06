@@ -1,8 +1,8 @@
 .git
 target
-examples/qwen3-embeddings/docs
-examples/qwen3-embeddings/data
-examples/qwen3-embeddings/docker
+examples/rocket-inference/docs
+examples/rocket-inference/data
+examples/rocket-inference/docker
 AGENTS.md
 README.md
-examples/qwen3-embeddings/README.md
+examples/rocket-inference/README.md

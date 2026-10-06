@@ -1,4 +1,4 @@
-# qwen3-embeddings
+# rocket-inference
 
 Burn inference examples for the [`burn-rocket`](../..) library on a Rock 5B+ (RK3588,
 4×Cortex-A76): the Qwen3-Embedding-0.6B embedding server (production `ik_llama.cpp` Q8_0
@@ -66,12 +66,12 @@ Both attention paths produce identical embeddings (cosine 1.000000 between them)
 
 ## Board results (rock-5b-plus, 2026-10-05)
 
-Deployed to the board (`/root/qwen3-embeddings/` + `/root/models/qwen3-embedding-0.6b/`)
+Deployed to the board (`/root/rocket-inference/` + `/root/models/qwen3-embedding-0.6b/`)
 and measured against the production `ik_llama.cpp` Q8_0 server, both on the A76 cores 4-7
 with 4 threads, identical text (the 2026-10-05 runs used `/root/embeddings-fast/`, the
 deploy dir's pre-inversion name):
 
-| Input | Production ik_llama.cpp | qwen3-embeddings (flex f32, low-RAM) |
+| Input | Production ik_llama.cpp | rocket-inference (flex f32, low-RAM) |
 |---|---|---|
 | 3,633 tokens | **46.7 s / 77.8 tok/s** | 106.2 s / 34.2 tok/s |
 | 6,501 tokens | 124.2 s / 52.3 tok/s | 262.2 s / 24.8 tok/s |
@@ -185,8 +185,8 @@ useful only when CPU should be left alone. OpenViking wiring and caveats:
 ## Usage
 
 ```sh
-# run from examples/qwen3-embeddings (the bench reads data/bench_text.txt)
-cd examples/qwen3-embeddings
+# run from examples/rocket-inference (the bench reads data/bench_text.txt)
+cd examples/rocket-inference
 
 # single-core benchmark on a fixed text
 taskset -c 2 cargo run --release -- bench --backend flex --dtype f32 --tokens 3633 --reps 2 --chunk 256
@@ -216,7 +216,7 @@ default `fused` path is better for long inputs and for multi-threaded serving.
 
 ```sh
 # from the repo root; add --features npu for the NPU build (links librocketnpu)
-cargo build --release -p qwen3-embeddings --target aarch64-unknown-linux-gnu \
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
 ```
 

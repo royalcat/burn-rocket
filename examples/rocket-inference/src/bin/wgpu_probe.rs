@@ -3,9 +3,9 @@
 //! Build (dev host, cross) — `cargo zigbuild`: the plain GNU cross toolchain links
 //! against glibc 2.44, newer than the board's 2.41:
 //!   cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 \
-//!       -p qwen3-embeddings --no-default-features --features gpu-wgsl --bin wgpu_probe
+//!       -p rocket-inference --no-default-features --features gpu-wgsl --bin wgpu_probe
 //!
-//! Run on the board (from /root/qwen3-embeddings):
+//! Run on the board (from /root/rocket-inference):
 //!   ./wgpu_probe --seq 3633 --reps 2
 //!
 //! Prints matmul GFLOPS (f16/f32), causal attention seconds/GFLOPS at the model's

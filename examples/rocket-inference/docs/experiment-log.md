@@ -1,9 +1,10 @@
 # Experiment log: Qwen3-Embedding-0.6B on Burn
 
 > Layout note (2026-10-06): the repository was inverted — `burn-rocket` is now the
-> root crate and this app lives in `examples/qwen3-embeddings/`. Paths like
-> `crates/burn-rocket` and board dirs like `/root/embeddings-fast/` below are the
-> historical pre-inversion locations; the measurements are unchanged.
+> root crate and this app lives in `examples/rocket-inference/` (renamed from
+> `examples/qwen3-embeddings/` on 2026-10-06, when it gained the Qwen3.5 intent-model
+> server). Paths like `crates/burn-rocket` and board dirs like `/root/embeddings-fast/`
+> below are the historical pre-inversion locations; the measurements are unchanged.
 
 Goal: run Qwen3-Embedding-0.6B (1024-dim, last-token pooling) in Rust/Burn, at least
 50 tok/s on one core, with Q8 weights and an OpenAI-compatible server. Board (RK3588)

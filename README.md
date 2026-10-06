@@ -74,7 +74,7 @@ reverts on reboot. Everything works at the stock clock.
 
 ## Example
 
-[`examples/qwen3-embeddings`](examples/qwen3-embeddings) is a complete inference app
+[`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
 built on this library. It serves the Qwen3-Embedding-0.6B embedding model (CLI `bench`,
 `embed`, `gemm`, `serve`, `tokenize`; OpenAI-compatible `/v1/embeddings`) and the
 Qwen3.5-0.8B intent/query-planner model (`gen`, `serve-ollama`; Ollama-compatible
