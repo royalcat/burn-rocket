@@ -47,6 +47,17 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
   for a container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192,
   0 disables). Board-verified for robustness only; long-context attention and performance
   are unchanged/deferred.
+- **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
+  is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
+  layers), not a relative of Qwen3-Embedding. It is implemented in the same example
+  (`src/intent_model.rs`, `src/intent_loader.rs`, `src/ollama.rs`; commands `gen` and
+  `serve-ollama`, an Ollama-compatible API on port 11434). Greedy output is
+  token-identical to HF transformers 5.19 on two prompts (32/32 on the v7 planner
+  prompt; per-layer hidden cosine 1.0). Board (166-token prompt, 32 tokens, busy board):
+  CPU f32 89.96 s vs `--npu` 11.65 s (prefill 2.94 s, decode 8.71 s) — decode stays on
+  the CPU with f16 copies because NPU matmuls pad `M` to 256; `--embed-f16` is faster
+  (9.29 s, 1.57 GB anon) but its f16 LM head changes near-ties. `--pure-npu` (no CPU
+  copies) runs decode on the NPU too: 1.5 tok/s, 1.29 GB anon.
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
   + Burn's wgpu backend was measured with `examples/qwen3-embeddings/src/bin/wgpu_probe.rs`.
   Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
@@ -68,8 +79,11 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`) |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
 | `examples/qwen3-embeddings/Cargo.toml` | workspace member `qwen3-embeddings`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/qwen3-embeddings/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`) |
-| `examples/qwen3-embeddings/src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
+| `examples/qwen3-embeddings/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`), intent model loading |
+| `examples/qwen3-embeddings/src/model.rs` | Qwen3-Embedding model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
+| `examples/qwen3-embeddings/src/intent_model.rs` | Qwen3.5-0.8B text model: chunked/recurrent gated delta rule, gated full attention, caches, greedy generation |
+| `examples/qwen3-embeddings/src/intent_loader.rs` | intent weight loading (`model.language_model.*`, vision skipped) + NPU pack-and-drop (fused groups, f16 CPU decode copies) |
+| `examples/qwen3-embeddings/src/ollama.rs` | Ollama-compatible intent API (`/api/chat`, `/api/generate`, `/api/tags`, `/api/show`) |
 | `examples/qwen3-embeddings/src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment, typed NPU-error mapping, `--max-tokens` enforcement |
 | `examples/qwen3-embeddings/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
 | `examples/qwen3-embeddings/data/` | bench/embedding fixtures (`bench_text.txt`) |
@@ -319,6 +333,11 @@ example's `src/model.rs` (`stage_stats`).
   whether the CPU-relief mode should be the default there (it is now).
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak in
   `--quant q8` mode; re-pack small-M weights lazily instead of padding to 256 rows.
+- Intent model: re-run the CPU/NPU A/B on an idle board (the 2026-10-06 numbers were
+  taken while `tstor-scan`/OpenViking ran, and `embeddings-fast` shares the NPU); probe a
+  small-`M` resident pack (`rocket_weights_pack(m < 256)` documents a `-2` re-pack
+  fallback) to move single-token decode onto the NPU; decide the production
+  `query_planner` wiring (memory is ~2.06 GB anon + ~1.2 GB NPU BOs with f32 table).
 
 ## Verification commands
 

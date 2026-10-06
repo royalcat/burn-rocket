@@ -1,14 +1,16 @@
 # qwen3-embeddings
 
-Qwen3-Embedding-0.6B inference example for the [`burn-rocket`](../..) library:
-Rust/Burn embedding serving on a Rock 5B+ (RK3588, 4×Cortex-A76), targeting the
-production `ik_llama.cpp` Q8_0 setup. CPU-only by default (`flex` backend), with
-optional RK3588 NPU offload of the projections and attention via the `--npu` flag.
+Burn inference examples for the [`burn-rocket`](../..) library on a Rock 5B+ (RK3588,
+4×Cortex-A76): the Qwen3-Embedding-0.6B embedding server (production `ik_llama.cpp` Q8_0
+reference) and the Qwen3.5-0.8B intent/query-planner model behind an Ollama-compatible
+API (`guoxuter/ov_intent_analysis_sft:v7_q8`). CPU-only by default (`flex` backend),
+with optional RK3588 NPU offload via `--npu`.
 
-Current status: **working model, CLI, and OpenAI-compatible server**; dev-host
-measurements beat the target comfortably. Deployed and benchmarked on the Rock 5B+
-(2026-10-05): numerically faithful and low-RAM, but 2.3× slower than the production
-int8 `ik_llama.cpp` path — see "Board results" below.
+Current status: **working models, CLI, and servers**. The embedding path is deployed
+and numerically faithful but 2.3× slower than production `ik_llama.cpp` (2026-10-05);
+the intent model matches the HF reference token-for-token and runs the real v7 planner
+prompt in 11.7 s on the board with `--npu` (89.9 s CPU-only) — see "Board results" and
+`docs/experiment-log.md` §14.
 
 ## Results so far
 
@@ -140,6 +142,46 @@ to f32 before quantization); the resident figure is the steady state a server ke
 mode. `libc::malloc_trim` is called after quantization because glibc otherwise retains
 the freed f32 weight pages in its arenas.
 
+## Intent model (`guoxuter/ov_intent_analysis_sft:v7_q8` = Qwen3.5-0.8B, Ollama API)
+
+The same binary also serves OpenViking's recommended local **query planner**:
+`guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder (18 Gated
+DeltaNet linear-attention layers + 6 gated full-attention layers), implemented in
+`src/intent_model.rs` and served through an Ollama-compatible API (`src/ollama.rs`)
+so OpenViking's `query_planner` config works unchanged. The HF safetensors
+(`model.language_model.*`; the vision tower is skipped) load through
+`src/intent_loader.rs`; `--npu` packs the projection groups into resident NPU weights
+for prefill and keeps f16 CPU copies for single-token decode (the NPU matmul pads every
+request to `M >= 256`, which is wasteful per decode step).
+
+```sh
+# one-shot greedy generation (raw prompt; drop --raw to wrap in the ChatML template)
+cargo run --release -- gen --model-dir ~/models/ov-intent-analysis-sft \
+  --text "Hello!" --raw --max-new-tokens 32
+
+# Ollama-compatible server (OpenViking query planner)
+cargo run --release -- serve-ollama --model-dir ~/models/ov-intent-analysis-sft \
+  --npu --npu-threads 3 --port 11434 --max-tokens 4096 --max-new-tokens 256
+curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
+```
+
+On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
+
+| Mode | Prefill | Decode | Total | Anon RSS |
+|---|---|---|---|---|
+| CPU f32 | 7.91 s | 82.05 s (0.4 tok/s) | 89.96 s | ~2.4 GB |
+| `--npu --npu-threads 3` | 2.94 s | 8.71 s (3.7 tok/s) | **11.65 s** | 2.06 GB |
+| `--npu --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
+
+The CPU f32 and NPU f32-table outputs are token-identical to the HF transformers
+reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0). `--embed-f16` is
+faster and smaller but its f16 LM head flips near-ties (the greedy stream diverges after
+~10 tokens); use it when memory matters more than exact parity. `--pure-npu` drops the
+CPU copies entirely (1.29 GB anon) and runs decode on the NPU too — slower (1.5 tok/s),
+useful only when CPU should be left alone. OpenViking wiring and caveats:
+`docs/experiment-log.md` §14.
+
 ## Usage
 
 ```sh
@@ -162,7 +204,10 @@ Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|f
 `--dtype f32|f16` (bf16 is broken in flex), `--quant none|q8` (q8 = Q8-resident low-RAM
 mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked attention only),
 `--tokens`, `--text`, `--text-file`, `--out`, `--port`, `--max-tokens`, `--model-name`.
-Subcommands: `bench`, `embed`, `gemm`, `serve`, `tokenize`.
+Subcommands: `bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`
+(the last two are the Qwen3.5 intent model; they take `--max-new-tokens`,
+`--temperature`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`, `--raw`
+and default `--model-dir` to `~/models/ov-intent-analysis-sft`).
 
 Single-core runs are fastest with `--attn blocked --chunk 256 --key-block 256`; the
 default `fused` path is better for long inputs and for multi-threaded serving.

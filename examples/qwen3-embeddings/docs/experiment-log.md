@@ -608,3 +608,101 @@ the device. Even an optimistic extrapolation leaves the wall at today's level, w
 instability, a watchdog that forbids the long dispatches 3.6k+ tokens need, and no path to
 30k context. The NPU stays the only practical accelerator; this lever reopens if CubeCL's
 panvk support, Mesa's compiler, or the panthor watchdog improve.
+
+## 14. Intent model (`ov_intent_analysis_sft` = Qwen3.5-0.8B) + Ollama API (2026-10-06)
+
+Goal: serve `guoxuter/ov_intent_analysis_sft:v7_q8` (OpenViking's recommended local
+query planner) from the board, with the RK3588 NPU offloading the projections. The
+Ollama tag is Qwen3.5-0.8B: the HF safetensors are a **hybrid decoder**, not a sibling
+of Qwen3-Embedding.
+
+### 14.1 Architecture and implementation
+
+`text_config` of `guoxuter/ov_intent_analysis_sft` (f32 text weights, 3.21 GB; the
+`model.visual.*` bf16 vision tower is skipped):
+
+- 24 decoder layers, `layer_types` = 18 × `linear_attention` + 6 × `full_attention`
+  (indices 3, 7, ...): **Gated DeltaNet** (16 heads × 128, conv1d k=4, `A_log`/`dt_bias`
+  gates, gated RMSNorm, all delta math f32) alternating with **gated full attention**
+  (8 q / 2 kv heads, head_dim 256, partial RoPE 64 dims, `q_proj` emits query+gate,
+  `sigmoid(gate)` before `o_proj`), hidden 1024, intermediate 3584, vocab 248320,
+  embeddings tied, zero-centered RMSNorm (`1 + w`).
+
+Port: `src/intent_model.rs` (chunked gated delta rule for prefill, recurrent form for
+decode, KV/conv/recurrent caches, explicit single-query attention for decode),
+`src/intent_loader.rs` (safetensors loader + NPU pack-and-drop), `src/ollama.rs`
+(Ollama-compatible `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`), wired into
+the existing binary as `gen` and `serve-ollama`. The chat template matches the model's
+Ollama template exactly (`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`,
+stops `<|im_end|>`/`<|endoftext|>`).
+
+### 14.2 Numerics — exact match against HF transformers 5.19
+
+Reference: `Qwen3_5ForConditionalGeneration` (text path), greedy decoding, on the dev
+host. Two prompts: a 10-token chat prompt and a 166-token rendered v7 planner prompt.
+
+| Check | Result |
+|---|---|
+| per-layer hidden states, last position (25 entries) | cosine 1.000000, max abs diff 0.0 |
+| greedy ids, chat prompt (9 tokens, stops at EOS) | identical to HF |
+| greedy ids, v7 prompt (32 tokens) | 32/32 identical (`{"queries": [{"query": "Guoxuter …` |
+| first-step logits (top-8) | identical to within 1e-4 |
+
+The port is bit-faithful in f32 on flex (the debug bisect needed two fixes: burn's
+`triu_mask(offset)` has numpy `k = offset - 1` semantics, and the decode path must
+write the updated recurrent state back into the cache).
+
+### 14.3 Board measurements (rock-5b-plus, 166-token v7 prompt, 32 greedy tokens)
+
+`taskset -c 4-7`; the 600 MHz patched `rocket` module was loaded. The board was NOT
+idle (`tstor-scan`, OpenViking and the embeddings service running; `embeddings-fast`
+uses the NPU), so treat the absolute numbers as an upper bound and re-run on an idle
+board for a production decision.
+
+| Mode | Prefill | Decode | Total | Decode speed | Anon RSS |
+|---|---|---|---|---|---|
+| CPU f32 (no `--npu`) | 7.91 s | 82.05 s | 89.96 s | 0.4 tok/s | ~2.4 GB |
+| `--npu --npu-threads 3` (f16 CPU copies for decode) | 2.94 s | 8.71 s | **11.65 s** | 3.7 tok/s | 2.06 GB |
+| `--npu --embed-f16` | 2.84 s | 6.45 s | 9.29 s | **5.0 tok/s** | 1.57 GB |
+| `--npu --pure-npu` (no CPU copies; NPU decode) | 1.39 s | — | — | 1.5 tok/s | 1.29 GB |
+
+- NPU vs CPU-only: **7.7× wall** (11.65 s vs 89.96 s); projections run on the NPU at
+  prefill, decode uses f16 CPU copies because the resident-weight matmul pads every
+  request to `M >= 256` (single-token NPU matmuls are 2.5× slower than the CPU f16 path).
+- The f16 token-embedding table (`--embed-f16`) is faster and ~0.5 GB smaller but its
+  f16 LM head flips near-ties: the greedy stream diverges from the f32 reference after
+  ~10 tokens (both outputs are valid JSON; the f32 default keeps exact parity).
+- Resident NPU memory: 96 packed weights (497 M params f16 ≈ 1 GB logical) show up as
+  ~1.2 GB of shared/BO memory; a `serve-ollama --npu` process holds ~2.06 GB anon +
+  ~1.2 GB shared while serving.
+- Server smoke test on the board (port 11434): `/api/chat` returns the same
+  `"Hello! How can I assist you today?"`, `/health` answers in ~1 ms while the model is
+  loaded, `prompt_eval 1.49 s`, `eval 2.59 s` for 9 tokens.
+
+### 14.4 OpenViking wiring
+
+```json
+{
+  "query_planner": {
+    "provider": "litellm",
+    "model": "ollama/guoxuter/ov_intent_analysis_sft:v7_q8",
+    "api_base": "http://<board-host>:11434",
+    "temperature": 0.0,
+    "timeout": 60,
+    "extra_request_body": { "think": false }
+  }
+}
+```
+
+The model string must stay `ollama/guoxuter/ov_intent_analysis_sft:v7_q8` so OpenViking
+picks its bundled v7 prompt. Keep `shutdown`/supervision in mind: the service needs
+~3.3 GB (2.06 GB anon + ~1.2 GB NPU BOs) while OpenViking + the embeddings service run.
+
+### 14.5 Open items
+
+- Re-run the A/B on an idle board (NPU contention with `embeddings-fast`; other
+  services were active during these runs).
+- NPU decode without the `M >= 256` padding: pack a second, small-`M` resident weight
+  per layer (the library documents a `-2` re-pack fallback for small `M`) — probe first.
+- The server is one-at-a-time (a global model lock); quantify OpenViking's concurrent
+  intent calls before a production switch.

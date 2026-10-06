@@ -74,13 +74,16 @@ reverts on reboot. Everything works at the stock clock.
 
 ## Example
 
-[`examples/qwen3-embeddings`](examples/qwen3-embeddings) is a complete
-Qwen3-Embedding-0.6B inference app built on this library: CLI (`bench`, `embed`, `gemm`,
-`serve`, `tokenize`), an OpenAI-compatible embedding server, and measurements from the
-Rock 5B+ (`docs/experiment-log.md` there). On the board the NPU path runs the 3,633-token
-input at 45 tok/s while using ~51% fewer CPU-seconds than the CPU-only flex path; the CPU
-path remains ~2.3× slower than the production `ik_llama.cpp` Q8_0 server, which is why
-production still runs on `ik_llama.cpp`.
+[`examples/qwen3-embeddings`](examples/qwen3-embeddings) is a complete inference app
+built on this library. It serves the Qwen3-Embedding-0.6B embedding model (CLI `bench`,
+`embed`, `gemm`, `serve`, `tokenize`; OpenAI-compatible `/v1/embeddings`) and the
+Qwen3.5-0.8B intent/query-planner model (`gen`, `serve-ollama`; Ollama-compatible
+`/api/chat`, `/api/generate`), with measurements from the Rock 5B+
+(`docs/experiment-log.md` there). On the board the embedding NPU path runs the
+3,633-token input at 45 tok/s while using ~51% fewer CPU-seconds than the CPU-only flex
+path (the CPU path remains ~2.3× slower than the production `ik_llama.cpp` Q8_0 server);
+the intent model is token-identical to the HF reference and runs a 166-token v7 planner
+prompt in 11.7 s with `--npu` (89.9 s CPU-only, 7.7× wall).
 
 ## License
 

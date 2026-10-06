@@ -1,4 +1,7 @@
+mod intent_loader;
+mod intent_model;
 mod model;
+mod ollama;
 mod server;
 
 use std::path::{Path, PathBuf};
@@ -7,7 +10,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
-use burn_store::{FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use burn_store::{
+    FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
+};
 use tokenizers::Tokenizer;
 
 use model::{Qwen3Config, Qwen3Embedding, RopeCache};
@@ -21,7 +26,11 @@ fn main() -> Result<()> {
         "gemm" => run_gemm(&args),
         "serve" => run_serve(&args),
         "tokenize" => run_tokenize(&args),
-        other => bail!("unknown command '{other}' (expected bench|embed|gemm|serve|tokenize)"),
+        "gen" => run_gen(&args),
+        "serve-ollama" => run_serve_ollama(&args),
+        other => bail!(
+            "unknown command '{other}' (expected bench|embed|gemm|serve|tokenize|gen|serve-ollama)"
+        ),
     }
 }
 
@@ -49,6 +58,15 @@ struct Args {
     port: u16,
     max_tokens: usize,
     model_name: String,
+    max_new_tokens: usize,
+    temperature: f32,
+    delta_chunk: usize,
+    embed_f16: bool,
+    raw: bool,
+    pure_npu: bool,
+    npu_decode: bool,
+    dump_hidden: Option<PathBuf>,
+    dump_steps: Option<PathBuf>,
 }
 
 impl Args {
@@ -56,9 +74,14 @@ impl Args {
         let mut it = std::env::args().skip(1);
         let cmd = it.next().unwrap_or_else(|| "bench".to_string());
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let intent_cmd = matches!(cmd.as_str(), "gen" | "serve-ollama");
         let mut args = Args {
             cmd,
-            model_dir: PathBuf::from(format!("{home}/models/qwen3-embedding-0.6b")),
+            model_dir: PathBuf::from(if intent_cmd {
+                format!("{home}/models/ov-intent-analysis-sft")
+            } else {
+                format!("{home}/models/qwen3-embedding-0.6b")
+            }),
             dtype: DType::F32,
             backend: if cfg!(feature = "cpu") { "cpu" } else { "flex" }.to_string(),
             chunk: 256,
@@ -80,9 +103,21 @@ impl Args {
             port: 8383,
             max_tokens: 30000,
             model_name: "qwen3-embedding-0.6b".to_string(),
+            max_new_tokens: 256,
+            temperature: 0.0,
+            delta_chunk: 64,
+            embed_f16: false,
+            raw: false,
+            pure_npu: false,
+            npu_decode: false,
+            dump_hidden: None,
+            dump_steps: None,
         };
         while let Some(flag) = it.next() {
-            let mut value = || it.next().with_context(|| format!("missing value for {flag}"));
+            let mut value = || {
+                it.next()
+                    .with_context(|| format!("missing value for {flag}"))
+            };
             match flag.as_str() {
                 "--model-dir" => args.model_dir = PathBuf::from(value()?),
                 "--backend" => args.backend = value()?,
@@ -129,6 +164,15 @@ impl Args {
                 }
                 "--max-tokens" => args.max_tokens = value()?.parse()?,
                 "--model-name" => args.model_name = value()?,
+                "--max-new-tokens" => args.max_new_tokens = value()?.parse()?,
+                "--temperature" => args.temperature = value()?.parse()?,
+                "--delta-chunk" => args.delta_chunk = value()?.parse()?,
+                "--embed-f16" => args.embed_f16 = true,
+                "--raw" => args.raw = true,
+                "--pure-npu" => args.pure_npu = true,
+                "--npu-decode" => args.npu_decode = true,
+                "--dump-hidden" => args.dump_hidden = Some(PathBuf::from(value()?)),
+                "--dump-steps" => args.dump_steps = Some(PathBuf::from(value()?)),
                 other => bail!("unknown flag '{other}'"),
             }
         }
@@ -153,7 +197,9 @@ fn device(args: &Args) -> Result<Device> {
         "cpu" => Ok(Device::cpu()),
         "flex" => Ok(Device::flex()),
         #[cfg(not(feature = "cpu"))]
-        "cpu" => bail!("this build has no 'cpu' backend (built without the 'cpu' feature); use flex"),
+        "cpu" => {
+            bail!("this build has no 'cpu' backend (built without the 'cpu' feature); use flex")
+        }
         other => bail!("unknown backend '{other}' (expected cpu|flex)"),
     }
 }
@@ -162,7 +208,12 @@ fn rss_mib() -> f64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in s.lines() {
         if let Some(v) = line.strip_prefix("RssAnon:") {
-            return v.trim().trim_end_matches(" kB").parse::<f64>().unwrap_or(0.0) / 1024.0;
+            return v
+                .trim()
+                .trim_end_matches(" kB")
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                / 1024.0;
         }
     }
     0.0
@@ -180,7 +231,9 @@ fn load_model(
     let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
     let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
     if dtype == DType::BF16 {
-        bail!("--dtype bf16 is broken in burn-flex 0.22.0-pre.4 (bf16 embedding gather panics); use f32 (or f16 for a smaller model)");
+        bail!(
+            "--dtype bf16 is broken in burn-flex 0.22.0-pre.4 (bf16 embedding gather panics); use f32 (or f16 for a smaller model)"
+        );
     }
     let mut model = Qwen3Embedding::new(&cfg, device);
     let t0 = Instant::now();
@@ -193,7 +246,10 @@ fn load_model(
         bail!("load errors: {:?}", result.errors);
     }
     if !result.missing.is_empty() {
-        bail!("{} model parameters missing from file", result.missing.len());
+        bail!(
+            "{} model parameters missing from file",
+            result.missing.len()
+        );
     }
     if !result.unused.is_empty() {
         println!(
@@ -229,7 +285,9 @@ fn load_model(
     load_cpu_projections(&mut model, &cfg, model_dir, dtype, quant_q8, device)?;
     if quant_q8 {
         if dtype != DType::F32 {
-            bail!("--quant q8 needs --dtype f32 (Q8-resident weights are dequantized to f32 on the fly)");
+            bail!(
+                "--quant q8 needs --dtype f32 (Q8-resident weights are dequantized to f32 on the fly)"
+            );
         }
         use burn::module::{ModuleMapper, Param, ParamGroup};
         use burn::tensor::quantization::{
@@ -490,7 +548,13 @@ fn run_bench(args: &Args) -> Result<()> {
     let mut times = Vec::new();
     for i in 0..=args.reps {
         let t0 = Instant::now();
-        let out = model.forward(input.clone(), &rope, args.chunk, args.key_block, args.attn_fused);
+        let out = model.forward(
+            input.clone(),
+            &rope,
+            args.chunk,
+            args.key_block,
+            args.attn_fused,
+        );
         let _ = out.to_data();
         device.sync()?;
         let dt = t0.elapsed().as_secs_f64();
@@ -498,10 +562,7 @@ fn run_bench(args: &Args) -> Result<()> {
         if i == 0 {
             println!("warmup: {dt:.3}s ({:.1} tok/s)", n as f64 / dt);
         } else {
-            println!(
-                "run {i}: {dt:.3}s ({:.1} tok/s)",
-                n as f64 / dt
-            );
+            println!("run {i}: {dt:.3}s ({:.1} tok/s)", n as f64 / dt);
         }
     }
     let best = times.iter().cloned().fold(f64::MAX, f64::min);
@@ -536,7 +597,8 @@ fn run_gemm(args: &Args) -> Result<()> {
     let device = device(args)?;
     let (m, n, k) = (args.m, args.n, args.k);
     let gflops = 2.0 * m as f64 * n as f64 * k as f64;
-    let a = Tensor::<2>::random([m, k], burn::tensor::Distribution::Default, &device).cast(args.dtype);
+    let a =
+        Tensor::<2>::random([m, k], burn::tensor::Distribution::Default, &device).cast(args.dtype);
     let b = if args.transb {
         Tensor::<2>::random([n, k], burn::tensor::Distribution::Default, &device)
     } else {
@@ -564,10 +626,17 @@ fn run_gemm(args: &Args) -> Result<()> {
         let data = out.to_data();
         device.sync()?;
         let dt = t0.elapsed().as_secs_f64();
-        let sum: f32 = data.try_to_vec::<f32>().map(|v| v.iter().sum()).unwrap_or(f32::NAN);
+        let sum: f32 = data
+            .try_to_vec::<f32>()
+            .map(|v| v.iter().sum())
+            .unwrap_or(f32::NAN);
         if i == 0 {
-            println!("warmup: {dt:.3}s out_shape={:?} sum={sum}", out.shape().dims::<2>());
-        } else {            println!("run {i}: {dt:.3}s => {:.1} GFLOPS", gflops / dt / 1e9);
+            println!(
+                "warmup: {dt:.3}s out_shape={:?} sum={sum}",
+                out.shape().dims::<2>()
+            );
+        } else {
+            println!("run {i}: {dt:.3}s => {:.1} GFLOPS", gflops / dt / 1e9);
             best = best.min(dt);
         }
     }
@@ -585,7 +654,10 @@ fn run_tokenize(args: &Args) -> Result<()> {
     println!("{} tokens", ids.len());
     println!(
         "{}",
-        ids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ")
+        ids.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     Ok(())
 }
@@ -615,6 +687,168 @@ fn run_serve(args: &Args) -> Result<()> {
             chunk: args.chunk,
             key_block: args.key_block,
             attn_fused: args.attn_fused,
+        },
+    )
+}
+
+/// Build the intent model + tokenizer for `gen` / `serve-ollama`.
+fn load_intent(args: &Args) -> Result<(intent_model::IntentModel, Tokenizer)> {
+    let device = device(args)?;
+    let opts = intent_loader::IntentLoadOptions {
+        npu: args.npu,
+        npu_threads: args.npu_threads,
+        embed_f16: args.embed_f16,
+        pure_npu: args.pure_npu,
+    };
+    let mut model = intent_loader::load_intent_model(&args.model_dir, &device, &opts)?;
+    model.chunk = args.delta_chunk.max(1);
+    model.npu_only = args.pure_npu;
+    model.npu_decode = args.npu_decode;
+    println!("intent model resident {:.0} MiB anon", rss_mib());
+    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    Ok((model, tokenizer))
+}
+
+/// EOS plus the ChatML stop specials.
+fn intent_stop_ids(
+    model_dir: &Path,
+    tokenizer: &Tokenizer,
+    cfg: &intent_model::IntentTextConfig,
+) -> Vec<u32> {
+    let mut ids = intent_loader::eos_ids(model_dir, cfg);
+    for tok in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
+        if let Some(id) = tokenizer.token_to_id(tok) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// ChatML wrapper identical to the model's Ollama template.
+fn chat_wrap(text: &str) -> String {
+    format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n")
+}
+
+fn run_gen(args: &Args) -> Result<()> {
+    let (mut model, tokenizer) = load_intent(args)?;
+    let text = args.input_text()?;
+    let prompt = if args.raw { text } else { chat_wrap(&text) };
+    let enc = tokenizer
+        .encode(prompt.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    let ids: Vec<u32> = enc.get_ids().to_vec();
+    if ids.len() > args.max_tokens {
+        bail!(
+            "prompt has {} tokens, over --max-tokens {}",
+            ids.len(),
+            args.max_tokens
+        );
+    }
+    let stops = intent_stop_ids(&args.model_dir, &tokenizer, &model.cfg);
+    if let Some(path) = &args.dump_hidden {
+        let hidden = model.forward_hidden(&ids);
+        let layers: Vec<Vec<f32>> = hidden
+            .iter()
+            .map(|h| {
+                let [_, s, _] = h.dims();
+                h.clone()
+                    .slice(burn::tensor::s![.., s - 1..s, ..])
+                    .reshape([h.dims()[2]])
+                    .to_data()
+                    .try_to_vec()
+                    .unwrap_or_default()
+            })
+            .collect();
+        std::fs::write(
+            path,
+            serde_json::to_string(&serde_json::json!({ "last_pos": layers }))?,
+        )?;
+        println!("wrote {} hidden states to {}", layers.len(), path.display());
+    }
+    if let Some(path) = &args.dump_steps {
+        // Debug: greedy decode recording top-3 logits per step.
+        model.cache.reset();
+        let mut logits = model.forward_logits(&ids);
+        let mut out = Vec::new();
+        let mut steps = Vec::new();
+        for _ in 0..args.max_new_tokens {
+            let v: Vec<f32> = logits.to_data().try_to_vec().unwrap_or_default();
+            let mut order: Vec<usize> = (0..v.len()).collect();
+            order.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+            steps.push(serde_json::json!({
+                "top": order[..3].iter().map(|&i| serde_json::json!({"id": i, "logit": v[i]})).collect::<Vec<_>>()
+            }));
+            let next = order[0] as u32;
+            if stops.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if out.len() == args.max_new_tokens {
+                break;
+            }
+            logits = model.forward_logits(&[next]);
+        }
+        std::fs::write(
+            path,
+            serde_json::to_string(&serde_json::json!({"gen_ids": out, "steps": steps}))?,
+        )?;
+        println!("wrote {} steps to {}", steps.len(), path.display());
+        let _ = &stops;
+        return Ok(());
+    }
+    let t0 = Instant::now();
+    let (out, stats) = model.generate(&ids, args.max_new_tokens, &stops, args.temperature, 42);
+    let total = t0.elapsed().as_secs_f64();
+    let decoded = tokenizer
+        .decode(&out, false)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    println!(
+        "prompt={} tokens generated={} done={:?} prefill={:.2}s decode={:.2}s ({:.1} tok/s) total={:.2}s",
+        ids.len(),
+        out.len(),
+        stats.stopped,
+        stats.prefill_s,
+        stats.decode_s,
+        if stats.decode_s > 0.0 {
+            out.len() as f64 / stats.decode_s
+        } else {
+            0.0
+        },
+        total
+    );
+    println!(
+        "ids: {}",
+        out.iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    println!("text: {decoded}");
+    println!("resident {:.0} MiB anon", rss_mib());
+    Ok(())
+}
+
+fn run_serve_ollama(args: &Args) -> Result<()> {
+    let (model, tokenizer) = load_intent(args)?;
+    let stop_ids = intent_stop_ids(&args.model_dir, &tokenizer, &model.cfg);
+    let model_name = if args.model_name == "qwen3-embedding-0.6b" {
+        "guoxuter/ov_intent_analysis_sft:v7_q8".to_string()
+    } else {
+        args.model_name.clone()
+    };
+    ollama::serve(
+        model,
+        tokenizer,
+        ollama::OllamaOptions {
+            addr: format!("0.0.0.0:{}", args.port),
+            model_name,
+            max_tokens: args.max_tokens,
+            max_new_tokens: args.max_new_tokens,
+            temperature: args.temperature,
+            stop_ids,
         },
     )
 }
