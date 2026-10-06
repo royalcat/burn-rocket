@@ -18,7 +18,8 @@ use axum::{
     Json, Router,
     body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
+    middleware::map_request,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -150,6 +151,27 @@ fn now_rfc3339() -> String {
     format!("1970-01-01T00:00:{:02}Z", secs % 60)
 }
 
+/// Ollama's Go server never inspects the request `Content-Type`, and litellm's
+/// Ollama client sends its JSON bodies as `application/octet-stream`
+/// (litellm 1.83: `client.post(url, data=json.dumps(...))`), which axum's `Json`
+/// extractor rejects with 415. Coerce the header on the way in so JSON bodies
+/// are accepted whatever the client declares — same tolerance as Ollama.
+async fn force_json_content_type(mut req: axum::extract::Request) -> axum::extract::Request {
+    let is_json = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("application/json"))
+        .unwrap_or(false);
+    if !is_json {
+        req.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
+    req
+}
+
 pub fn serve(model: IntentModel, tokenizer: Tokenizer, opts: OllamaOptions) -> Result<()> {
     let OllamaOptions {
         addr,
@@ -178,6 +200,7 @@ pub fn serve(model: IntentModel, tokenizer: Tokenizer, opts: OllamaOptions) -> R
         .route("/api/show", post(show))
         .route("/api/chat", post(chat))
         .route("/api/generate", post(generate))
+        .layer(map_request(force_json_content_type))
         .with_state(state);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
