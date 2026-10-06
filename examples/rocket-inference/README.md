@@ -166,6 +166,12 @@ curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
 ```
 
+The JSON endpoints accept any request `Content-Type` (like Ollama itself): litellm's
+Ollama client posts its bodies as `application/octet-stream` (litellm 1.83) and axum's
+`Json` extractor would otherwise reject them with 415. litellm routes `ollama/…` through
+`/api/generate` (plain-prompt formatting, then templated here) and `ollama_chat/…`
+through `/api/chat` (ChatML directly).
+
 On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
 
 | Mode | Prefill | Decode | Total | Anon RSS |
@@ -175,7 +181,10 @@ On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
 | `--npu --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
 
 The CPU f32 and NPU f32-table outputs are token-identical to the HF transformers
-reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0). `--embed-f16` is
+reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0). The table's decode
+column is per 32 greedy tokens: at ~3.7 tok/s a full v7 planner plan (~185 tokens, as
+the model emits for the bundled prompt) takes ~55–60 s — size OpenViking's planner and
+query-expansion timeouts with that in mind. `--embed-f16` is
 faster and smaller but its f16 LM head flips near-ties (the greedy stream diverges after
 ~10 tokens); use it when memory matters more than exact parity. `--pure-npu` drops the
 CPU copies entirely (1.29 GB anon) and runs decode on the NPU too — slower (1.5 tok/s),
