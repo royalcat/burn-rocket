@@ -125,8 +125,15 @@ Loading streams each tensor to its final dtype (f16 tables, f32 projections by
 default; `--f16` = 8.9 GiB/3.5 tok/s decode, `--quant q8` = 7.3 GiB but 0.09
 tok/s because flex has no int8 GEMM and `lin` dequantizes per call). f32 =
 12.5 GiB/2.8 tok/s and is the parity mode; `serve-chat` is a non-streaming
-OpenAI `/v1/chat/completions`. Not yet done: multimodal prefill, NPU prefill
-offload, streaming.
+OpenAI `/v1/chat/completions` (text + `image_url`/`input_audio` parts).
+
+NPU prefill (log §11): `--npu` packs the used text projections into resident
+fp16 NPU weights and runs prefill matmuls + `attention_causal_window` on the
+NPU, while decode keeps the CPU f32 copies (`layers::set_prefill_mode` wraps
+only `GenRoot::prefill`; NPU matmuls pad M to 256). Mask builders live in
+`burn-rocket/src/masks.rs` with host unit tests (`cargo test -p burn-rocket`).
+Board measurement pending an idle board (`--f16 --npu` needs ~11 GB resident;
+rock-5b-plus has been busy). Not yet done: streaming, video input.
 
 NPU round (2026-10-07, log §9): the `npu` feature packs all 218 text projections
 into resident fp16 NPU weights (0.25 GiB; registered by `ParamId`, `lin()`

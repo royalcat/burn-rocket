@@ -168,6 +168,12 @@ $B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What is in this image? <|
 $B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What do you hear? <|audio|>" \
     --audio data/speech5s.wav --max-new-tokens 64
 
+# NPU prefill (aarch64 `--features npu` build): text projections are packed into
+# resident fp16 NPU weights and prefill runs on the NPU (projections + causal /
+# causal+window attention); decode keeps the CPU f32 copies, because NPU
+# matmuls pad M to 256 and a single decode row would waste that work.
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What is the capital of France?" --npu
+
 # non-streaming OpenAI-compatible server
 $B serve-chat --gen-model-dir ~/models/gemma-4-E2B-it --port 8391
 curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
@@ -228,6 +234,9 @@ user CPU): 1.61x faster, 33 % less CPU. Numerics vs the HF f32 reference:
   ~4.2 GiB *load peak* because the checkpoint is materialized f32 before
   quantization/packing and the 1.49 GB mmap is touched.
 - Batch inputs are processed one at a time.
+- **NPU prefill is not yet measured on the board** (the implementation is in
+  place and cross-builds): the board needs ~11 GB free for the `--f16 --npu`
+  configuration, and it has been busy with other workloads.
 - **f32 only**: `--dtype f16` loads (1.5 GiB resident) but is numerically broken
   in this architecture — RMSNorm/softmax/PLE need f32 precision (text cosine
   0.984, image 0.70 vs the f32 reference), so the CLI rejects it. Use

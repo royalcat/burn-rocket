@@ -541,6 +541,44 @@ fn read_audio_clip_bounds(
     Ok(bounds)
 }
 
+/// Pack the generation model's text projections into resident fp16 NPU weights
+/// for the prefill pass. `keep_cpu` retains the f32 copies (decode runs on the
+/// CPU); with `keep_cpu == false` the CPU copies are dropped.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn pack_gen_text(
+    model: &mut gen_model::GenRoot,
+    threads: usize,
+    device: &Device,
+    keep_cpu: bool,
+) -> Result<()> {
+    burn_rocket::init(threads)
+        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    layers::set_npu_prefill_only(keep_cpu);
+    let t0 = Instant::now();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    model.text_mut().for_each_projection_mut(|lin| {
+        let (n, k) = layers::pack_linear_into_npu(lin, device, keep_cpu);
+        count += 1;
+        bytes += n * k * 2;
+    });
+    if !keep_cpu {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    println!(
+        "NPU: packed {count} text projections ({:.2} GiB f16) in {:.2}s; \
+         prefill on the NPU, decode on the CPU{} (resident {:.0} MiB anon)",
+        bytes as f64 / (1u64 << 30) as f64,
+        t0.elapsed().as_secs_f64(),
+        if keep_cpu { " (CPU copies kept)" } else { "" },
+        rss_mib()
+    );
+    Ok(())
+}
+
 /// Build `(input_ids, soft tokens, seq_len)` through the shared input assembly.
 fn build_inputs(
     args: &Args,
@@ -768,7 +806,15 @@ fn run_gen(args: &Args) -> Result<()> {
     } else {
         gen_loader::LoadDtype::F32
     };
-    let (model, cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    let (mut model, cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if args.npu {
+        pack_gen_text(&mut model, args.npu_threads, &device, true)?;
+    }
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    if args.npu {
+        bail!("--npu requires an aarch64 build with --features npu");
+    }
     let lm_head =
         gen_loader::build_lm_head(model.text(), dtype != gen_loader::LoadDtype::F32, &device);
     let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
@@ -870,7 +916,15 @@ fn run_serve_chat(args: &Args) -> Result<()> {
     } else {
         gen_loader::LoadDtype::F32
     };
-    let (model, _cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    let (mut model, _cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if args.npu {
+        pack_gen_text(&mut model, args.npu_threads, &device, true)?;
+    }
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    if args.npu {
+        bail!("--npu requires an aarch64 build with --features npu");
+    }
     let lm_head =
         gen_loader::build_lm_head(model.text(), dtype != gen_loader::LoadDtype::F32, &device);
     let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))

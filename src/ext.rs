@@ -27,6 +27,7 @@ use burn::backend::{Backend, Dispatch, Flex, TensorMetadata, backend_extension};
 use burn::tensor::{DType, Tensor, TensorData};
 use half::f16;
 
+use crate::masks::{build_causal_mask, build_causal_window_mask, build_window_mask};
 use crate::{Error, OpFailure, RocketCtx, RocketFaCtx, RocketWeight, pad_rows};
 
 /// The Flex backend's float primitive, the concrete type the ops execute on.
@@ -78,6 +79,20 @@ pub trait RocketOps: Backend {
     /// `|t - j| <= window`. `window < 0` disables the mask (full bidirectional).
     #[allow(clippy::too_many_arguments)]
     fn rocket_attention_window(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+    ) -> FloatTensor<Self>;
+    /// Causal sliding-window attention (generation prefill): position `t`
+    /// attends to `j` iff `t - window < j <= t`. `window < 0` = plain causal.
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_causal_window(
         q: FloatTensor<Self>,
         k: FloatTensor<Self>,
         v: FloatTensor<Self>,
@@ -185,6 +200,9 @@ struct FaState {
     /// Cached bidirectional band mask for the current `n` (`usize::MAX` = none).
     win: usize,
     win_mask: Vec<f16>, // [n][n] additive: 0 for |t-j|<=win, -inf otherwise
+    /// Cached causal sliding-window mask for the current `n`.
+    cw: usize,
+    cw_mask: Vec<f16>, // [n][n] additive: 0 for t-w<j<=t, -inf otherwise
     q: Vec<f16>,    // [n_head][n][head_dim]
     k: Vec<f16>,    // [n_kv][n][head_dim]
     v: Vec<f16>,    // [n_kv][head_dim][n]  (per-head transposed)
@@ -311,6 +329,26 @@ impl RocketOps for Flex {
             MaskMode::None
         } else {
             MaskMode::Window(window as usize)
+        };
+        attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_causal_window(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+    ) -> FloatTensor<Self> {
+        let mode = if window < 0 {
+            MaskMode::Causal
+        } else {
+            MaskMode::CausalWindow(window as usize)
         };
         attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
     }
@@ -441,6 +479,8 @@ enum MaskMode {
     Causal,
     /// Symmetric band: `|t - j| <= window`.
     Window(usize),
+    /// Causal sliding window: `t - window < j <= t`.
+    CausalWindow(usize),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -506,6 +546,8 @@ fn attention_impl(
                 mask: Vec::new(),
                 win: usize::MAX,
                 win_mask: Vec::new(),
+                cw: usize::MAX,
+                cw_mask: Vec::new(),
                 q: Vec::new(),
                 k: Vec::new(),
                 v: Vec::new(),
@@ -518,6 +560,8 @@ fn attention_impl(
             st.mask = build_causal_mask(n);
             st.win = usize::MAX;
             st.win_mask.clear();
+            st.cw = usize::MAX;
+            st.cw_mask.clear();
             st.q = vec![f16::ZERO; n_head * n * head_dim];
             st.k = vec![f16::ZERO; n_kv * n * head_dim];
             st.v = vec![f16::ZERO; n_kv * head_dim * n];
@@ -531,10 +575,17 @@ fn attention_impl(
                 st.win = w;
             }
         }
+        if let MaskMode::CausalWindow(w) = mode {
+            if st.cw != w {
+                st.cw_mask = build_causal_window_mask(n, w);
+                st.cw = w;
+            }
+        }
         let FaState {
             fa,
             mask,
             win_mask,
+            cw_mask,
             q,
             k,
             v,
@@ -551,6 +602,7 @@ fn attention_impl(
             MaskMode::None => None,
             MaskMode::Causal => Some(&mask[..]),
             MaskMode::Window(_) => Some(&win_mask[..]),
+            MaskMode::CausalWindow(_) => Some(&cw_mask[..]),
         };
         fa.flash_attn(
             n,
@@ -670,6 +722,34 @@ pub fn attention_window<const D: usize>(
     ))
 }
 
+/// Causal sliding-window grouped-query attention on the NPU (generation
+/// prefill): position `t` attends to `j` iff `t - window < j <= t`
+/// (`window < 0` = plain causal). Same input layout as [`attention`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_causal_window<const D: usize>(
+    q: Tensor<D>,
+    k: Tensor<D>,
+    v: Tensor<D>,
+    n_head: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    softcap: Option<f32>,
+    window: i64,
+) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_causal_window(
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
+        n_head,
+        n_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        window,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Conversions and layouts (rayon-parallel)
 // ---------------------------------------------------------------------------
@@ -704,35 +784,8 @@ fn f16_to_f32_par(src: &[f16]) -> Vec<f32> {
     out
 }
 
-/// Symmetric band additive mask: `mask[t][j] = 0` for `|t - j| <= window`,
-/// `-inf` otherwise.
-fn build_window_mask(n: usize, window: usize) -> Vec<f16> {
-    use rayon::prelude::*;
-    let mut mask = vec![f16::ZERO; n * n];
-    mask.par_chunks_mut(n).enumerate().for_each(|(t, row)| {
-        let lo = t.saturating_sub(window);
-        let hi = (t + window + 1).min(n);
-        for m in row[..lo].iter_mut() {
-            *m = f16::NEG_INFINITY;
-        }
-        for m in row[hi..].iter_mut() {
-            *m = f16::NEG_INFINITY;
-        }
-    });
-    mask
-}
 
-/// Causal additive mask: `mask[t][j] = 0` for `j <= t`, `-inf` otherwise.
-fn build_causal_mask(n: usize) -> Vec<f16> {
-    use rayon::prelude::*;
-    let mut mask = vec![f16::ZERO; n * n];
-    mask.par_chunks_mut(n).enumerate().for_each(|(t, row)| {
-        for m in row[t + 1..].iter_mut() {
-            *m = f16::NEG_INFINITY;
-        }
-    });
-    mask
-}
+
 
 /// `src` is `[n, heads*d]` row-major; writes `dst[head][n][d]`.
 fn fill_heads(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {

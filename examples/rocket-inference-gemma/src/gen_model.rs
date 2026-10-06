@@ -443,6 +443,29 @@ impl GenAttention {
             (kk, vv)
         };
 
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if s > 1 && crate::layers::prefill_mode() {
+            // Generation prefill on the NPU: causal (full layers) or causal +
+            // sliding window (sliding layers); decode stays on the CPU.
+            let window = if spec.sliding {
+                gspec.sliding_window as i64
+            } else {
+                -1
+            };
+            let o = burn_rocket::attention_causal_window(
+                q.reshape([b, s, h * d]),
+                k.reshape([b, s, kvh * d]),
+                v.reshape([b, s, kvh * d]),
+                h,
+                kvh,
+                d,
+                1.0,
+                None,
+                window,
+            );
+            return lin(&self.o_proj, o);
+        }
+
         let q = q.swap_dims(1, 2);
         let k = repeat_kv(k, h / kvh);
         let v = repeat_kv(v, h / kvh);
@@ -615,6 +638,25 @@ impl GenTextModel {
 
     pub fn spec(&self) -> &GenSpec {
         &self.spec
+    }
+
+    /// Visit every *used* text projection (q/k/v/o, MLP, PLE); the k/v of
+    /// KV-shared layers are never called and are skipped.
+    pub fn for_each_projection_mut(&mut self, mut f: impl FnMut(&mut Linear)) {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            if !self.spec.layers[i].is_kv_shared {
+                f(&mut layer.self_attn.k_proj);
+                f(&mut layer.self_attn.v_proj);
+            }
+            f(&mut layer.self_attn.q_proj);
+            f(&mut layer.self_attn.o_proj);
+            f(&mut layer.mlp.gate_proj);
+            f(&mut layer.mlp.up_proj);
+            f(&mut layer.mlp.down_proj);
+            f(&mut layer.per_layer_input_gate);
+            f(&mut layer.per_layer_projection);
+        }
+        f(&mut self.per_layer_model_projection);
     }
 
     /// Per-layer inputs `[B, S, L, ple_dim]`:

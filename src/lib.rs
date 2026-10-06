@@ -29,14 +29,17 @@
 
 pub mod ffi;
 
+/// Host-side additive attention masks (unit tested on any host).
+pub(crate) mod masks;
+
 /// Burn backend-extension ops (`#[backend_extension(Flex)]`); NPU builds only.
 #[cfg(feature = "npu")]
 pub mod ext;
 
 #[cfg(feature = "npu")]
 pub use ext::{
-    Stats, WeightId, attention, attention_window, init, matmul, pack, pack2, pack3, stats,
-    stats_reset,
+    Stats, WeightId, attention, attention_causal_window, attention_window, init, matmul, pack,
+    pack2, pack3, stats, stats_reset,
 };
 
 pub use half;

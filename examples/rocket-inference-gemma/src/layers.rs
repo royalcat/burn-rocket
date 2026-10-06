@@ -50,7 +50,11 @@ pub(crate) fn weight_dtype<const D: usize>(w: &Param<Tensor<D>>) -> DType {
 pub(crate) fn lin<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(id) = npu_lookup(&l.weight) {
-        return burn_rocket::matmul(x, &id);
+        // Generation packs weights for prefill only: decode keeps the CPU
+        // copies (NPU matmuls pad M to 256, so M=1 would be wasted work).
+        if !npu_prefill_only() || prefill_mode() {
+            return burn_rocket::matmul(x, &id);
+        }
     }
     if is_quantized() {
         let weight = l.weight.val().dequantize();
@@ -91,6 +95,61 @@ fn npu_lookup(param: &Param<Tensor<2>>) -> Option<burn_rocket::WeightId> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.as_ref().and_then(|m| m.get(&param.id.val()).copied())
+}
+
+/// Generation mode: registered NPU weights are used only inside prefill.
+static NPU_PREFILL_ONLY: AtomicBool = AtomicBool::new(false);
+static PREFILL_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_npu_prefill_only(on: bool) {
+    NPU_PREFILL_ONLY.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn npu_prefill_only() -> bool {
+    NPU_PREFILL_ONLY.load(Ordering::Relaxed)
+}
+
+/// Set around the prefill pass of a generation request.
+pub fn set_prefill_mode(on: bool) {
+    PREFILL_MODE.store(on, Ordering::Relaxed);
+}
+
+pub fn prefill_mode() -> bool {
+    PREFILL_MODE.load(Ordering::Relaxed)
+}
+
+/// Pack one `Linear` into resident NPU memory and register it. With
+/// `keep_cpu` the f32 copy stays (prefill-only mode), otherwise it is shrunk to
+/// a `[1, 1]` placeholder (the id is preserved so `lin` still finds the weight).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn pack_linear_into_npu(
+    lin: &mut Linear,
+    device: &Device,
+    keep_cpu: bool,
+) -> (usize, usize) {
+    let w = lin.weight.val();
+    let [k, n] = w.shape().dims::<2>();
+    let values: Vec<f32> = w
+        .cast(DType::F32)
+        .into_data()
+        .try_to_vec()
+        .expect("f32 projection weights");
+    // Burn `Linear` is `[in, out]`; the NPU packs HF `[out, in]` = `[N, K]`.
+    let mut t = vec![0f32; n * k];
+    for i in 0..k {
+        let src = &values[i * n..(i + 1) * n];
+        for j in 0..n {
+            t[j * k + i] = src[j];
+        }
+    }
+    let tensor = Tensor::<2>::from_data(TensorData::new(t, [n, k]), device);
+    let id = burn_rocket::pack(tensor);
+    register_npu_weight(&lin.weight, id);
+    if !keep_cpu {
+        let dev = device.clone();
+        lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
+    }
+    (n, k)
 }
 
 /// Number of registered NPU weights (for loader summaries).

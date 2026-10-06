@@ -239,7 +239,10 @@ pub fn generate_with_media(
     let mut rng = SplitMix64(0x5EED_1234_ABCD_0001);
 
     let t0 = std::time::Instant::now();
+    // NPU prefill: the packed weights are used only inside this call.
+    crate::layers::set_prefill_mode(true);
     let logits = model.prefill(ids, soft, &ropes, &mut kv, lm_head, chunk, pad_id);
+    crate::layers::set_prefill_mode(false);
     let mut next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
 

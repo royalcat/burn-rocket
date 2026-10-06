@@ -326,6 +326,29 @@ plain text. Smoke-tested on the dev host: the image request returns the CLI's
 284-prompt/24-completion output and the audio request the 145/24 output; the
 `/v1/models` id defaults to the generation model's directory name.
 
+### NPU prefill (implemented 2026-10-07; board measurement pending)
+
+`--npu` on the aarch64 build packs the generation model's *used* text
+projections (q/k/v/o, MLPs, PLE; the KV-shared layers' unused k/v are skipped)
+into resident fp16 NPU weights and runs the prefill pass on the NPU:
+
+- matmuls through the same `ParamId` registry as the embedding round (`lin`
+  routes registered weights to `burn_rocket::matmul`);
+- attention through the new `burn_rocket::attention_causal_window` op: causal
+  for full layers, causal + sliding window (`t - window < j <= t`) for sliding
+  layers. The mask builders moved to `burn-rocket/src/masks.rs` and are unit
+  tested on any host (`cargo test -p burn-rocket`: causal, band and
+  causal-window semantics);
+- **decode stays on the CPU**: `layers::set_prefill_mode` is set only around
+  `GenRoot::prefill`, and the CPU f32 copies are kept (`keep_cpu`), because NPU
+  matmuls pad M to 256 and a single decode row would waste that work.
+
+Not yet measured on the board: the `--f16 --npu` configuration needs ~11 GB
+resident (8.9 GiB f16 text + towers, plus 2.1 GiB of packed fp16 NPU weights),
+and `rock-5b-plus` has been busy with other workloads (~4 GB free, loadavg ~7).
+The embedding round measured 1.61x on prefill for the same NPU machinery, so a
+similar prefill gain is expected here; decode throughput is unchanged.
+
 ## 12. Deferred
 
 - Q8/low-RAM mode (the f32 resident model is 2.9 GB).
