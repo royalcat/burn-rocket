@@ -10,9 +10,9 @@ use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
 
-use crate::audio_frontend;
-use crate::media;
-use crate::model::Emb2Model;
+use crate::audio_frontend::{self, AudioFeatures};
+use crate::media::{self, PreparedImage};
+use crate::vision::VisionSpec;
 
 /// Soft-token budgets from `processor_config.json` (image and video processor
 /// sections), matching the saved checkpoint configuration.
@@ -45,6 +45,23 @@ pub fn task_prompts(model_dir: &Path) -> HashMap<String, String> {
         }
     }
     out
+}
+
+/// A model that can encode media into text-space soft tokens: implemented by the
+/// embedding model and by the generation model (both own the Gemma 4 towers).
+pub trait MediaModel {
+    fn vision_spec(&self) -> &VisionSpec;
+    /// Image soft tokens `[num_soft_tokens, text_hidden]`; `debug_dir` dumps
+    /// pooled features (and per-layer outputs when `layers` is set).
+    fn encode_image(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        debug_dir: Option<&Path>,
+        layers: Option<&Path>,
+    ) -> Tensor<2>;
+    /// Audio soft tokens (valid frames only).
+    fn encode_audio(&self, feats: &AudioFeatures, debug_dir: Option<&Path>) -> Tensor<2>;
 }
 
 /// Everything needed to build one embedding input.
@@ -106,8 +123,8 @@ fn dump_f32(path: &Path, values: &[f32]) -> Result<()> {
 /// towers), tokenizes `prompt + text`, and encodes the media. Placeholders must
 /// appear in the text in image-then-video-then-audio order (the default text
 /// does).
-pub fn prepare(
-    model: &Emb2Model,
+pub fn prepare<M: MediaModel>(
+    model: &M,
     tokenizer: &Tokenizer,
     req: &MediaInputs,
     debug: &DebugPaths,
@@ -141,7 +158,7 @@ pub fn prepare(
     let mut n_audio = 0usize;
 
     if let Some(path) = &req.image {
-        let vspec = model.vision().spec();
+        let vspec = model.vision_spec();
         let decoded = media::load_image(path)?;
         if let Some(dump) = &debug.dump_image {
             media::dump_rgb(&dump.with_extension("raw"), &decoded)?;
@@ -176,18 +193,18 @@ pub fn prepare(
             "image {}x{} patches -> {n_image} soft tokens",
             img.patch_w, img.patch_h
         );
-        let tokens = model.encode_image(&img, req.attn_chunk);
+        let tokens = model.encode_image(
+            &img,
+            req.attn_chunk,
+            debug.dump_vision.as_deref(),
+            debug.dump_vision_layers.as_deref(),
+        );
         if let Some(path) = &debug.dump_vision {
-            let raw = model.vision_tower_features(
-                &img,
-                req.attn_chunk,
-                debug.dump_vision_layers.as_deref(),
-            );
-            let values: Vec<f32> = raw.cast(DType::F32).into_data().try_to_vec()?;
+            let values: Vec<f32> = tokens.clone().cast(DType::F32).into_data().try_to_vec()?;
             dump_f32(path, &values)?;
             println!(
-                "dumped pooled vision features [{}] to {}",
-                values.len() / 768,
+                "dumped vision soft tokens [{}] to {}",
+                values.len() / tokens.dims()[1],
                 path.display()
             );
         }
@@ -195,7 +212,7 @@ pub fn prepare(
     }
 
     if let Some(path) = &req.video {
-        let vspec = model.vision().spec();
+        let vspec = model.vision_spec();
         let info = media::video_info(path)?;
         let indices =
             media::sample_frame_indices(&info, req.video_fps, req.video_max_frames);
@@ -219,7 +236,7 @@ pub fn prepare(
             )?;
             let img = media::patchify(&resized, vspec.patch_size, vspec.pooling)?;
             per_frame = img.num_soft_tokens();
-            frame_tokens.push(model.encode_image(&img, req.attn_chunk));
+            frame_tokens.push(model.encode_image(&img, req.attn_chunk, None, None));
         }
         n_video = per_frame * frames.len();
         println!("video: {per_frame} soft tokens per frame, {n_video} total");
@@ -255,7 +272,7 @@ pub fn prepare(
             "<|audio|>",
             &format!("<|audio>{}<audio|>", "<|audio|>".repeat(n_audio)),
         );
-        let tokens = model.encode_audio_debug(&feats, debug.dump_audio_layers.as_deref());
+        let tokens = model.encode_audio(&feats, debug.dump_audio_layers.as_deref());
         token_rows.push(tokens);
     }
 

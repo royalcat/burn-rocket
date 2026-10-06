@@ -27,6 +27,7 @@ use burn_store::{
 };
 
 use crate::config::Emb2Config;
+use crate::layers::ClipBounds;
 use crate::gen_model::{GenRoot, GenTextModel};
 
 /// Q8_0 (llama.cpp layout: symmetric int8, 32-value blocks, f16 scales).
@@ -152,16 +153,107 @@ pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
     Ok(model)
 }
 
-/// Load the E2B-it text model (`model.language_model.*`); vision/audio keys are
-/// left unused until the multimodal phase.
+/// Vision-tower `Gemma4ClippableLinear` paths (E2B ships clip bounds for these;
+/// EmbeddingGemma 2 does not).
+pub const VISION_LINEAR_NAMES: [&str; 7] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+];
+
+/// Audio-tower `Gemma4ClippableLinear` paths (same as the EmbeddingGemma 2 round).
+pub const AUDIO_LINEAR_NAMES: [&str; 10] = [
+    "feed_forward1.ffw_layer_1",
+    "feed_forward1.ffw_layer_2",
+    "feed_forward2.ffw_layer_1",
+    "feed_forward2.ffw_layer_2",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.post",
+    "lconv1d.linear_start",
+    "lconv1d.linear_end",
+];
+
+/// Read `input_min/max`, `output_min/max` scalars for every clippable linear of
+/// `layers` layers, keyed `layers.{i}.{name}` (relative to the tower root).
+pub fn read_clip_bounds(
+    model_dir: &std::path::Path,
+    key_prefix: &str,
+    names: &[&str],
+    layers: usize,
+) -> Result<std::collections::HashMap<String, ClipBounds>> {
+    use burn_store::ModuleStore;
+    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
+    let mut read = |key: &str| -> Result<f32> {
+        let tensor = store
+            .get_tensor(key)?
+            .ok_or_else(|| anyhow::anyhow!("missing clip scalar {key}"))?;
+        let data = burn_store::bridge::to_data(tensor)?.convert_dtype(DType::F32);
+        let v: Vec<f32> = data.try_to_vec()?;
+        v.first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("empty clip scalar {key}"))
+    };
+    let mut bounds = std::collections::HashMap::new();
+    for layer in 0..layers {
+        for name in names {
+            let base = format!("{key_prefix}.{layer}.{name}");
+            bounds.insert(
+                format!("layers.{layer}.{name}"),
+                ClipBounds {
+                    input_min: read(&format!("{base}.input_min"))?,
+                    input_max: read(&format!("{base}.input_max"))?,
+                    output_min: read(&format!("{base}.output_min"))?,
+                    output_max: read(&format!("{base}.output_max"))?,
+                },
+            );
+        }
+    }
+    Ok(bounds)
+}
+
+/// Load the E2B model: text backbone (`model.language_model.*`) plus the Gemma 4
+/// vision/audio towers (`model.vision_tower.*`, `model.audio_tower.*`).
 pub fn load_gen_model(
     model_dir: &std::path::Path,
     dtype: LoadDtype,
     device: &Device,
 ) -> Result<(GenRoot, Emb2Config)> {
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
+    let vision_cfg = cfg
+        .vision_config
+        .as_ref()
+        .context("checkpoint has no vision_config")?;
+    let audio_cfg = cfg
+        .audio_config
+        .as_ref()
+        .context("checkpoint has no audio_config")?;
     let t0 = std::time::Instant::now();
-    let mut model = GenRoot::new(&cfg.text_config, device);
+    let vision_bounds = read_clip_bounds(
+        model_dir,
+        "model.vision_tower.encoder.layers",
+        &VISION_LINEAR_NAMES,
+        vision_cfg.num_hidden_layers,
+    )?;
+    let audio_bounds = read_clip_bounds(
+        model_dir,
+        "model.audio_tower.layers",
+        &AUDIO_LINEAR_NAMES,
+        audio_cfg.num_hidden_layers,
+    )?;
+    let mut model = GenRoot::new(
+        &cfg.text_config,
+        vision_cfg,
+        audio_cfg,
+        &vision_bounds,
+        &audio_bounds,
+        device,
+    );
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
         .allow_partial(true)
         .with_from_adapter(

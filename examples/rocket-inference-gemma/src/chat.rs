@@ -211,6 +211,23 @@ pub fn generate(
     chunk: usize,
     device: &Device,
 ) -> Result<(Vec<u32>, GenStats)> {
+    generate_with_media(model, lm_head, ids, None, 0, opts, chunk, device)
+}
+
+/// Like [`generate`], with optional media soft tokens scattered into the
+/// placeholder positions of `ids` (the ids are used for the PLE token lookup,
+/// with the media slots replaced by `pad_id`, exactly like the reference).
+#[allow(clippy::too_many_arguments)]
+pub fn generate_with_media(
+    model: &GenRoot,
+    lm_head: &Tensor<2>,
+    ids: &[u32],
+    soft: Option<(Vec<usize>, Tensor<2>)>,
+    pad_id: u32,
+    opts: &GenOptions,
+    chunk: usize,
+    device: &Device,
+) -> Result<(Vec<u32>, GenStats)> {
     let spec = model.text().spec();
     let max_seq = ids.len() + opts.max_new_tokens + 1;
     let ropes = GenRopes::new(spec, max_seq, DType::F32, device);
@@ -222,9 +239,7 @@ pub fn generate(
     let mut rng = SplitMix64(0x5EED_1234_ABCD_0001);
 
     let t0 = std::time::Instant::now();
-    let input = crate::inputs::make_input(ids, device);
-    let h = model.text().forward(input, &ropes, &mut kv, 0, chunk);
-    let logits = model.text().logits(h, lm_head);
+    let logits = model.prefill(ids, soft, &ropes, &mut kv, lm_head, chunk, pad_id);
     let mut next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
 

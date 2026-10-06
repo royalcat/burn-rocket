@@ -542,7 +542,7 @@ impl Emb2Model {
     }
 
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
-    pub fn encode_image(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
+    pub fn image_soft_tokens(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
         let pooled = self.vision_tower.forward(img, chunk, None);
         self.embed_vision
             .forward(pooled, self.vision_tower.spec().eps)
@@ -550,11 +550,11 @@ impl Emb2Model {
 
     /// Soft tokens for one audio clip: `[num_valid_soft_tokens, text_hidden]`
     /// (invalid frames are dropped, matching the reference).
-    pub fn encode_audio(&self, feats: &AudioFeatures) -> Tensor<2> {
-        self.encode_audio_debug(feats, None)
+    pub fn audio_soft_tokens(&self, feats: &AudioFeatures) -> Tensor<2> {
+        self.audio_soft_tokens_debug(feats, None)
     }
 
-    pub fn encode_audio_debug(
+    pub fn audio_soft_tokens_debug(
         &self,
         feats: &AudioFeatures,
         debug_dir: Option<&std::path::Path>,
@@ -619,6 +619,33 @@ impl Emb2Model {
         }
         let h = self.language_model.forward_embeds(x, rope, chunk);
         h.mean_dim(1).reshape([b, dim])
+    }
+}
+
+impl crate::inputs::MediaModel for Emb2Model {
+    fn vision_spec(&self) -> &crate::vision::VisionSpec {
+        self.vision_tower.spec()
+    }
+
+    fn encode_image(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        debug_dir: Option<&std::path::Path>,
+        layers: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        if debug_dir.is_some() {
+            let _ = self.vision_tower.forward(img, chunk, layers);
+        }
+        self.image_soft_tokens(img, chunk)
+    }
+
+    fn encode_audio(
+        &self,
+        feats: &AudioFeatures,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        self.audio_soft_tokens_debug(feats, debug_dir)
     }
 }
 

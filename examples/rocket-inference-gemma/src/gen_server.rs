@@ -1,6 +1,7 @@
 //! Non-streaming OpenAI-compatible `/v1/chat/completions` for the Gemma 4
 //! generation model (text content only for now; media parts are a later phase).
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, Result};
@@ -17,7 +18,9 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::chat::{self, GenOptions};
+use crate::inputs;
 use crate::gen_model::GenRoot;
+use crate::server::resolve_media;
 
 pub struct ChatServeOptions {
     pub addr: String,
@@ -29,8 +32,11 @@ pub struct ChatServeOptions {
 
 struct Settings {
     model_name: String,
+    model_dir: std::path::PathBuf,
     attn_chunk: usize,
     max_new_tokens: usize,
+    image_soft_tokens: usize,
+    video_soft_tokens: usize,
     eos: Vec<u32>,
 }
 
@@ -39,6 +45,7 @@ struct Inner {
     lm_head: Tensor<2>,
     tokenizer: Tokenizer,
     device: Device,
+    pad_id: u32,
 }
 
 #[derive(Clone)]
@@ -61,10 +68,20 @@ pub fn serve(
     device: Device,
     opts: ChatServeOptions,
 ) -> Result<()> {
+    let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&opts.model_dir);
+    let pad_id = std::fs::read_to_string(opts.model_dir.join("config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|j| j["text_config"]["pad_token_id"].as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(0);
     let settings = Arc::new(Settings {
         model_name: opts.model_name.clone(),
+        model_dir: opts.model_dir.clone(),
         attn_chunk: opts.attn_chunk,
         max_new_tokens: opts.max_new_tokens,
+        image_soft_tokens,
+        video_soft_tokens,
         eos: crate::gen_eos(&opts.model_dir),
     });
     let state = AppState {
@@ -73,6 +90,7 @@ pub fn serve(
             lm_head,
             tokenizer,
             device,
+            pad_id,
         })),
         settings,
     };
@@ -132,23 +150,63 @@ struct MessageIn {
     content: serde_json::Value,
 }
 
-/// OpenAI content is a string or an array of parts; only text parts are used
-/// (media parts arrive in the multimodal phase).
-fn content_text(v: &serde_json::Value) -> String {
+/// OpenAI content parts: text is kept as-is, an `image_url` / `input_audio`
+/// part becomes the `<|image|>` / `<|audio|>` placeholder (its payload is
+/// resolved to a local file for the towers).
+fn content_parts(
+    v: &serde_json::Value,
+    images: &mut Vec<PathBuf>,
+    audios: &mut Vec<PathBuf>,
+) -> Result<String, String> {
     match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| {
-                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    p.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                } else {
-                    None
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut out: Vec<String> = Vec::new();
+            for p in parts {
+                match p.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => {
+                        if let Some(s) = p.get("text").and_then(|t| t.as_str()) {
+                            out.push(s.to_string());
+                        }
+                    }
+                    Some("image_url") | Some("image") => {
+                        let url = p
+                            .get("image_url")
+                            .and_then(|u| u.get("url"))
+                            .and_then(|u| u.as_str())
+                            .or_else(|| p.get("image").and_then(|u| u.as_str()))
+                            .ok_or("image part needs image_url.url")?;
+                        images.push(resolve_media(url, "img")?);
+                        out.push("<|image|>".to_string());
+                    }
+                    Some("input_audio") | Some("audio") => {
+                        let payload = p
+                            .get("input_audio")
+                            .and_then(|a| a.get("data"))
+                            .and_then(|d| d.as_str())
+                            .or_else(|| p.get("audio").and_then(|a| a.as_str()))
+                            .ok_or("audio part needs input_audio.data")?;
+                        let format = p
+                            .get("input_audio")
+                            .and_then(|a| a.get("format"))
+                            .and_then(|f| f.as_str())
+                            .unwrap_or("wav");
+                        // `input_audio.data` is bare base64 (no data: prefix).
+                        let uri = if payload.starts_with("data:") {
+                            payload.to_string()
+                        } else {
+                            format!("data:audio/{format};base64,{payload}")
+                        };
+                        audios.push(resolve_media(&uri, "wav")?);
+                        out.push("<|audio|>".to_string());
+                    }
+                    Some(other) => return Err(format!("unsupported content part type '{other}'")),
+                    None => return Err("content part without a type".to_string()),
                 }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
+            }
+            Ok(out.join(" "))
+        }
+        _ => Ok(String::new()),
     }
 }
 
@@ -166,14 +224,22 @@ async fn chat_completions(
     if req.messages.is_empty() {
         return bad_request("empty messages");
     }
-    let messages: Vec<chat::Message> = req
-        .messages
-        .iter()
-        .map(|m| chat::Message {
+    let mut images: Vec<PathBuf> = Vec::new();
+    let mut audios: Vec<PathBuf> = Vec::new();
+    let mut messages: Vec<chat::Message> = Vec::with_capacity(req.messages.len());
+    for m in req.messages.iter() {
+        let content = match content_parts(&m.content, &mut images, &mut audios) {
+            Ok(c) => c,
+            Err(e) => return bad_request(e),
+        };
+        messages.push(chat::Message {
             role: m.role.clone(),
-            content: content_text(&m.content),
-        })
-        .collect();
+            content,
+        });
+    }
+    if images.len() > 1 || audios.len() > 1 {
+        return bad_request("at most one image and one audio per request for now");
+    }
     let thinking = req.enable_thinking.unwrap_or(false);
     let opts = GenOptions {
         max_new_tokens: req.max_tokens.unwrap_or(state.settings.max_new_tokens),
@@ -184,15 +250,54 @@ async fn chat_completions(
         eos: state.settings.eos.clone(),
     };
     let attn_chunk = state.settings.attn_chunk;
+    let model_dir = state.settings.model_dir.clone();
+    let image_soft = state.settings.image_soft_tokens;
+    let video_soft = state.settings.video_soft_tokens;
     let inner = state.inner.clone();
     let computed = tokio::task::spawn_blocking(move || -> Result<(String, usize, usize), String> {
         let mut guard = lock_or_recover(&inner);
         let rendered = chat::render(&messages, thinking);
-        let ids = chat::encode(&guard.tokenizer, &rendered).map_err(|e| format!("{e:#}"))?;
+        let (ids, soft) = if images.is_empty() && audios.is_empty() {
+            (
+                chat::encode(&guard.tokenizer, &rendered).map_err(|e| format!("{e:#}"))?,
+                None,
+            )
+        } else {
+            let req = inputs::MediaInputs {
+                text: Some(rendered.clone()),
+                image: images.first().cloned(),
+                video: None,
+                audio: audios.first().cloned(),
+                prompt_prefix: String::new(),
+                max_tokens: None,
+                image_soft_tokens: image_soft,
+                video_soft_tokens: video_soft,
+                video_fps: 1.0,
+                video_max_frames: 32,
+                attn_chunk,
+            };
+            let prepared = inputs::prepare(
+                &guard.model,
+                &guard.tokenizer,
+                &req,
+                &inputs::DebugPaths::default(),
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            (prepared.ids, prepared.soft)
+        };
         let n_prompt = ids.len();
-        let (out, _stats) =
-            chat::generate(&guard.model, &guard.lm_head, &ids, &opts, attn_chunk, &guard.device)
-                .map_err(|e| format!("{e:#}"))?;
+        let pad_id = guard.pad_id;
+        let (out, _stats) = chat::generate_with_media(
+            &guard.model,
+            &guard.lm_head,
+            &ids,
+            soft,
+            pad_id,
+            &opts,
+            attn_chunk,
+            &guard.device,
+        )
+        .map_err(|e| format!("{e:#}"))?;
         let text = guard
             .tokenizer
             .decode(&out, true)

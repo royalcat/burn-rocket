@@ -11,7 +11,10 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use burn::tensor::activation::gelu_approximate;
 
+use std::collections::HashMap;
+
 use crate::config::VisionConfig;
+use crate::layers::ClipBounds;
 use crate::layers::ClippableLinear;
 use crate::media::PreparedImage;
 use crate::layers::lin;
@@ -150,13 +153,30 @@ pub struct VisionAttention {
 }
 
 impl VisionAttention {
-    fn new(cfg: &VisionConfig, spec: &VisionSpec, device: &Device) -> Self {
+    fn new(
+        cfg: &VisionConfig,
+        spec: &VisionSpec,
+        bounds: &HashMap<String, ClipBounds>,
+        path: &str,
+        device: &Device,
+    ) -> Self {
         let (h, kv, d) = (spec.heads, spec.kv_heads, spec.head_dim);
+        // E2B ships clipped vision linears (`use_clipped_linears`); EmbeddingGemma 2
+        // has none, so missing bounds are only an error when the config asks for them.
+        let clip = |name: &str| -> Option<ClipBounds> {
+            match bounds.get(&format!("{path}.{name}")) {
+                Some(c) => Some(*c),
+                None if cfg.use_clipped_linears => {
+                    panic!("missing vision clip bounds for {path}.{name}")
+                }
+                None => None,
+            }
+        };
         Self {
-            q_proj: ClippableLinear::new(spec.hidden, h * d, device),
-            k_proj: ClippableLinear::new(spec.hidden, kv * d, device),
-            v_proj: ClippableLinear::new(spec.hidden, kv * d, device),
-            o_proj: ClippableLinear::new(h * d, spec.hidden, device),
+            q_proj: ClippableLinear::with_clip(spec.hidden, h * d, clip("q_proj"), device),
+            k_proj: ClippableLinear::with_clip(spec.hidden, kv * d, clip("k_proj"), device),
+            v_proj: ClippableLinear::with_clip(spec.hidden, kv * d, clip("v_proj"), device),
+            o_proj: ClippableLinear::with_clip(h * d, spec.hidden, clip("o_proj"), device),
             q_norm: RmsNormConfig::new(d).with_epsilon(cfg.rms_norm_eps).init(device),
             k_norm: RmsNormConfig::new(d).with_epsilon(cfg.rms_norm_eps).init(device),
         }
@@ -190,11 +210,26 @@ pub struct VisionMlp {
 }
 
 impl VisionMlp {
-    fn new(spec: &VisionSpec, device: &Device) -> Self {
+    fn new(
+        cfg: &VisionConfig,
+        spec: &VisionSpec,
+        bounds: &HashMap<String, ClipBounds>,
+        path: &str,
+        device: &Device,
+    ) -> Self {
+        let clip = |name: &str| -> Option<ClipBounds> {
+            match bounds.get(&format!("{path}.{name}")) {
+                Some(c) => Some(*c),
+                None if cfg.use_clipped_linears => {
+                    panic!("missing vision clip bounds for {path}.{name}")
+                }
+                None => None,
+            }
+        };
         Self {
-            gate_proj: ClippableLinear::new(spec.hidden, spec.inter, device),
-            up_proj: ClippableLinear::new(spec.hidden, spec.inter, device),
-            down_proj: ClippableLinear::new(spec.inter, spec.hidden, device),
+            gate_proj: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("gate_proj"), device),
+            up_proj: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("up_proj"), device),
+            down_proj: ClippableLinear::with_clip(spec.inter, spec.hidden, clip("down_proj"), device),
         }
     }
 
@@ -216,16 +251,29 @@ pub struct VisionLayer {
 }
 
 impl VisionLayer {
-    fn new(cfg: &VisionConfig, spec: &VisionSpec, device: &Device) -> Self {
+    fn new(
+        cfg: &VisionConfig,
+        spec: &VisionSpec,
+        bounds: &HashMap<String, ClipBounds>,
+        index: usize,
+        device: &Device,
+    ) -> Self {
         let eps = cfg.rms_norm_eps;
+        let base = format!("layers.{index}");
         Self {
             input_layernorm: RmsNormConfig::new(spec.hidden).with_epsilon(eps).init(device),
-            self_attn: VisionAttention::new(cfg, spec, device),
+            self_attn: VisionAttention::new(
+                cfg,
+                spec,
+                bounds,
+                &format!("{base}.self_attn"),
+                device,
+            ),
             post_attention_layernorm: RmsNormConfig::new(spec.hidden).with_epsilon(eps).init(device),
             pre_feedforward_layernorm: RmsNormConfig::new(spec.hidden)
                 .with_epsilon(eps)
                 .init(device),
-            mlp: VisionMlp::new(spec, device),
+            mlp: VisionMlp::new(cfg, spec, bounds, &format!("{base}.mlp"), device),
             post_feedforward_layernorm: RmsNormConfig::new(spec.hidden)
                 .with_epsilon(eps)
                 .init(device),
@@ -288,9 +336,19 @@ pub struct VisionTower {
 
 impl VisionTower {
     pub fn new(cfg: &VisionConfig, device: &Device) -> Self {
+        Self::new_with_clip(cfg, &HashMap::new(), device)
+    }
+
+    /// `bounds` are keyed like `layers.{i}.self_attn.q_proj` (the checkpoint's
+    /// `Gemma4ClippableLinear` scalars); E2B has them, EmbeddingGemma 2 does not.
+    pub fn new_with_clip(
+        cfg: &VisionConfig,
+        bounds: &HashMap<String, ClipBounds>,
+        device: &Device,
+    ) -> Self {
         let spec = VisionSpec::from_config(cfg);
         let layers = (0..spec.layers)
-            .map(|_| VisionLayer::new(cfg, &spec, device))
+            .map(|i| VisionLayer::new(cfg, &spec, bounds, i, device))
             .collect();
         Self {
             patch_embedder: PatchEmbedder {

@@ -25,7 +25,14 @@ use burn::prelude::*;
 use burn::tensor::activation::{gelu_approximate, softmax};
 use burn::tensor::{DType, Int, s};
 
-use crate::config::TextConfig;
+use std::collections::HashMap;
+
+use crate::audio::AudioTower;
+use crate::audio_frontend::{AudioFeatures, subsample_mask};
+use crate::config::{AudioConfig, TextConfig, VisionConfig};
+use crate::layers::ClipBounds;
+use crate::media::PreparedImage;
+use crate::vision::{MultimodalEmbedder, VisionSpec, VisionTower};
 use crate::layers::lin;
 use crate::model::{linear_cfg, repeat_kv, rms_norm_noscale};
 
@@ -639,12 +646,27 @@ impl GenTextModel {
         chunk: usize,
     ) -> Tensor<3> {
         let spec = &self.spec;
-        let [b, s] = input_ids.dims();
         let x = self
             .embed_tokens
             .forward(input_ids.clone())
             .cast(DType::F32)
             .mul_scalar((spec.hidden as f64).sqrt());
+        self.forward_embeds(input_ids, x, ropes, kv, seq_start, chunk)
+    }
+
+    /// The decoder stack over already-embedded inputs; `input_ids` are still the
+    /// (media-pad) ids, used for the PLE token-table lookup like the reference.
+    pub fn forward_embeds(
+        &self,
+        input_ids: Tensor<2, Int>,
+        x: Tensor<3>,
+        ropes: &GenRopes,
+        kv: &mut GenKv,
+        seq_start: usize,
+        chunk: usize,
+    ) -> Tensor<3> {
+        let spec = &self.spec;
+        let [b, s] = input_ids.dims();
         let ple = self.per_layer_inputs(input_ids, x.clone());
         let mut h = x;
         for (i, layer) in self.layers.iter().enumerate() {
@@ -689,13 +711,37 @@ pub struct GenRoot {
 #[derive(Module, Debug)]
 pub struct GenInner {
     language_model: GenTextModel,
+    vision_tower: VisionTower,
+    audio_tower: AudioTower,
+    embed_vision: MultimodalEmbedder,
+    embed_audio: MultimodalEmbedder,
 }
 
 impl GenRoot {
-    pub fn new(cfg: &TextConfig, device: &Device) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        text_cfg: &TextConfig,
+        vision_cfg: &VisionConfig,
+        audio_cfg: &AudioConfig,
+        vision_bounds: &HashMap<String, ClipBounds>,
+        audio_bounds: &HashMap<String, ClipBounds>,
+        device: &Device,
+    ) -> Self {
         Self {
             model: GenInner {
-                language_model: GenTextModel::new(cfg, device),
+                language_model: GenTextModel::new(text_cfg, device),
+                vision_tower: VisionTower::new_with_clip(vision_cfg, vision_bounds, device),
+                audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
+                embed_vision: MultimodalEmbedder::new(
+                    vision_cfg.hidden_size,
+                    text_cfg.hidden_size,
+                    device,
+                ),
+                embed_audio: MultimodalEmbedder::new(
+                    audio_cfg.output_proj_dims,
+                    text_cfg.hidden_size,
+                    device,
+                ),
             },
         }
     }
@@ -706,6 +752,112 @@ impl GenRoot {
 
     pub fn text_mut(&mut self) -> &mut GenTextModel {
         &mut self.model.language_model
+    }
+
+    /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
+    pub fn image_soft_tokens(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
+        let pooled = self.model.vision_tower.forward(img, chunk, None);
+        self.model
+            .embed_vision
+            .forward(pooled, self.model.vision_tower.spec().eps)
+    }
+
+    /// Soft tokens for one audio clip: valid frames only, matching the reference.
+    pub fn audio_soft_tokens(
+        &self,
+        feats: &AudioFeatures,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        let h = self.model.audio_tower.forward_debug(feats, debug_dir);
+        let device = h.device();
+        let (m1, _) = subsample_mask(&feats.mask);
+        let (m2, _) = subsample_mask(&m1);
+        let keep: Vec<i64> = m2
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v)
+            .map(|(i, _)| i as i64)
+            .collect();
+        let n = keep.len();
+        let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
+        let h = h.select(0, idx);
+        self.model
+            .embed_audio
+            .forward(h, self.model.audio_tower.spec().eps)
+    }
+
+    /// Prefill over `ids` with optional media soft tokens scattered into the
+    /// placeholder positions; returns the soft-capped logits of the last position.
+    pub fn prefill(
+        &self,
+        ids: &[u32],
+        soft: Option<(Vec<usize>, Tensor<2>)>,
+        ropes: &GenRopes,
+        kv: &mut GenKv,
+        lm_head: &Tensor<2>,
+        chunk: usize,
+        pad_id: u32,
+    ) -> Tensor<2> {
+        let device = self.model.language_model.embed_table().val().device();
+        let mut llm_ids = ids.to_vec();
+        if let Some((positions, _)) = &soft {
+            for &p in positions {
+                llm_ids[p] = pad_id;
+            }
+        }
+        let n = llm_ids.len();
+        let ids_i64: Vec<i64> = llm_ids.iter().map(|&t| t as i64).collect();
+        let ids_t = Tensor::<2, Int>::from_data(TensorData::new(ids_i64, [1, n]), &device);
+        let text = self.text();
+        let mut x = text
+            .embed_tokens
+            .forward(ids_t.clone())
+            .cast(DType::F32)
+            .mul_scalar((text.spec().hidden as f64).sqrt());
+        if let Some((positions, tokens)) = soft {
+            let dtype = x.dtype();
+            let mut data: Vec<f32> = x.cast(DType::F32).into_data().try_to_vec().expect("embeds");
+            let values: Vec<f32> = tokens
+                .cast(DType::F32)
+                .into_data()
+                .try_to_vec()
+                .expect("soft tokens");
+            let d = text.spec().hidden;
+            let dd = values.len() / positions.len().max(1);
+            for (i, &pos) in positions.iter().enumerate() {
+                data[pos * d..pos * d + dd].copy_from_slice(&values[i * dd..(i + 1) * dd]);
+            }
+            x = Tensor::<3>::from_data(TensorData::new(data, [1, n, d]), &device).cast(dtype);
+        }
+        let h = text.forward_embeds(ids_t, x, ropes, kv, 0, chunk);
+        text.logits(h, lm_head)
+    }
+}
+
+impl crate::inputs::MediaModel for GenRoot {
+    fn vision_spec(&self) -> &VisionSpec {
+        self.model.vision_tower.spec()
+    }
+
+    fn encode_image(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        debug_dir: Option<&std::path::Path>,
+        layers: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        if debug_dir.is_some() {
+            let _ = self.model.vision_tower.forward(img, chunk, layers);
+        }
+        self.image_soft_tokens(img, chunk)
+    }
+
+    fn encode_audio(
+        &self,
+        feats: &AudioFeatures,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        self.audio_soft_tokens(feats, debug_dir)
     }
 }
 

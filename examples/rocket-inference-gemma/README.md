@@ -133,7 +133,12 @@ Text generation (`gemma-4-E2B-it`, greedy) is **token-identical** to the HF 5.19
 reference on: a 16-token question, a system+user prompt, a multi-turn
 conversation and a 631-token prompt (16 generated tokens each). The chat
 template renders token-exactly for the same cases (system, multi-turn,
-`enable_thinking`).
+`enable_thinking`). Image-conditioned generation (280 soft tokens from
+`data/cat.jpeg`) is token-identical to the bf16 reference, and audio-conditioned
+generation to the f32 reference (the bf16 reference flips one near-tie:
+"vehicle" vs "car"). `serve-chat` accepts the same media as OpenAI content parts
+(`image_url` data URIs / `input_audio` base64) and produces the same outputs as
+the CLI (image: 284 prompt + 24 completion tokens; audio: 145 + 24).
 
 ## Text generation (Gemma 4 E2B-it)
 
@@ -157,10 +162,21 @@ $B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What is the capital of Fr
 $B gen --gen-model-dir ~/models/gemma-4-E2B-it \
     --messages '[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}]' \
     --sample --temperature 0.7 --top-k 64 --top-p 0.95
+# image / audio input (the placeholder expands to the tower's soft tokens)
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What is in this image? <|image|>" \
+    --image data/cat.jpeg --max-new-tokens 64
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What do you hear? <|audio|>" \
+    --audio data/speech5s.wav --max-new-tokens 64
+
 # non-streaming OpenAI-compatible server
 $B serve-chat --gen-model-dir ~/models/gemma-4-E2B-it --port 8391
 curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+# media parts: `image_url` (data URI or path) and `input_audio` (base64 + format),
+# one of each per request; the server inserts the placeholder tokens itself
+curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":[{"type":"text","text":"What is this?"},
+         {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}]}],"max_tokens":64}'
 ```
 
 Precision modes (`gen`/`serve-chat`), measured on the dev host (32 threads,

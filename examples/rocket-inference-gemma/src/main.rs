@@ -786,7 +786,28 @@ fn run_gen(args: &Args) -> Result<()> {
         None => vec![chat::Message::user(args.input_text()?)],
     };
     let rendered = chat::render(&messages, args.enable_thinking);
-    let ids = chat::encode(&tokenizer, &rendered)?;
+    // Media inputs expand their `<|image|>` / `<|audio|>` placeholders in the
+    // rendered conversation and are encoded with the checkpoint's own towers.
+    let (ids, soft) = if args.image.is_some() || args.audio.is_some() {
+        let (img_soft, video_soft) = inputs::media_soft_tokens(&args.gen_model_dir);
+        let req = inputs::MediaInputs {
+            text: Some(rendered.clone()),
+            image: args.image.clone(),
+            video: None,
+            audio: args.audio.clone(),
+            prompt_prefix: String::new(),
+            max_tokens: None,
+            image_soft_tokens: args.max_soft_tokens.unwrap_or(img_soft),
+            video_soft_tokens: video_soft,
+            video_fps: args.video_fps,
+            video_max_frames: args.video_max_frames,
+            attn_chunk: args.attn_chunk,
+        };
+        let prepared = inputs::prepare(&model, &tokenizer, &req, &inputs::DebugPaths::default())?;
+        (prepared.ids, prepared.soft)
+    } else {
+        (chat::encode(&tokenizer, &rendered)?, None)
+    };
     if std::env::var("DUMP_RENDER").is_ok() {
         println!("rendered: {rendered:?}");
         println!("prompt ids: {ids:?}");
@@ -807,7 +828,17 @@ fn run_gen(args: &Args) -> Result<()> {
         opts.eos
     );
     gen_model::gen_stage_stats_reset();
-    let (out, stats) = chat::generate(&model, &lm_head, &ids, &opts, args.attn_chunk, &device)?;
+    let pad_id = cfg.text_config.pad_token_id.unwrap_or(0);
+    let (out, stats) = chat::generate_with_media(
+        &model,
+        &lm_head,
+        &ids,
+        soft,
+        pad_id,
+        &opts,
+        args.attn_chunk,
+        &device,
+    )?;
     let (attn, mlp, ple, norms) = gen_model::gen_stage_stats();
     println!(
         "stages: attn {attn:.2}s, mlp {mlp:.2}s, ple {ple:.2}s, norms {norms:.2}s ({} tokens)",
@@ -844,6 +875,15 @@ fn run_serve_chat(args: &Args) -> Result<()> {
         gen_loader::build_lm_head(model.text(), dtype != gen_loader::LoadDtype::F32, &device);
     let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let model_name = if args.model_name == "embeddinggemma-2" {
+        // The chat server's default name should match the generation model.
+        args.gen_model_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "gemma-4-E2B-it".to_string())
+    } else {
+        args.model_name.clone()
+    };
     gen_server::serve(
         model,
         lm_head,
@@ -851,7 +891,7 @@ fn run_serve_chat(args: &Args) -> Result<()> {
         device,
         gen_server::ChatServeOptions {
             addr: format!("0.0.0.0:{}", args.port),
-            model_name: args.model_name.clone(),
+            model_name,
             model_dir: args.gen_model_dir.clone(),
             attn_chunk: args.attn_chunk,
             max_new_tokens: args.max_new_tokens,

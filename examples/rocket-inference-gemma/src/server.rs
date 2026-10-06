@@ -282,13 +282,20 @@ async fn embed_native(State(state): State<AppState>, Json(req): Json<NativeReque
 
 /// A media value is either a filesystem path or a `data:<mime>;base64,<payload>`
 /// blob (written to a temp file so ffmpeg/hound can read it).
-fn resolve_media(value: &str, ext: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<PathBuf, String> {
     let Some(rest) = value.strip_prefix("data:") else {
         return Ok(PathBuf::from(value));
     };
-    let (_, b64) = rest
+    let (mime, b64) = rest
         .split_once(";base64,")
         .ok_or("bad data URI (expected data:<mime>;base64,<payload>)")?;
+    // The decoders pick their backend by file extension, so take it from the MIME
+    // type (`image/jpeg` -> jpg, `audio/wav` -> wav) instead of a generic name.
+    let ext = match mime.split('/').nth(1) {
+        Some("jpeg") => "jpg",
+        Some(other) if !other.is_empty() => other,
+        _ => ext,
+    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("base64: {e}"))?;

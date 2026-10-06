@@ -54,12 +54,31 @@ def cmd_tokens(args):
     print(json.dumps({"text": text, "n": len(ids), "ids": ids}))
 
 
+def media_inputs(args, proc, text):
+    """Processor inputs for a rendered conversation plus optional media."""
+    from PIL import Image
+
+    kwargs = {"text": text, "return_tensors": "pt"}
+    if args.image:
+        kwargs["images"] = [Image.open(p).convert("RGB") for p in args.image]
+    if args.audio:
+        import librosa
+        import numpy as np
+
+        wavs = []
+        for p in args.audio:
+            w, _ = librosa.load(p, sr=16000)
+            wavs.append(w)
+        kwargs["audio"] = wavs
+    return proc(**kwargs)
+
+
 def cmd_gen(args):
     import torch
 
     proc, model, torch = load(args, getattr(torch, args.dtype))
     _, text = render(args, proc)
-    inputs = proc.tokenizer(text, add_special_tokens=False, return_tensors="pt")
+    inputs = media_inputs(args, proc, text)
     n_prompt = inputs["input_ids"].shape[1]
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
@@ -93,7 +112,7 @@ def cmd_logits(args):
 
     proc, model, torch = load(args, getattr(torch, args.dtype))
     _, text = render(args, proc)
-    inputs = proc.tokenizer(text, add_special_tokens=False, return_tensors="pt")
+    inputs = media_inputs(args, proc, text)
     with torch.no_grad():
         out = model(**inputs)
     logits = out.logits[0, -1].float()
@@ -143,6 +162,9 @@ def main():
         sp.add_argument("--text-file", default=None)
         sp.add_argument("--messages", default=None, help="JSON list of chat messages")
         sp.add_argument("--enable-thinking", action="store_true")
+        if name in ("gen", "logits", "tokens"):
+            sp.add_argument("--image", action="append", default=None)
+            sp.add_argument("--audio", action="append", default=None)
         if name == "gen":
             sp.add_argument("--dtype", default="bfloat16")
             sp.add_argument("--max-new-tokens", type=int, default=32)

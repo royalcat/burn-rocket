@@ -295,6 +295,37 @@ near-tie on the 631-token case, so f32 remains the parity mode; Q8 decode is
 dominated by flex's scalar per-call `dequantize` (flex has no int8 GEMM), so q8
 is a memory-only mode here.
 
+### Multimodal prefill (2026-10-07)
+
+`gen`/`serve-chat` accept `<|image|>` / `<|audio|>` placeholders in the rendered
+conversation; `inputs::prepare` expands them (BOI/BOA + soft tokens + EOI/EOA)
+and encodes the media with the checkpoint's own towers, then the text model runs
+over the scattered embeddings. The PLE token-table lookup uses the media-pad ids
+(pad 0 at the placeholder slots), exactly like the reference; the PLE context
+term uses the scattered embeddings.
+
+The E2B vision tower needed clip bounds (`use_clipped_linears: true`, unlike
+EmbeddingGemma 2): the loader reads the 7 x 16 `Gemma4ClippableLinear` scalar
+sets and the vision tower applies them; the audio tower is byte-for-byte the
+EmbeddingGemma 2 tower (same keys, same clip bounds).
+
+| case | prompt | result |
+|---|---|---|
+| image (`cat.jpeg`, 280 soft tokens) | "What is in this image? `<\|image\|>`" | 284-token prompt, 24/24 generated tokens identical to HF bf16 |
+| audio (`speech5s.wav`, 125 soft tokens) | "What do you hear in this audio? `<\|audio\|>`" | 145-token prompt, 24/24 identical to HF **f32** |
+
+The audio case diverges from the bf16 reference at token 20 ("vehicle" vs
+"car"); the f32 reference matches our output exactly, so it is a bf16 near-tie,
+not a numerical bug (the same caveat as the `--f16` text mode). Memory with the
+towers loaded: f32 ~16.5 GiB resident (text 12.5 + towers ~4).
+
+`serve-chat` accepts the same media as OpenAI content parts: `image_url` with a
+data URI or path, `input_audio` with base64 `data` + `format` (at most one of
+each per request). The placeholders are inserted by the server, so clients send
+plain text. Smoke-tested on the dev host: the image request returns the CLI's
+284-prompt/24-completion output and the audio request the 145/24 output; the
+`/v1/models` id defaults to the generation model's directory name.
+
 ## 12. Deferred
 
 - Q8/low-RAM mode (the f32 resident model is 2.9 GB).
