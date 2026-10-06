@@ -7,9 +7,13 @@ an example of it, at `examples/qwen3-embeddings/`. Read `README.md` (library) an
 `examples/qwen3-embeddings/README.md` (app) first; measurements live in
 `examples/qwen3-embeddings/docs/experiment-log.md`.
 
-The repo was inverted on 2026-10-06 with no functional changes: the former root package
-`embeddings-fast` moved to `examples/qwen3-embeddings/`, the former `crates/burn-rocket`
-became the root package. The git remote is still `embeddings-fast.git`. Board artifacts
+The repo was inverted on 2026-10-06 with no functional changes (commits `8c7eabb`
+structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
+`examples/qwen3-embeddings/`, the former `crates/burn-rocket` became the root package.
+The inversion is verified on the dev host: `cargo check -p burn-rocket` (plain / `flex` /
+`npu`) and `-p qwen3-embeddings` (default `cpu` and `--no-default-features`), aarch64
+cross-builds of the example (`--features npu`) and of `--example probe`, plus a tokenize +
+q8 embed smoke run. The git remote is still `embeddings-fast.git`. Board artifacts
 deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 `/root/qwen3-embeddings/`.
 
@@ -63,6 +67,7 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`) |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
+| `examples/qwen3-embeddings/Cargo.toml` | workspace member `qwen3-embeddings`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/qwen3-embeddings/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`) |
 | `examples/qwen3-embeddings/src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
 | `examples/qwen3-embeddings/src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment, typed NPU-error mapping, `--max-tokens` enforcement |
@@ -79,8 +84,11 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 # NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
 cargo build --release -p qwen3-embeddings --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
+ssh root@rock-5b-plus.lan 'mkdir -p /root/qwen3-embeddings'
 scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/qwen3-embeddings \
     root@rock-5b-plus.lan:/root/qwen3-embeddings/
+# the bench needs data/ relative to the deploy dir
+scp -r examples/qwen3-embeddings/data root@rock-5b-plus.lan:/root/qwen3-embeddings/
 # CPU-only build: drop --features npu (binary name is the same)
 ```
 
@@ -91,6 +99,12 @@ The binary is self-contained (`librocketnpu` is statically linked); the model li
 Library-only builds: `cargo check -p burn-rocket --features npu` compiles the extension
 on any host (no linking); `cargo build --release -p burn-rocket --features npu --target
 aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the FFI probe.
+
+Container image: `examples/qwen3-embeddings/docker/build.sh [git-ref]` stages the tree,
+builds the aarch64 image on the board and pushes
+`git.kmsign.org/royalcat/qwen3-embeddings:<sha>`. It needs
+`vendor/rocketnpu/librocketnpu.a` (or `VENDOR_SRC`) and registry credentials on the
+control host; run it from anywhere in the repo.
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
