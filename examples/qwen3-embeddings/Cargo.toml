@@ -1,0 +1,54 @@
+[package]
+name = "qwen3-embeddings"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["cpu"]
+# CubeCL/LLVM CPU backend. Disabled for cross-builds: cubecl-llvm links a prebuilt
+# host-architecture LLVM bundle (fails to link for aarch64). The `flex` backend is
+# always available.
+cpu = ["burn/cpu", "burn/autotune", "burn/fusion"]
+# RK3588 NPU offload via librocketnpu (aarch64 only; see the root burn-rocket crate).
+npu = ["dep:burn-rocket", "burn-rocket/npu"]
+# GPU (CubeCL/wgpu) backend; the Rock 5B+ reaches it through Mesa panvk.
+# `gpu-spirv` uses CubeCL's SPIR-V compiler (burn's `vulkan` feature), `gpu-wgsl`
+# the WGSL one (naga). panvk's own compiler segfaults on CubeCL SPIR-V shaders,
+# so `gpu-wgsl` is the working path on the board.
+# `gpu-autotune` adds CubeCL's runtime kernel autotuning: it benchmarks kernel
+# candidates per shape, and a slow candidate can trip the panthor job watchdog,
+# so it is opt-in.
+gpu = []
+gpu-spirv = ["gpu", "burn/vulkan"]
+gpu-wgsl = ["gpu", "burn/webgpu"]
+gpu-autotune = ["burn/autotune"]
+
+[[bin]]
+name = "wgpu_probe"
+path = "src/bin/wgpu_probe.rs"
+required-features = ["gpu"]
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+burn-rocket = { path = "../..", optional = true }
+
+[dependencies]
+burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "flex",
+    "rayon",
+    "simd",
+    "store",
+] }
+burn-store = { version = "=0.22.0-pre.4", default-features = false, features = [
+    "std",
+    "safetensors",
+    "memmap",
+] }
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+base64 = "0.22"

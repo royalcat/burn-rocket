@@ -22,7 +22,7 @@ fn main() {
         Some(dir) => PathBuf::from(dir),
         None => {
             let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-            manifest.join("../../vendor/rocketnpu")
+            manifest.join("vendor/rocketnpu")
         }
     };
 

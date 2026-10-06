@@ -1,7 +1,8 @@
 .git
 target
-docs
-data
-docker
+examples/qwen3-embeddings/docs
+examples/qwen3-embeddings/data
+examples/qwen3-embeddings/docker
 AGENTS.md
 README.md
+examples/qwen3-embeddings/README.md

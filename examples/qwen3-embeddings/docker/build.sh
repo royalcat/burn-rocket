@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the aarch64 container image for embeddings-fast and push it to the
-# Forgejo registry (git.kmsign.org/royalcat/embeddings-fast).
+# Build the aarch64 container image for qwen3-embeddings and push it to the
+# Forgejo registry (git.kmsign.org/royalcat/qwen3-embeddings).
 #
 # The image is aarch64-only (the `npu` feature links the aarch64-only static
 # librocketnpu), so it is built natively on the rock-5b-plus board, which has
@@ -8,28 +8,28 @@
 # credentials.
 #
 # Usage:
-#   docker/build.sh                 # HEAD of this checkout
-#   docker/build.sh <git-ref>       # any commit/tag in this checkout
-#   COMMIT=<sha> TAG=<tag> docker/build.sh
+#   examples/qwen3-embeddings/docker/build.sh                 # HEAD of this checkout
+#   examples/qwen3-embeddings/docker/build.sh <git-ref>       # any commit/tag in this checkout
+#   COMMIT=<sha> TAG=<tag> examples/qwen3-embeddings/docker/build.sh
 #
 # Env overrides:
 #   BOARD=root@rock-5b-plus.lan      ssh target for the build host
-#   REMOTE_DIR=/root/embeddings-fast-image  staging dir on the board
+#   REMOTE_DIR=/root/qwen3-embeddings-image  staging dir on the board
 #   VENDOR_SRC=<path-to-librocketnpu.a>  vendor library; unset = the checkout's
 #                                        vendor/rocketnpu, else the board's
 #                                        rocket-userspace build tree
 #   CARGO_BUILD_JOBS=4               cargo parallelism inside the image build
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
 
 COMMIT="${COMMIT:-${1:-HEAD}}"
 SHA="$(git -C "$REPO" rev-parse --short "$COMMIT")"
 TAG="${TAG:-$SHA}"
-IMAGE="git.kmsign.org/royalcat/embeddings-fast:${TAG}"
+IMAGE="git.kmsign.org/royalcat/qwen3-embeddings:${TAG}"
 BOARD="${BOARD:-root@rock-5b-plus.lan}"
-STAGE="${STAGE:-/tmp/embeddings-fast-build-$TAG}"
-REMOTE_DIR="${REMOTE_DIR:-/root/embeddings-fast-image}"
+STAGE="${STAGE:-/tmp/qwen3-embeddings-build-$TAG}"
+REMOTE_DIR="${REMOTE_DIR:-/root/qwen3-embeddings-image}"
 JOBS="${CARGO_BUILD_JOBS:-4}"
 BOARD_VENDOR="${BOARD_VENDOR:-/root/npu-poc/rocket-userspace/build/librocketnpu.a}"
 
@@ -37,8 +37,9 @@ echo "==> staging source ${SHA} (${TAG}) -> ${STAGE}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 git -C "$REPO" archive "$COMMIT" | tar -C "$STAGE" -xf -
-# Refs that predate the Dockerfile: borrow the worktree copy.
-[ -f "$STAGE/Dockerfile" ] || cp "$REPO/Dockerfile" "$STAGE/Dockerfile"
+# New refs keep the Dockerfile under examples/; stage it at the context root so
+# plain `docker build .` works. Old refs (root Dockerfile) pass through.
+[ -f "$STAGE/Dockerfile" ] || cp "$REPO/examples/qwen3-embeddings/Dockerfile" "$STAGE/Dockerfile"
 [ -f "$STAGE/.dockerignore" ] || cp "$REPO/.dockerignore" "$STAGE/.dockerignore"
 
 # vendor/rocketnpu/librocketnpu.a is gitignored; take it from VENDOR_SRC, the

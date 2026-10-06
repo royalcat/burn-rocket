@@ -1,5 +1,10 @@
 # Experiment log: Qwen3-Embedding-0.6B on Burn
 
+> Layout note (2026-10-06): the repository was inverted — `burn-rocket` is now the
+> root crate and this app lives in `examples/qwen3-embeddings/`. Paths like
+> `crates/burn-rocket` and board dirs like `/root/embeddings-fast/` below are the
+> historical pre-inversion locations; the measurements are unchanged.
+
 Goal: run Qwen3-Embedding-0.6B (1024-dim, last-token pooling) in Rust/Burn, at least
 50 tok/s on one core, with Q8 weights and an OpenAI-compatible server. Board (RK3588)
 work is deliberately deferred; all numbers below are from the development host.
@@ -366,7 +371,7 @@ the board.
 Goal: move the model's projection matmuls to the RK3588 NPU through the mainline `rocket`
 driver, freeing CPU time for other board services (the ≥50 tok/s wall target is relaxed
 for this path). Stack: `librocketnpu` (gregordinary/rocket-userspace) wrapped by a new
-`crates/burn-rocket` crate; the Burn model calls it through a `Proj::Npu` variant
+`burn-rocket` crate; the Burn model calls it through a `Proj::Npu` variant
 (`--npu`, pack-and-drop: no CPU-side projection weights).
 
 ### 10.1 M0 — baseline measurements (600 MHz, resident weights, M=3636)
@@ -399,7 +404,7 @@ rocket_npu_clk_hz=600000000`) raises it to 600 MHz under load (verified via
 
 ### 10.2 M1 — integration
 
-`crates/burn-rocket` is an FFI wrapper over `librocketnpu` (RocketCtx/RocketWeight/
+`burn-rocket` is an FFI wrapper over `librocketnpu` (RocketCtx/RocketWeight/
 RocketStream/RocketFaCtx; `build.rs` links the static archive, `ROCKETNPU_DIR` overrides
 the vendored copy). `src/npu.rs` holds `NpuModel` (one context + 28x7 resident weights)
 and `NpuAttention` (persistent attention context + per-length scratch). The model's
@@ -462,7 +467,7 @@ reboot restores the stock 200 MHz in-tree module). The NPU deployment needs
 
 ### 11.1 Refactor
 
-The NPU runtime moved out of the app into `crates/burn-rocket` as a Burn *backend
+The NPU runtime moved out of the app into a separate `burn-rocket` crate as a Burn *backend
 extension* (`#[backend_extension(Flex)]`, the out-of-tree op hook of
 0.22.0-pre.4): the `RocketOps` trait declares `rocket_pack/pack2/pack3` (weights ->
 resident handles), `rocket_matmul` and `rocket_attention`; the safe wrappers `pack`,
