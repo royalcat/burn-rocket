@@ -689,15 +689,28 @@ board for a production decision.
     "model": "ollama/guoxuter/ov_intent_analysis_sft:v7_q8",
     "api_base": "http://<board-host>:11434",
     "temperature": 0.0,
-    "timeout": 60,
+    "timeout": 120,
     "extra_request_body": { "think": false }
-  }
+  },
+  "retrieval": { "recall_intent_timeout_s": 120 }
 }
 ```
 
 The model string must stay `ollama/guoxuter/ov_intent_analysis_sft:v7_q8` so OpenViking
-picks its bundled v7 prompt. Keep `shutdown`/supervision in mind: the service needs
-~3.3 GB (2.06 GB anon + ~1.2 GB NPU BOs) while OpenViking + the embeddings service run.
+picks its bundled v7 prompt. Two integration facts the deployment surfaced
+(2026-10-06):
+
+- litellm's Ollama client posts its JSON bodies as `application/octet-stream` and takes
+  the `ollama/…` route through `/api/generate`; the server must accept any request
+  `Content-Type` (like Ollama itself — the fix is in `ollama.rs`, commit `0bc0774`).
+- Decode runs at ~3.3 tok/s, and the model emits ~185 tokens for the bundled v7
+  prompt, so a planner call is ~55–60 s. Timeouts must cover that (the first wiring
+  used 60 s and one slow decode away from tripping); measured end to end through
+  OpenViking on the board: a session-listed search 64 s, context assembly 84 s.
+
+Keep `shutdown`/supervision in mind: the service holds ~2.6 GB anon + ~1.7 GB NPU BOs
+after a 1.7k-token prompt (the original ~3.3 GB steady figure was the bare 32-token
+measurement), so give the container ≥6 GB.
 
 ### 14.5 Open items
 
