@@ -343,11 +343,21 @@ into resident fp16 NPU weights and runs the prefill pass on the NPU:
   `GenRoot::prefill`, and the CPU f32 copies are kept (`keep_cpu`), because NPU
   matmuls pad M to 256 and a single decode row would waste that work.
 
-Not yet measured on the board: the `--f16 --npu` configuration needs ~11 GB
-resident (8.9 GiB f16 text + towers, plus 2.1 GiB of packed fp16 NPU weights),
-and `rock-5b-plus` has been busy with other workloads (~4 GB free, loadavg ~7).
-The embedding round measured 1.61x on prefill for the same NPU machinery, so a
-similar prefill gain is expected here; decode throughput is unchanged.
+Board attempt (2026-10-07): run under a cgroup guard
+(`systemd-run --scope -p MemoryMax=8G -p MemorySwapMax=4G`) so only our process
+could be killed. It was OOM-killed during load (global OOM, `anon-rss` 2.8 GB
+at the time, `total-vm` 15.4 GB): `rock-5b-plus` was holding ~11 GB with other
+workloads and has only ~4.5 GB available (8 GB zram, already 4.8 GB used), so
+the ~9.5 GB f16 working set (8.6 GiB text + ~0.9 GiB towers) plus the 2.1 GiB
+of packed fp16 NPU weights cannot fit alongside them. The guard contained the
+kill to the scoped process; the board's other services were unaffected.
+
+On an idle board the configuration fits (15.8 GB total RAM vs ~9.5 GB host +
+2.1 GiB NPU + system), so the A/B only needs a free board. The model is
+deployed at `/root/models/gemma-4-E2B-it/` and the aarch64 `--features npu`
+binary at `/root/rocket-inference-gemma/`; the same NPU machinery measured 1.61x
+on prefill for the embedding model (log §9), and decode throughput is unchanged
+by design.
 
 ## 12. Deferred
 

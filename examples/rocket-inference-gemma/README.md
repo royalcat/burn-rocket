@@ -234,9 +234,11 @@ user CPU): 1.61x faster, 33 % less CPU. Numerics vs the HF f32 reference:
   ~4.2 GiB *load peak* because the checkpoint is materialized f32 before
   quantization/packing and the 1.49 GB mmap is touched.
 - Batch inputs are processed one at a time.
-- **NPU prefill is not yet measured on the board** (the implementation is in
-  place and cross-builds): the board needs ~11 GB free for the `--f16 --npu`
-  configuration, and it has been busy with other workloads.
+- **NPU prefill is not yet measured on the board**: the implementation is in
+  place and cross-builds, and the model is deployed at
+  `/root/models/gemma-4-E2B-it/`, but `rock-5b-plus` was holding ~11 GB with
+  other workloads (only ~4.5 GB available) and a guarded attempt was OOM-killed
+  during load. It needs an idle board (~9.5 GB host + 2.1 GiB NPU).
 - **f32 only**: `--dtype f16` loads (1.5 GiB resident) but is numerically broken
   in this architecture — RMSNorm/softmax/PLE need f32 precision (text cosine
   0.984, image 0.70 vs the f32 reference), so the CLI rejects it. Use

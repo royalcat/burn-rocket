@@ -132,8 +132,12 @@ fp16 NPU weights and runs prefill matmuls + `attention_causal_window` on the
 NPU, while decode keeps the CPU f32 copies (`layers::set_prefill_mode` wraps
 only `GenRoot::prefill`; NPU matmuls pad M to 256). Mask builders live in
 `burn-rocket/src/masks.rs` with host unit tests (`cargo test -p burn-rocket`).
-Board measurement pending an idle board (`--f16 --npu` needs ~11 GB resident;
-rock-5b-plus has been busy). Not yet done: streaming, video input.
+Board measurement pending an idle board: the model is deployed at
+`/root/models/gemma-4-E2B-it/` and the aarch64 npu binary at
+`/root/rocket-inference-gemma/`, but rock-5b-plus holds ~11 GB with other
+workloads and a cgroup-guarded attempt was OOM-killed during load (2.8 GB of
+the ~9.5 GB f16 working set; only ~4.5 GB available). Not yet done: streaming,
+video input.
 
 NPU round (2026-10-07, log §9): the `npu` feature packs all 218 text projections
 into resident fp16 NPU weights (0.25 GiB; registered by `ParamId`, `lin()`
