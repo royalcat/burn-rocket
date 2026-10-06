@@ -5,7 +5,11 @@
 
 mod audio;
 mod audio_frontend;
+mod chat;
 mod config;
+mod gen_loader;
+mod gen_model;
+mod gen_server;
 mod inputs;
 mod layers;
 mod media;
@@ -34,7 +38,11 @@ fn main() -> Result<()> {
         "bench" => run_bench(&args),
         "tokenize" => run_tokenize(&args),
         "serve" => run_serve(&args),
-        other => bail!("unknown command '{other}' (expected embed|bench|tokenize|serve)"),
+        "gen" => run_gen(&args),
+        "serve-chat" => run_serve_chat(&args),
+        other => bail!(
+            "unknown command '{other}' (expected embed|bench|tokenize|serve|gen|serve-chat)"
+        ),
     }
 }
 
@@ -73,6 +81,15 @@ struct Args {
     npu: bool,
     npu_threads: usize,
     npu_attn: bool,
+    gen_model_dir: PathBuf,
+    messages: Option<String>,
+    max_new_tokens: usize,
+    greedy: bool,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    enable_thinking: bool,
+    gen_f16: bool,
 }
 
 impl Args {
@@ -115,6 +132,15 @@ impl Args {
             npu: false,
             npu_threads: 5,
             npu_attn: true,
+            gen_model_dir: PathBuf::from("/mnt/hub/models/gemma-4-E2B-it"),
+            messages: None,
+            max_new_tokens: 64,
+            greedy: true,
+            temperature: 1.0,
+            top_k: 64,
+            top_p: 0.95,
+            enable_thinking: false,
+            gen_f16: false,
         };
         while let Some(flag) = it.next() {
             let mut value = || {
@@ -152,6 +178,15 @@ impl Args {
                 "--port" => args.port = value()?.parse()?,
                 "--model-name" => args.model_name = value()?,
                 "--max-tokens" => args.max_tokens = value()?.parse()?,
+                "--gen-model-dir" => args.gen_model_dir = PathBuf::from(value()?),
+                "--messages" => args.messages = Some(value()?),
+                "--max-new-tokens" => args.max_new_tokens = value()?.parse()?,
+                "--sample" => args.greedy = false,
+                "--temperature" => args.temperature = value()?.parse()?,
+                "--top-k" => args.top_k = value()?.parse()?,
+                "--top-p" => args.top_p = value()?.parse()?,
+                "--enable-thinking" => args.enable_thinking = true,
+                "--f16" => args.gen_f16 = true,
                 "--npu" => args.npu = true,
                 "--npu-threads" => args.npu_threads = value()?.parse()?,
                 "--npu-attn" => {
@@ -693,6 +728,133 @@ fn run_serve(args: &Args) -> Result<()> {
             max_tokens: args.max_tokens,
             video_fps: args.video_fps,
             video_max_frames: args.video_max_frames,
+        },
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct MessageJson {
+    role: String,
+    content: String,
+}
+
+/// EOS ids from the checkpoint's `generation_config.json` (fallback: 1, 106, 50).
+pub(crate) fn gen_eos(model_dir: &Path) -> Vec<u32> {
+    let mut eos = vec![1u32, 106, 50];
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            match json.get("eos_token_id") {
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(v) = n.as_u64() {
+                        eos = vec![v as u32];
+                    }
+                }
+                Some(serde_json::Value::Array(a)) => {
+                    eos = a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+                }
+                _ => {}
+            }
+        }
+    }
+    eos
+}
+
+fn run_gen(args: &Args) -> Result<()> {
+    let device = device(args)?;
+    let dtype = if args.quant_q8 {
+        gen_loader::LoadDtype::Q8
+    } else if args.gen_f16 {
+        gen_loader::LoadDtype::F16
+    } else {
+        gen_loader::LoadDtype::F32
+    };
+    let (model, cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    let lm_head =
+        gen_loader::build_lm_head(model.text(), dtype != gen_loader::LoadDtype::F32, &device);
+    let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+
+    let messages: Vec<chat::Message> = match &args.messages {
+        Some(json) => serde_json::from_str::<Vec<MessageJson>>(json)
+            .context("parse --messages JSON")?
+            .into_iter()
+            .map(|m| chat::Message {
+                role: m.role,
+                content: m.content,
+            })
+            .collect(),
+        None => vec![chat::Message::user(args.input_text()?)],
+    };
+    let rendered = chat::render(&messages, args.enable_thinking);
+    let ids = chat::encode(&tokenizer, &rendered)?;
+    if std::env::var("DUMP_RENDER").is_ok() {
+        println!("rendered: {rendered:?}");
+        println!("prompt ids: {ids:?}");
+    }
+    let opts = chat::GenOptions {
+        max_new_tokens: args.max_new_tokens,
+        greedy: args.greedy,
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        eos: gen_eos(&args.gen_model_dir),
+    };
+    println!(
+        "model: {} layers, hidden {}, ple_dim {}, eos {:?}",
+        cfg.text_config.num_hidden_layers,
+        cfg.text_config.hidden_size,
+        cfg.text_config.hidden_size_per_layer_input,
+        opts.eos
+    );
+    gen_model::gen_stage_stats_reset();
+    let (out, stats) = chat::generate(&model, &lm_head, &ids, &opts, args.attn_chunk, &device)?;
+    let (attn, mlp, ple, norms) = gen_model::gen_stage_stats();
+    println!(
+        "stages: attn {attn:.2}s, mlp {mlp:.2}s, ple {ple:.2}s, norms {norms:.2}s ({} tokens)",
+        stats.prompt_tokens + stats.generated
+    );
+    let text = tokenizer
+        .decode(&out, false)
+        .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    println!("prompt {} tokens, generated {} in {:.2}s (prefill {:.2}s, decode {:.2}s = {:.2} tok/s)",
+        stats.prompt_tokens, stats.generated, stats.prefill_s + stats.decode_s,
+        stats.prefill_s, stats.decode_s,
+        stats.generated as f64 / stats.decode_s.max(1e-9));
+    println!("ids: {out:?}");
+    println!("text: {text}");
+    if let Some(path) = &args.out {
+        std::fs::write(path, serde_json::to_string(&out)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn run_serve_chat(args: &Args) -> Result<()> {
+    let device = device(args)?;
+    let dtype = if args.quant_q8 {
+        gen_loader::LoadDtype::Q8
+    } else if args.gen_f16 {
+        gen_loader::LoadDtype::F16
+    } else {
+        gen_loader::LoadDtype::F32
+    };
+    let (model, _cfg) = gen_loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    let lm_head =
+        gen_loader::build_lm_head(model.text(), dtype != gen_loader::LoadDtype::F32, &device);
+    let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    gen_server::serve(
+        model,
+        lm_head,
+        tokenizer,
+        device,
+        gen_server::ChatServeOptions {
+            addr: format!("0.0.0.0:{}", args.port),
+            model_name: args.model_name.clone(),
+            model_dir: args.gen_model_dir.clone(),
+            attn_chunk: args.attn_chunk,
+            max_new_tokens: args.max_new_tokens,
         },
     )
 }

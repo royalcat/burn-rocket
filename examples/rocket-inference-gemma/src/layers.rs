@@ -20,6 +20,18 @@ pub fn is_quantized() -> bool {
     QUANTIZED.load(Ordering::Relaxed)
 }
 
+/// Process-wide f16-weight flag (`gen --f16`): the projection weights are f16
+/// and activations are cast per call (f32 compute stays in the norms/attention).
+static F16_WEIGHTS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_f16_weights(on: bool) {
+    F16_WEIGHTS.store(on, Ordering::Relaxed);
+}
+
+pub fn f16_weights() -> bool {
+    F16_WEIGHTS.load(Ordering::Relaxed)
+}
+
 /// The activation dtype matching a (possibly Q8-resident) weight: activations
 /// stay f32 in low-RAM mode because `lin` dequantizes weights to f32.
 pub(crate) fn weight_dtype<const D: usize>(w: &Param<Tensor<D>>) -> DType {
@@ -40,11 +52,17 @@ pub(crate) fn lin<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
     if let Some(id) = npu_lookup(&l.weight) {
         return burn_rocket::matmul(x, &id);
     }
-    if !is_quantized() {
-        return l.forward(x);
+    if is_quantized() {
+        let weight = l.weight.val().dequantize();
+        return burn::tensor::module::linear(x, weight, l.bias.as_ref().map(|b| b.val()));
     }
-    let weight = l.weight.val().dequantize();
-    burn::tensor::module::linear(x, weight, l.bias.as_ref().map(|b| b.val()))
+    if f16_weights() {
+        // f16-resident weights: compute in f16, return in the activation dtype.
+        let dt = x.dtype();
+        let out = burn::tensor::module::linear(x.cast(DType::F16), l.weight.val(), None);
+        return out.cast(dt);
+    }
+    l.forward(x)
 }
 
 // ---------------------------------------------------------------------------

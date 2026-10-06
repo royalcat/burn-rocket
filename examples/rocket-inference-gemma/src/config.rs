@@ -125,6 +125,34 @@ pub struct TextConfig {
     pub eos_token_id: Option<u32>,
     #[serde(default)]
     pub pad_token_id: Option<u32>,
+    // --- Gemma 4 generation fields ---
+    /// Layers `num_hidden_layers - num_kv_shared_layers ..` reuse the K/V of the
+    /// last non-shared layer of the same attention type.
+    #[serde(default)]
+    pub num_kv_shared_layers: usize,
+    /// Shared layers use an MLP with twice the intermediate size.
+    #[serde(default)]
+    pub use_double_wide_mlp: bool,
+    /// Head dim of the full-attention layers (sliding layers use `head_dim`).
+    #[serde(default)]
+    pub global_head_dim: Option<usize>,
+    /// KV heads of the full-attention layers (only when `attention_k_eq_v`).
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
+    /// Vocabulary of the per-layer token table (`embed_tokens_per_layer`).
+    #[serde(default)]
+    pub vocab_size_per_layer_input: usize,
+    /// `tanh(logits / c) * c` on the output logits.
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f64>,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    /// `"all"` disables causal masking (EmbeddingGemma 2 style).
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<String>,
+    /// Full layers derive V from the raw `k_proj` output through `v_norm`.
+    #[serde(default)]
+    pub attention_k_eq_v: bool,
 }
 
 impl TextConfig {

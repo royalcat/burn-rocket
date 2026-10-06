@@ -114,6 +114,20 @@ Build: `cargo build --release -p rocket-inference-gemma --no-default-features`
 torch/torchvision CPU wheels). Board deploy at `/root/rocket-inference-gemma/`
 (aarch64 `--features npu` build; model at `/root/models/embeddinggemma-2/`).
 
+Generation round (2026-10-07, log §11): `gen` / `serve-chat` run
+`google/gemma-4-E2B-it` (10.25 GB BF16, `/mnt/hub/models/gemma-4-E2B-it`) with a
+causal Gemma 4 decoder: KV sharing (layers 15-34 reuse layer 13/14 K/V, double-
+wide MLPs), PLE with the token table, proportional p-RoPE on full layers,
+soft-capped tied LM head, `<|turn>` chat template. Greedy output is
+**token-identical to HF 5.19** on a short question, a system+user prompt, a
+multi-turn chat and a 631-token prompt; the template renders token-exactly.
+Loading streams each tensor to its final dtype (f16 tables, f32 projections by
+default; `--f16` = 8.9 GiB/3.5 tok/s decode, `--quant q8` = 7.3 GiB but 0.09
+tok/s because flex has no int8 GEMM and `lin` dequantizes per call). f32 =
+12.5 GiB/2.8 tok/s and is the parity mode; `serve-chat` is a non-streaming
+OpenAI `/v1/chat/completions`. Not yet done: multimodal prefill, NPU prefill
+offload, streaming.
+
 NPU round (2026-10-07, log §9): the `npu` feature packs all 218 text projections
 into resident fp16 NPU weights (0.25 GiB; registered by `ParamId`, `lin()`
 routes them to `burn_rocket::matmul`) and runs attention on the NPU through the

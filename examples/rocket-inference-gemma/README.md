@@ -129,6 +129,53 @@ reference (transformers 5.19, f32):
 | any modality, `--quant q8` | 0.9996-0.9999 |
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
 
+Text generation (`gemma-4-E2B-it`, greedy) is **token-identical** to the HF 5.19
+reference on: a 16-token question, a system+user prompt, a multi-turn
+conversation and a 631-token prompt (16 generated tokens each). The chat
+template renders token-exactly for the same cases (system, multi-turn,
+`enable_thinking`).
+
+## Text generation (Gemma 4 E2B-it)
+
+The same crate generates text with `google/gemma-4-E2B-it` (10.25 GB BF16
+checkpoint): the causal Gemma 4 decoder with KV sharing (layers 15-34 reuse the
+K/V of layer 13/14 and use double-wide MLPs), per-layer embeddings with the
+token table, proportional p-RoPE on the full layers and a soft-capped tied LM
+head. Output is token-identical to the HF 5.19 reference (see the log).
+
+```sh
+# model files (10.25 GB)
+mkdir -p ~/models/gemma-4-E2B-it && cd ~/models/gemma-4-E2B-it
+base=https://huggingface.co/google/gemma-4-E2B-it/resolve/main
+for f in config.json generation_config.json model.safetensors processor_config.json \
+         tokenizer.json tokenizer_config.json chat_template.jinja; do curl -sLO "$base/$f"; done
+
+# greedy generation (f32 parity mode)
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it --text "What is the capital of France?" \
+    --max-new-tokens 64
+# chat-style messages and sampling
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it \
+    --messages '[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}]' \
+    --sample --temperature 0.7 --top-k 64 --top-p 0.95
+# non-streaming OpenAI-compatible server
+$B serve-chat --gen-model-dir ~/models/gemma-4-E2B-it --port 8391
+curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+```
+
+Precision modes (`gen`/`serve-chat`), measured on the dev host (32 threads,
+16-token prompt / 9-token answer):
+
+| mode | flags | resident | decode | notes |
+|---|---|---|---|---|
+| f32 (default) | - | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
+| f16 | `--f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** (631-token case flipped a near-tie) |
+| Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call, which dominates decode (flex has no int8 GEMM) |
+
+Prefill is compute-bound (631 tokens: 7.5 s f32, 11.3 s f16); decode is
+memory-bandwidth-bound (f32 reads 17 GB of weights per token). The chat server
+is non-streaming and takes OpenAI-style `messages` (string or text-part content).
+
 ## NPU offload (aarch64)
 
 The `npu` feature (RK3588, `librocketnpu` from the root `burn-rocket` crate)

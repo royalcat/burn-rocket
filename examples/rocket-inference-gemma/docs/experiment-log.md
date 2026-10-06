@@ -242,7 +242,60 @@ JPEG), with an audio-path failure. The CLI now rejects `--dtype f16` with a
 clear message. A real low-RAM mode needs Q8-resident weights dequantized per
 forward (the `rocket-inference` `--quant q8` pattern), not f16.
 
-## 11. Deferred
+## 11. Gemma 4 E2B-it text generation (2026-10-07)
+
+Target: `google/gemma-4-E2B-it` (10.25 GB BF16, 5.12B params: ~4.3B text of
+which 2.35B is the PLE token table, plus the round-1 vision/audio towers).
+Reference: transformers 5.19.0 (bf16) with the checkpoint's chat template and
+greedy decoding; the checkpoint was built with 5.5.0.dev0 and its KV-sharing
+path was reworked since, so the pinned reference is the gate.
+
+Architecture (all verified against the config and 5.19 source):
+
+- 35 causal layers, hidden 1536, 8 q heads, 1 KV head, head_dim 256 (sliding,
+  window 512) / 512 (full layers at 4, 9, ..., 34), attention scale 1.0;
+- layers 15-34 **share K/V** with the last non-shared layer of their type
+  (13 sliding, 14 full) and use double-wide (12288) MLPs; their k/v weights are
+  present in the checkpoint but ignored;
+- PLE: `embed_tokens_per_layer` [262144, 8960] x sqrt(256), blended with the
+  context projection as `(norm(ctx) + token) / sqrt(2)`;
+- full layers use proportional p-RoPE (partial factor 0.25: 64 of 256
+  frequencies, tail zero); sliding layers use default RoPE (theta 1e4);
+- tied LM head, `tanh(logits / 30) * 30` soft cap, eos [1, 106, 50];
+- chat template `<bos><|turn>role\n...<turn|>\n...<|turn>model\n`, optional
+  `<|think|>`.
+
+Verification (dev host, f32, greedy):
+
+| case | prompt tokens | generated | vs HF |
+|---|---|---|---|
+| `What is the capital of France?` | 16 | 9 | identical ids |
+| system + user (`Name three colors.`) | 24 | 24 | identical ids |
+| multi-turn (2+2) | 34 | 9 | identical ids |
+| 631-token document | 631 | 16 | identical ids |
+
+Template rendering is token-exact for system, multi-turn and `enable_thinking`
+cases. The chat server returns the same text and usage counts as the reference.
+
+Loading (the checkpoint does not fit as f32: 20.5 GB of weights plus the mmap):
+a store adapter converts each tensor to its final dtype while it is applied —
+the two token tables become f16 (exact: bf16 sources have fewer mantissa bits),
+projections stay f32 by default, and `--f16`/`--quant q8` select f16 or Q8_0.
+The tied LM head is materialized once as a transposed copy for the logits path.
+
+| mode | resident | load | prefill (631 tok) | decode |
+|---|---|---|---|---|
+| f32 | 12494 MiB | 30 s | 7.5 s | 2.2-2.8 tok/s |
+| `--f16` | 8923 MiB | 20 s | 11.3 s | 3.5 tok/s (short), 1.9 tok/s (631-token context) |
+| `--quant q8` | 7290 MiB | 17 s + 24 s quantize | 13.8 s | 0.09 tok/s |
+
+Notes: decode is memory-bandwidth-bound (f32 reads ~17 GB of weights per
+token); f16 is token-identical on the short and multi-turn cases but flipped a
+near-tie on the 631-token case, so f32 remains the parity mode; Q8 decode is
+dominated by flex's scalar per-call `dequantize` (flex has no int8 GEMM), so q8
+is a memory-only mode here.
+
+## 12. Deferred
 
 - Q8/low-RAM mode (the f32 resident model is 2.9 GB).
 - NPU offload of the text backbone (RK3588; needs a board round).
