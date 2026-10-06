@@ -34,7 +34,10 @@ pub mod ffi;
 pub mod ext;
 
 #[cfg(feature = "npu")]
-pub use ext::{Stats, WeightId, attention, init, matmul, pack, pack2, pack3, stats, stats_reset};
+pub use ext::{
+    Stats, WeightId, attention, attention_window, init, matmul, pack, pack2, pack3, stats,
+    stats_reset,
+};
 
 pub use half;
 use half::f16;

@@ -74,6 +74,20 @@ pub trait RocketOps: Backend {
         softcap: Option<f32>,
         is_causal: bool,
     ) -> FloatTensor<Self>;
+    /// Bidirectional windowed attention: position `t` attends to `j` iff
+    /// `|t - j| <= window`. `window < 0` disables the mask (full bidirectional).
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_window(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+    ) -> FloatTensor<Self>;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +182,9 @@ struct FaState {
     head_dim: usize,
     n: usize,
     mask: Vec<f16>, // [n][n] additive: 0 for j<=t, -inf otherwise
+    /// Cached bidirectional band mask for the current `n` (`usize::MAX` = none).
+    win: usize,
+    win_mask: Vec<f16>, // [n][n] additive: 0 for |t-j|<=win, -inf otherwise
     q: Vec<f16>,    // [n_head][n][head_dim]
     k: Vec<f16>,    // [n_kv][n][head_dim]
     v: Vec<f16>,    // [n_kv][head_dim][n]  (per-head transposed)
@@ -266,8 +283,36 @@ impl RocketOps for Flex {
         is_causal: bool,
     ) -> FloatTensor<Self> {
         attention_impl(
-            q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, is_causal,
+            q,
+            k,
+            v,
+            n_head,
+            n_kv_heads,
+            head_dim,
+            scale,
+            softcap,
+            if is_causal { MaskMode::Causal } else { MaskMode::None },
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_window(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+    ) -> FloatTensor<Self> {
+        let mode = if window < 0 {
+            MaskMode::None
+        } else {
+            MaskMode::Window(window as usize)
+        };
+        attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
     }
 }
 
@@ -387,6 +432,17 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
     })
 }
 
+/// Additive-mask selection for the NPU attention op.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaskMode {
+    /// Full bidirectional attention (no mask).
+    None,
+    /// Causal: `j <= t`.
+    Causal,
+    /// Symmetric band: `|t - j| <= window`.
+    Window(usize),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attention_impl(
     q: FlexTensor,
@@ -397,7 +453,7 @@ fn attention_impl(
     head_dim: usize,
     scale: f64,
     softcap: Option<f32>,
-    is_causal: bool,
+    mode: MaskMode,
 ) -> FlexTensor {
     let q_dims: Vec<usize> = q.shape().into();
     assert_eq!(q_dims.len(), 3, "NPU attention input must be [1, S, H*D]");
@@ -448,6 +504,8 @@ fn attention_impl(
                 head_dim,
                 n: 0,
                 mask: Vec::new(),
+                win: usize::MAX,
+                win_mask: Vec::new(),
                 q: Vec::new(),
                 k: Vec::new(),
                 v: Vec::new(),
@@ -458,6 +516,8 @@ fn attention_impl(
         if st.n != n {
             st.n = n;
             st.mask = build_causal_mask(n);
+            st.win = usize::MAX;
+            st.win_mask.clear();
             st.q = vec![f16::ZERO; n_head * n * head_dim];
             st.k = vec![f16::ZERO; n_kv * n * head_dim];
             st.v = vec![f16::ZERO; n_kv * head_dim * n];
@@ -465,9 +525,16 @@ fn attention_impl(
         }
 
         let t_conv = Instant::now();
+        if let MaskMode::Window(w) = mode {
+            if st.win != w {
+                st.win_mask = build_window_mask(n, w);
+                st.win = w;
+            }
+        }
         let FaState {
             fa,
             mask,
+            win_mask,
             q,
             k,
             v,
@@ -480,7 +547,11 @@ fn attention_impl(
         T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t_npu = Instant::now();
-        let mask = if is_causal { Some(&mask[..]) } else { None };
+        let mask = match mode {
+            MaskMode::None => None,
+            MaskMode::Causal => Some(&mask[..]),
+            MaskMode::Window(_) => Some(&win_mask[..]),
+        };
         fa.flash_attn(
             n,
             n,
@@ -571,6 +642,34 @@ pub fn attention<const D: usize>(
     ))
 }
 
+/// Bidirectional windowed grouped-query attention on the NPU: position `t`
+/// attends to `j` iff `|t - j| <= window` (`window < 0` = no mask). Same input
+/// layout as [`attention`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_window<const D: usize>(
+    q: Tensor<D>,
+    k: Tensor<D>,
+    v: Tensor<D>,
+    n_head: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    softcap: Option<f32>,
+    window: i64,
+) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_window(
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
+        n_head,
+        n_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        window,
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Conversions and layouts (rayon-parallel)
 // ---------------------------------------------------------------------------
@@ -603,6 +702,24 @@ fn f16_to_f32_par(src: &[f16]) -> Vec<f32> {
             }
         });
     out
+}
+
+/// Symmetric band additive mask: `mask[t][j] = 0` for `|t - j| <= window`,
+/// `-inf` otherwise.
+fn build_window_mask(n: usize, window: usize) -> Vec<f16> {
+    use rayon::prelude::*;
+    let mut mask = vec![f16::ZERO; n * n];
+    mask.par_chunks_mut(n).enumerate().for_each(|(t, row)| {
+        let lo = t.saturating_sub(window);
+        let hi = (t + window + 1).min(n);
+        for m in row[..lo].iter_mut() {
+            *m = f16::NEG_INFINITY;
+        }
+        for m in row[hi..].iter_mut() {
+            *m = f16::NEG_INFINITY;
+        }
+    });
+    mask
 }
 
 /// Causal additive mask: `mask[t][j] = 0` for `j <= t`, `-inf` otherwise.

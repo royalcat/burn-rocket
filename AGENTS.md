@@ -91,8 +91,38 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `examples/rocket-inference/data/` | bench/embedding fixtures (`bench_text.txt`) |
 | `examples/rocket-inference/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
+| `examples/rocket-inference-gemma/` | EmbeddingGemma 2 multimodal example (text/image/video/audio embeddings, OpenAI-compatible + multimodal server, `--quant q8`, NPU text backbone); layout, flags and deploy in its `README.md`, measurements in `docs/experiment-log.md` |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
+
+## EmbeddingGemma 2 example (`examples/rocket-inference-gemma`)
+
+Full multimodal inference for `google/embeddinggemma-2` (Gemma 4 towers): text,
+image, video and audio embeddings, plus an OpenAI-compatible server
+(`/v1/embeddings` + native multimodal `/embed`). Verified against the HF f32
+reference (transformers 5.19) — see
+`examples/rocket-inference-gemma/docs/experiment-log.md`: all modalities
+cosine 1.00000000 (JPEG decode via mozjpeg = libjpeg-turbo parity; the resize
+is a bit-exact port of ATen's antialiased bicubic uint8 kernel). `--quant q8`
+keeps Q8-resident projections (1216 MiB vs 2845 MiB resident) at 0.9996-0.9999
+cosine; f16 is numerically broken (rejected). Dev-host throughput: 2587-token
+text 8.0 s (~322 tok/s), image 0.70 s, 5 s audio 0.34 s.
+
+Build: `cargo build --release -p rocket-inference-gemma --no-default-features`
+(flex). Model `/mnt/hub/models/embeddinggemma-2`, reference venv
+`/mnt/hub/venvs/emb2` (transformers 5.19 + sentence-transformers 6.1,
+torch/torchvision CPU wheels). Board deploy at `/root/rocket-inference-gemma/`
+(aarch64 `--features npu` build; model at `/root/models/embeddinggemma-2/`).
+
+NPU round (2026-10-07, log §9): the `npu` feature packs all 218 text projections
+into resident fp16 NPU weights (0.25 GiB; registered by `ParamId`, `lin()`
+routes them to `burn_rocket::matmul`) and runs attention on the NPU through the
+new `burn_rocket::attention_window` band-mask op. `--npu` combines with
+`--quant q8` (validated deployment config). Board (4 A76 threads, 2587-token
+text, busy board): q8 CPU 34.5 s / 94 s user CPU -> q8+npu 21.4 s / 63 s
+(1.61x faster, 33 % less CPU); numerics vs HF f32 0.9996-0.9999 (text/image/
+audio), 0.9992 (video). Not yet done: f32 `--npu` on the board, NPU offload for
+the vision/audio towers, 8k-context NPU attention memory.
 
 ## Rebuild + deploy to the board
 
@@ -106,6 +136,23 @@ scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rocket-inference \
 # the bench needs data/ relative to the deploy dir
 scp -r examples/rocket-inference/data root@rock-5b-plus.lan:/root/rocket-inference/
 # CPU-only build: drop --features npu (binary name is the same)
+```
+
+EmbeddingGemma 2 example (same pattern; the model is ~1.5 GB, copy it once):
+
+```sh
+cargo build --release -p rocket-inference-gemma --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu
+ssh root@rock-5b-plus.lan 'mkdir -p /root/rocket-inference-gemma /root/models/embeddinggemma-2'
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rocket-inference-gemma \
+    root@rock-5b-plus.lan:/root/rocket-inference-gemma/
+scp -r examples/rocket-inference-gemma/data root@rock-5b-plus.lan:/root/rocket-inference-gemma/
+scp /mnt/hub/models/embeddinggemma-2/{model.safetensors,config.json,tokenizer.json,tokenizer.model,\
+tokenizer_config.json,preprocessor_config.json,processor_config.json,config_sentence_transformers.json} \
+    root@rock-5b-plus.lan:/root/models/embeddinggemma-2/
+# board run (lowest-memory config; the board must be idle for meaningful A/B numbers)
+taskset -c 4-7 /root/rocket-inference-gemma/rocket-inference-gemma bench \
+    --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
 ```
 
 The binary is self-contained (`librocketnpu` is statically linked); the model lives at
@@ -188,7 +235,10 @@ example's `src/model.rs` (`stage_stats`).
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
   one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
-  serialize.
+  serialize. `attention_window(q, k, v, h, kv, d, scale, softcap, window)` (added
+  2026-10-07 for EmbeddingGemma 2) applies a bidirectional band mask
+  (`|q - kv| <= window`; `window < 0` = no mask); both attention ops cache their
+  `[n, n]` f16 mask per sequence length in the engine.
 - `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
   f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
   attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (within ~1 s on

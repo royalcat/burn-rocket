@@ -24,6 +24,11 @@ driver.
   let out = burn_rocket::attention(
       q, k, v, 16, 8, 128, scale, None, true,  // n_head, n_kv_heads, head_dim, scale, softcap, causal
   );
+
+  // bidirectional band attention (encoders): |q - kv| <= window, window < 0 = no mask
+  let out = burn_rocket::attention_window(
+      q, k, v, 4, 2, 256, 1.0, None, 512,
+  );
   ```
 
   `pack`/`pack2`/`pack3` consume f32 CPU weights and keep fp16 resident copies in NPU
@@ -84,6 +89,14 @@ Qwen3.5-0.8B intent/query-planner model (`gen`, `serve-ollama`; Ollama-compatibl
 path (the CPU path remains ~2.3× slower than the production `ik_llama.cpp` Q8_0 server);
 the intent model is token-identical to the HF reference and runs a 166-token v7 planner
 prompt in 11.7 s with `--npu` (89.9 s CPU-only, 7.7× wall).
+
+[`examples/rocket-inference-gemma`](examples/rocket-inference-gemma) is a second,
+multimodal app: EmbeddingGemma 2 (text, image, video and audio embeddings, plus an
+OpenAI-compatible `/v1/embeddings` and a native multimodal `/embed`), with all
+modalities matching the HF f32 reference (cosine 1.0; `--quant q8` gives 0.9996-0.9999
+at 1216 MiB resident). Its text backbone runs on the NPU: 218 projections packed into
+0.25 GiB of resident fp16 weights plus windowed attention, for 1.61x wall and -33 %
+user CPU vs the CPU baseline on the board (2587-token text).
 
 ## License
 

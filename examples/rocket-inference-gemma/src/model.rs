@@ -1,0 +1,770 @@
+//! EmbeddingGemma 2 text backbone: an adapted, bidirectional Gemma 4 decoder
+//! (Burn, inference only). P1 implements the text/code path; the Gemma 4 vision
+//! and audio towers land in later modules.
+//!
+//! Reference: HF `transformers/models/embedding_gemma2/modeling_embedding_gemma2.py`.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+use burn::module::Param;
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
+use burn::prelude::*;
+use burn::tensor::activation::{gelu_approximate, softmax};
+use burn::tensor::{DType, Int, s};
+
+use crate::audio::AudioTower;
+use crate::audio_frontend::{AudioFeatures, subsample_mask};
+use crate::config::{AudioConfig, TextConfig, VisionConfig};
+use crate::layers::{ClipBounds, lin};
+use crate::media::PreparedImage;
+use crate::vision::{MultimodalEmbedder, VisionTower};
+use std::collections::HashMap;
+
+/// Bias-free linear (all projections in this checkpoint family have no bias).
+pub(crate) fn linear_cfg(in_features: usize, out_features: usize) -> LinearConfig {
+    LinearConfig::new(in_features, out_features).with_bias(false)
+}
+
+// ---------------------------------------------------------------------------
+// Stage timers (attention / mlp / norms / per-layer embeddings), microseconds.
+// ---------------------------------------------------------------------------
+
+static T_ATTN_US: AtomicU64 = AtomicU64::new(0);
+static T_MLP_US: AtomicU64 = AtomicU64::new(0);
+static T_NORM_US: AtomicU64 = AtomicU64::new(0);
+static T_PLE_US: AtomicU64 = AtomicU64::new(0);
+
+/// `(attention_s, mlp_s, norms_s, ple_s)` accumulated since the last reset.
+pub fn stage_stats() -> (f64, f64, f64, f64) {
+    (
+        T_ATTN_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_MLP_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_NORM_US.load(Ordering::Relaxed) as f64 / 1e6,
+        T_PLE_US.load(Ordering::Relaxed) as f64 / 1e6,
+    )
+}
+
+pub fn stage_stats_reset() {
+    T_ATTN_US.store(0, Ordering::Relaxed);
+    T_MLP_US.store(0, Ordering::Relaxed);
+    T_NORM_US.store(0, Ordering::Relaxed);
+    T_PLE_US.store(0, Ordering::Relaxed);
+}
+
+/// Per-layer attention geometry, resolved from `layer_types` + `per_layer_config`.
+#[derive(Debug, Clone)]
+pub struct LayerSpec {
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub sliding: bool,
+}
+
+/// Plain-data model spec (kept out of the module tree).
+#[derive(Debug, Clone)]
+pub struct TextSpec {
+    pub hidden_size: usize,
+    pub embedding_dim: usize,
+    pub ple_dim: usize,
+    pub num_layers: usize,
+    pub eps: f64,
+    pub sliding_window: usize,
+    pub sliding_theta: f64,
+    pub full_theta: f64,
+    pub layers: Vec<LayerSpec>,
+}
+
+impl TextSpec {
+    pub fn from_config(cfg: &TextConfig) -> Self {
+        let types = cfg.layer_types();
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|i| {
+                let ov = cfg.layer_override(i);
+                LayerSpec {
+                    head_dim: ov.head_dim.unwrap_or_else(|| cfg.head_dim()),
+                    n_heads: cfg.num_attention_heads,
+                    n_kv_heads: ov.num_key_value_heads.unwrap_or(cfg.num_key_value_heads),
+                    sliding: types[i] == "sliding_attention",
+                }
+            })
+            .collect();
+        let sliding_theta = cfg
+            .rope_parameters
+            .sliding_attention
+            .as_ref()
+            .and_then(|r| r.rope_theta)
+            .unwrap_or(10_000.0);
+        let full_theta = cfg
+            .rope_parameters
+            .full_attention
+            .as_ref()
+            .and_then(|r| r.rope_theta)
+            .unwrap_or(1_000_000.0);
+        Self {
+            hidden_size: cfg.hidden_size,
+            embedding_dim: cfg.embedding_dim,
+            ple_dim: cfg.hidden_size_per_layer_input,
+            num_layers: cfg.num_hidden_layers,
+            eps: cfg.rms_norm_eps,
+            sliding_window: cfg.sliding_window,
+            sliding_theta,
+            full_theta,
+            layers,
+        }
+    }
+}
+
+/// Precomputed RoPE cos/sin table `[max_seq, head_dim / 2]` (GPT-NeoX rotate-half
+/// layout: `cos = cat([f, f])`, pairs are the two halves of the head).
+pub struct RopeTable {
+    cos: Tensor<2>,
+    sin: Tensor<2>,
+    half: usize,
+}
+
+impl RopeTable {
+    pub fn new(max_seq: usize, head_dim: usize, theta: f64, dtype: DType, device: &Device) -> Self {
+        let half = head_dim / 2;
+        let inv_freq: Vec<f32> = (0..half)
+            .map(|i| (1.0 / theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
+            .collect();
+        let mut cos = Vec::with_capacity(max_seq * half);
+        let mut sin = Vec::with_capacity(max_seq * half);
+        for pos in 0..max_seq {
+            for f in &inv_freq {
+                let angle = pos as f32 * *f;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+        }
+        let cos =
+            Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
+        let sin =
+            Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
+        Self { cos, sin, half }
+    }
+
+    /// Applies RoPE to `x` of shape `[batch, seq, heads, head_dim]`.
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        let [_, s, _, d] = x.dims();
+        let half = self.half;
+        let cos = self
+            .cos
+            .clone()
+            .slice(s![0..s, ..])
+            .reshape([1, s, 1, half])
+            .cast(x.dtype());
+        let sin = self
+            .sin
+            .clone()
+            .slice(s![0..s, ..])
+            .reshape([1, s, 1, half])
+            .cast(x.dtype());
+        let x1 = x.clone().slice(s![.., .., .., 0..half]);
+        let x2 = x.slice(s![.., .., .., half..d]);
+        let o1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
+        let o2 = x2 * cos + x1 * sin;
+        Tensor::cat(vec![o1, o2], 3)
+    }
+}
+
+/// `x * (mean(x^2) + eps)^-0.5` on the last dim, computed in the input dtype
+/// (f32 in practice); used for value norms, which carry no scale.
+pub(crate) fn rms_norm_noscale<const D: usize>(x: Tensor<D>, eps: f64) -> Tensor<D> {
+    let ms = x.clone().square().mean_dim(D - 1);
+    x * (ms + eps).powf_scalar(-0.5)
+}
+
+/// GQA expansion: `[B, KV, S, D] -> [B, KV * n, S, D]`.
+pub(crate) fn repeat_kv(x: Tensor<4>, n: usize) -> Tensor<4> {
+    if n == 1 {
+        return x;
+    }
+    let [b, kv, s, d] = x.dims();
+    x.unsqueeze_dim::<5>(2).repeat_dim(2, n).reshape([b, kv * n, s, d])
+}
+
+/// Bidirectional attention with an optional symmetric sliding window
+/// (`|q - kv| <= window`), chunked over queries to bound the score scratch.
+/// `q`, `k`, `v` are `[B, H, S, D]` with `k`/`v` already GQA-repeated; the
+/// attention scale is 1.0 (QK-RMSNorm replaces it).
+pub(crate) fn chunked_attention(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    window: Option<usize>,
+    chunk: usize,
+) -> Tensor<4> {
+    let [b, h, s, _d] = q.dims();
+    let chunk = chunk.max(1);
+    let device = q.device();
+    let dt = q.dtype();
+    let mut outs: Vec<Tensor<4>> = Vec::new();
+    let mut q0 = 0;
+    while q0 < s {
+        let q1 = (q0 + chunk).min(s);
+        let (k0, k1) = match window {
+            Some(w) => (q0.saturating_sub(w), (q1 + w).min(s)),
+            None => (0, s),
+        };
+        let qc = q.clone().slice(s![.., .., q0..q1, ..]);
+        let kc = k.clone().slice(s![.., .., k0..k1, ..]);
+        let vc = v.clone().slice(s![.., .., k0..k1, ..]);
+
+        let mut sc = qc.matmul(kc.swap_dims(2, 3));
+        if sc.dtype() != DType::F32 {
+            sc = sc.cast(DType::F32);
+        }
+        if let Some(w) = window {
+            let rows =
+                Tensor::arange(q0 as i64..q1 as i64, &device).reshape([1, 1, q1 - q0, 1]);
+            let cols =
+                Tensor::arange(k0 as i64..k1 as i64, &device).reshape([1, 1, 1, k1 - k0]);
+            let w = w as i64;
+            let keep = cols
+                .clone()
+                .lower_equal(rows.clone() + w)
+                .bool_and(rows.lower_equal(cols + w));
+            let fill = keep.bool_not().expand([b, h, q1 - q0, k1 - k0]);
+            sc = sc.mask_fill(fill, f32::NEG_INFINITY);
+        }
+        let p = softmax(sc, 3);
+        let p = if dt == DType::F32 { p } else { p.cast(dt) };
+        outs.push(p.matmul(vc));
+        q0 = q1;
+    }
+    Tensor::cat(outs, 2)
+}
+
+#[derive(Module, Debug)]
+pub struct TextAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
+    /// Set in `--npu --npu-attn npu` mode: attention runs on the RK3588 NPU.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    #[module(skip)]
+    npu_attn: bool,
+}
+
+impl TextAttention {
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        rope: &RopeTable,
+        spec: &LayerSpec,
+        sliding_window: usize,
+        eps: f64,
+        chunk: usize,
+    ) -> Tensor<3> {
+        let [b, s, _] = x.dims();
+        let (h, kv, d) = (spec.n_heads, spec.n_kv_heads, spec.head_dim);
+        let q = lin(&self.q_proj, x.clone()).reshape([b, s, h, d]);
+        let k = lin(&self.k_proj, x.clone()).reshape([b, s, kv, d]);
+        let v = lin(&self.v_proj, x).reshape([b, s, kv, d]);
+
+        let q = rope.apply(self.q_norm.forward(q));
+        let k = rope.apply(self.k_norm.forward(k));
+        let v = rms_norm_noscale(v, eps);
+
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if self.npu_attn {
+            // NPU attention takes the [1, S, H*D] layout; sliding layers get the
+            // symmetric band mask, full layers no mask.
+            let window = if spec.sliding { sliding_window as i64 } else { -1 };
+            let o = burn_rocket::attention_window(
+                q.reshape([b, s, h * d]),
+                k.reshape([b, s, kv * d]),
+                v.reshape([b, s, kv * d]),
+                h,
+                kv,
+                d,
+                1.0,
+                None,
+                window,
+            );
+            return lin(&self.o_proj, o);
+        }
+
+        let q = q.swap_dims(1, 2);
+        let k = repeat_kv(k.swap_dims(1, 2), h / kv);
+        let v = repeat_kv(v.swap_dims(1, 2), h / kv);
+        let window = spec.sliding.then_some(sliding_window);
+        let o = chunked_attention(q, k, v, window, chunk);
+        let o = o.swap_dims(1, 2).reshape([b, s, h * d]);
+        lin(&self.o_proj, o)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TextMlp {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
+}
+
+impl TextMlp {
+    fn new(cfg: &TextConfig, device: &Device) -> Self {
+        Self {
+            gate_proj: linear_cfg(cfg.hidden_size, cfg.intermediate_size).init(device),
+            up_proj: linear_cfg(cfg.hidden_size, cfg.intermediate_size).init(device),
+            down_proj: linear_cfg(cfg.intermediate_size, cfg.hidden_size).init(device),
+        }
+    }
+
+    fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let gate = gelu_approximate(lin(&self.gate_proj, x.clone()));
+        let up = lin(&self.up_proj, x);
+        lin(&self.down_proj, gate * up)
+    }
+}
+
+/// The third residual sub-block of a decoder layer: gate the per-layer embedding
+/// slice into the residual stream.
+#[derive(Module, Debug)]
+pub struct TextPleBlock {
+    per_layer_input_gate: Linear,
+    per_layer_projection: Linear,
+    post_per_layer_input_norm: RmsNorm,
+}
+
+impl TextPleBlock {
+    fn new(cfg: &TextConfig, device: &Device) -> Self {
+        Self {
+            per_layer_input_gate: linear_cfg(cfg.hidden_size, cfg.hidden_size_per_layer_input)
+                .init(device),
+            per_layer_projection: linear_cfg(cfg.hidden_size_per_layer_input, cfg.hidden_size)
+                .init(device),
+            post_per_layer_input_norm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(cfg.rms_norm_eps)
+                .init(device),
+        }
+    }
+
+    /// Returns the PLE contribution (residual add and `layer_scalar` are applied
+    /// by the caller, matching the reference).
+    fn forward(&self, x: Tensor<3>, per_layer_input: Tensor<3>) -> Tensor<3> {
+        let h = gelu_approximate(lin(&self.per_layer_input_gate, x));
+        let h = h * per_layer_input;
+        let h = lin(&self.per_layer_projection, h);
+        self.post_per_layer_input_norm.forward(h)
+    }
+}
+
+/// Projection-only per-layer embeddings (no token-identity table in
+/// EmbeddingGemma 2).
+#[derive(Module, Debug)]
+pub struct TextPle {
+    per_layer_model_projection: Linear,
+    per_layer_projection_norm: RmsNorm,
+}
+
+impl TextPle {
+    fn new(cfg: &TextConfig, device: &Device) -> Self {
+        Self {
+            per_layer_model_projection: linear_cfg(
+                cfg.hidden_size,
+                cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
+            )
+            .init(device),
+            per_layer_projection_norm: RmsNormConfig::new(cfg.hidden_size_per_layer_input)
+                .with_epsilon(cfg.rms_norm_eps)
+                .init(device),
+        }
+    }
+
+    /// `[B, S, hidden] -> [B, S, num_layers, ple_dim]`.
+    fn forward(&self, x: Tensor<3>, spec: &TextSpec) -> Tensor<4> {
+        let [b, s, _] = x.dims();
+        let scale = (spec.hidden_size as f64).powf(-0.5);
+        let p = lin(&self.per_layer_model_projection, x).mul_scalar(scale);
+        let p = p.reshape([b, s, spec.num_layers, spec.ple_dim]);
+        self.per_layer_projection_norm.forward(p)
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TextLayer {
+    input_layernorm: RmsNorm,
+    self_attn: TextAttention,
+    post_attention_layernorm: RmsNorm,
+    pre_feedforward_layernorm: RmsNorm,
+    mlp: TextMlp,
+    post_feedforward_layernorm: RmsNorm,
+    ple_block: TextPleBlock,
+    layer_scalar: Param<Tensor<1>>,
+}
+
+impl TextLayer {
+    /// `cfg` must be the *per-layer resolved* geometry (head_dim / kv heads of
+    /// this layer), as reported by `TextSpec::layers[i]`.
+    fn new(cfg: &TextConfig, spec: &LayerSpec, device: &Device) -> Self {
+        let h = spec.n_heads;
+        let kv = spec.n_kv_heads;
+        let d = spec.head_dim;
+        let eps = cfg.rms_norm_eps;
+        Self {
+            input_layernorm: RmsNormConfig::new(cfg.hidden_size).with_epsilon(eps).init(device),
+            self_attn: TextAttention {
+                q_proj: linear_cfg(cfg.hidden_size, h * d).init(device),
+                k_proj: linear_cfg(cfg.hidden_size, kv * d).init(device),
+                v_proj: linear_cfg(cfg.hidden_size, kv * d).init(device),
+                o_proj: linear_cfg(h * d, cfg.hidden_size).init(device),
+                q_norm: RmsNormConfig::new(d).with_epsilon(eps).init(device),
+                k_norm: RmsNormConfig::new(d).with_epsilon(eps).init(device),
+                #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+                npu_attn: false,
+            },
+            post_attention_layernorm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(eps)
+                .init(device),
+            pre_feedforward_layernorm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(eps)
+                .init(device),
+            mlp: TextMlp::new(cfg, device),
+            post_feedforward_layernorm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(eps)
+                .init(device),
+            ple_block: TextPleBlock::new(cfg, device),
+            layer_scalar: Param::from_tensor(Tensor::ones([1], device)),
+        }
+    }
+
+    fn forward(
+        &self,
+        x: Tensor<3>,
+        ple_i: Tensor<3>,
+        rope: &RopeTable,
+        spec: &LayerSpec,
+        sliding_window: usize,
+        eps: f64,
+        chunk: usize,
+    ) -> Tensor<3> {
+        let residual = x.clone();
+        let t = Instant::now();
+        let h = self.input_layernorm.forward(x);
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
+        let h = self
+            .self_attn
+            .forward(h, rope, spec, sliding_window, eps, chunk);
+        T_ATTN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
+        let h = self.post_attention_layernorm.forward(h);
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let x = residual + h;
+
+        let residual = x.clone();
+        let t = Instant::now();
+        let h = self.pre_feedforward_layernorm.forward(x);
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
+        let h = self.mlp.forward(h);
+        T_MLP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        let t = Instant::now();
+        let h = self.post_feedforward_layernorm.forward(h);
+        T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let x = residual + h;
+
+        let t = Instant::now();
+        let residual = x.clone();
+        let h = self.ple_block.forward(x, ple_i);
+        T_PLE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let x = residual + h;
+        x * self.layer_scalar.val().reshape([1, 1, 1])
+    }
+}
+
+#[derive(Module, Debug)]
+pub struct TextModel {
+    embed_tokens: Embedding,
+    ple: TextPle,
+    layers: Vec<TextLayer>,
+    norm: RmsNorm,
+    embedding_projection: Linear,
+    #[module(skip)]
+    spec: TextSpec,
+}
+
+/// Root of the checkpoint module tree: keys are prefixed `language_model.*`
+/// (the vision tower is added by `vision.rs`).
+#[derive(Module, Debug)]
+pub struct Emb2Model {
+    language_model: TextModel,
+    vision_tower: VisionTower,
+    embed_vision: MultimodalEmbedder,
+    audio_tower: AudioTower,
+    embed_audio: MultimodalEmbedder,
+}
+
+impl Emb2Model {
+    pub fn new(
+        text_cfg: &TextConfig,
+        vision_cfg: &VisionConfig,
+        audio_cfg: &AudioConfig,
+        audio_bounds: &HashMap<String, ClipBounds>,
+        device: &Device,
+    ) -> Self {
+        let text_hidden = text_cfg.hidden_size;
+        let vision_hidden = vision_cfg.hidden_size;
+        let audio_dims = audio_cfg.output_proj_dims;
+        Self {
+            language_model: TextModel::new(text_cfg, device),
+            vision_tower: VisionTower::new(vision_cfg, device),
+            embed_vision: MultimodalEmbedder::new(
+                vision_hidden,
+                text_hidden,
+                device,
+            ),
+            audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
+            embed_audio: MultimodalEmbedder::new(audio_dims, text_hidden, device),
+        }
+    }
+
+    pub fn text(&self) -> &TextModel {
+        &self.language_model
+    }
+
+    pub fn text_mut(&mut self) -> &mut TextModel {
+        &mut self.language_model
+    }
+
+    pub fn vision(&self) -> &VisionTower {
+        &self.vision_tower
+    }
+
+    /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
+    pub fn encode_image(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
+        let pooled = self.vision_tower.forward(img, chunk, None);
+        self.embed_vision
+            .forward(pooled, self.vision_tower.spec().eps)
+    }
+
+    /// Soft tokens for one audio clip: `[num_valid_soft_tokens, text_hidden]`
+    /// (invalid frames are dropped, matching the reference).
+    pub fn encode_audio(&self, feats: &AudioFeatures) -> Tensor<2> {
+        self.encode_audio_debug(feats, None)
+    }
+
+    pub fn encode_audio_debug(
+        &self,
+        feats: &AudioFeatures,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        let h = self.audio_tower.forward_debug(feats, debug_dir);
+        let device = h.device();
+        let (m1, _) = subsample_mask(&feats.mask);
+        let (m2, _) = subsample_mask(&m1);
+        let keep: Vec<i64> = m2
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v)
+            .map(|(i, _)| i as i64)
+            .collect();
+        let n = keep.len();
+        let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
+        let h = h.select(0, idx);
+        self.embed_audio.forward(h, self.audio_tower.spec().eps)
+    }
+
+    /// The vision tower's pooled features before `embed_vision` (debug).
+    pub fn vision_tower_features(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        self.vision_tower.forward(img, chunk, debug_dir)
+    }
+
+    /// Mean-pooled embedding of `input_ids`, with optional image soft tokens
+    /// scattered into the positions listed in `soft`.
+    pub fn embed_ids(
+        &self,
+        input_ids: Tensor<2, Int>,
+        rope: &TextRope,
+        chunk: usize,
+        soft: Option<(Vec<usize>, Tensor<2>)>,
+    ) -> Tensor<2> {
+        let [b, s] = input_ids.dims();
+        let d = self.language_model.spec().hidden_size;
+        let dim = self.language_model.embedding_dim();
+        let device = input_ids.device();
+        let mut x = self.language_model.embed_tokens_scaled(input_ids);
+        if let Some((positions, tokens)) = soft {
+            let dtype = x.dtype();
+            let mut data: Vec<f32> = x
+                .cast(DType::F32)
+                .into_data()
+                .try_to_vec()
+                .expect("embeddings f32");
+            let values: Vec<f32> = tokens
+                .cast(DType::F32)
+                .into_data()
+                .try_to_vec()
+                .expect("soft tokens f32");
+            let dd = values.len() / positions.len().max(1);
+            for (i, &pos) in positions.iter().enumerate() {
+                data[pos * d..pos * d + dd].copy_from_slice(&values[i * dd..(i + 1) * dd]);
+            }
+            x = Tensor::<3>::from_data(TensorData::new(data, [b, s, d]), &device).cast(dtype);
+        }
+        let h = self.language_model.forward_embeds(x, rope, chunk);
+        h.mean_dim(1).reshape([b, dim])
+    }
+}
+
+impl TextModel {
+    pub fn new(cfg: &TextConfig, device: &Device) -> Self {
+        let spec = TextSpec::from_config(cfg);
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|i| TextLayer::new(cfg, &spec.layers[i], device))
+            .collect();
+        Self {
+            embed_tokens: EmbeddingConfig::new(cfg.vocab_size, cfg.hidden_size).init(device),
+            ple: TextPle::new(cfg, device),
+            layers,
+            norm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(cfg.rms_norm_eps)
+                .init(device),
+            embedding_projection: linear_cfg(cfg.hidden_size, cfg.embedding_dim).init(device),
+            spec,
+        }
+    }
+
+    pub fn spec(&self) -> &TextSpec {
+        &self.spec
+    }
+
+    /// Visit every text projection weight (q/k/v/o, MLP, PLE, output projection).
+    pub fn for_each_projection_mut(&mut self, mut f: impl FnMut(&mut Linear)) {
+        for layer in &mut self.layers {
+            f(&mut layer.self_attn.q_proj);
+            f(&mut layer.self_attn.k_proj);
+            f(&mut layer.self_attn.v_proj);
+            f(&mut layer.self_attn.o_proj);
+            f(&mut layer.mlp.gate_proj);
+            f(&mut layer.mlp.up_proj);
+            f(&mut layer.mlp.down_proj);
+            f(&mut layer.ple_block.per_layer_input_gate);
+            f(&mut layer.ple_block.per_layer_projection);
+        }
+        f(&mut self.ple.per_layer_model_projection);
+        f(&mut self.embedding_projection);
+    }
+
+    /// Enable/disable NPU attention on every layer (`--npu-attn`).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn set_npu_attn(&mut self, on: bool) {
+        for layer in &mut self.layers {
+            layer.self_attn.npu_attn = on;
+        }
+    }
+
+    /// RoPE tables for the sequence length `max_seq`: sliding and full layers
+    /// use different head dims and thetas.
+    pub fn rope_tables(&self, max_seq: usize, dtype: DType, device: &Device) -> TextRope {
+        let mut sliding = None;
+        let mut full = None;
+        for ls in &self.spec.layers {
+            if ls.sliding {
+                if sliding.is_none() {
+                    sliding = Some(RopeTable::new(
+                        max_seq,
+                        ls.head_dim,
+                        self.spec.sliding_theta,
+                        dtype,
+                        device,
+                    ));
+                }
+            } else if full.is_none() {
+                full = Some(RopeTable::new(
+                    max_seq,
+                    ls.head_dim,
+                    self.spec.full_theta,
+                    dtype,
+                    device,
+                ));
+            }
+        }
+        TextRope { sliding, full }
+    }
+
+    /// Per-token embeddings `[B, S, embedding_dim]` (not pooled, not normalized).
+    pub fn forward(&self, input_ids: Tensor<2, Int>, rope: &TextRope, chunk: usize) -> Tensor<3> {
+        let x = self.embed_tokens_scaled(input_ids);
+        self.forward_embeds(x, rope, chunk)
+    }
+
+    /// The scaled token embedding (`x * sqrt(hidden)`).
+    pub fn embed_tokens_scaled(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
+        let scale = (self.spec.hidden_size as f64).sqrt();
+        self.embed_tokens.forward(input_ids).mul_scalar(scale)
+    }
+
+    pub fn embedding_dim(&self) -> usize {
+        self.spec.embedding_dim
+    }
+
+    /// The decoder stack over already-embedded inputs `[B, S, hidden]`.
+    pub fn forward_embeds(&self, x: Tensor<3>, rope: &TextRope, chunk: usize) -> Tensor<3> {
+        let [b, s, _] = x.dims();
+        let spec = &self.spec;
+        let ple = self.ple.forward(x.clone(), spec);
+        let mut h = x;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let ls = &spec.layers[i];
+            let ple_i = ple
+                .clone()
+                .slice(s![.., .., i..i + 1, ..])
+                .reshape([b, s, spec.ple_dim]);
+            let rope = if ls.sliding {
+                rope.sliding.as_ref().expect("sliding rope table")
+            } else {
+                rope.full.as_ref().expect("full rope table")
+            };
+            h = layer.forward(
+                h,
+                ple_i,
+                rope,
+                ls,
+                spec.sliding_window,
+                spec.eps,
+                chunk,
+            );
+        }
+        lin(&self.embedding_projection, self.norm.forward(h))
+    }
+
+    /// Mean-pooled embeddings `[B, embedding_dim]` (no truncation / normalization).
+    pub fn embed(&self, input_ids: Tensor<2, Int>, rope: &TextRope, chunk: usize) -> Tensor<2> {
+        let [b, _s] = input_ids.dims();
+        let dim = self.spec.embedding_dim;
+        let h = self.forward(input_ids, rope, chunk);
+        h.mean_dim(1).reshape([b, dim])
+    }
+}
+
+/// The two RoPE tables used by a text backbone (only the layer types present).
+pub struct TextRope {
+    sliding: Option<RopeTable>,
+    full: Option<RopeTable>,
+}
+
+impl TextRope {
+    pub fn sliding(&self) -> &RopeTable {
+        self.sliding.as_ref().expect("sliding rope table")
+    }
+
+    pub fn full(&self) -> &RopeTable {
+        self.full.as_ref().expect("full rope table")
+    }
+}

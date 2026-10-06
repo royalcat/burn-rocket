@@ -1,0 +1,171 @@
+# rocket-inference-gemma
+
+EmbeddingGemma 2 inference in Burn (`flex` backend), inference only.
+
+[EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) is a
+multimodal embedding model built from the Gemma 4 family: a 270M-parameter
+bidirectional text decoder, a 170M vision tower and a 300M audio tower, all
+projected into one 768-d embedding space (MRL: 128/256/512/768), with
+per-layer embeddings (PLE) and an 8192-token context.
+
+This example implements the full checkpoint — text, image, video and audio —
+and reproduces the HF reference numerics (see `docs/experiment-log.md`).
+
+## Layout
+
+| path | contents |
+|---|---|
+| `src/config.rs` | `config.json` schemas (text / vision / audio sub-configs, per-layer overrides) |
+| `src/model.rs` | text backbone (bidirectional Gemma 4 decoder: PLE, QK-RMSNorm, sliding/full layer types, chunked attention), `Emb2Model` assembly |
+| `src/vision.rs` | Gemma 4 vision tower (patch embedder, axial 2-D RoPE, encoder, pooling, `embed_vision`) |
+| `src/audio.rs` | Gemma 4 audio tower (subsample conv, chunked relative-attention conformer, clipped linears, `embed_audio`) |
+| `src/audio_frontend.rs` | USM log-mel frontend (rustfft + HTK mel), waveform loading via hound / ffmpeg |
+| `src/media.rs` | image decode + torchvision-exact bicubic resize + patchify; video sampling/extraction (ffprobe/ffmpeg) |
+| `src/inputs.rs` | shared placeholder expansion (`<\|image\|>` / `<\|video\|>` / `<\|audio\|>`), media encoding, token assembly |
+| `src/layers.rs` | `ClippableLinear` (audio/vision linears with checkpoint clip bounds), low-RAM `lin()` helper |
+| `src/server.rs` | OpenAI-compatible `/v1/embeddings` + native multimodal `/embed` |
+| `src/main.rs` | CLI (`embed`, `bench`, `tokenize`, `serve`) and model loading |
+| `tools/ref_embeddinggemma2.py` | HF reference: token ids, text/image/video/audio embeddings, debug dumps |
+| `tools/debug_audio_hf.py` | HF audio-tower intermediate dumps (debugging) |
+| `docs/experiment-log.md` | measurements and verification results |
+
+## Build
+
+```sh
+# dev host (flex backend; `--no-default-features` skips the CubeCL LLVM backend)
+cargo build --release -p rocket-inference-gemma --no-default-features
+# default build (adds the CubeCL/LLVM `cpu` backend)
+cargo build --release -p rocket-inference-gemma
+# aarch64 (board), NPU feature links librocketnpu
+cargo build --release -p rocket-inference-gemma --target aarch64-unknown-linux-gnu \
+    --no-default-features
+```
+
+## Model files
+
+```sh
+mkdir -p ~/models/embeddinggemma-2 && cd ~/models/embeddinggemma-2
+base=https://huggingface.co/google/embeddinggemma-2/resolve/main
+for f in config.json model.safetensors tokenizer.json tokenizer.model tokenizer_config.json \
+         preprocessor_config.json processor_config.json chat_template.jinja \
+         config_sentence_transformers.json sentence_bert_config.json modules.json; do
+  curl -sLO "$base/$f"
+done
+mkdir -p 1_Pooling 2_Normalize
+curl -sL -o 1_Pooling/config.json "$base/1_Pooling/config.json"
+curl -sL -o 2_Normalize/config.json "$base/2_Normalize/config.json"
+```
+
+## CLI
+
+```sh
+B=target/release/rocket-inference-gemma   # or $CARGO_TARGET_DIR/release/...
+M=~/models/embeddinggemma-2
+
+# text embedding (768-d, L2-normalized; --dim for MRL truncation, --prompt for task prefixes)
+$B embed --model-dir $M --text "what is the capital of france?" --out out.json
+$B embed --model-dir $M --prompt query --dim 256 --text-file data/one_long.txt --out out.json
+
+# low-RAM mode: Q8-resident projections, dequantized per call (1216 MiB vs 2845 MiB)
+$B embed --model-dir $M --quant q8 --text-file data/one_long.txt --out out.json
+
+# image (the placeholder <|image|> is expanded to BOI + soft tokens + EOI)
+$B embed --model-dir $M --image data/cat.jpeg --out img.json
+$B embed --model-dir $M --image data/cat.jpeg --text "task: search result | query: <|image|>" --out img_q.json
+
+# video (1 fps, at most 32 frames, 140 soft tokens per frame)
+$B embed --model-dir $M --video data/test.mp4 --out vid.json
+
+# audio (16 kHz mono WAV via hound; anything else through ffmpeg)
+$B embed --model-dir $M --audio data/speech5s.wav --out audio.json
+$B embed --model-dir $M --audio data/speech5s.wav --text "task: sentence similarity | query: <|audio|>" --out a.json
+
+# timings and stage breakdown
+$B bench --model-dir $M --text-file data/one_long.txt --reps 2
+
+# token ids (compare with the HF tokenizer)
+$B tokenize --model-dir $M --text "hello"
+
+# server
+$B serve --model-dir $M --port 8390
+```
+
+Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
+`code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`
+for no prefix. `--prompt none` is also accepted.
+
+### Server
+
+```sh
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"what is the capital of france?"}'
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":["a","b"],"dim":256,"prompt":"query"}'
+# native multimodal endpoint: paths, or data: URIs with base64 payloads
+curl -s localhost:8390/embed -H 'Content-Type: application/json' \
+  -d '{"image":"/path/to/cat.jpeg"}'
+curl -s localhost:8390/embed -H 'Content-Type: application/json' \
+  -d '{"audio":"/path/to/speech.wav","text":"task: sentence similarity | query: <|audio|>"}'
+curl -s localhost:8390/health; curl -s localhost:8390/v1/models
+```
+
+`/v1/embeddings` accepts a string or an array of strings; `/embed` accepts
+`text`/`image`/`video`/`audio` (media values are filesystem paths or
+`data:<mime>;base64,<payload>` blobs). Every embedding is L2-normalized; `dim`
+applies MRL truncation before normalization.
+
+## Verification
+
+`docs/experiment-log.md` has the full numbers. Summary against the HF
+reference (transformers 5.19, f32):
+
+| input | cosine |
+|---|---|
+| text (9 tok, 2594 tok; dims 768/256) | 1.00000000 |
+| image, PNG or JPEG | 1.00000000 |
+| video (4 frames) | 1.00000000 |
+| audio, 16 kHz mono (5 s / 30 s) | 1.00000000 |
+| text + image / text + audio | 1.00000000 / 1.00000000 |
+| any modality, `--quant q8` | 0.9996-0.9999 |
+| any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
+
+## NPU offload (aarch64)
+
+The `npu` feature (RK3588, `librocketnpu` from the root `burn-rocket` crate)
+offloads the text backbone: all 218 text projections are packed into resident
+fp16 NPU weights (0.25 GiB, f32 copies dropped) and attention runs on the NPU
+through the windowed attention op (`burn_rocket::attention_window`). The
+vision/audio towers, norms, RoPE and the embedding table stay on the CPU.
+
+```sh
+# cross-build (links vendor/rocketnpu/librocketnpu.a)
+cargo build --release -p rocket-inference-gemma --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu
+
+# on the board: lowest-memory mode = Q8 CPU towers + NPU text backbone
+./rocket-inference-gemma bench --model-dir /root/models/embeddinggemma-2 \
+    --quant q8 --npu --text-file data/one_long.txt --reps 1
+# --npu-attn cpu keeps the CPU attention; --npu-threads N sets the NPU threads
+```
+
+Measured on `rock-5b-plus.lan` (4 A76 threads, 2587-token text): `--quant q8`
+34.5 s (75 tok/s, 94 s user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s
+user CPU): 1.61x faster, 33 % less CPU. Numerics vs the HF f32 reference:
+0.9996-0.9999 for text/image/audio, 0.9992 for video. See
+`docs/experiment-log.md` §9.
+
+## Known limits
+
+- **Audio resampling**: 16 kHz mono WAV is exact. Other sample rates go through
+  ffmpeg's resampler, which differs from librosa/soxr used by the HF reference
+  (~0.994 cosine on a 44.1 kHz clip). Resample to 16 kHz mono first for exact
+  numbers.
+- **Memory**: f32 weights are ~2.9 GB resident (2845 MiB anon), `--quant q8`
+  brings that down to 1216 MiB and `--quant q8 --npu` to 1068 MiB; all share a
+  ~4.2 GiB *load peak* because the checkpoint is materialized f32 before
+  quantization/packing and the 1.49 GB mmap is touched.
+- Batch inputs are processed one at a time.
+- **f32 only**: `--dtype f16` loads (1.5 GiB resident) but is numerically broken
+  in this architecture — RMSNorm/softmax/PLE need f32 precision (text cosine
+  0.984, image 0.70 vs the f32 reference), so the CLI rejects it. Use
+  `--quant q8` for the low-RAM mode instead.
