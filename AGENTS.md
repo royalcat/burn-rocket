@@ -1,77 +1,101 @@
-# AGENTS.md — embeddings-fast
+# AGENTS.md — burn-rocket
 
-Qwen3-Embedding-0.6B inference in Rust/Burn. Read `README.md` for usage and
-`docs/experiment-log.md` for measurements and findings. Git repo (`main`), created
-2026-10-05.
+`burn-rocket` is the main crate: RK3588 NPU offload for Burn models — an FFI wrapper
+over `librocketnpu` plus the `RocketOps` Burn backend extension (projections and
+attention on the mainline `rocket` driver). The Qwen3-Embedding-0.6B inference app is
+an example of it, at `examples/qwen3-embeddings/`. Read `README.md` (library) and
+`examples/qwen3-embeddings/README.md` (app) first; measurements live in
+`examples/qwen3-embeddings/docs/experiment-log.md`.
 
-## Status (2026-10-05)
+The repo was inverted on 2026-10-06 with no functional changes: the former root package
+`embeddings-fast` moved to `examples/qwen3-embeddings/`, the former `crates/burn-rocket`
+became the root package. The git remote is still `embeddings-fast.git`. Board artifacts
+deployed before that date live under `/root/embeddings-fast/`; new deploys go to
+`/root/qwen3-embeddings/`.
 
-- **CPU path** (`flex` backend, Q8 low-RAM): numerically faithful (cosine 0.9991-0.9995
-  vs the production Q8_0 reference) and ~5× lower RAM (776 MiB vs ~4 GB), but 2.3× slower
-  than the production `ik_llama.cpp` int8 server on the board (34.2 vs 77.8 tok/s at
-  3,633 tokens). Production stays on `ik_llama.cpp`; flex has no int8 GEMM.
-- **NPU path** (`--npu`, RK3588 `rocket` driver via `crates/burn-rocket`): projections and
-  attention on the NPU, exposed as Burn *backend-extension* ops
-  (`#[backend_extension(Flex)]`, log §11). 45 tok/s and **-51% CPU-seconds** vs the
-  CPU-only path at 3,633 tokens, 298 MiB CPU-resident. Wall is ~20% better than CPU-only
-  but still below production; its value is freeing CPU for other board services.
-- The refactor surfaced a pre-existing bug: the projection fields were `#[module(skip)]`
-  in every build, so the store and the q8 mapper had not touched them since the NPU
-  commit. Fixed (log §11.1): dev-host cosine 0.9994 (f32) / 0.9993 (q8), board q8 is
-  771 MiB resident again.
+## Status (2026-10-06)
+
+- **Library**: `burn-rocket` exposes the NPU as a Burn backend extension
+  (`#[backend_extension(Flex)]`, `src/ext.rs`); ordinary `Tensor`s in/out via
+  `burn_rocket::{init, pack, pack2, pack3, matmul, attention, stats}`. Failure payloads
+  are typed (`OpFailure`), one global engine serializes the not-thread-safe FFI contexts.
+  Compile-checks on x86 with `--features npu`; linking needs aarch64.
+- **Example CPU path** (`flex` backend, Q8 low-RAM): numerically faithful (cosine
+  0.9991-0.9995 vs the production Q8_0 reference) and ~5× lower RAM (776 MiB vs ~4 GB),
+  but 2.3× slower than the production `ik_llama.cpp` int8 server on the board
+  (34.2 vs 77.8 tok/s at 3,633 tokens). Production stays on `ik_llama.cpp`; flex has no
+  int8 GEMM.
+- **Example NPU path** (`--npu`): projections and attention on the NPU, 45 tok/s and
+  **-51% CPU-seconds** vs the CPU-only path at 3,633 tokens, 298 MiB CPU-resident. The
+  value is freeing CPU for other board services; wall is ~20% better than CPU-only but
+  still below production.
+- The extension-ops refactor surfaced a pre-existing bug: projection fields were
+  `#[module(skip)]` in every build, so the store and q8 mapper had not touched them since
+  the NPU commit. Fixed (log §11.1): dev-host cosine 0.9994 (f32) / 0.9993 (q8), board q8
+  is 771 MiB resident again.
 - 30k-token inputs work on the CPU path (fused flash attention, 52.4 tok/s at 32 dev
   threads); 30k with `--npu` is not yet measured. The OpenAI-compatible server is
   implemented and smoke-tested.
-- **Serving robustness** (2026-10-05, log §12): a forward panic no longer poisons the server
-  or wedges it (catch_unwind + poison recovery), `/health`/`/v1/models` never take the model
-  lock, raw-token inputs are capped at `--max-tokens`, NPU failures panic with a typed
-  `OpFailure` payload (NOMEM -> 503, shape/tiling -> 500, device -> log + `exit(1)` for a
-  container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192, 0
-  disables). Board-verified for robustness only; long-context attention and performance are
-  unchanged/deferred.
+- **Serving robustness** (2026-10-05, log §12): a forward panic no longer poisons the
+  server or wedges it (catch_unwind + poison recovery), `/health`/`/v1/models` never take
+  the model lock, raw-token inputs are capped at `--max-tokens`, NPU failures panic with a
+  typed `OpFailure` payload (NOMEM -> 503, shape/tiling -> 500, device -> log + `exit(1)`
+  for a container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192,
+  0 disables). Board-verified for robustness only; long-context attention and performance
+  are unchanged/deferred.
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
-  + Burn's wgpu backend was measured with `src/bin/wgpu_probe.rs`. Only the WGSL path works
-  (CubeCL's SPIR-V shaders segfault panvk's compiler); the best attention throughput is
-  **34 GF/s at seq 1024** (gate was >=200-300), the real qkv shape trips the panthor
-  job watchdog (device lost), and the tuner OOMs at seq 512/1024. Fixed-strategy kernels
-  are 3.8 GF/s. The flex+NPU configuration remains the fastest; the GPU lever is closed
-  until CubeCL/panvk improve.
+  + Burn's wgpu backend was measured with `examples/qwen3-embeddings/src/bin/wgpu_probe.rs`.
+  Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
+  attention throughput is **34 GF/s at seq 1024** (gate was >=200-300), the real qkv shape
+  trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
+  Fixed-strategy kernels are 3.8 GF/s. The flex+NPU configuration remains the fastest; the
+  GPU lever is closed until CubeCL/panvk improve.
 - Not done: int8 GEMM (the only lever that would close the speed gap; flex lacks it, and
   burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and board
-  service deployment. The OpenViking entity
-  (`viking://user/royalcat/memories/entities/software_project/embeddings_fast.md`) is
-  written.
+  service deployment.
 
 ## Repo layout
 
 | path | contents |
 |---|---|
-| `src/main.rs` | CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`) and CPU projection loading for the NPU build (`load_cpu_projections`) |
-| `src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
-| `src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment (`catch_unwind` + poison recovery), typed NPU-error mapping, `--max-tokens` enforcement |
-| `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features): device init, smoke ops, GEMM + attention throughput, Flex-vs-GPU cosine. See "Vulkan GPU probe" below |
-| `crates/burn-rocket/` | FFI to `librocketnpu` (RocketCtx/RocketWeight/RocketStream/RocketFaCtx, `pack_weight_seg`, `flash_attn`, `examples/probe.rs`) plus `src/ext.rs`: the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
+| `src/lib.rs` | FFI wrappers (`RocketCtx`/`RocketWeight`/`RocketStream`/`RocketFaCtx`, `pack_weight_seg`, `flash_attn`), driver/counter helpers, `Error`/`OpFailure` |
+| `src/ffi.rs` | raw `extern "C"` declarations for `librocketnpu` |
+| `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
+| `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`) |
+| `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
+| `examples/qwen3-embeddings/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`) |
+| `examples/qwen3-embeddings/src/model.rs` | model: layers, RoPE, RMSNorm, attention paths, `Proj::Cpu\|Npu` (transparent `Module` wrapper, `Npu` only in the NPU build), stage timers |
+| `examples/qwen3-embeddings/src/server.rs` | axum OpenAI-compatible `/v1/embeddings`; immutable settings outside the model lock, panic containment, typed NPU-error mapping, `--max-tokens` enforcement |
+| `examples/qwen3-embeddings/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
+| `examples/qwen3-embeddings/data/` | bench/embedding fixtures (`bench_text.txt`) |
+| `examples/qwen3-embeddings/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
+| `examples/qwen3-embeddings/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
-| `docs/experiment-log.md` | all measurements: §1-8 dev-host/board CPU work, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness |
+| `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
 ## Rebuild + deploy to the board
 
 ```sh
-# NPU build (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
-cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features npu
-scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/embeddings-fast \
-    root@rock-5b-plus.lan:/root/embeddings-fast/
-# CPU-only build: drop --features npu
+# NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
+cargo build --release -p qwen3-embeddings --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/qwen3-embeddings \
+    root@rock-5b-plus.lan:/root/qwen3-embeddings/
+# CPU-only build: drop --features npu (binary name is the same)
 ```
 
 The binary is self-contained (`librocketnpu` is statically linked); the model lives at
 `/root/models/qwen3-embedding-0.6b/` on the board. On the board run from
-`/root/embeddings-fast` (the bench uses the relative `data/bench_text.txt`).
+`/root/qwen3-embeddings` (the bench uses the relative `data/bench_text.txt`).
+
+Library-only builds: `cargo check -p burn-rocket --features npu` compiles the extension
+on any host (no linking); `cargo build --release -p burn-rocket --features npu --target
+aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the FFI probe.
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
-The NPU counters live in `crates/burn-rocket/src/ext.rs` (`burn_rocket::stats`), the
-stage counters in `src/model.rs` (`stage_stats`).
+The NPU counters live in `src/ext.rs` (`burn_rocket::stats`), the stage counters in the
+example's `src/model.rs` (`stage_stats`).
 
 ## Environment facts
 
@@ -90,9 +114,10 @@ stage counters in `src/model.rs` (`stage_stats`).
 
 ## Board deployment (2026-10-05)
 
-- Deployed: `/root/embeddings-fast/embeddings-fast` (cross-built aarch64 binary + `data/`)
-  and `/root/models/qwen3-embedding-0.6b/`. Run from `/root/embeddings-fast` (the bench
-  uses the relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
+- Deployed: `/root/embeddings-fast/` (pre-inversion dir; binary + `data/`) and
+  `/root/models/qwen3-embedding-0.6b/`. New deploys go to `/root/qwen3-embeddings/`;
+  the old directory is left in place. Run from the deploy dir (the bench uses the
+  relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
   --embedding --pooling last -c 32768 -b 32768 -ub 32768 -np 1 -ctk q8_0 -ctv q8_0 -t 4
@@ -101,9 +126,9 @@ stage counters in `src/model.rs` (`stage_stats`).
   command line and kills the session).
 - Measured verdict, CPU path (4 threads, 3,633 tokens): production 46.7 s (77.8 tok/s) vs
   ours 106.2 s (34.2 tok/s) — **target ≥50 tok/s is not met on the board**; production is
-  2.28× faster. (The NPU path below reaches 45.7 tok/s at -49% CPU.) Our single-core is
-  35% of the A76 f32 peak and flex's unary/binary ops have no rayon, so scaling caps at
-  ~3×; flex has no int8 GEMM. f16 does not help (36.1 tok/s).
+  2.28× faster. (The NPU path reaches 45.7 tok/s at -49% CPU.) Our single-core is 35% of
+  the A76 f32 peak and flex's unary/binary ops have no rayon, so scaling caps at ~3×; flex
+  has no int8 GEMM. f16 does not help (36.1 tok/s).
 - RAM: low-RAM mode is 771 MiB resident on the board vs ~4 GB for the production server;
   the Q8 dequant tax is ~7 s per forward on A76 (single-threaded scalar).
 - Numerics: board cosines match the dev host (0.99928 at 82 tokens vs the unquantized
@@ -114,40 +139,39 @@ stage counters in `src/model.rs` (`stage_stats`).
 - The deployed binary as of 2026-10-05 is the NPU-enabled build and the board is running
   the 600 MHz patched `rocket` module (revert: `rmmod rocket && modprobe rocket`, or
   reboot). `--npu` runs need no extra setup beyond that.
-- The board binary at `/root/embeddings-fast/embeddings-fast` is the post-refactor build
-  from this repo (sha256 `05c38e18dfe57501…`). Later that evening the user reported the
-  board busy with another workload: re-run the A/B only on an idle board.
 - `/root/embeddings-fast/embeddings-fast-robust` is the robustness-round test binary
   (log §12.2): run as a second instance on port 8393 (production container untouched,
   `taskset -c 0-3`); poison recovery, tokio starvation, input caps and chunked matmul are
   verified there. It is not the deployed service build.
+- The board was later reported busy with another workload: re-run an A/B only on an idle
+  board.
 
 ## NPU offload (`--npu`, aarch64)
 
-- `crates/burn-rocket` = FFI to `librocketnpu` (rocket-userspace) plus the `RocketOps`
-  Burn backend extension. Build the app with `--no-default-features --features npu`; the
-  crate's `npu` feature implies `flex` (required because Burn's `#[backend_extension(Flex)]`
-  reads `feature = "flex"` in the consuming crate) and links
+- `burn-rocket` (repo root) = FFI to `librocketnpu` (rocket-userspace) plus the `RocketOps`
+  Burn backend extension. Build the example with `--no-default-features --features npu`;
+  the crate's `npu` feature implies `flex` (required because Burn's
+  `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and links
   `vendor/rocketnpu/librocketnpu.a` (override with `ROCKETNPU_DIR`, e.g.
   `/root/npu-poc/rocket-userspace/build` on the board). aarch64 only: the dep is
-  target-gated in Cargo.toml.
+  target-gated in `examples/qwen3-embeddings/Cargo.toml`.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
-  `WeightId`s), `matmul` and `attention` — the app's model calls these directly; `src/npu.rs`
-  no longer exists. All ops share one global engine behind a mutex (the FFI contexts are
-  not thread-safe), so NPU calls serialize.
+  `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
+  one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
+  serialize.
 - `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
   f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
   attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (within ~1 s on
   wall, ~40% more CPU). `--npu` requires `--dtype f32` and excludes `--quant q8`.
 - Resident weights are packed for the M>=256 tiling; requests with fewer rows are padded
   to 256 rows (the extra rows are ignored on readback). One pack serves all lengths.
-- Failures panic with a structured `OpFailure { error, m, k, n }` payload (detail logged by
-  `op_failure` before the panic). `serve` maps `ROCKET_E_NOMEM` -> 503, shape/tiling -> 500,
-  device/unsupported -> log + `exit(1)` for a supervisor restart. Matmuls chunk above
+- Failures panic with a structured `OpFailure { error, m, k, n }` payload (detail logged
+  by `op_failure` before the panic). `serve` maps `ROCKET_E_NOMEM` -> 503, shape/tiling ->
+  500, device/unsupported -> log + `exit(1)` for a supervisor restart. Matmuls chunk above
   `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, 0 disables) so the per-call input-BO
   scratch stays bounded; rows are independent, so chunking is bit-identical.
 - Failures/logs aside, a panic in an op can no longer poison the server's model lock
-  (poison recovery + `catch_unwind` in `src/server.rs`, log §12).
+  (poison recovery + `catch_unwind` in the example's `src/server.rs`, log §12).
 - Board: the 600 MHz patched module (`insmod /root/npu-poc/rocket-patched-600/rocket-npu600.ko
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
   stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
@@ -161,8 +185,7 @@ stage counters in `src/model.rs` (`stage_stats`).
 - q|k|v and gate|up are packed as one segmented resident weight each
   (`pack_weight_seg`, concatenated along N): 196 tensors -> 112 resident weights, 4
   matmuls per layer, one input conversion per group. The loader packs each weight straight
-  from the store and drops the host copy (`pack-and-drop`); the old Arc/handle-assignment
-  dance is gone.
+  from the store and drops the host copy (`pack-and-drop`).
 - Projection fields are `#[cfg_attr(npu, module(skip))]` so the store never materializes
   CPU copies in the NPU build. For that build's CPU modes (`--quant q8`, no `--npu`),
   `load_cpu_projections` loads the same tensors explicitly (with the PyTorch `[out,in]` ->
@@ -187,12 +210,14 @@ stage counters in `src/model.rs` (`stage_stats`).
 - The board's GPU is reachable only through **Mesa panvk** (armbian 26.8.3 trixie, Mesa
   26.1.6 backports; Vendor `libmali` needs the vendor kernel, rusticl exposes no device).
   `vulkaninfo` shows Vulkan 1.4.354 on `Mali-G610 MC4` with all features CubeCL needs.
-- Probe: `src/bin/wgpu_probe.rs`, built with the `gpu-wgsl` (+ optional `gpu-autotune`)
-  cargo feature. `gpu-spirv` (burn's `vulkan` feature, CubeCL's SPIR-V compiler) segfaults
-  inside `libvulkan_panfrost.so` at the first shader compile — use `gpu-wgsl`.
+- Probe: `examples/qwen3-embeddings/src/bin/wgpu_probe.rs`, built with the `gpu-wgsl`
+  (+ optional `gpu-autotune`) cargo feature. `gpu-spirv` (burn's `vulkan` feature,
+  CubeCL's SPIR-V compiler) segfaults inside `libvulkan_panfrost.so` at the first shader
+  compile — use `gpu-wgsl`.
 - Build with **`cargo zigbuild --target aarch64-unknown-linux-gnu.2.41`**: the plain GNU
   cross toolchain links against glibc 2.44 while the board has 2.41 (the wgpu tree pulls
-  libm symbols at 2.43/2.44). Then scp the binary; run from `/root/embeddings-fast`.
+  libm symbols at 2.43/2.44). Then scp the binary; run it from the deploy dir
+  (`/root/qwen3-embeddings`).
 - Measured: fixed-strategy GEMM 3.8 GF/s, autotuned GEMM 79 GF/s (1024³), f16 causal
   attention 34 GF/s at seq 1024 (4.3 GF/s at 256). The real qkv GEMM shape trips the
   panthor job watchdog (>4.6 s dispatches die; device lost, `dmesg` "job timeout");
@@ -216,10 +241,10 @@ stage counters in `src/model.rs` (`stage_stats`).
   forward.
 - `--quant q8` = low-RAM mode: projection weights stay Q8_0-quantized and are
   dequantized once per layer per forward (`linear_forward` + `Qwen3Embedding::quantized`
-  in `src/model.rs`); the embedding table is f16; `libc::malloc_trim` after quantization
-  releases the freed f32 pages (glibc otherwise retains ~1.3 GB in arenas). Resident
-  ~0.78 GB anon vs ~2.4 GB for f32, cost ~2 s per forward. Load peak is still ~2.3 GB
-  (the file is materialized as f32 before quantization).
+  in the example's `src/model.rs`); the embedding table is f16; `libc::malloc_trim` after
+  quantization releases the freed f32 pages (glibc otherwise retains ~1.3 GB in arenas).
+  Resident ~0.78 GB anon vs ~2.4 GB for f32, cost ~2 s per forward. Load peak is still
+  ~2.3 GB (the file is materialized as f32 before quantization).
 - `--dtype bf16` panics in flex 0.22.0-pre.4 (bf16 embedding gather, "storage: dtype
   mismatch (expected BF16, got F32)"); `load_model` bails with a clear message. f16 works
   but is ~1.9× slower at model level.
@@ -256,15 +281,16 @@ stage counters in `src/model.rs` (`stage_stats`).
 - Cross-compile: `.cargo/config.toml` sets `aarch64-linux-gnu-gcc` for
   `aarch64-unknown-linux-gnu`; artifacts land in
   `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/`. Build with
-  `--no-default-features` (the default `cpu` feature pulls in cubecl-llvm, whose prebuilt
-  LLVM bundle is host-arch and fails to link for aarch64; `flex` needs none of it).
+  `--no-default-features` (the example's default `cpu` feature pulls in cubecl-llvm,
+  whose prebuilt LLVM bundle is host-arch and fails to link for aarch64; `flex` needs
+  none of it).
 
 ## Future work
 
-- **int8 GEMM** is the only lever that would close the speed gap with production. flex has
-  none; the candidates are the `burn-cpu` (CubeCL/LLVM) backend (CPU quantized matmul
-  unverified, cannot cross-compile — would need a native build + JIT on the board) or a
-  custom int8 microkernel (upstream contribution).
+- **int8 GEMM** is the only lever that would close the speed gap with production (example
+  CPU path). flex has none; the candidates are the `burn-cpu` (CubeCL/LLVM) backend (CPU
+  quantized matmul unverified, cannot cross-compile — would need a native build + JIT on
+  the board) or a custom int8 microkernel (upstream contribution).
 - **Vulkan/GPU path is closed** (log §13): measured 3.8-79 GF/s with CubeCL on panvk,
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
@@ -273,8 +299,8 @@ stage counters in `src/model.rs` (`stage_stats`).
   library's `ROCKET_FA_TILE_KV` bounds the score scratch but not the mask and loses on
   speed; the candidate is app-side bounded-causal query blocking (per-block `[C, q1]`
   mask, prefix keys, ~half the causal MACs). Deferred from the robustness round; board
-  work required.
-- Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev threads).
+  work required. Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev
+  threads).
 - Board service: run `serve --npu --max-tokens 30000` under a supervisor, and decide
   whether the CPU-relief mode should be the default there (it is now).
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak in
@@ -283,15 +309,18 @@ stage counters in `src/model.rs` (`stage_stats`).
 ## Verification commands
 
 ```sh
-B=$CARGO_TARGET_DIR/release/embeddings-fast
-# single-core speed gate (blocked path is the single-core record)
-taskset -c 2 $B bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
+B=$CARGO_TARGET_DIR/release/qwen3-embeddings
+# library compile checks (npu needs aarch64 only for linking)
+cargo check -p burn-rocket --features npu
+# single-core speed gate (blocked path is the single-core record); run from
+# examples/qwen3-embeddings
+taskset -c 2 cargo run --release -- bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
 # multi-threaded / long-input (fused default)
-$B bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
+cargo run --release -- bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
 # embedding + cosine against a reference JSON
-$B embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
+cargo run --release -- embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
 # server smoke test
-$B serve --backend flex --dtype f32 --quant q8 --port 8383 &
+cargo run --release -- serve --backend flex --dtype f32 --quant q8 --port 8383 &
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"hi"}'
 # robustness: a panicking forward (invalid token id) must 500 and leave the server alive
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
@@ -301,10 +330,10 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):
 
 ```sh
-cd /root/embeddings-fast
-ROCKET_MATMUL_CHUNK_M=0 ./embeddings-fast-robust embed --backend flex --dtype f32 --npu \
+cd /root/qwen3-embeddings
+ROCKET_MATMUL_CHUNK_M=0 ./qwen3-embeddings embed --backend flex --dtype f32 --npu \
   --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e0.json
-ROCKET_MATMUL_CHUNK_M=1024 ./embeddings-fast-robust embed --backend flex --dtype f32 --npu \
+ROCKET_MATMUL_CHUNK_M=1024 ./qwen3-embeddings embed --backend flex --dtype f32 --npu \
   --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e1.json
 python3 -c "import json,math;a=json.load(open('/tmp/e0.json'));b=json.load(open('/tmp/e1.json'));d=sum(x*y for x,y in zip(a,b));na=math.sqrt(sum(x*x for x in a));nb=math.sqrt(sum(x*x for x in b));print('cosine',d/(na*nb))"
 ```
@@ -313,21 +342,21 @@ On the board (after the cross-build + scp above; the NPU-enabled binary):
 
 ```sh
 ssh root@rock-5b-plus.lan
-cd /root/embeddings-fast
+cd /root/qwen3-embeddings
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
-taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
-taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
-taskset -c 4-7 ./embeddings-fast bench --backend flex --dtype f32 --tokens 3633 --reps 1
+taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
+taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
+taskset -c 4-7 ./qwen3-embeddings bench --backend flex --dtype f32 --tokens 3633 --reps 1
 # numerics vs the production reference (copy the JSON back and compare cosines)
-./embeddings-fast embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
+./qwen3-embeddings embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
 # CPU modes of the same NPU binary (projections are loaded explicitly there)
-./embeddings-fast embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
-./embeddings-fast embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
+./qwen3-embeddings embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
+./qwen3-embeddings embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
 ```
 
 Vulkan/wgpu GPU probe (separate binary; built with
-`cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 --no-default-features --features gpu-wgsl,gpu-autotune --bin wgpu_probe`;
+`cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.41 -p qwen3-embeddings --no-default-features --features gpu-wgsl,gpu-autotune --bin wgpu_probe`;
 see "Vulkan GPU probe" in this file for the verdict):
 
 ```sh
@@ -339,5 +368,6 @@ see "Vulkan GPU probe" in this file for the verdict):
 
 Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencode/`
 (`ref_causal.json`, `ref1_{64,512,3633}.json`, `one_{64,512,3633}.txt`) and partially on
-the board in `/root/embeddings-fast/data/`. Regenerate them with the `llama-embedding`
-invocation in "Environment facts" if missing.
+the board in `/root/embeddings-fast/data/` (historical) and under
+`examples/qwen3-embeddings/data/`. Regenerate them with the `llama-embedding` invocation
+in "Environment facts" if missing.
