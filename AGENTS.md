@@ -78,7 +78,8 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `src/lib.rs` | FFI wrappers (`RocketCtx`/`RocketWeight`/`RocketStream`/`RocketFaCtx`, `pack_weight_seg`, `flash_attn`), driver/counter helpers, `Error`/`OpFailure` |
 | `src/ffi.rs` | raw `extern "C"` declarations for `librocketnpu` |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
-| `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`) |
+| `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`); warns on a missing archive or an `ARCH` provenance mismatch |
+| `scripts/build-rocketnpu.sh` | builds `vendor/rocketnpu/` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); caches under `${XDG_CACHE_HOME:-~/.cache}/rocket-userspace` |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`), intent model loading |
@@ -92,7 +93,7 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `examples/rocket-inference/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
 | `examples/rocket-inference-gemma/` | EmbeddingGemma 2 multimodal example (text/image/video/audio embeddings, OpenAI-compatible + multimodal server, `--quant q8`, NPU text backbone); layout, flags and deploy in its `README.md`, measurements in `docs/experiment-log.md` |
-| `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers — copy from the board's `/root/npu-poc/rocket-userspace/build` or build `gregordinary/rocket-userspace` |
+| `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy) |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
 ## EmbeddingGemma 2 example (`examples/rocket-inference-gemma`)
@@ -165,6 +166,8 @@ the vision/audio towers, 8k-context NPU attention memory.
 ## Rebuild + deploy to the board
 
 ```sh
+# once per checkout (and after an upstream bump): supply the aarch64 archive
+scripts/build-rocketnpu.sh
 # NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
@@ -204,8 +207,9 @@ aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the FF
 Container image: `examples/rocket-inference/docker/build.sh [git-ref]` stages the tree,
 builds the aarch64 image on the board and pushes
 `git.kmsign.org/royalcat/rocket-inference:<sha>`. It needs
-`vendor/rocketnpu/librocketnpu.a` (or `VENDOR_SRC`) and registry credentials on the
-control host; run it from anywhere in the repo.
+`vendor/rocketnpu/librocketnpu.a` (run `scripts/build-rocketnpu.sh`; `VENDOR_SRC`
+overrides) and registry credentials on the control host; run it from anywhere in the
+repo.
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
@@ -216,6 +220,9 @@ example's `src/model.rs` (`stage_stats`).
 
 - `$CARGO_TARGET_DIR` is a shared cache (`/home/royalcat/.cache/rust/target`); never
   assume a project-local `target/`.
+- `librocketnpu` source/build cache: `${XDG_CACHE_HOME:-~/.cache}/rocket-userspace/`
+  (`src/` clone + `build-<target>-<sha>/` cmake trees), managed by
+  `scripts/build-rocketnpu.sh`.
 - Model: `~/models/qwen3-embedding-0.6b/` (HF bf16 safetensors + tokenizer.json).
 - Production reference: `~/projects/ik_llama.cpp/build/bin/llama-embedding` +
   `~/models/qwen3-embedding-0.6b-q8_0.gguf` (patched skip-lm-head build).
@@ -267,9 +274,9 @@ example's `src/model.rs` (`stage_stats`).
   Burn backend extension. Build the example with `--no-default-features --features npu`;
   the crate's `npu` feature implies `flex` (required because Burn's
   `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and links
-  `vendor/rocketnpu/librocketnpu.a` (override with `ROCKETNPU_DIR`, e.g.
-  `/root/npu-poc/rocket-userspace/build` on the board). aarch64 only: the dep is
-  target-gated in `examples/rocket-inference/Cargo.toml`.
+  `vendor/rocketnpu/librocketnpu.a` (built by `scripts/build-rocketnpu.sh`; override with
+  `ROCKETNPU_DIR`). aarch64 only: the dep is target-gated in
+  `examples/rocket-inference/Cargo.toml`.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
   one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
@@ -292,8 +299,9 @@ example's `src/model.rs` (`stage_stats`).
   (poison recovery + `catch_unwind` in the example's `src/server.rs`, log §12).
 - Board: the 600 MHz patched module (`insmod /root/npu-poc/rocket-patched-600/rocket-npu600.ko
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
-  stock 200 MHz boot clock. `librocketnpu` must be the built archive from the board's
-  `/root/npu-poc/rocket-userspace` (it is GPL-3.0-or-later).
+  stock 200 MHz boot clock. `librocketnpu` is the host cross-built archive from
+  `scripts/build-rocketnpu.sh` (GPL-3.0-or-later); the board's
+  `/root/npu-poc/rocket-userspace` tree is an older revision and is no longer the source.
 - Measured (3,633 tok, 4 threads, cores 4-7): CPU-only 100.1 s / 622 CPU-s;
   `--npu --npu-attn cpu` 86.9 s / 409 CPU-s; `--npu` (NPU attention, default) 80.8 s /
   302 CPU-s — re-verified after the extension-ops refactor (log §11; the pre-refactor

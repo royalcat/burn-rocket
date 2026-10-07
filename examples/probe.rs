@@ -1,9 +1,8 @@
 //! Probe: open the NPU, pack a resident fp16 weight, run one matmul, verify
 //! against a CPU reference and print timing/counters.
 //!
-//! Build (dev host, cross) — plain GNU cross toolchain, needs aarch64 librocketnpu:
-//!   ROCKETNPU_DIR=/root/npu-poc/rocket-userspace/build \
-//!     cargo build --release -p burn-rocket --example probe --features npu \
+//! Build (dev host, cross) — run `scripts/build-rocketnpu.sh` first (aarch64 default):
+//!   cargo build --release -p burn-rocket --example probe --features npu \
 //!       --target aarch64-unknown-linux-gnu
 //! then scp `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/examples/probe` to the board.
 

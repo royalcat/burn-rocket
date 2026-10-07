@@ -16,8 +16,7 @@
 #   BOARD=root@rock-5b-plus.lan      ssh target for the build host
 #   REMOTE_DIR=/root/rocket-inference-image  staging dir on the board
 #   VENDOR_SRC=<path-to-librocketnpu.a>  vendor library; unset = the checkout's
-#                                        vendor/rocketnpu, else the board's
-#                                        rocket-userspace build tree
+#                                        vendor/rocketnpu (scripts/build-rocketnpu.sh)
 #   CARGO_BUILD_JOBS=4               cargo parallelism inside the image build
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,7 +30,6 @@ BOARD="${BOARD:-root@rock-5b-plus.lan}"
 STAGE="${STAGE:-/tmp/rocket-inference-build-$TAG}"
 REMOTE_DIR="${REMOTE_DIR:-/root/rocket-inference-image}"
 JOBS="${CARGO_BUILD_JOBS:-4}"
-BOARD_VENDOR="${BOARD_VENDOR:-/root/npu-poc/rocket-userspace/build/librocketnpu.a}"
 
 echo "==> staging source ${SHA} (${TAG}) -> ${STAGE}"
 rm -rf "$STAGE"
@@ -42,8 +40,8 @@ git -C "$REPO" archive "$COMMIT" | tar -C "$STAGE" -xf -
 [ -f "$STAGE/Dockerfile" ] || cp "$REPO/examples/rocket-inference/Dockerfile" "$STAGE/Dockerfile"
 [ -f "$STAGE/.dockerignore" ] || cp "$REPO/.dockerignore" "$STAGE/.dockerignore"
 
-# vendor/rocketnpu/librocketnpu.a is gitignored; take it from VENDOR_SRC, the
-# worktree, or the board.
+# vendor/rocketnpu/librocketnpu.a is gitignored; take it from VENDOR_SRC or the
+# worktree (scripts/build-rocketnpu.sh).
 mkdir -p "$STAGE/vendor/rocketnpu"
 LIB="$STAGE/vendor/rocketnpu/librocketnpu.a"
 if [ -n "${VENDOR_SRC:-}" ]; then
@@ -51,8 +49,8 @@ if [ -n "${VENDOR_SRC:-}" ]; then
 elif [ -s "$REPO/vendor/rocketnpu/librocketnpu.a" ]; then
     cp "$REPO/vendor/rocketnpu/librocketnpu.a" "$LIB"
 else
-    echo "==> fetching librocketnpu.a from ${BOARD}:${BOARD_VENDOR}"
-    ssh "$BOARD" "cat '$BOARD_VENDOR'" > "$LIB"
+    echo "error: no librocketnpu.a: run scripts/build-rocketnpu.sh or set VENDOR_SRC" >&2
+    exit 1
 fi
 test -s "$LIB" || { echo "error: empty vendor library" >&2; exit 1; }
 

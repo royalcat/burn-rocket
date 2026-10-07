@@ -1,10 +1,10 @@
-//! Links `librocketnpu.a` (gregordinary/rocket-userspace) for aarch64 targets.
+//! Links `librocketnpu.a` (gregordinary/rocket-userspace) for `npu` builds.
 //!
-//! The library is aarch64-only. Set `ROCKETNPU_DIR` to the directory holding
-//! `librocketnpu.a`; the default is `<repo>/vendor/rocketnpu`.
-//!
-//! On the board the library can be used straight from its build tree:
-//! `ROCKETNPU_DIR=/root/npu-poc/rocket-userspace/build`.
+//! Supply the archive with `scripts/build-rocketnpu.sh`: it builds a pinned
+//! upstream commit on this host (aarch64 cross by default; `--target host`
+//! makes a native archive for link checks) and installs it to
+//! `<repo>/vendor/rocketnpu` together with `COMMIT`/`ARCH` provenance files.
+//! Set `ROCKETNPU_DIR` to override the directory holding `librocketnpu.a`.
 
 use std::path::{Path, PathBuf};
 
@@ -29,20 +29,42 @@ fn main() {
     let lib = dir.join("librocketnpu.a");
     if !lib.exists() {
         println!(
-            "cargo:warning=librocketnpu.a not found at {} (set ROCKETNPU_DIR); \
-             the crate compiles but will not link",
+            "cargo:warning=librocketnpu.a not found at {}; run scripts/build-rocketnpu.sh \
+             (or set ROCKETNPU_DIR to a directory holding it). The crate compiles but \
+             will not link",
             lib.display()
         );
         return;
     }
 
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if arch != "aarch64" {
-        println!(
-            "cargo:warning=burn-rocket targets aarch64 only (current arch: {arch}); \
-             linking {} will fail",
-            lib.display()
-        );
+
+    // The build script records the archive's architecture next to it; use it
+    // to catch a stale archive of the other flavor (the link would otherwise
+    // fail with confusing symbol errors).
+    let built = std::fs::read_to_string(dir.join("ARCH"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    match &built {
+        Some(built) if *built != arch => {
+            println!(
+                "cargo:warning=librocketnpu.a at {} was built for {built}, not {arch}; \
+                 rebuild it with scripts/build-rocketnpu.sh --target {}",
+                lib.display(),
+                if arch == "aarch64" { "aarch64" } else { "host" }
+            );
+        }
+        None if arch != "aarch64" => {
+            println!(
+                "cargo:warning=burn-rocket targets aarch64; current target is {arch}. The \
+                 archive at {} has no ARCH provenance — if it was built for aarch64 it \
+                 will not link here; use scripts/build-rocketnpu.sh --target host for \
+                 link checks",
+                lib.display()
+            );
+        }
+        _ => {}
     }
 
     if let Some(parent) = lib.parent() {

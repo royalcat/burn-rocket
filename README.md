@@ -58,19 +58,30 @@ packed for the `M >= 256` tiling, smaller requests are padded.
 
 ## Building
 
-`librocketnpu.a` is expected at `vendor/rocketnpu/` (gitignored; copy it from the board's
-`/root/npu-poc/rocket-userspace/build` or build
-[`gregordinary/rocket-userspace`](https://github.com/gregordinary/rocket-userspace)), or
-point `ROCKETNPU_DIR` at the directory holding it.
+`librocketnpu.a` is expected at `vendor/rocketnpu/` (gitignored). Build it on this host
+from a pinned
+[`gregordinary/rocket-userspace`](https://github.com/gregordinary/rocket-userspace)
+commit — no board copy needed:
+
+```sh
+# aarch64 archive for the board (cross; the default)
+scripts/build-rocketnpu.sh
+# host archive, for link checks on this machine
+scripts/build-rocketnpu.sh --target host
+```
+
+The script caches the upstream clone and cmake trees under
+`${XDG_CACHE_HOME:-~/.cache}/rocket-userspace/`, records the built commit and architecture
+in `vendor/rocketnpu/{COMMIT,ARCH}`, and skips the build when the directory already
+matches. `--commit <sha>` moves the pin; `ROCKETNPU_DIR` still overrides the directory.
 
 ```sh
 # compile check, works on any target that has no NPU (no linking)
 cargo check -p burn-rocket --features npu
 
-# aarch64 build of the probe example (links librocketnpu.a)
-ROCKETNPU_DIR=<dir with librocketnpu.a> \
-  cargo build --release -p burn-rocket --example probe --features npu \
-    --target aarch64-unknown-linux-gnu
+# aarch64 build of the probe example (links vendor/rocketnpu/librocketnpu.a)
+cargo build --release -p burn-rocket --example probe --features npu \
+  --target aarch64-unknown-linux-gnu
 ```
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
