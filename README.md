@@ -10,6 +10,33 @@ The library is `aarch64`-only for anything that touches the NPU: it links the st
 `librocketnpu.a`, which talks to `/dev/accel/accel0` through the in-kernel `rocket`
 driver.
 
+## AI Disclosure
+
+This project was fully developed by AI (coding agents under human direction). Every
+result was validated on real hardware: numerics against reference implementations
+(cosine parity, token-identical output) and performance on the dev host and the
+Rock 5B+ board — nothing is taken on trust.
+
+## Inference server
+
+The examples are complete HTTP servers with OpenAI- and Ollama-compatible APIs, so
+standard clients work unchanged:
+
+| model | API | command |
+|---|---|---|
+| Qwen3-Embedding-0.6B | OpenAI `/v1/embeddings`, `/v1/models`, `/health` | `rocket-inference serve` |
+| Qwen3.5-0.8B intent/query planner | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve-ollama` |
+| EmbeddingGemma 2 (text/image/video/audio) | OpenAI `/v1/embeddings` + native multimodal `/embed` | `rocket-inference-gemma serve` |
+| Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions` | `rocket-inference-gemma serve-chat` |
+
+The Qwen3 embedding server is the configuration running in production on a Rock 5B+
+(OpenViking's embedding backend, `--npu --npu-attn cpu --max-tokens 8192`): a
+3,633-token input runs in ~87 s (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds
+than the CPU-only flex path (the default NPU attention is slightly faster: ~45 tok/s,
+-51% CPU). The intent model answers the 166-token v7 planner prompt in 11.7 s with
+`--npu` (89.9 s CPU-only). Flags, endpoints and deployment:
+[examples/rocket-inference/README.md](examples/rocket-inference/README.md).
+
 ## What it provides
 
 - **Burn backend extension** (`#[backend_extension(Flex)]`, feature `npu`): ordinary

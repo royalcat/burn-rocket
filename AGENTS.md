@@ -5,7 +5,11 @@ over `librocketnpu` plus the `RocketOps` Burn backend extension (projections and
 attention on the mainline `rocket` driver). The Qwen3-Embedding-0.6B inference app is
 an example of it, at `examples/rocket-inference/`. Read `README.md` (library) and
 `examples/rocket-inference/README.md` (app) first; measurements live in
-`examples/rocket-inference/docs/experiment-log.md`.
+`examples/rocket-inference/docs/experiment-log.md`. The root README opens with
+`## AI Disclosure` and `## Inference server` (the four servers with their OpenAI/Ollama
+APIs and commands, plus the production embedding deployment and its board speeds)
+before "What it provides"; the speeds there mirror the experiment logs — keep both in
+sync when measurements change.
 
 The repo was inverted on 2026-10-06 with no functional changes (commits `8c7eabb`
 structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
@@ -59,7 +63,9 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
   CPU f32 89.96 s vs `--npu` 11.65 s (prefill 2.94 s, decode 8.71 s) — decode stays on
   the CPU with f16 copies because NPU matmuls pad `M` to 256; `--embed-f16` is faster
   (9.29 s, 1.57 GB anon) but its f16 LM head changes near-ties. `--pure-npu` (no CPU
-  copies) runs decode on the NPU too: 1.5 tok/s, 1.29 GB anon.
+  copies) runs decode on the NPU too: 1.5 tok/s, 1.29 GB anon. The OpenViking planner
+  wiring ran live 2026-10-06 → reverted 2026-10-07 (planner back on OpenCode Zen, model
+  removed from the board; log §14.4) — the server stays in the example for a re-enable.
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
   + Burn's wgpu backend was measured with `examples/rocket-inference/src/bin/wgpu_probe.rs`.
   Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
@@ -68,8 +74,9 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
   Fixed-strategy kernels are 3.8 GF/s. The flex+NPU configuration remains the fastest; the
   GPU lever is closed until CubeCL/panvk improve.
 - Not done: int8 GEMM (the only lever that would close the speed gap; flex lacks it, and
-  burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and board
-  service deployment.
+  burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and deploying
+  the current build as the board service — the live OpenViking embedding backend still
+  runs the 2026-10-05 image (`embeddings-fast:0c99eed`).
 
 ## Repo layout
 
@@ -241,6 +248,15 @@ example's `src/model.rs` (`stage_stats`).
   `/root/models/qwen3-embedding-0.6b/`. New deploys go to `/root/rocket-inference/`;
   the old directory is left in place. Run from the deploy dir (the bench uses the
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
+- **Live service**: since 2026-10-05 the example also runs as OpenViking's embedding
+  backend (Komodo `openviking` stack): container image
+  `git.kmsign.org/royalcat/embeddings-fast:0c99eed` (project `9264f92` + Dockerfile
+  `0c99eed` — older than `main` and predating the repo inversion; the service name
+  stayed `embeddings-fast`), `serve --backend flex --dtype f32 --npu --npu-attn cpu
+  --port 8383 --max-tokens 8192`, CPUs 4-7, `mem_limit`/`memswap_limit` 8g, weights
+  read-only at `/root/models/qwen3-embedding-0.6b`; OpenViking's `dense.api_base` is
+  `http://embeddings-fast:8383/v1`. `examples/rocket-inference/docker/build.sh` now
+  pushes `git.kmsign.org/royalcat/rocket-inference:<sha>` instead.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
   --embedding --pooling last -c 32768 -b 32768 -ub 32768 -np 1 -ctk q8_0 -ctv q8_0 -t 4
