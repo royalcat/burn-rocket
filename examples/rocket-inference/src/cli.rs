@@ -10,17 +10,21 @@ use anyhow::{Result, bail};
 pub const USAGE: &str = "\
 rocket-inference - Burn inference on the RK3588 (flex CPU backend, optional NPU offload)
 
-usage: rocket-inference <family> <command> [flags]
+usage: rocket-inference <family|serve> <command> [flags]
 
 families and commands:
-  qwen3   bench | embed | gemm | serve | tokenize
+  serve   [--model-dir <dir>] [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
+          one server for one loaded model; the routes follow the model:
+          /v1/embeddings (+ /embed) for embedding models, /v1/chat/completions
+          and the Ollama API (/api/*) for chat models, /health and /v1/models always
+  qwen3   bench | embed | gemm | tokenize
           Qwen3-Embedding-0.6B (OpenAI /v1/embeddings)
-  intent  gen | serve-ollama
+  intent  gen
           Qwen3.5-0.8B intent/query-planner (Ollama /api/chat, /api/generate)
-  gemma   embed | bench | tokenize | serve
-          EmbeddingGemma 2 (text/image/video/audio; /v1/embeddings, /embed)
-  gemma   gen | serve-chat
-          Gemma 4 E2B-it text generation (/v1/chat/completions)
+  gemma   embed | bench | tokenize
+          EmbeddingGemma 2 (text/image/video/audio embeddings)
+  gemma   gen
+          Gemma 4 E2B-it text generation
 
 Flags are per family and command; see README.md.";
 
@@ -63,6 +67,12 @@ impl FlagArgs {
         let before = self.args.len();
         self.args.retain(|a| a != flag);
         self.args.len() != before
+    }
+
+    /// Like [`FlagArgs::take_bool`], but distinguishes "absent" from "false".
+    /// Useful for validating that a family actually accepts the flag.
+    pub fn take_flag(&mut self, flag: &str) -> Option<bool> {
+        self.take_bool(flag).then_some(true)
     }
 
     /// `--flag value` parsed as `T`.

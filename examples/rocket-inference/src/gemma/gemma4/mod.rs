@@ -5,4 +5,3 @@ pub mod chat;
 pub mod cli;
 pub mod loader;
 pub mod model;
-pub mod server;

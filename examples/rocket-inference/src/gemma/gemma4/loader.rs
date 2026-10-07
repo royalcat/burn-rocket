@@ -26,6 +26,45 @@ use crate::gemma::config::Emb2Config;
 use crate::gemma::gemma4::model::{GenRoot, GenTextModel};
 use crate::gemma::layers::ClipBounds;
 
+/// Pack the generation model's text projections into resident fp16 NPU weights
+/// for the prefill pass. `keep_cpu` retains the f32 copies (decode runs on the
+/// CPU); with `keep_cpu == false` the CPU copies are dropped.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn pack_text_for_prefill(
+    model: &mut GenRoot,
+    threads: usize,
+    device: &Device,
+    keep_cpu: bool,
+) -> Result<()> {
+    use crate::gemma::layers;
+    burn_rocket::init(threads)
+        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    layers::set_npu_prefill_only(keep_cpu);
+    let t0 = std::time::Instant::now();
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    model.text_mut().for_each_projection_mut(|lin| {
+        let (n, k) = layers::pack_linear_into_npu(lin, device, keep_cpu);
+        count += 1;
+        bytes += n * k * 2;
+    });
+    if !keep_cpu {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+    println!(
+        "NPU: packed {count} text projections ({:.2} GiB f16) in {:.2}s; \
+         prefill on the NPU, decode on the CPU{} (resident {:.0} MiB anon)",
+        bytes as f64 / (1u64 << 30) as f64,
+        t0.elapsed().as_secs_f64(),
+        if keep_cpu { " (CPU copies kept)" } else { "" },
+        crate::util::rss_mib()
+    );
+    Ok(())
+}
+
 /// Per-tensor dtype selection, applied during loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadDtype {

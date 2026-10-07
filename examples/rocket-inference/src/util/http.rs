@@ -23,3 +23,33 @@ pub fn panic_message(payload: &(dyn Any + Send)) -> String {
         "unknown panic".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn lock_or_recover_survives_a_poisoned_mutex() {
+        let mutex = Arc::new(Mutex::new(7u32));
+        let poisoned = mutex.clone();
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(joined.is_err(), "the helper thread must have panicked");
+        assert_eq!(*lock_or_recover(&mutex), 7);
+    }
+
+    #[test]
+    fn panic_message_renders_both_payload_kinds() {
+        let text = panic_message(&("boom" as &str));
+        assert_eq!(text, "boom");
+        let owned = "owned".to_string();
+        let text = panic_message(&owned);
+        assert_eq!(text, "owned");
+        let other = 3u32;
+        assert_eq!(panic_message(&other), "unknown panic");
+    }
+}

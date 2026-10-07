@@ -1,6 +1,7 @@
-//! `intent` subcommands: `gen`, `serve-ollama` (Qwen3.5-0.8B intent model).
+//! `intent gen`: one-shot generation with the Qwen3.5-0.8B intent model
+//! (serving lives in the top-level `serve` command).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -8,24 +9,18 @@ use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
 use crate::qwen35_intent::loader::{self, IntentLoadOptions};
-use crate::qwen35_intent::model::{IntentModel, IntentTextConfig};
-use crate::qwen35_intent::ollama;
+use crate::qwen35_intent::model::IntentModel;
 use crate::util::device;
 use crate::util::rss_mib;
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut it = it;
     let cmd = it.next().unwrap_or_default();
-    match cmd.as_str() {
-        "gen" | "serve-ollama" => {}
-        other => bail!("unknown intent command '{other}' (expected gen|serve-ollama)"),
+    if cmd != "gen" {
+        bail!("unknown intent command '{cmd}' (expected gen)");
     }
     let args = Args::parse(&cmd, FlagArgs::new(it))?;
-    match cmd.as_str() {
-        "gen" => run_gen(&args),
-        "serve-ollama" => run_serve_ollama(&args),
-        _ => unreachable!(),
-    }
+    run_gen(&args)
 }
 
 struct Args {
@@ -45,8 +40,6 @@ struct Args {
     raw: bool,
     dump_hidden: Option<PathBuf>,
     dump_steps: Option<PathBuf>,
-    port: u16,
-    model_name: String,
 }
 
 impl Args {
@@ -69,8 +62,6 @@ impl Args {
             raw: false,
             dump_hidden: None,
             dump_steps: None,
-            port: 8383,
-            model_name: "qwen3-embedding-0.6b".to_string(),
         };
         if let Some(v) = f.take("--model-dir")? {
             args.model_dir = PathBuf::from(v);
@@ -110,12 +101,6 @@ impl Args {
         if let Some(v) = f.take("--dump-steps")? {
             args.dump_steps = Some(PathBuf::from(v));
         }
-        if let Some(v) = f.take_parsed("--port")? {
-            args.port = v;
-        }
-        if let Some(v) = f.take("--model-name")? {
-            args.model_name = v;
-        }
         f.finish(&format!("intent {cmd}"))?;
         Ok(args)
     }
@@ -132,7 +117,7 @@ impl Args {
     }
 }
 
-/// Build the intent model + tokenizer for `gen` / `serve-ollama`.
+/// Build the intent model + tokenizer for `gen`.
 fn load_intent(args: &Args) -> Result<(IntentModel, Tokenizer)> {
     let device = device(&args.backend)?;
     let opts = IntentLoadOptions {
@@ -141,31 +126,16 @@ fn load_intent(args: &Args) -> Result<(IntentModel, Tokenizer)> {
         embed_f16: args.embed_f16,
         pure_npu: args.pure_npu,
     };
-    let mut model = loader::load_intent_model(&args.model_dir, &device, &opts)?;
-    model.chunk = args.delta_chunk.max(1);
-    model.npu_only = args.pure_npu;
-    model.npu_decode = args.npu_decode;
+    let loaded = loader::load_for_serving(
+        &args.model_dir,
+        &device,
+        &opts,
+        args.delta_chunk,
+        args.pure_npu,
+        args.npu_decode,
+    )?;
     println!("intent model resident {:.0} MiB anon", rss_mib());
-    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    Ok((model, tokenizer))
-}
-
-/// EOS plus the ChatML stop specials.
-fn intent_stop_ids(
-    model_dir: &Path,
-    tokenizer: &Tokenizer,
-    cfg: &IntentTextConfig,
-) -> Vec<u32> {
-    let mut ids = loader::eos_ids(model_dir, cfg);
-    for tok in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
-        if let Some(id) = tokenizer.token_to_id(tok) {
-            ids.push(id);
-        }
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    ids
+    Ok((loaded.model, loaded.tokenizer))
 }
 
 /// ChatML wrapper identical to the model's Ollama template.
@@ -188,7 +158,7 @@ fn run_gen(args: &Args) -> Result<()> {
             args.max_tokens
         );
     }
-    let stops = intent_stop_ids(&args.model_dir, &tokenizer, &model.cfg);
+    let stops = loader::stop_ids(&args.model_dir, &tokenizer, &model.cfg);
     if let Some(path) = &args.dump_hidden {
         let hidden = model.forward_hidden(&ids);
         let layers: Vec<Vec<f32>> = hidden
@@ -270,26 +240,4 @@ fn run_gen(args: &Args) -> Result<()> {
     println!("text: {decoded}");
     println!("resident {:.0} MiB anon", rss_mib());
     Ok(())
-}
-
-fn run_serve_ollama(args: &Args) -> Result<()> {
-    let (model, tokenizer) = load_intent(args)?;
-    let stop_ids = intent_stop_ids(&args.model_dir, &tokenizer, &model.cfg);
-    let model_name = if args.model_name == "qwen3-embedding-0.6b" {
-        "guoxuter/ov_intent_analysis_sft:v7_q8".to_string()
-    } else {
-        args.model_name.clone()
-    };
-    ollama::serve(
-        model,
-        tokenizer,
-        ollama::OllamaOptions {
-            addr: format!("0.0.0.0:{}", args.port),
-            model_name,
-            max_tokens: args.max_tokens,
-            max_new_tokens: args.max_new_tokens,
-            temperature: args.temperature,
-            stop_ids,
-        },
-    )
 }

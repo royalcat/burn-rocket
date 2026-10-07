@@ -1,4 +1,4 @@
-//! `qwen3` subcommands: `bench`, `embed`, `gemm`, `serve`, `tokenize`
+//! `qwen3` subcommands: `bench`, `embed`, `gemm`, `tokenize`
 //! (Qwen3-Embedding-0.6B).
 
 use std::path::PathBuf;
@@ -12,7 +12,6 @@ use tokenizers::Tokenizer;
 use crate::cli::FlagArgs;
 use crate::qwen3_embedding::load::load_model;
 use crate::qwen3_embedding::model::{stage_stats, stage_stats_reset};
-use crate::qwen3_embedding::server::{self, ServeOptions};
 use crate::util::device;
 use crate::util::rope::RopeCache;
 
@@ -20,9 +19,9 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut it = it;
     let cmd = it.next().unwrap_or_default();
     match cmd.as_str() {
-        "bench" | "embed" | "gemm" | "serve" | "tokenize" => {}
+        "bench" | "embed" | "gemm" | "tokenize" => {}
         other => bail!(
-            "unknown qwen3 command '{other}' (expected bench|embed|gemm|serve|tokenize)"
+            "unknown qwen3 command '{other}' (expected bench|embed|gemm|tokenize)"
         ),
     }
     let args = Args::parse(&cmd, FlagArgs::new(it))?;
@@ -30,7 +29,6 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         "bench" => run_bench(&args),
         "embed" => run_embed(&args),
         "gemm" => run_gemm(&args),
-        "serve" => run_serve(&args),
         "tokenize" => run_tokenize(&args),
         _ => unreachable!(),
     }
@@ -56,9 +54,6 @@ struct Args {
     npu_attn: bool,
     attn_fused: bool,
     key_block: usize,
-    port: u16,
-    max_tokens: usize,
-    model_name: String,
 }
 
 impl Args {
@@ -84,9 +79,6 @@ impl Args {
             npu_attn: true,
             attn_fused: true,
             key_block: 256,
-            port: 8383,
-            max_tokens: 30000,
-            model_name: "qwen3-embedding-0.6b".to_string(),
         };
         if let Some(v) = f.take("--model-dir")? {
             args.model_dir = PathBuf::from(v);
@@ -145,15 +137,6 @@ impl Args {
         }
         if let Some(v) = f.take_parsed("--key-block")? {
             args.key_block = v;
-        }
-        if let Some(v) = f.take_parsed("--port")? {
-            args.port = v;
-        }
-        if let Some(v) = f.take_parsed("--max-tokens")? {
-            args.max_tokens = v;
-        }
-        if let Some(v) = f.take("--model-name")? {
-            args.model_name = v;
         }
         f.finish(&format!("qwen3 {cmd}"))?;
         Ok(args)
@@ -325,35 +308,6 @@ fn run_tokenize(args: &Args) -> Result<()> {
             .join(" ")
     );
     Ok(())
-}
-
-fn run_serve(args: &Args) -> Result<()> {
-    let device = device(&args.backend)?;
-    let (model, cfg) = load_model(
-        &args.model_dir,
-        args.dtype,
-        args.quant_q8,
-        args.npu,
-        args.npu_threads,
-        args.npu_attn,
-        &device,
-    )?;
-    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    server::serve(
-        model,
-        cfg,
-        tokenizer,
-        device,
-        ServeOptions {
-            addr: format!("0.0.0.0:{}", args.port),
-            max_tokens: args.max_tokens,
-            model_name: args.model_name.clone(),
-            chunk: args.chunk,
-            key_block: args.key_block,
-            attn_fused: args.attn_fused,
-        },
-    )
 }
 
 fn run_embed(args: &Args) -> Result<()> {

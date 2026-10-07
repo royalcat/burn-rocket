@@ -14,6 +14,7 @@ mod cli;
 mod gemma;
 mod qwen35_intent;
 mod qwen3_embedding;
+mod server;
 mod util;
 
 use anyhow::{Result, bail};
@@ -25,6 +26,7 @@ fn main() -> Result<()> {
         std::process::exit(2);
     };
     match family.as_str() {
+        "serve" => server::cli::run(it),
         "qwen3" => qwen3_embedding::cli::run(it),
         "intent" => qwen35_intent::cli::run(it),
         "gemma" => gemma::cli::run(it),
@@ -33,7 +35,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         other => bail!(
-            "unknown family '{other}' (expected qwen3|intent|gemma)\n\n{}",
+            "unknown family '{other}' (expected serve|qwen3|intent|gemma)\n\n{}",
             cli::USAGE
         ),
     }

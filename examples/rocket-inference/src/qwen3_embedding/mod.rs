@@ -3,4 +3,3 @@
 pub mod cli;
 pub mod load;
 pub mod model;
-pub mod server;

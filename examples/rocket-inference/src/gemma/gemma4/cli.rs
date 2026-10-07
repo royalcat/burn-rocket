@@ -1,19 +1,15 @@
-//! `gemma gen|serve-chat` subcommands: the Gemma 4 E2B-it generation model.
+//! `gemma gen`: one-shot generation with the Gemma 4 E2B-it model
+//! (serving lives in the top-level `serve` command).
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-use burn::prelude::Device;
 use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
 use crate::gemma::gemma4::chat::{self, gen_eos};
 use crate::gemma::gemma4::loader::{self, LoadDtype};
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-use crate::gemma::gemma4::model::GenRoot;
 use crate::gemma::gemma4::model::{gen_stage_stats, gen_stage_stats_reset};
-use crate::gemma::gemma4::server::{self, ChatServeOptions};
 use crate::gemma::inputs;
 use crate::util::device;
 
@@ -21,7 +17,6 @@ pub fn run(cmd: &str, it: impl Iterator<Item = String>) -> Result<()> {
     let args = Args::parse(cmd, FlagArgs::new(it))?;
     match cmd {
         "gen" => run_gen(&args),
-        "serve-chat" => run_serve_chat(&args),
         _ => bail!("unknown gemma4 command '{cmd}'"),
     }
 }
@@ -39,8 +34,6 @@ struct Args {
     attn_chunk: usize,
     dump_logits: Option<PathBuf>,
     out: Option<PathBuf>,
-    port: u16,
-    model_name: String,
     quant_q8: bool,
     npu: bool,
     npu_threads: usize,
@@ -69,8 +62,6 @@ impl Args {
             attn_chunk: 1024,
             dump_logits: None,
             out: None,
-            port: 8391,
-            model_name: "embeddinggemma-2".to_string(),
             quant_q8: false,
             npu: false,
             npu_threads: 5,
@@ -119,12 +110,6 @@ impl Args {
         if let Some(v) = f.take("--out")? {
             args.out = Some(PathBuf::from(v));
         }
-        if let Some(v) = f.take_parsed("--port")? {
-            args.port = v;
-        }
-        if let Some(v) = f.take("--model-name")? {
-            args.model_name = v;
-        }
         if let Some(v) = f.take_choice("--quant", &["none", "q8"])? {
             args.quant_q8 = v == "q8";
         }
@@ -166,45 +151,6 @@ impl Args {
     }
 }
 
-/// Pack the generation model's text projections into resident fp16 NPU weights
-/// for the prefill pass. `keep_cpu` retains the f32 copies (decode runs on the
-/// CPU); with `keep_cpu == false` the CPU copies are dropped.
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-fn pack_gen_text(
-    model: &mut GenRoot,
-    threads: usize,
-    device: &Device,
-    keep_cpu: bool,
-) -> Result<()> {
-    use crate::gemma::layers;
-    burn_rocket::init(threads)
-        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
-    layers::set_npu_prefill_only(keep_cpu);
-    let t0 = std::time::Instant::now();
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    model.text_mut().for_each_projection_mut(|lin| {
-        let (n, k) = layers::pack_linear_into_npu(lin, device, keep_cpu);
-        count += 1;
-        bytes += n * k * 2;
-    });
-    if !keep_cpu {
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
-    println!(
-        "NPU: packed {count} text projections ({:.2} GiB f16) in {:.2}s; \
-         prefill on the NPU, decode on the CPU{} (resident {:.0} MiB anon)",
-        bytes as f64 / (1u64 << 30) as f64,
-        t0.elapsed().as_secs_f64(),
-        if keep_cpu { " (CPU copies kept)" } else { "" },
-        crate::util::rss_mib()
-    );
-    Ok(())
-}
-
 #[derive(serde::Deserialize)]
 struct MessageJson {
     role: String,
@@ -224,7 +170,7 @@ fn run_gen(args: &Args) -> Result<()> {
     let (mut model, cfg) = loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if args.npu {
-        pack_gen_text(&mut model, args.npu_threads, &device, true)?;
+        loader::pack_text_for_prefill(&mut model, args.npu_threads, &device, true)?;
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if args.npu {
@@ -336,50 +282,4 @@ fn run_gen(args: &Args) -> Result<()> {
         println!("wrote {}", path.display());
     }
     Ok(())
-}
-
-fn run_serve_chat(args: &Args) -> Result<()> {
-    let device = device(&args.backend)?;
-    let dtype = if args.quant_q8 {
-        LoadDtype::Q8
-    } else if args.gen_f16 {
-        LoadDtype::F16
-    } else {
-        LoadDtype::F32
-    };
-    #[allow(unused_mut)]
-    let (mut model, _cfg) = loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
-    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if args.npu {
-        pack_gen_text(&mut model, args.npu_threads, &device, true)?;
-    }
-    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-    if args.npu {
-        bail!("--npu requires an aarch64 build with --features npu");
-    }
-    let lm_head = loader::build_lm_head(model.text(), dtype != LoadDtype::F32, &device);
-    let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
-    let model_name = if args.model_name == "embeddinggemma-2" {
-        // The chat server's default name should match the generation model.
-        args.gen_model_dir
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "gemma-4-E2B-it".to_string())
-    } else {
-        args.model_name.clone()
-    };
-    server::serve(
-        model,
-        lm_head,
-        tokenizer,
-        device,
-        ChatServeOptions {
-            addr: format!("0.0.0.0:{}", args.port),
-            model_name,
-            model_dir: args.gen_model_dir.clone(),
-            attn_chunk: args.attn_chunk,
-            max_new_tokens: args.max_new_tokens,
-        },
-    )
 }

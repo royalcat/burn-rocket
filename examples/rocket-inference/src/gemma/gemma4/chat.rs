@@ -115,6 +115,8 @@ pub struct GenStats {
     pub decode_s: f64,
     pub prompt_tokens: usize,
     pub generated: usize,
+    /// True when generation ended on an EOS token (not the length cap).
+    pub stopped: bool,
     /// Per-step top-8 `(id, logit)` (cheap; the CLI can dump it for parity checks).
     pub top8: Vec<Vec<(u32, f32)>>,
 }
@@ -269,10 +271,12 @@ pub fn generate_with_media(
     stats.prefill_s = t0.elapsed().as_secs_f64();
 
     let mut out: Vec<u32> = Vec::new();
+    let mut stopped = false;
     let t1 = std::time::Instant::now();
     for _ in 0..opts.max_new_tokens {
         out.push(next);
         if opts.eos.contains(&next) {
+            stopped = true;
             break;
         }
         let input = crate::gemma::inputs::make_input(&[next], device);
@@ -284,6 +288,7 @@ pub fn generate_with_media(
     }
     stats.decode_s = t1.elapsed().as_secs_f64();
     stats.generated = out.len();
+    stats.stopped = stopped;
     Ok((out, stats))
 }
 

@@ -15,6 +15,7 @@ use burn_store::{ModuleStore, SafetensorsStore};
 
 use crate::qwen35_intent::model::{DeltaNet, GatedAttention, IntentModel, IntentTextConfig, Mixer};
 use crate::util::proj::Proj;
+use tokenizers::Tokenizer;
 
 pub struct IntentLoadOptions {
     /// Pack projections into resident NPU weights (aarch64 + `npu` feature only).
@@ -338,4 +339,48 @@ pub fn eos_ids(model_dir: &Path, cfg: &IntentTextConfig) -> Vec<u32> {
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() { fallback() } else { ids }
+}
+
+/// Stop ids for generation: EOS plus the ChatML stop specials.
+pub fn stop_ids(model_dir: &Path, tokenizer: &Tokenizer, cfg: &IntentTextConfig) -> Vec<u32> {
+    let mut ids = eos_ids(model_dir, cfg);
+    for tok in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"] {
+        if let Some(id) = tokenizer.token_to_id(tok) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// A loaded intent model ready to serve.
+pub struct LoadedIntent {
+    pub model: IntentModel,
+    pub tokenizer: Tokenizer,
+    pub stop_ids: Vec<u32>,
+}
+
+/// Load the intent model for serving: same options as one-shot `gen`, plus the
+/// decode-side settings and the stop-id set.
+pub fn load_for_serving(
+    model_dir: &Path,
+    device: &Device,
+    opts: &IntentLoadOptions,
+    delta_chunk: usize,
+    pure_npu: bool,
+    npu_decode: bool,
+) -> Result<LoadedIntent> {
+    let mut model = load_intent_model(model_dir, device, opts)?;
+    model.chunk = delta_chunk.max(1);
+    model.npu_only = pure_npu;
+    model.npu_decode = npu_decode;
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let stop_ids = stop_ids(model_dir, &tokenizer, &model.cfg);
+    Ok(LoadedIntent {
+        model,
+        tokenizer,
+        stop_ids,
+    })
 }

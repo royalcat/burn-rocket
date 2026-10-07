@@ -1,5 +1,5 @@
-//! `gemma embed|bench|tokenize|serve` subcommands: the EmbeddingGemma 2
-//! multimodal embedding model.
+//! `gemma embed|bench|tokenize` subcommands: the EmbeddingGemma 2
+//! multimodal embedding model (serving lives in the top-level `serve` command).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -12,7 +12,6 @@ use tokenizers::Tokenizer;
 use crate::cli::FlagArgs;
 use crate::gemma::embeddinggemma::load::load_model;
 use crate::gemma::embeddinggemma::model::{stage_stats, stage_stats_reset};
-use crate::gemma::embeddinggemma::server::{self, ServeOptions};
 use crate::gemma::inputs;
 use crate::util::device;
 
@@ -21,7 +20,6 @@ pub fn run(cmd: &str, it: impl Iterator<Item = String>) -> Result<()> {
     match cmd {
         "bench" => run_bench(&args),
         "embed" => run_embed(&args),
-        "serve" => run_serve(&args),
         "tokenize" => run_tokenize(&args),
         _ => bail!("unknown gemma command '{cmd}'"),
     }
@@ -54,9 +52,6 @@ struct Args {
     dump_image: Option<PathBuf>,
     dump_vision: Option<PathBuf>,
     dump_vision_layers: Option<PathBuf>,
-    port: u16,
-    model_name: String,
-    max_tokens: usize,
     quant_q8: bool,
     npu: bool,
     npu_threads: usize,
@@ -93,9 +88,6 @@ impl Args {
             dump_image: None,
             dump_vision: None,
             dump_vision_layers: None,
-            port: 8390,
-            model_name: "embeddinggemma-2".to_string(),
-            max_tokens: 8192,
             quant_q8: false,
             npu: false,
             npu_threads: 5,
@@ -180,15 +172,6 @@ impl Args {
         }
         if let Some(v) = f.take("--dump-vision-layers")? {
             args.dump_vision_layers = Some(PathBuf::from(v));
-        }
-        if let Some(v) = f.take_parsed("--port")? {
-            args.port = v;
-        }
-        if let Some(v) = f.take("--model-name")? {
-            args.model_name = v;
-        }
-        if let Some(v) = f.take_parsed("--max-tokens")? {
-            args.max_tokens = v;
         }
         if let Some(v) = f.take_choice("--quant", &["none", "q8"])? {
             args.quant_q8 = v == "q8";
@@ -406,34 +389,4 @@ fn run_tokenize(args: &Args) -> Result<()> {
     println!("{} tokens", ids.len());
     println!("{ids:?}");
     Ok(())
-}
-
-fn run_serve(args: &Args) -> Result<()> {
-    let device = device(&args.backend)?;
-    let (model, cfg) = load_model(
-        &args.model_dir,
-        args.dtype,
-        args.quant_q8,
-        args.npu,
-        args.npu_threads,
-        args.npu_attn,
-        &device,
-    )?;
-    let tokenizer = args.tokenizer()?;
-    server::serve(
-        model,
-        cfg,
-        tokenizer,
-        device,
-        args.dtype,
-        ServeOptions {
-            addr: format!("0.0.0.0:{}", args.port),
-            model_name: args.model_name.clone(),
-            model_dir: args.model_dir.clone(),
-            attn_chunk: args.attn_chunk,
-            max_tokens: args.max_tokens,
-            video_fps: args.video_fps,
-            video_max_frames: args.video_max_frames,
-        },
-    )
 }
