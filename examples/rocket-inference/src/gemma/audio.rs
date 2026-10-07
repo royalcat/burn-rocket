@@ -399,16 +399,6 @@ impl AudioLayer {
         }
     }
 
-    fn forward(
-        &self,
-        x: Tensor<2>,
-        pos: &Tensor<2>,
-        mask: &Tensor<4, Bool>,
-        spec: &AudioSpec,
-    ) -> Tensor<2> {
-        self.forward_debug(x, pos, mask, spec, None, 0)
-    }
-
     fn forward_debug(
         &self,
         x: Tensor<2>,
@@ -419,10 +409,10 @@ impl AudioLayer {
         index: usize,
     ) -> Tensor<2> {
         let dump = |name: &str, t: &Tensor<2>| {
-            if let Some(dir) = debug_dir {
-                if index == 0 {
-                    dump_tensor(dir, name, t);
-                }
+            if let Some(dir) = debug_dir
+                && index == 0
+            {
+                dump_tensor(dir, name, t);
             }
         };
         let h = self.feed_forward1.forward(x, spec);
@@ -496,10 +486,6 @@ impl AudioTower {
 
     /// `[frames, MEL_BINS]` log-mel features -> `[T/4, out_dims]` soft tokens
     /// (all frames; callers keep only the valid ones).
-    pub fn forward(&self, feats: &AudioFeatures) -> Tensor<2> {
-        self.forward_debug(feats, None)
-    }
-
     pub fn forward_debug(&self, feats: &AudioFeatures, debug_dir: Option<&std::path::Path>) -> Tensor<2> {
         let device = self.output_proj.weight.val().device();
         let t = feats.frames;
@@ -527,10 +513,10 @@ impl AudioTower {
                 for j in 0..ctx {
                     let kj = b * c + j - spec.past;
                     let valid = qi < t2
-                        && (kj as usize) < t2
-                        && m2.get(kj as usize).copied().unwrap_or(false)
-                        && qi >= kj as usize
-                        && qi - (kj as usize) < spec.past;
+                        && kj < t2
+                        && m2.get(kj).copied().unwrap_or(false)
+                        && qi >= kj
+                        && qi - kj < spec.past;
                     mask_data[(b * c + i) * ctx + j] = valid;
                 }
             }

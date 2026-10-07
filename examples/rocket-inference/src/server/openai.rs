@@ -18,7 +18,6 @@ use super::error::{ApiError, OpenAiError, blocking};
 pub(crate) struct EmbeddingRequest {
     input: Input,
     #[serde(default)]
-    #[allow(dead_code)]
     model: Option<String>,
     #[serde(default)]
     encoding_format: Option<String>,

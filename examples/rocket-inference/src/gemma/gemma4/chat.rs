@@ -22,13 +22,6 @@ impl Message {
             content: content.into(),
         }
     }
-
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: "system".to_string(),
-            content: content.into(),
-        }
-    }
 }
 
 /// Renders the canonical Gemma 4 chat template (tools omitted; thinking is
@@ -94,6 +87,8 @@ pub struct GenOptions {
     pub top_k: usize,
     pub top_p: f32,
     pub eos: Vec<u32>,
+    /// Collect per-step top-8 logits into `GenStats::top8` (debug/parity dumps).
+    pub collect_top8: bool,
 }
 
 impl Default for GenOptions {
@@ -105,6 +100,7 @@ impl Default for GenOptions {
             top_k: 64,
             top_p: 0.95,
             eos: vec![1, 106, 50],
+            collect_top8: false,
         }
     }
 }
@@ -225,19 +221,7 @@ fn sample(logits: &Tensor<2>, opts: &GenOptions, rng: &mut SplitMix64) -> Result
     Ok(order[0] as u32)
 }
 
-/// Prefill + decode loop. `ids` are the rendered-conversation token ids.
-pub fn generate(
-    model: &GenRoot,
-    lm_head: &Tensor<2>,
-    ids: &[u32],
-    opts: &GenOptions,
-    chunk: usize,
-    device: &Device,
-) -> Result<(Vec<u32>, GenStats)> {
-    generate_with_media(model, lm_head, ids, None, 0, opts, chunk, device)
-}
-
-/// Like [`generate`], with optional media soft tokens scattered into the
+/// Prefill + decode loop with optional media soft tokens scattered into the
 /// placeholder positions of `ids` (the ids are used for the PLE token lookup,
 /// with the media slots replaced by `pad_id`, exactly like the reference).
 #[allow(clippy::too_many_arguments)]
@@ -266,7 +250,9 @@ pub fn generate_with_media(
     crate::gemma::layers::set_prefill_mode(true);
     let logits = model.prefill(ids, soft, &ropes, &mut kv, lm_head, chunk, pad_id);
     crate::gemma::layers::set_prefill_mode(false);
-    stats.top8.push(top_k(&logits, 8));
+    if opts.collect_top8 {
+        stats.top8.push(top_k(&logits, 8));
+    }
     let mut next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
 
@@ -283,7 +269,9 @@ pub fn generate_with_media(
         let seq_start = kv.len;
         let h = model.text().forward(input, &ropes, &mut kv, seq_start, chunk);
         let logits = model.text().logits(h, lm_head);
-        stats.top8.push(top_k(&logits, 8));
+        if opts.collect_top8 {
+            stats.top8.push(top_k(&logits, 8));
+        }
         next = sample(&logits, opts, &mut rng)?;
     }
     stats.decode_s = t1.elapsed().as_secs_f64();
@@ -295,19 +283,19 @@ pub fn generate_with_media(
 /// EOS ids from the checkpoint's `generation_config.json` (fallback: 1, 106, 50).
 pub(crate) fn gen_eos(model_dir: &Path) -> Vec<u32> {
     let mut eos = vec![1u32, 106, 50];
-    if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-            match json.get("eos_token_id") {
-                Some(serde_json::Value::Number(n)) => {
-                    if let Some(v) = n.as_u64() {
-                        eos = vec![v as u32];
-                    }
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json"))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        match json.get("eos_token_id") {
+            Some(serde_json::Value::Number(n)) => {
+                if let Some(v) = n.as_u64() {
+                    eos = vec![v as u32];
                 }
-                Some(serde_json::Value::Array(a)) => {
-                    eos = a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
-                }
-                _ => {}
             }
+            Some(serde_json::Value::Array(a)) => {
+                eos = a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+            }
+            _ => {}
         }
     }
     eos

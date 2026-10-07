@@ -89,12 +89,8 @@ pub struct GenSpec {
     pub eps: f64,
     pub sliding_window: usize,
     pub ple_dim: usize,
-    pub vocab: usize,
-    pub ple_vocab: usize,
     pub logit_softcap: Option<f64>,
     pub layers: Vec<GenLayerSpec>,
-    /// Index of the last non-shared layer of each type (0 = sliding, 1 = full).
-    pub shared_source: [Option<usize>; 2],
 }
 
 impl GenSpec {
@@ -155,11 +151,8 @@ impl GenSpec {
             eps: cfg.rms_norm_eps,
             sliding_window: cfg.sliding_window,
             ple_dim: cfg.hidden_size_per_layer_input,
-            vocab: cfg.vocab_size,
-            ple_vocab: cfg.vocab_size_per_layer_input,
             logit_softcap: cfg.final_logit_softcapping,
             layers,
-            shared_source,
         }
     }
 
@@ -304,17 +297,6 @@ impl GenKv {
         self.k[layer] = Some(kk.clone());
         self.v[layer] = Some(vv.clone());
         (kk, vv)
-    }
-
-    pub fn reset(&mut self) {
-        for slot in &mut self.k {
-            *slot = None;
-        }
-        for slot in &mut self.v {
-            *slot = None;
-        }
-        self.shared = [None, None];
-        self.len = 0;
     }
 }
 
@@ -664,6 +646,7 @@ impl GenTextModel {
 
     /// Visit every *used* text projection (q/k/v/o, MLP, PLE); the k/v of
     /// KV-shared layers are never called and are skipped.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn for_each_projection_mut(&mut self, mut f: impl FnMut(&mut Linear)) {
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if !self.spec.layers[i].is_kv_shared {
@@ -870,6 +853,7 @@ impl GenRoot {
 
     /// Prefill over `ids` with optional media soft tokens scattered into the
     /// placeholder positions; returns the soft-capped logits of the last position.
+    #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
         ids: &[u32],

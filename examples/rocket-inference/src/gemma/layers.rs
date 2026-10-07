@@ -152,13 +152,16 @@ fn npu_lookup(param: &Param<Tensor<2>>) -> Option<burn_rocket::WeightId> {
 }
 
 /// Generation mode: registered NPU weights are used only inside prefill.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
 static NPU_PREFILL_ONLY: AtomicBool = AtomicBool::new(false);
 static PREFILL_MODE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn set_npu_prefill_only(on: bool) {
     NPU_PREFILL_ONLY.store(on, Ordering::Relaxed);
 }
 
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub(crate) fn npu_prefill_only() -> bool {
     NPU_PREFILL_ONLY.load(Ordering::Relaxed)
 }
@@ -168,6 +171,7 @@ pub fn set_prefill_mode(on: bool) {
     PREFILL_MODE.store(on, Ordering::Relaxed);
 }
 
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn prefill_mode() -> bool {
     PREFILL_MODE.load(Ordering::Relaxed)
 }
@@ -206,15 +210,6 @@ pub fn pack_linear_into_npu(
     (n, k)
 }
 
-/// Number of registered NPU weights (for loader summaries).
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub fn npu_weight_count() -> usize {
-    let guard = NPU_WEIGHTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.as_ref().map(|m| m.len()).unwrap_or(0)
-}
-
 /// Clipping bounds for `Gemma4ClippableLinear` (audio tower only; the vision
 /// tower ships `use_clipped_linears = false` and has no bound tensors).
 #[derive(Debug, Clone, Copy)]
@@ -235,15 +230,6 @@ pub struct ClippableLinear {
 }
 
 impl ClippableLinear {
-    pub fn new(in_features: usize, out_features: usize, device: &Device) -> Self {
-        Self {
-            linear: LinearConfig::new(in_features, out_features)
-                .with_bias(false)
-                .init(device),
-            clip: None,
-        }
-    }
-
     pub fn with_clip(
         in_features: usize,
         out_features: usize,
@@ -256,10 +242,6 @@ impl ClippableLinear {
                 .init(device),
             clip,
         }
-    }
-
-    pub fn weight(&self) -> &Param<Tensor<2>> {
-        &self.linear.weight
     }
 
     pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {

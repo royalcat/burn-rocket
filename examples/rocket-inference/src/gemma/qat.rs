@@ -145,16 +145,6 @@ pub fn dequantize_weight(
     out
 }
 
-/// `x / scale` rounded to the int8 grid and back (no-op when uncalibrated).
-pub fn apply_srq_vec(values: &mut [f32], scale: f32) {
-    if scale == 0.0 {
-        return;
-    }
-    for v in values.iter_mut() {
-        *v = (*v / scale).round().clamp(-128.0, 127.0) * scale;
-    }
-}
-
 /// Read all `*.weight_scale` / `*_activation_scale` tensors into per-module
 /// scale records.
 pub fn read_scales(
@@ -165,7 +155,7 @@ pub fn read_scales(
 
     let keys = store.keys()?;
     let mut out: HashMap<String, ModuleScales> = HashMap::new();
-    let mut read_f32 = |store: &mut burn_store::SafetensorsStore, key: &str| -> Result<Vec<f32>> {
+    let read_f32 = |store: &mut burn_store::SafetensorsStore, key: &str| -> Result<Vec<f32>> {
         let t = store
             .get_tensor(key)?
             .ok_or_else(|| anyhow::anyhow!("missing {key}"))?;

@@ -18,6 +18,9 @@ use crate::util::rope::RopeCache;
 
 use super::error::ApiError;
 
+/// `(input ids, optional media soft tokens)` for one generation pass.
+type EncodedInput = (Vec<u32>, Option<(Vec<usize>, Tensor<2>)>);
+
 /// The model family loaded in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -444,12 +447,12 @@ impl IntentEngine {
             return Ok(turn.prompt.clone().unwrap_or_default());
         }
         let mut out = String::new();
-        if let Some(sys) = &turn.system {
-            if !sys.is_empty() {
-                out.push_str("<|im_start|>system\n");
-                out.push_str(sys);
-                out.push_str("<|im_end|>\n");
-            }
+        if let Some(sys) = &turn.system
+            && !sys.is_empty()
+        {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(sys);
+            out.push_str("<|im_end|>\n");
         }
         for m in &turn.messages {
             if !matches!(m.role.as_str(), "system" | "user" | "assistant") {
@@ -563,6 +566,7 @@ impl Gemma4Engine {
             top_k: turn.top_k.unwrap_or(64),
             top_p: turn.top_p.unwrap_or(0.95),
             eos: self.eos.clone(),
+            collect_top8: false,
         };
         let (out, stats) = chat::generate_with_media(
             &self.model,
@@ -598,7 +602,7 @@ impl Gemma4Engine {
         thinking: bool,
         image: Option<PathBuf>,
         audio: Option<PathBuf>,
-    ) -> Result<(Vec<u32>, Option<(Vec<usize>, Tensor<2>)>), ApiError> {
+    ) -> Result<EncodedInput, ApiError> {
         let rendered = chat::render(messages, thinking);
         if image.is_none() && audio.is_none() {
             let ids = chat::encode(&self.tokenizer, &rendered)

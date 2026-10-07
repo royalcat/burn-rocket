@@ -58,23 +58,7 @@ pub fn load_model(
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
-    if !result.errors.is_empty() {
-        bail!("load errors: {:?}", result.errors);
-    }
-    if !result.missing.is_empty() {
-        bail!(
-            "{} model parameters missing from file (first: {:?})",
-            result.missing.len(),
-            result.missing.first()
-        );
-    }
-    if !result.unused.is_empty() {
-        let sample: Vec<&String> = result.unused.iter().take(8).collect();
-        println!(
-            "note: {} file tensors unused by the model tree (e.g. {sample:?})",
-            result.unused.len()
-        );
-    }
+    crate::util::store::check_load_report(&result, |_| false)?;
     println!(
         "loaded {} tensors as {:?} in {:.2}s (resident {:.0} MiB anon)",
         result.applied.len(),

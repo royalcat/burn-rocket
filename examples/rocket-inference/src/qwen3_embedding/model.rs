@@ -42,6 +42,7 @@ pub fn stage_stats_reset() {
 }
 
 /// Model hyper-parameters, deserialized from the HF `config.json`.
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Qwen3Config {
     pub vocab_size: usize,
@@ -446,7 +447,7 @@ impl Qwen3Attention {
             let mut l = Tensor::<4>::zeros([b, h, c, 1], (&device, DType::F32));
             let mut acc = Tensor::<4>::zeros([b, h, c, d], (&device, DType::F32));
 
-            let n_blocks = (q1 + kb - 1) / kb;
+            let n_blocks = q1.div_ceil(kb);
             for i in 0..n_blocks {
                 let k0 = i * kb;
                 let k1 = (k0 + kb).min(q1);

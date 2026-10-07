@@ -39,16 +39,6 @@ pub struct AudioFeatures {
 }
 
 impl AudioFeatures {
-    pub fn frame(&self, i: usize) -> &[f32] {
-        &self.mel[i * MEL_BINS..(i + 1) * MEL_BINS]
-    }
-
-    /// Number of soft tokens: two stride-2 (k=3, p=1) convolutions subsample the
-    /// frame axis twice.
-    pub fn num_soft_tokens(&self) -> usize {
-        subsample_count(subsample_count(self.frames))
-    }
-
     /// Valid soft tokens (the tower's output mask subsampled the same way).
     pub fn valid_soft_tokens(&self) -> usize {
         let (m1, _) = subsample_mask(&self.mask);
@@ -126,8 +116,10 @@ fn read_ffmpeg(path: &Path) -> Result<Vec<f32>> {
     }
     Ok(out
         .stdout
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -189,7 +181,7 @@ pub fn mel_features(waveform: &[f32]) -> AudioFeatures {
     padded[PAD_LEFT..PAD_LEFT + real].copy_from_slice(&waveform[..real]);
 
     let total = padded.len();
-    let frames = if total >= FRAME_LENGTH + 1 {
+    let frames = if total > FRAME_LENGTH {
         (total - (FRAME_LENGTH + 1)) / HOP_LENGTH + 1
     } else {
         0

@@ -35,6 +35,7 @@ fn default_pooling_kernel() -> usize {
 }
 
 /// Top-level `config.json` of the checkpoint.
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Emb2Config {
     pub text_config: TextConfig,
@@ -69,6 +70,7 @@ pub struct LayerOverride {
 }
 
 /// RoPE parameters per layer type.
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct RopeSpec {
     #[serde(default)]
@@ -88,6 +90,7 @@ pub struct RopeParameters {
 }
 
 /// The `text_config` (model_type `embedding_gemma2_text`).
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TextConfig {
     #[serde(default = "default_vocab")]
@@ -190,6 +193,7 @@ impl TextConfig {
 }
 
 /// Gemma 4 vision tower config (subset needed for inference).
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct VisionConfig {
     pub hidden_size: usize,
@@ -229,6 +233,7 @@ impl VisionConfig {
 }
 
 /// Gemma 4 audio tower config (subset needed for inference).
+#[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AudioConfig {
     pub hidden_size: usize,

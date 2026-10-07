@@ -15,6 +15,9 @@ use crate::gemma::embeddinggemma::model::{stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
 use crate::util::device;
 
+/// `(input ids, optional media soft tokens, sequence length)`.
+type PreparedInput = (Tensor<2, Int>, Option<(Vec<usize>, Tensor<2>)>, usize);
+
 pub fn run(cmd: &str, it: impl Iterator<Item = String>) -> Result<()> {
     let args = Args::parse(cmd, FlagArgs::new(it))?;
     match cmd {
@@ -236,7 +239,7 @@ fn build_inputs(
     args: &Args,
     model: &crate::gemma::embeddinggemma::model::Emb2Model,
     device: &Device,
-) -> Result<(Tensor<2, Int>, Option<(Vec<usize>, Tensor<2>)>, usize)> {
+) -> Result<PreparedInput> {
     let tokenizer = args.tokenizer()?;
     let prefix = args.prompt_prefix()?;
     let (img_soft_default, video_soft_default) = inputs::media_soft_tokens(&args.model_dir);

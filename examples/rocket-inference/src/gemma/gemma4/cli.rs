@@ -226,6 +226,7 @@ fn run_gen(args: &Args) -> Result<()> {
         top_k: args.top_k,
         top_p: args.top_p,
         eos: gen_eos(&args.gen_model_dir),
+        collect_top8: args.dump_logits.is_some(),
     };
     println!(
         "model: {} layers, hidden {}, ple_dim {}, eos {:?}",

@@ -20,7 +20,8 @@ use tokenizers::Tokenizer;
 pub struct IntentLoadOptions {
     /// Pack projections into resident NPU weights (aarch64 + `npu` feature only).
     pub npu: bool,
-    #[allow(dead_code)]
+    /// NPU worker threads; read by the aarch64 + `npu` build only.
+    #[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
     pub npu_threads: usize,
     /// Keep only an f16 copy of the tied embedding/LM-head table (saves ~0.5 GB).
     pub embed_f16: bool,

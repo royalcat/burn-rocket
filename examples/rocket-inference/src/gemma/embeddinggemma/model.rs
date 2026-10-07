@@ -1,6 +1,6 @@
 //! EmbeddingGemma 2 text backbone: an adapted, bidirectional Gemma 4 decoder
-//! (Burn, inference only). P1 implements the text/code path; the Gemma 4 vision
-//! and audio towers land in later modules.
+//! (Burn, inference only), plus the model assembly that pairs it with the
+//! Gemma 4 vision and audio towers (see `crate::gemma::{vision, audio}`).
 //!
 //! Reference: HF `transformers/models/embedding_gemma2/modeling_embedding_gemma2.py`.
 
@@ -362,6 +362,7 @@ impl TextLayer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: Tensor<3>,
@@ -461,12 +462,9 @@ impl Emb2Model {
         &self.language_model
     }
 
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn text_mut(&mut self) -> &mut TextModel {
         &mut self.language_model
-    }
-
-    pub fn vision(&self) -> &VisionTower {
-        &self.vision_tower
     }
 
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
@@ -474,12 +472,6 @@ impl Emb2Model {
         let pooled = self.vision_tower.forward(img, chunk, None);
         self.embed_vision
             .forward(pooled, self.vision_tower.spec().eps)
-    }
-
-    /// Soft tokens for one audio clip: `[num_valid_soft_tokens, text_hidden]`
-    /// (invalid frames are dropped, matching the reference).
-    pub fn audio_soft_tokens(&self, feats: &AudioFeatures) -> Tensor<2> {
-        self.audio_soft_tokens_debug(feats, None)
     }
 
     pub fn audio_soft_tokens_debug(
@@ -501,16 +493,6 @@ impl Emb2Model {
         let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
         let h = h.select(0, idx);
         self.embed_audio.forward(h, self.audio_tower.spec().eps)
-    }
-
-    /// The vision tower's pooled features before `embed_vision` (debug).
-    pub fn vision_tower_features(
-        &self,
-        img: &PreparedImage,
-        chunk: usize,
-        debug_dir: Option<&std::path::Path>,
-    ) -> Tensor<2> {
-        self.vision_tower.forward(img, chunk, debug_dir)
     }
 
     /// Mean-pooled embedding of `input_ids`, with optional image soft tokens
@@ -600,6 +582,7 @@ impl TextModel {
     }
 
     /// Visit every text projection weight (q/k/v/o, MLP, PLE, output projection).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn for_each_projection_mut(&mut self, mut f: impl FnMut(&mut Linear)) {
         for layer in &mut self.layers {
             f(&mut layer.self_attn.q_proj);
@@ -653,12 +636,6 @@ impl TextModel {
         TextRope { sliding, full }
     }
 
-    /// Per-token embeddings `[B, S, embedding_dim]` (not pooled, not normalized).
-    pub fn forward(&self, input_ids: Tensor<2, Int>, rope: &TextRope, chunk: usize) -> Tensor<3> {
-        let x = self.embed_tokens_scaled(input_ids);
-        self.forward_embeds(x, rope, chunk)
-    }
-
     /// The scaled token embedding (`x * sqrt(hidden)`).
     pub fn embed_tokens_scaled(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
         let scale = (self.spec.hidden_size as f64).sqrt();
@@ -698,28 +675,10 @@ impl TextModel {
         }
         lin(&self.embedding_projection, self.norm.forward(h))
     }
-
-    /// Mean-pooled embeddings `[B, embedding_dim]` (no truncation / normalization).
-    pub fn embed(&self, input_ids: Tensor<2, Int>, rope: &TextRope, chunk: usize) -> Tensor<2> {
-        let [b, _s] = input_ids.dims();
-        let dim = self.spec.embedding_dim;
-        let h = self.forward(input_ids, rope, chunk);
-        h.mean_dim(1).reshape([b, dim])
-    }
 }
 
 /// The two RoPE tables used by a text backbone (only the layer types present).
 pub struct TextRope {
     sliding: Option<RopeTable>,
     full: Option<RopeTable>,
-}
-
-impl TextRope {
-    pub fn sliding(&self) -> &RopeTable {
-        self.sliding.as_ref().expect("sliding rope table")
-    }
-
-    pub fn full(&self) -> &RopeTable {
-        self.full.as_ref().expect("full rope table")
-    }
 }

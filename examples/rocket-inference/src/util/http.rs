@@ -1,5 +1,5 @@
-//! Small helpers shared by the model servers: mutex poisoning recovery and
-//! panic-payload rendering.
+//! Small helpers shared by the HTTP server and its handlers: mutex poisoning
+//! recovery and panic-payload rendering.
 
 use std::any::Any;
 use std::sync::{Mutex, MutexGuard, PoisonError};

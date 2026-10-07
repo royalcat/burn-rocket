@@ -67,10 +67,10 @@ pub fn aspect_ratio_preserving_size(
     let max_side_length = (max_patches / (pooling_kernel_size * pooling_kernel_size)) * side_mult;
     if target_height == 0 {
         target_height = side_mult;
-        target_width = ((width / height) as usize * side_mult).min(max_side_length);
+        target_width = ((width / height) * side_mult).min(max_side_length);
     } else if target_width == 0 {
         target_width = side_mult;
-        target_height = ((height / width) as usize * side_mult).min(max_side_length);
+        target_height = ((height / width) * side_mult).min(max_side_length);
     }
 
     if target_height * target_width > max_patches * patch_size * patch_size {
@@ -270,7 +270,7 @@ fn bicubic_kernel(x: f64) -> f64 {
 
 /// Per-axis antialias resampling plan (ATen `_compute_indices_min_size_weights_aa`
 /// + `_compute_index_ranges_int16_weights`): integer taps and weights with a
-/// per-axis precision, applied in integer arithmetic.
+///   per-axis precision, applied in integer arithmetic.
 struct AxisPlan {
     xmin: Vec<usize>,
     size: Vec<usize>,
@@ -382,7 +382,7 @@ pub fn resize_bicubic_aa(img: &RgbImage, out_w: usize, out_h: usize) -> RgbImage
     let plane_len = in_w * in_h;
     // Split into per-channel planes (ATen treats N*C as the outer dimension).
     let mut planes = vec![vec![0u8; plane_len]; 3];
-    for (i, chunk) in raw.chunks_exact(3).enumerate() {
+    for (i, chunk) in raw.as_chunks::<3>().0.iter().enumerate() {
         planes[0][i] = chunk[0];
         planes[1][i] = chunk[1];
         planes[2][i] = chunk[2];
@@ -427,19 +427,6 @@ pub fn resize_rgb(
     Ok(resize_bicubic_aa(img, target_w, target_h))
 }
 
-/// Resize so the largest dimension fits `max_side`, preserving aspect ratio; the
-/// result has both dims divisible by `side_mult`. Used for video frames, where
-/// the processor must fit all frames in one patch budget.
-pub fn prepare_rgb(
-    img: &RgbImage,
-    patch_size: usize,
-    max_soft_tokens: usize,
-    pooling_kernel_size: usize,
-) -> Result<PreparedImage> {
-    let resized = resize_rgb(img, patch_size, max_soft_tokens, pooling_kernel_size)?;
-    patchify(&resized, patch_size, pooling_kernel_size)
-}
-
 /// Dump an RGB8 image as `width:u32 | height:u32 | rgb bytes` for debugging.
 pub fn dump_rgb(path: &Path, img: &RgbImage) -> Result<()> {
     let (w, h) = (img.width(), img.height());
@@ -450,17 +437,6 @@ pub fn dump_rgb(path: &Path, img: &RgbImage) -> Result<()> {
     std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
     println!("dumped image {w}x{h} to {}", path.display());
     Ok(())
-}
-
-/// Load and preprocess an image file.
-pub fn prepare_image(
-    path: &Path,
-    patch_size: usize,
-    max_soft_tokens: usize,
-    pooling_kernel_size: usize,
-) -> Result<PreparedImage> {
-    let img = load_image(path)?;
-    prepare_rgb(&img, patch_size, max_soft_tokens, pooling_kernel_size)
 }
 
 /// Patchify an already-resized RGB image: patches in row-major order, each
@@ -503,7 +479,7 @@ pub fn patchify(
         }
     }
     let k = pooling_kernel_size;
-    if patch_h % k != 0 || patch_w % k != 0 {
+    if !patch_h.is_multiple_of(k) || !patch_w.is_multiple_of(k) {
         bail!("patch grid {patch_w}x{patch_h} is not divisible by pooling {k}");
     }
     Ok(PreparedImage {

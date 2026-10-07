@@ -19,14 +19,14 @@ use crate::gemma::vision::VisionSpec;
 pub fn media_soft_tokens(model_dir: &Path) -> (usize, usize) {
     let mut image = 280;
     let mut video = 140;
-    if let Ok(text) = std::fs::read_to_string(model_dir.join("processor_config.json")) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(v) = json["image_processor"]["max_soft_tokens"].as_u64() {
-                image = v as usize;
-            }
-            if let Some(v) = json["video_processor"]["max_soft_tokens"].as_u64() {
-                video = v as usize;
-            }
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("processor_config.json"))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        if let Some(v) = json["image_processor"]["max_soft_tokens"].as_u64() {
+            image = v as usize;
+        }
+        if let Some(v) = json["video_processor"]["max_soft_tokens"].as_u64() {
+            video = v as usize;
         }
     }
     (image, video)
@@ -35,13 +35,12 @@ pub fn media_soft_tokens(model_dir: &Path) -> (usize, usize) {
 /// Task prompts from `config_sentence_transformers.json` (name -> prefix).
 pub fn task_prompts(model_dir: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    if let Ok(text) = std::fs::read_to_string(model_dir.join("config_sentence_transformers.json")) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(prompts) = json["prompts"].as_object() {
-                for (k, v) in prompts {
-                    out.insert(k.to_lowercase(), v.as_str().unwrap_or_default().to_string());
-                }
-            }
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("config_sentence_transformers.json"))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(prompts) = json["prompts"].as_object()
+    {
+        for (k, v) in prompts {
+            out.insert(k.to_lowercase(), v.as_str().unwrap_or_default().to_string());
         }
     }
     out

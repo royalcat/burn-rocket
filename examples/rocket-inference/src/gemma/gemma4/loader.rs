@@ -78,8 +78,6 @@ pub enum LoadDtype {
 
 #[derive(Debug, Clone)]
 pub struct LoadDtypeAdapter {
-    device: Device,
-    q8: bool,
     f16: bool,
     /// Keep token tables in f32 (QAT parity: the reference dequantizes to f32,
     /// so an f16 table would round the per-layer embeddings).
@@ -87,10 +85,8 @@ pub struct LoadDtypeAdapter {
 }
 
 impl LoadDtypeAdapter {
-    pub fn new(device: &Device, dtype: LoadDtype) -> Self {
+    pub fn new(_device: &Device, dtype: LoadDtype) -> Self {
         Self {
-            device: device.clone(),
-            q8: dtype == LoadDtype::Q8,
             f16: matches!(dtype, LoadDtype::F16 | LoadDtype::Q8),
             f32_tables: false,
         }
@@ -314,28 +310,16 @@ pub fn load_gen_model(
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
-    if !result.errors.is_empty() {
-        anyhow::bail!("load errors: {:?}", result.errors);
-    }
     // KV-shared layers never compute K/V, so checkpoints may omit their
     // weights (the QAT export does; the bf16 one ships them anyway).
     let first_shared = cfg
         .text_config
         .num_hidden_layers
         .saturating_sub(cfg.text_config.num_kv_shared_layers);
-    let missing: Vec<_> = result
-        .missing
-        .iter()
-        .filter(|(name, _)| !is_shared_kv_param(name, first_shared))
-        .collect();
-    if !missing.is_empty() {
-        anyhow::bail!(
-            "{} model parameters missing from file (first: {:?})",
-            missing.len(),
-            missing.first()
-        );
-    }
-    let tolerated = result.missing.len() - missing.len();
+    crate::util::store::check_load_report(&result, |name| {
+        is_shared_kv_param(name, first_shared)
+    })?;
+    let tolerated = result.missing.len();
     if qat.is_some() {
         let bits = qat
             .as_ref()
@@ -541,11 +525,11 @@ fn register_srq_scales(
     for (path, id) in paths.out {
         // The visitor's stack ends at the parameter itself (`...q_proj.weight`).
         let key = path.strip_suffix(".weight").unwrap_or(&path);
-        if let Some(s) = scales.get(key) {
-            if s.in_scale != 0.0 || s.out_scale != 0.0 {
-                crate::gemma::layers::register_srq(id, s.in_scale, s.out_scale);
-                n += 1;
-            }
+        if let Some(s) = scales.get(key)
+            && (s.in_scale != 0.0 || s.out_scale != 0.0)
+        {
+            crate::gemma::layers::register_srq(id, s.in_scale, s.out_scale);
+            n += 1;
         }
     }
     n

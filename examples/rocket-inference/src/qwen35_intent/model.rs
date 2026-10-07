@@ -808,6 +808,9 @@ impl Mlp {
     }
 }
 
+// The per-layer mixer is stored by value in `Vec<Layer>`; boxing the large
+// variant would add indirection in the forward path for no memory win.
+#[allow(clippy::large_enum_variant)]
 pub enum Mixer {
     Linear(DeltaNet),
     Full(GatedAttention),

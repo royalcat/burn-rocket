@@ -39,22 +39,7 @@ pub fn load_model(
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
-    if !result.errors.is_empty() {
-        bail!("load errors: {:?}", result.errors);
-    }
-    if !result.missing.is_empty() {
-        bail!(
-            "{} model parameters missing from file",
-            result.missing.len()
-        );
-    }
-    if !result.unused.is_empty() {
-        println!(
-            "warning: {} file tensors unused by the model (first: {:?})",
-            result.unused.len(),
-            result.unused.first()
-        );
-    }
+    crate::util::store::check_load_report(&result, |_| false)?;
     println!(
         "loaded {} tensors as {:?} in {:.2}s",
         result.applied.len(),
