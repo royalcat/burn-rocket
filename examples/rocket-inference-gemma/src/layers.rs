@@ -42,12 +42,26 @@ pub(crate) fn weight_dtype<const D: usize>(w: &Param<Tensor<D>>) -> DType {
     }
 }
 
-/// Linear forward that supports Q8-resident weights and NPU-resident weights.
+/// Linear forward that supports Q8-resident weights, NPU-resident weights, f16
+/// weights and SRQ activation rounding (QAT checkpoints).
 ///
 /// The NPU registry is keyed by the weight's `ParamId`, so no model code has to
 /// know which projections were packed: the loader packs a weight, registers its
-/// id and drops the CPU copy.
+/// id and drops the CPU copy. The SRQ registry works the same way.
 pub(crate) fn lin<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
+    let srq = srq_lookup(&l.weight);
+    let x = match srq {
+        Some((in_scale, _)) => apply_srq(x, in_scale),
+        None => x,
+    };
+    let y = linear_body(l, x);
+    match srq {
+        Some((_, out_scale)) => apply_srq(y, out_scale),
+        None => y,
+    }
+}
+
+fn linear_body<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(id) = npu_lookup(&l.weight) {
         // Generation packs weights for prefill only: decode keeps the CPU
@@ -67,6 +81,46 @@ pub(crate) fn lin<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
         return out.cast(dt);
     }
     l.forward(x)
+}
+
+// ---------------------------------------------------------------------------
+// SRQ (static range quantization) activation rounding, for QAT checkpoints
+// ---------------------------------------------------------------------------
+
+/// Calibrated `(input, output)` SRQ scales by weight `ParamId`.
+static SRQ: std::sync::Mutex<Option<std::collections::HashMap<u64, (f32, f32)>>> =
+    std::sync::Mutex::new(None);
+
+/// Register the SRQ scales of a quantized linear (a scale of 0 is a no-op).
+pub fn register_srq(id: burn::module::ParamId, in_scale: f32, out_scale: f32) {
+    let mut guard = SRQ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(id.val(), (in_scale, out_scale));
+}
+
+fn srq_lookup<const D: usize>(w: &Param<Tensor<D>>) -> Option<(f32, f32)> {
+    let guard = SRQ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_ref().and_then(|m| m.get(&w.id.val()).copied())
+}
+
+/// `clamp(round(x / scale), -128, 127) * scale` (the int8 SRQ grid, in f32).
+///
+/// Rounding is ties-to-even, like `torch.round`; the difference matters because
+/// a long sequence makes exact `.5` quotients likely somewhere in the model.
+pub(crate) fn apply_srq<const D: usize>(x: Tensor<D>, scale: f32) -> Tensor<D> {
+    if scale == 0.0 {
+        return x;
+    }
+    let r = x / scale;
+    let f = r.clone().floor();
+    let frac = r - f.clone();
+    let half = frac.clone().equal_elem(0.5);
+    let f_mod2 = f.clone() - (f.clone() / 2.0).floor() * 2.0;
+    let f_odd = f_mod2.equal_elem(1.0);
+    let up = frac.greater_elem(0.5).bool_or(half.bool_and(f_odd));
+    let rounded = f + up.float();
+    rounded.clamp(-128.0, 127.0) * scale
 }
 
 // ---------------------------------------------------------------------------

@@ -53,6 +53,9 @@ pub struct LoadDtypeAdapter {
     device: Device,
     q8: bool,
     f16: bool,
+    /// Keep token tables in f32 (QAT parity: the reference dequantizes to f32,
+    /// so an f16 table would round the per-layer embeddings).
+    f32_tables: bool,
 }
 
 impl LoadDtypeAdapter {
@@ -61,7 +64,16 @@ impl LoadDtypeAdapter {
             device: device.clone(),
             q8: dtype == LoadDtype::Q8,
             f16: matches!(dtype, LoadDtype::F16 | LoadDtype::Q8),
+            f32_tables: false,
         }
+    }
+}
+
+impl LoadDtypeAdapter {
+    /// Keep the token tables in f32 (QAT checkpoints dequantize to f32).
+    pub fn with_f32_tables(mut self, on: bool) -> Self {
+        self.f32_tables = on;
+        self
     }
 }
 
@@ -73,7 +85,11 @@ impl ModuleAdapter for LoadDtypeAdapter {
             || name.ends_with("embed_tokens_per_layer.weight");
         let is_linear = ctx.module_type() == Some("Struct:Linear");
 
-        if is_table {
+        if is_table && self.f32_tables {
+            bridge::map_data(tensor, name, DType::F32, shape, |data| {
+                data.convert_dtype(DType::F32)
+            })
+        } else if is_table {
             // f16 storage; the gathered rows are cast back to f32.
             bridge::map_data(tensor, name, DType::F16, shape, |data| {
                 data.convert_dtype(DType::F16)
@@ -234,18 +250,28 @@ pub fn load_gen_model(
         .as_ref()
         .context("checkpoint has no audio_config")?;
     let t0 = std::time::Instant::now();
-    let vision_bounds = read_clip_bounds(
-        model_dir,
-        "model.vision_tower.encoder.layers",
-        &VISION_LINEAR_NAMES,
-        vision_cfg.num_hidden_layers,
-    )?;
-    let audio_bounds = read_clip_bounds(
-        model_dir,
-        "model.audio_tower.layers",
-        &AUDIO_LINEAR_NAMES,
-        audio_cfg.num_hidden_layers,
-    )?;
+    // Only checkpoints trained with clipped linears carry the bound scalars
+    // (the QAT export sets `use_clipped_linears: false` and has none).
+    let vision_bounds = if vision_cfg.use_clipped_linears {
+        read_clip_bounds(
+            model_dir,
+            "model.vision_tower.encoder.layers",
+            &VISION_LINEAR_NAMES,
+            vision_cfg.num_hidden_layers,
+        )?
+    } else {
+        Default::default()
+    };
+    let audio_bounds = if audio_cfg.use_clipped_linears {
+        read_clip_bounds(
+            model_dir,
+            "model.audio_tower.layers",
+            &AUDIO_LINEAR_NAMES,
+            audio_cfg.num_hidden_layers,
+        )?
+    } else {
+        Default::default()
+    };
     let mut model = GenRoot::new(
         &cfg.text_config,
         vision_cfg,
@@ -254,23 +280,98 @@ pub fn load_gen_model(
         &audio_bounds,
         device,
     );
+    // Pre-quantized (QAT) checkpoints carry a `quantization_config`; their
+    // weights are packed INT2/4/8 with scales and SRQ activation rounding.
+    let cfg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let qat = crate::qat::QatConfig::from_json(&cfg_json)?;
+    if qat.is_some() {
+        // The PLE table is read packed; stub the parameter first so the
+        // dequantized table is never allocated.
+        model.text_mut().shrink_ple_table();
+    }
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
-        .allow_partial(true)
-        .with_from_adapter(
-            PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, dtype)),
-        );
+        .allow_partial(true);
+    let scales = match &qat {
+        Some(_) => {
+            let scales = crate::qat::read_scales(&mut store)?;
+            println!("QAT checkpoint: {} quantized modules", scales.len());
+            Some(std::sync::Arc::new(scales))
+        }
+        None => None,
+    };
+    let mut store = match &qat {
+        Some(qat) => store.with_from_adapter(
+            QatAdapter {
+                qat: std::sync::Arc::new(qat.clone()),
+                scales: scales.clone().expect("scales"),
+                dtype,
+            }
+            .chain(
+                LoadDtypeAdapter::new(device, dtype)
+                    .with_f32_tables(dtype == LoadDtype::F32),
+            )
+            .chain(PyTorchToBurnAdapter),
+        ),
+        None => store
+            .with_from_adapter(PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, dtype))),
+    };
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
     if !result.errors.is_empty() {
         anyhow::bail!("load errors: {:?}", result.errors);
     }
-    if !result.missing.is_empty() {
+    // KV-shared layers never compute K/V, so checkpoints may omit their
+    // weights (the QAT export does; the bf16 one ships them anyway).
+    let first_shared = cfg
+        .text_config
+        .num_hidden_layers
+        .saturating_sub(cfg.text_config.num_kv_shared_layers);
+    let missing: Vec<_> = result
+        .missing
+        .iter()
+        .filter(|(name, _)| !is_shared_kv_param(name, first_shared))
+        .collect();
+    if !missing.is_empty() {
         anyhow::bail!(
             "{} model parameters missing from file (first: {:?})",
-            result.missing.len(),
-            result.missing.first()
+            missing.len(),
+            missing.first()
         );
+    }
+    let tolerated = result.missing.len() - missing.len();
+    if qat.is_some() {
+        let bits = qat
+            .as_ref()
+            .and_then(|q| q.bits_for("model.language_model.embed_tokens_per_layer"))
+            .unwrap_or(4);
+        let table = crate::qat::read_packed_table(
+            &mut store,
+            "model.language_model.embed_tokens_per_layer",
+            bits,
+        )?;
+        println!(
+            "QAT: PLE table kept packed ({} bits, {:.2} GiB vs {:.2} GiB dequantized)",
+            table.bits,
+            (table.data.len() + table.scales.len() * 4) as f64 / (1u64 << 30) as f64,
+            (table.rows * table.k * 4) as f64 / (1u64 << 30) as f64
+        );
+        model.text_mut().set_packed_ple(table);
+    }
+    if let Ok(want) = std::env::var("DUMP_PARAM") {
+        dump_param(&model, &want)?;
+    }
+    if let Some(scales) = &scales {
+        if std::env::var("NO_SRQ").is_ok() {
+            println!("QAT: SRQ disabled (NO_SRQ)");
+        } else {
+            let n = register_srq_scales(&model, scales);
+            println!("QAT: SRQ activation rounding on {n} linears");
+        }
+    }
+    if tolerated > 0 {
+        println!("note: {tolerated} KV-shared layer weights absent (never used)");
     }
     println!(
         "loaded {} tensors{} in {:.2}s (resident {:.0} MiB anon)",
@@ -319,4 +420,204 @@ fn rss_mib() -> f64 {
         }
     }
     0.0
+}
+
+// ---------------------------------------------------------------------------
+// QAT (pre-quantized) checkpoints
+// ---------------------------------------------------------------------------
+
+/// Unpacks packed INT2/INT4/INT8 weights (and `embedding_quantized` tables) into
+/// ordinary float tensors while the store applies them, so the model tree sees
+/// the same `Linear`/`Embedding` fields as for a bf16 checkpoint.
+pub struct QatAdapter {
+    qat: std::sync::Arc<crate::qat::QatConfig>,
+    scales: std::sync::Arc<std::collections::HashMap<String, crate::qat::ModuleScales>>,
+    dtype: LoadDtype,
+}
+
+impl ModuleAdapter for QatAdapter {
+    fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
+        use crate::qat::{dequantize_weight, values_per_byte};
+        use burn_store::burn_pack::Shape;
+
+        let name = tensor.name.clone();
+        let (target_name, module_path) = if let Some(p) = name.strip_suffix(".embedding_quantized")
+        {
+            (format!("{p}.weight"), p.to_string())
+        } else if let Some(p) = name.strip_suffix(".weight") {
+            (name.clone(), p.to_string())
+        } else {
+            // scale tensors and other auxiliaries: no target parameter
+            return tensor;
+        };
+        // The PLE table stays packed (rows are dequantized on lookup).
+        if module_path.ends_with("embed_tokens_per_layer") {
+            use burn_store::burn_pack::Shape;
+            return bridge::map_data(tensor, target_name, DType::F32, Shape::new([1, 1]), |_| {
+                TensorData::new(vec![0.0f32], [1, 1])
+            });
+        }
+        let Some(bits) = self.qat.bits_for(&module_path) else {
+            return tensor;
+        };
+        let Some(scales) = self.scales.get(&module_path) else {
+            return tensor;
+        };
+        let dims: Vec<usize> = tensor.shape.clone().into();
+        let (rows, packed_k) = match dims.as_slice() {
+            [r, k] => (*r, *k),
+            _ => return tensor,
+        };
+        let k = packed_k * values_per_byte(bits);
+        let target = match self.dtype {
+            LoadDtype::F32 => DType::F32,
+            LoadDtype::F16 | LoadDtype::Q8 => DType::F16,
+        };
+        let scales = scales.clone();
+        let shape = Shape::new([rows, k]);
+        bridge::map_data(tensor, target_name, target, shape, move |data| {
+            let bytes: Vec<u8> = if data.dtype == DType::U8 {
+                data.try_to_vec().expect("packed u8")
+            } else {
+                data.try_to_vec::<i8>()
+                    .expect("packed i8")
+                    .into_iter()
+                    .map(|v| v as u8)
+                    .collect()
+            };
+            let w = dequantize_weight(&bytes, bits, rows, k, &scales);
+            TensorData::new(w, [rows, k]).convert_dtype(target)
+        })
+    }
+
+    fn get_alternative_param_name(&self, param_name: &str, container_type: &str) -> Option<String> {
+        // Quantized embedding tables are stored as `embedding_quantized`.
+        if param_name == "weight" && container_type == "Struct:Embedding" {
+            return Some("embedding_quantized".to_string());
+        }
+        None
+    }
+
+    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
+        Box::new(Self {
+            qat: self.qat.clone(),
+            scales: self.scales.clone(),
+            dtype: self.dtype,
+        })
+    }
+}
+
+/// Register the SRQ scales of every quantized linear, keyed by the weight's
+/// `ParamId` (the visitor path matches the checkpoint's module paths).
+fn register_srq_scales(
+    model: &GenRoot,
+    scales: &std::collections::HashMap<String, crate::qat::ModuleScales>,
+) -> usize {
+    use burn::module::{ModuleVisitor, Param};
+
+    #[derive(Default)]
+    struct Paths {
+        stack: Vec<String>,
+        out: Vec<(String, burn::module::ParamId)>,
+    }
+    impl ModuleVisitor for Paths {
+        fn enter_module(&mut self, name: &str, _container_type: &str) {
+            self.stack.push(name.to_string());
+        }
+        fn exit_module(&mut self, _name: &str, _container_type: &str) {
+            self.stack.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            self.out.push((self.stack.join("."), param.id));
+        }
+    }
+    let mut paths = Paths::default();
+    model.visit(&mut paths);
+    if std::env::var("DUMP_SRQ").is_ok() {
+        eprintln!("debug: {} param paths, {} scale keys", paths.out.len(), scales.len());
+        for (p, _) in paths.out.iter().take(6) {
+            eprintln!("  param: {p}");
+        }
+        for k in scales.keys().take(6) {
+            eprintln!("  scale: {k}");
+        }
+    }
+    let mut n = 0;
+    for (path, id) in paths.out {
+        // The visitor's stack ends at the parameter itself (`...q_proj.weight`).
+        let key = path.strip_suffix(".weight").unwrap_or(&path);
+        if let Some(s) = scales.get(key) {
+            if s.in_scale != 0.0 || s.out_scale != 0.0 {
+                crate::layers::register_srq(id, s.in_scale, s.out_scale);
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// `model.language_model.layers.{i}.self_attn.{k_proj,k_norm,v_proj,v_norm}` for
+/// a KV-shared layer (never used by the forward).
+fn is_shared_kv_param(name: &str, first_shared: usize) -> bool {
+    let Some(rest) = name.strip_prefix("model.language_model.layers.") else {
+        return false;
+    };
+    let Some((idx, tail)) = rest.split_once('.') else {
+        return false;
+    };
+    let Ok(i) = idx.parse::<usize>() else {
+        return false;
+    };
+    i >= first_shared
+        && ["self_attn.k_proj", "self_attn.k_norm", "self_attn.v_proj", "self_attn.v_norm"]
+            .iter()
+            .any(|p| tail.starts_with(p))
+}
+
+/// Debug: dump one loaded parameter as raw f32 + dims (compare with the
+/// reference's dequantized weights).
+fn dump_param(model: &GenRoot, want: &str) -> Result<()> {
+    use burn::module::{ModuleVisitor, Param};
+
+    #[derive(Default)]
+    struct Find<'a> {
+        stack: Vec<String>,
+        want: &'a str,
+        found: Option<(String, Vec<usize>, Vec<f32>)>,
+    }
+    impl ModuleVisitor for Find<'_> {
+        fn enter_module(&mut self, name: &str, _ct: &str) {
+            self.stack.push(name.to_string());
+        }
+        fn exit_module(&mut self, _name: &str, _ct: &str) {
+            self.stack.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            let path = self.stack.join(".");
+            if self.found.is_none() && path.contains(self.want) {
+                let dims: Vec<usize> = param.val().dims().to_vec();
+                let values: Vec<f32> = param
+                    .val()
+                    .cast(DType::F32)
+                    .into_data()
+                    .try_to_vec()
+                    .expect("f32");
+                self.found = Some((path, dims, values));
+            }
+        }
+    }
+    let mut find = Find {
+        want,
+        ..Default::default()
+    };
+    model.visit(&mut find);
+    let (path, dims, values) = find.found.ok_or_else(|| anyhow::anyhow!("no param matching {want}"))?;
+    let out = std::env::var("DUMP_PARAM_OUT").unwrap_or_else(|_| "/tmp/param.bin".into());
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in &values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(&out, &bytes)?;
+    println!("dumped {path} {dims:?} ({} values) to {out}", values.len());
+    Ok(())
 }

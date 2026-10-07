@@ -88,8 +88,19 @@ def cmd_gen(args):
     if not args.greedy:
         gen_kwargs.update(temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
         torch.manual_seed(args.seed)
+    dump = args.dump_logits
+    if dump:
+        gen_kwargs.update(output_scores=True, return_dict_in_generate=True)
     with torch.no_grad():
         out = model.generate(**inputs, **gen_kwargs)
+    if dump:
+        steps = []
+        for score in out.scores:
+            top = torch.topk(score[0].float(), 8)
+            steps.append([[int(i), float(v)] for i, v in zip(top.indices, top.values)])
+        json.dump(steps, open(dump, "w"))
+        print(f"dumped {len(steps)} steps of top-8 logits to {dump}")
+        out = out.sequences
     new = out[0, n_prompt:]
     toks = proc.tokenizer.convert_ids_to_tokens(new.tolist())
     print(
@@ -174,6 +185,7 @@ def main():
             sp.add_argument("--top-p", type=float, default=0.95)
             sp.add_argument("--seed", type=int, default=0)
             sp.add_argument("--out", default=None)
+            sp.add_argument("--dump-logits", default=None)
         if name == "logits":
             sp.add_argument("--dtype", default="float32")
             sp.add_argument("--top", type=int, default=8)

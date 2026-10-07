@@ -198,6 +198,40 @@ Prefill is compute-bound (631 tokens: 7.5 s f32, 11.3 s f16); decode is
 memory-bandwidth-bound (f32 reads 17 GB of weights per token). The chat server
 is non-streaming and takes OpenAI-style `messages` (string or text-part content).
 
+### QAT mobile checkpoint (`*-qat-mobile-transformers`)
+
+The pre-quantized mobile checkpoints
+([`google/gemma-4-E2B-it-qat-mobile-transformers`](https://huggingface.co/google/gemma-4-E2B-it-qat-mobile-transformers),
+2.46 GB) are supported natively — no conversion step. Weights are packed
+INT2/INT4 (two/four values per byte) or stored INT8, dequantized with
+per-output-channel scales (per-row block scales for the token tables), and the
+checkpoint's SRQ (static range quantization) activation rounding is applied
+around the affected linears. `--f16` is the useful configuration:
+
+```sh
+$B gen --gen-model-dir ~/models/gemma-4-E2B-it-qat-mobile --f16 \
+    --text "What is the capital of France?" --max-new-tokens 16
+```
+
+The PLE table (2.35B parameters) stays **packed** and its rows are dequantized
+on lookup — bit-identical values, 1.13 GiB instead of 8.75 GiB (f32) or 4.4 GiB
+(f16):
+
+| mode | resident | short decode | notes |
+|---|---|---|---|
+| f32 | 12.0 GiB | 3.9 tok/s | parity mode (f32 projections) |
+| `--f16` | 6.6 GiB | 4.9 tok/s | 12/12 tokens identical to the f32 reference on the 631-token prompt |
+| `--quant q8` | 6.1 GiB | 0.07 tok/s | memory-only |
+
+Verified against HF 5.19: the loaded weights are **bit-exact** (checked for a
+4-bit projection, a 2-bit MLP and the 4-bit PLE table), greedy output is
+token-identical on the short and system-prompt cases, and the long prompt is
+9/12 (f32) or 12/12 (f16) — the first divergence is a top-2 swap with a 0.23
+logit margin. SRQ rounds activations to an int8 grid, so a long sequence can
+turn the f32 accumulation-order difference between flex and torch into a
+one-quantum activation jump; the reference itself flips tokens between bf16 and
+f32 on the same prompt.
+
 ## NPU offload (aarch64)
 
 The `npu` feature (RK3588, `librocketnpu` from the root `burn-rocket` crate)

@@ -127,6 +127,19 @@ tok/s because flex has no int8 GEMM and `lin` dequantizes per call). f32 =
 12.5 GiB/2.8 tok/s and is the parity mode; `serve-chat` is a non-streaming
 OpenAI `/v1/chat/completions` (text + `image_url`/`input_audio` parts).
 
+QAT mobile checkpoint (log §11): `google/gemma-4-E2B-it-qat-mobile-transformers`
+(2.46 GB) is supported natively — packed INT2/4/8 weights + per-channel scales +
+SRQ activation rounding, unpacked by a load adapter (`src/qat.rs`), with the SRQ
+scales registered per weight `ParamId` and applied in `lin()` (ties-to-even
+rounding). The PLE table stays packed (rows dequantized on lookup, bit-identical
+values, 1.13 GiB vs 8.75 GiB f32). Weights are bit-exact vs HF; short prompts
+are token-identical and the 631-token prompt is 12/12 with `--f16` (6.6 GiB
+resident, 4.9 tok/s). SRQ makes long-context near-ties sensitive (a
+full-quantum activation jump from f32 accumulation order); `NO_SRQ=1` /
+`DUMP_PARAM=<substr>` are debug hooks. Board attempt: deployed at
+`/root/models/gemma-4-E2B-it-qat-mobile/`, OOM-killed at 7.6 GB (board busy);
+needs an idle board.
+
 NPU prefill (log §11): `--npu` packs the used text projections into resident
 fp16 NPU weights and runs prefill matmuls + `attention_causal_window` on the
 NPU, while decode keeps the CPU f32 copies (`layers::set_prefill_mode` wraps

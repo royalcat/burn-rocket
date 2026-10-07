@@ -14,6 +14,7 @@ mod inputs;
 mod layers;
 mod media;
 mod model;
+mod qat;
 mod server;
 mod vision;
 
@@ -74,6 +75,7 @@ struct Args {
     dump_image: Option<PathBuf>,
     dump_vision: Option<PathBuf>,
     dump_vision_layers: Option<PathBuf>,
+    dump_logits: Option<PathBuf>,
     port: u16,
     model_name: String,
     max_tokens: usize,
@@ -125,6 +127,7 @@ impl Args {
             dump_image: None,
             dump_vision: None,
             dump_vision_layers: None,
+            dump_logits: None,
             port: 8390,
             model_name: "embeddinggemma-2".to_string(),
             max_tokens: 8192,
@@ -175,6 +178,7 @@ impl Args {
                 "--attn-chunk" => args.attn_chunk = value()?.parse()?,
                 "--dump-pixels" => args.dump_pixels = Some(PathBuf::from(value()?)),
                 "--dump-ids" => args.dump_ids = Some(PathBuf::from(value()?)),
+                "--dump-logits" => args.dump_logits = Some(PathBuf::from(value()?)),
                 "--port" => args.port = value()?.parse()?,
                 "--model-name" => args.model_name = value()?,
                 "--max-tokens" => args.max_tokens = value()?.parse()?,
@@ -885,6 +889,22 @@ fn run_gen(args: &Args) -> Result<()> {
         args.attn_chunk,
         &device,
     )?;
+    if let Some(path) = &args.dump_logits {
+        let dump: Vec<serde_json::Value> = stats
+            .top8
+            .iter()
+            .map(|step| {
+                serde_json::json!(
+                    step.iter()
+                        .map(|(id, v)| serde_json::json!([id, v]))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        std::fs::write(path, serde_json::to_string(&dump)?)
+            .with_context(|| format!("write {}", path.display()))?;
+        println!("dumped {} steps of top-8 logits to {}", stats.top8.len(), path.display());
+    }
     let (attn, mlp, ple, norms) = gen_model::gen_stage_stats();
     println!(
         "stages: attn {attn:.2}s, mlp {mlp:.2}s, ple {ple:.2}s, norms {norms:.2}s ({} tokens)",

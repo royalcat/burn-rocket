@@ -107,12 +107,31 @@ impl Default for GenOptions {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct GenStats {
     pub prefill_s: f64,
     pub decode_s: f64,
     pub prompt_tokens: usize,
     pub generated: usize,
+    /// Per-step top-8 `(id, logit)` (cheap; the CLI can dump it for parity checks).
+    pub top8: Vec<Vec<(u32, f32)>>,
+}
+
+/// Top-`k` ids and logits of a logit tensor (any rank, flattened).
+pub fn top_k<const D: usize>(logits: &Tensor<D>, k: usize) -> Vec<(u32, f32)> {
+    let n: usize = logits.dims().iter().product();
+    let values: Vec<f32> = logits
+        .clone()
+        .reshape([n])
+        .into_data()
+        .try_to_vec()
+        .expect("logits f32");
+    let mut idx: Vec<usize> = (0..values.len()).collect();
+    idx.sort_unstable_by(|a, b| values[*b].total_cmp(&values[*a]));
+    idx.into_iter()
+        .take(k)
+        .map(|i| (i as u32, values[i]))
+        .collect()
 }
 
 /// Deterministic SplitMix64 for the sampled path (reproducible runs).
@@ -243,6 +262,7 @@ pub fn generate_with_media(
     crate::layers::set_prefill_mode(true);
     let logits = model.prefill(ids, soft, &ropes, &mut kv, lm_head, chunk, pad_id);
     crate::layers::set_prefill_mode(false);
+    stats.top8.push(top_k(&logits, 8));
     let mut next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
 
@@ -257,6 +277,7 @@ pub fn generate_with_media(
         let seq_start = kv.len;
         let h = model.text().forward(input, &ropes, &mut kv, seq_start, chunk);
         let logits = model.text().logits(h, lm_head);
+        stats.top8.push(top_k(&logits, 8));
         next = sample(&logits, opts, &mut rng)?;
     }
     stats.decode_s = t1.elapsed().as_secs_f64();

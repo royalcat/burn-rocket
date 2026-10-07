@@ -34,6 +34,7 @@ base64 = "0.22"
 rustfft = "6"
 hound = "3"
 tokenizers = "0.21"
+fancy-regex = "0.16"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
@@ -42,7 +43,7 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
 ] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 libc = "0.2"
 anyhow = "1"
 mozjpeg = "0.10.13"

@@ -147,17 +147,24 @@ pub struct AudioAttention {
 impl AudioAttention {
     fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
         let spec = AudioSpec::from_config(cfg);
-        let clip = |name: &str| {
-            bounds
-                .get(&format!("{path}.{name}"))
-                .copied()
-                .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}"))
+        let clip = |name: &str| -> Option<ClipBounds> {
+            // Checkpoints without clipped linears (the QAT export) carry no
+            // bound scalars; those towers run unclipped.
+            if !cfg.use_clipped_linears {
+                return None;
+            }
+            Some(
+                bounds
+                    .get(&format!("{path}.{name}"))
+                    .copied()
+                    .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}")),
+            )
         };
         Self {
-            q_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, Some(clip("q_proj")), device),
-            k_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, Some(clip("k_proj")), device),
-            v_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, Some(clip("v_proj")), device),
-            post: ClippableLinear::with_clip(spec.hidden, spec.hidden, Some(clip("post")), device),
+            q_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("q_proj"), device),
+            k_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("k_proj"), device),
+            v_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("v_proj"), device),
+            post: ClippableLinear::with_clip(spec.hidden, spec.hidden, clip("post"), device),
             relative_k_proj: LinearConfig::new(spec.hidden, spec.heads * spec.head_dim)
                 .with_bias(false)
                 .init(device),
@@ -272,15 +279,22 @@ pub struct AudioFeedForward {
 impl AudioFeedForward {
     fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
         let spec = AudioSpec::from_config(cfg);
-        let clip = |name: &str| {
-            bounds
-                .get(&format!("{path}.{name}"))
-                .copied()
-                .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}"))
+        let clip = |name: &str| -> Option<ClipBounds> {
+            // Checkpoints without clipped linears (the QAT export) carry no
+            // bound scalars; those towers run unclipped.
+            if !cfg.use_clipped_linears {
+                return None;
+            }
+            Some(
+                bounds
+                    .get(&format!("{path}.{name}"))
+                    .copied()
+                    .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}")),
+            )
         };
         Self {
-            ffw_layer_1: ClippableLinear::with_clip(spec.hidden, spec.inter, Some(clip("ffw_layer_1")), device),
-            ffw_layer_2: ClippableLinear::with_clip(spec.inter, spec.hidden, Some(clip("ffw_layer_2")), device),
+            ffw_layer_1: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("ffw_layer_1"), device),
+            ffw_layer_2: ClippableLinear::with_clip(spec.inter, spec.hidden, clip("ffw_layer_2"), device),
             pre_layer_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
             post_layer_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
         }
@@ -309,15 +323,22 @@ pub struct AudioLightConv1d {
 impl AudioLightConv1d {
     fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
         let spec = AudioSpec::from_config(cfg);
-        let clip = |name: &str| {
-            bounds
-                .get(&format!("{path}.{name}"))
-                .copied()
-                .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}"))
+        let clip = |name: &str| -> Option<ClipBounds> {
+            // Checkpoints without clipped linears (the QAT export) carry no
+            // bound scalars; those towers run unclipped.
+            if !cfg.use_clipped_linears {
+                return None;
+            }
+            Some(
+                bounds
+                    .get(&format!("{path}.{name}"))
+                    .copied()
+                    .unwrap_or_else(|| panic!("missing clip bounds for {path}.{name}")),
+            )
         };
         Self {
-            linear_start: ClippableLinear::with_clip(spec.hidden, spec.hidden * 2, Some(clip("linear_start")), device),
-            linear_end: ClippableLinear::with_clip(spec.hidden, spec.hidden, Some(clip("linear_end")), device),
+            linear_start: ClippableLinear::with_clip(spec.hidden, spec.hidden * 2, clip("linear_start"), device),
+            linear_end: ClippableLinear::with_clip(spec.hidden, spec.hidden, clip("linear_end"), device),
             depthwise_conv1d: Conv1dConfig::new(spec.hidden, spec.hidden, spec.conv_kernel)
                 .with_groups(spec.hidden)
                 .with_bias(false)

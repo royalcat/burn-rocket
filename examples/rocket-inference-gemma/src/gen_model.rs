@@ -599,6 +599,10 @@ impl GenLayer {
 pub struct GenTextModel {
     embed_tokens: Embedding,
     embed_tokens_per_layer: Embedding,
+    /// QAT checkpoints: the PLE table stays packed and rows are dequantized on
+    /// lookup (bit-identical values, a fraction of the memory).
+    #[module(skip)]
+    packed_ple: Option<crate::qat::PackedTable>,
     per_layer_model_projection: Linear,
     per_layer_projection_norm: RmsNorm,
     layers: Vec<GenLayer>,
@@ -615,6 +619,7 @@ impl GenTextModel {
             .collect();
         Self {
             embed_tokens: EmbeddingConfig::new(cfg.vocab_size, cfg.hidden_size).init(device),
+            packed_ple: None,
             embed_tokens_per_layer: EmbeddingConfig::new(
                 cfg.vocab_size_per_layer_input,
                 cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
@@ -634,6 +639,23 @@ impl GenTextModel {
                 .init(device),
             spec,
         }
+    }
+
+    /// Install a packed PLE table (QAT checkpoints) and drop the f16/f32 copy.
+    pub fn set_packed_ple(&mut self, table: crate::qat::PackedTable) {
+        self.packed_ple = Some(table);
+    }
+
+    /// Replace the PLE table parameter with a 1-element stub *before* loading:
+    /// the packed table is read separately, so the dequantized copy is never
+    /// materialized (4.7 GiB in f16, 9.4 GiB in f32).
+    pub fn shrink_ple_table(&mut self) {
+        let dev = self.embed_tokens.weight.val().device();
+        self.embed_tokens_per_layer.weight =
+            self.embed_tokens_per_layer
+                .weight
+                .clone()
+                .map(|_| Tensor::zeros([1, 1], &dev));
     }
 
     pub fn spec(&self) -> &GenSpec {
@@ -664,12 +686,30 @@ impl GenTextModel {
     fn per_layer_inputs(&self, ids: Tensor<2, Int>, x: Tensor<3>) -> Tensor<4> {
         let spec = &self.spec;
         let [b, s, _] = x.dims();
-        let token = self
-            .embed_tokens_per_layer
-            .forward(ids)
-            .cast(DType::F32)
-            .mul_scalar((spec.ple_dim as f64).sqrt())
-            .reshape([b, s, spec.num_layers, spec.ple_dim]);
+        let token = match &self.packed_ple {
+            Some(table) => {
+                let row_ids: Vec<i32> = ids
+                    .clone()
+                    .into_data()
+                    .try_to_vec()
+                    .expect("token ids");
+                let row_ids: Vec<u32> = row_ids.iter().map(|&v| v as u32).collect();
+                let values = table.gather_f32(&row_ids);
+                let device = ids.device();
+                Tensor::<3>::from_data(
+                    TensorData::new(values, [b, s, spec.num_layers * spec.ple_dim]),
+                    &device,
+                )
+                .mul_scalar((spec.ple_dim as f64).sqrt())
+                .reshape([b, s, spec.num_layers, spec.ple_dim])
+            }
+            None => self
+                .embed_tokens_per_layer
+                .forward(ids)
+                .cast(DType::F32)
+                .mul_scalar((spec.ple_dim as f64).sqrt())
+                .reshape([b, s, spec.num_layers, spec.ple_dim]),
+        };
         let ctx = lin(&self.per_layer_model_projection, x)
             .mul_scalar((spec.hidden as f64).powf(-0.5))
             .reshape([b, s, spec.num_layers, spec.ple_dim]);

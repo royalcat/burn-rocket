@@ -359,6 +359,62 @@ binary at `/root/rocket-inference-gemma/`; the same NPU machinery measured 1.61x
 on prefill for the embedding model (log §9), and decode throughput is unchanged
 by design.
 
+### QAT mobile checkpoint (`google/gemma-4-E2B-it-qat-mobile-transformers`)
+
+2.46 GB, 2780 tensors: packed INT2/INT4 weights (2/4 values per byte, low bits
+first, unsigned shifted to signed), INT8 weights for the vision tower and the
+PLE gate/projection, `weight_scale` `[N, 1]` per-output-channel scales,
+`embedding_scale` `[rows, blocks]` block scales for the token tables (35 blocks
+of 256 for the PLE table), plus SRQ (static range quantization) activation
+scales. The checkpoint has `use_clipped_linears: false` for both towers and
+omits the KV-shared layers' k/v weights (the reference ignores them too).
+
+Implementation (`src/qat.rs` + a load adapter): the `quantization_config` regex
+table selects the bit width per module (look-around patterns need
+`fancy-regex`), the scale tensors are pre-read into per-module records, and the
+adapter unpacks + dequantizes each packed tensor while the store applies it
+(no conversion pass, no temp files). SRQ scales are registered per weight
+`ParamId` from a module-path visitor and applied around the matmul in `lin()`;
+rounding is ties-to-even like `torch.round`. `NO_SRQ=1` and
+`DUMP_PARAM=<substr>` are debug hooks.
+
+Verification (dev host, f32 unless noted):
+
+| check | result |
+|---|---|
+| dequantized weights vs HF | **bit-exact** (4-bit `q_proj`, 2-bit MLP `gate_proj`, 4-bit PLE table: `max|d| = 0`) |
+| short prompt, greedy | token-identical to HF f32 (9/9) |
+| system+user prompt | token-identical (7/7) |
+| 631-token prompt | 9/12 (f32), **12/12** (`--f16`) |
+| image prompt (280 soft tokens) | 16/24 (f32) |
+| control: bf16 checkpoint, our logits vs HF | `|d| <= 1e-4` (essentially exact) |
+
+The QAT-specific residual (logits within 0.01-0.7 of ~27) comes from SRQ: it
+rounds activations to an int8 grid, so the f32 accumulation-order difference
+between flex and torch occasionally lands on the other side of a rounding
+boundary and shifts an activation by a full quantum. The first long-prompt
+divergence is a top-2 swap with a 0.23 logit margin, and the reference itself
+flips at the same prompt between bf16 and f32. SRQ is essential, not optional:
+with `NO_SRQ=1` the top-3 tokens diverge immediately (24.5 vs 21.3 logits).
+
+The PLE table stays packed (`PackedTable` in `src/qat.rs`): its rows are
+dequantized on lookup, which is bit-identical to dequantizing the whole table
+and costs 1.13 GiB instead of 8.75 GiB (f32) / 4.4 GiB (f16). The parameter is
+stubbed to `[1, 1]` before loading, so the dequantized table is never allocated.
+
+| mode | resident | load | short decode | 631-token prompt |
+|---|---|---|---|---|
+| f32 (f32 projections) | 12.0 GiB | 56 s | 3.9 tok/s | prefill 0.8 s, 9/12 tokens |
+| `--f16` | 6.6 GiB | 56 s | 4.9 tok/s | prefill 22.2 s, 3.5 tok/s, 12/12 tokens |
+| `--quant q8` | 6.1 GiB | 61 s | 0.07 tok/s | memory-only |
+
+Board attempt (2026-10-07): the QAT checkpoint (2.46 GB) and the aarch64 npu
+binary are deployed (`/root/models/gemma-4-E2B-it-qat-mobile/`), but the f16
+configuration was OOM-killed at 7.6 GB anon while `rock-5b-plus` was holding
+7.4 GB with other workloads plus 2.6 GB of shared memory. All three attempts
+were contained to their systemd scope; the board's services were unaffected.
+With an idle board the 6.6 GiB working set fits comfortably.
+
 ## 12. Deferred
 
 - Q8/low-RAM mode (the f32 resident model is 2.9 GB).
