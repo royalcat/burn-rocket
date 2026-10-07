@@ -48,8 +48,27 @@ command (`src/server/`): it detects the checkpoint family from `config.json`
 Ollama API for chat models; `/health` + `/v1/models` always). The old commands
 `qwen3 serve`, `intent serve-ollama`, `gemma serve` and `gemma serve-chat` are gone;
 the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API.
+`serve` flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--family`,
+`--backend`, `--port` (default 8383), `--model-name` (default: the model directory
+name), `--max-tokens`, `--max-new-tokens`, `--temperature`, plus the detected
+family's loading flags:
 
-## Status (2026-10-06)
+- qwen3: `--dtype`, `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--chunk`, `--key-block`, `--attn`
+- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
+- intent: `--npu`, `--npu-threads`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`
+- Gemma 4: `--f16`, `--quant`, `--npu`, `--npu-threads`, `--attn-chunk`
+
+A flag that does not apply to the detected model is rejected.
+
+Cleanup + formatting (2026-10-08): commit `2301d3b` removed the dead code across
+the Gemma modules, cfg-gated the NPU-only helpers, annotated the checkpoint-config
+structs, moved the safetensors load-report checks into `util/store.rs`, and made
+`GenOptions.collect_top8` opt-in (serving no longer collects per-step top-8 logits;
+`--dump-logits` enables it). Commit `9849926` applied `cargo fmt --all`, so the
+workspace is `cargo fmt --all --check` clean. All builds below are warning-free and
+`cargo clippy -p rocket-inference --no-default-features` is clean.
+
+## Status (2026-10-06, extended 2026-10-07/08)
 
 - **Library**: `burn-rocket` exposes the NPU as a Burn backend extension
   (`#[backend_extension(Flex)]`, `src/ext.rs`); ordinary `Tensor`s in/out via
@@ -117,7 +136,7 @@ the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
 | `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
-| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`) |
+| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), safetensors load-report checks (`store`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
 | `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs` |
@@ -246,7 +265,10 @@ builds the aarch64 image on the board and pushes
 `git.kmsign.org/royalcat/rocket-inference:<sha>`. It needs
 `vendor/rocketnpu/librocketnpu.a` (run `scripts/build-rocketnpu.sh`; `VENDOR_SRC`
 overrides) and registry credentials on the control host; run it from anywhere in the
-repo.
+repo. The image CMD is the unified server:
+`serve --backend flex --dtype f32 --npu --npu-attn cpu --port 8383 --max-tokens 8192
+--model-dir /models/qwen3-embedding-0.6b --model-name qwen3-embedding` (the image
+needs a rebuild to pick up the post-merge CMD).
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
@@ -270,6 +292,11 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   sequences — use newline-free text for single-embedding comparisons).
 - Board `rock-5b-plus.lan` is accessed as `root@rock-5b-plus.lan` (the `royalcat` user
   has no key there). Do not touch the board unless the task says so.
+- A real Ollama daemon listens on `localhost:11434` on the dev host — use another
+  port (e.g. 11435) for `serve` smoke tests, or the responses come from Ollama.
+- `serve` smoke footgun: the OpenAI chat content parts (`image_url`/`input_audio`)
+  insert the `<|image|>`/`<|audio|>` placeholders themselves; putting the placeholder
+  in the text part as well yields a 400 `placeholder mismatch`.
 
 ## Board deployment (2026-10-05)
 
@@ -506,6 +533,11 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 B=$CARGO_TARGET_DIR/release/rocket-inference
 # library compile checks (npu needs aarch64 only for linking)
 cargo check -p burn-rocket --features npu
+# example npu compile check (the dep is aarch64-gated, so use the target)
+cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
+# formatting + lint gates (both clean)
+cargo fmt --all -- --check
+cargo clippy -p rocket-inference --no-default-features
 # single-core speed gate (blocked path is the single-core record); run from
 # examples/rocket-inference
 taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
