@@ -241,7 +241,8 @@ through the windowed attention op (`burn_rocket::attention_window`). The
 vision/audio towers, norms, RoPE and the embedding table stay on the CPU.
 
 ```sh
-# cross-build (links vendor/rocketnpu/librocketnpu.a; run scripts/build-rocketnpu.sh once)
+# cross-build (links the pinned librocketnpu; build.rs auto-builds it, or run
+# scripts/build-rocketnpu.sh once)
 cargo build --release -p rocket-inference-gemma --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
 

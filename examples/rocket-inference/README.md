@@ -96,9 +96,10 @@ The projection matmuls (and optionally attention) can run on the RK3588 NPU thro
 mainline `rocket` driver, via the [`burn-rocket`](../..) library at the repo root, which
 wraps `librocketnpu` (gregordinary/rocket-userspace) and exposes the operations as a Burn
 **backend extension** (`#[backend_extension(Flex)]`; the model calls
-`burn_rocket::matmul` / `burn_rocket::attention`). Build with `--features npu` (aarch64)
-after `scripts/build-rocketnpu.sh` (builds the pinned archive into `vendor/rocketnpu/`;
-`ROCKETNPU_DIR=<dir>` overrides). The NPU path is aarch64-only and links the static
+`burn_rocket::matmul` / `burn_rocket::attention`). Build with `--features npu` (aarch64);
+`build.rs` auto-builds the pinned archive into `$OUT_DIR` when `vendor/rocketnpu/` is
+absent (or run `scripts/build-rocketnpu.sh` to install it there; `ROCKETNPU_DIR=<dir>`
+overrides). The NPU path is aarch64-only and links the static
 archive. Weights are **pack-and-drop**: all 196 projections are packed straight
 into resident fp16 NPU buffers (0.82 GiB; q|k|v and gate|up are each one segmented
 weight, so a layer is 4 matmuls) and the CPU keeps only an f16 embedding table

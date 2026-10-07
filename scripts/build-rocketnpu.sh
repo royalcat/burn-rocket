@@ -6,22 +6,25 @@
 # what was built (COMMIT + ARCH) and the script is a no-op when it already
 # matches the request. Nothing is copied from the board.
 #
-# Source cache: ${XDG_CACHE_HOME:-$HOME/.cache}/rocket-userspace (clone + one
-# cmake tree per target/commit); it survives cargo clean.
+# Source/build cache: $OUT_DIR/rocket-userspace when invoked from a build
+# script (build.rs), else ${CARGO_TARGET_DIR:-<repo>/target}/<profile>/build/
+# burn-rocket (--profile, default release). Holds the clone plus one cmake tree
+# per target/commit; removed by cargo clean.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_COMMIT=f86cf52c666b4eddadc17d80d6c558b4067c0d6b
 UPSTREAM=https://github.com/gregordinary/rocket-userspace
-CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/rocket-userspace"
 HEADERS=(rocket_npu.h rocket_matmul.h)
 
 TARGET=aarch64
 COMMIT="$DEFAULT_COMMIT"
 OUT="$REPO/vendor/rocketnpu"
-SRC=""
+SRC="${ROCKETNPU_SRC:-}"
 JOBS="$(nproc)"
 FORCE=0
+CACHE_ARG=""
+PROFILE=release
 
 usage() {
     cat <<'EOF'
@@ -34,7 +37,12 @@ Usage: scripts/build-rocketnpu.sh [options]
                           host    = native build for link checks on this machine
   --commit <sha>          upstream commit to build (default: the pinned commit)
   --out <dir>             install dir (default: <repo>/vendor/rocketnpu)
-  --src <checkout>        use an existing rocket-userspace checkout (offline)
+  --cache <dir>           source/build cache (default: $OUT_DIR/rocket-userspace
+                          from build.rs, else
+                          <target-dir>/<profile>/build/burn-rocket)
+  --profile <name>        profile in the manual cache default (default: release)
+  --src <checkout>        use an existing rocket-userspace checkout (offline;
+                          also read from $ROCKETNPU_SRC)
   --jobs <n>              build parallelism (default: nproc)
   --force                 rebuild even when --out already matches
   -h, --help              show this help
@@ -52,6 +60,8 @@ while [ $# -gt 0 ]; do
         --target)  TARGET="${2:?--target needs a value}"; shift 2 ;;
         --commit)  COMMIT="${2:?--commit needs a value}"; shift 2 ;;
         --out)     OUT="${2:?--out needs a value}"; shift 2 ;;
+        --cache)   CACHE_ARG="${2:?--cache needs a value}"; shift 2 ;;
+        --profile) PROFILE="${2:?--profile needs a value}"; shift 2 ;;
         --src)     SRC="${2:?--src needs a value}"; shift 2 ;;
         --jobs)    JOBS="${2:?--jobs needs a value}"; shift 2 ;;
         --force)   FORCE=1; shift ;;
@@ -73,6 +83,18 @@ case "$TARGET" in
         ;;
     *) die "unknown --target: $TARGET (want aarch64 or host)" ;;
 esac
+
+# --- cache location ---------------------------------------------------------
+# From a build script the cache lives inside OUT_DIR (per target/profile/hash;
+# `cargo clean` removes it). A manual run uses the cargo target dir, mirroring
+# the layout of build-script outputs.
+if [ -n "$CACHE_ARG" ]; then
+    CACHE_BASE="$CACHE_ARG"
+elif [ -n "${OUT_DIR:-}" ]; then
+    CACHE_BASE="$OUT_DIR/rocket-userspace"
+else
+    CACHE_BASE="${CARGO_TARGET_DIR:-$REPO/target}/$PROFILE/build/burn-rocket"
+fi
 
 # The install dir records what was built; skip when it already matches. Short
 # and full forms of the same sha count as equal (prefix in either direction).
@@ -107,6 +129,15 @@ if [ "$TARGET" = aarch64 ]; then
 fi
 
 # --- source -----------------------------------------------------------------
+mkdir -p "$CACHE_BASE"
+if command -v flock >/dev/null; then
+    # Serialize runs sharing the cache: two cargo invocations on one target
+    # dir, or a manual run next to a build script.
+    exec 9>"$CACHE_BASE/.lock"
+    flock -w 600 9 || die "timed out waiting for the build lock in $CACHE_BASE"
+else
+    echo "warning: flock not found; runs sharing $CACHE_BASE are not serialized" >&2
+fi
 if [ -n "$SRC" ]; then
     [ -d "$SRC" ] || die "--src directory not found: $SRC"
     SRC_ABS="$(cd "$SRC" && pwd)"

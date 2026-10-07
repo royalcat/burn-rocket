@@ -58,10 +58,17 @@ packed for the `M >= 256` tiling, smaller requests are padded.
 
 ## Building
 
-`librocketnpu.a` is expected at `vendor/rocketnpu/` (gitignored). Build it on this host
-from a pinned
+`librocketnpu.a` is supplied automatically: `build.rs` uses `ROCKETNPU_DIR` when set,
+else a matching `vendor/rocketnpu/` archive, else builds one into `$OUT_DIR/rocketnpu`
+with `scripts/build-rocketnpu.sh` (pinned
 [`gregordinary/rocket-userspace`](https://github.com/gregordinary/rocket-userspace)
-commit — no board copy needed:
+commit, aarch64 cross by default). The first build clones and compiles the C library
+(clone/cmake cache under `$OUT_DIR/rocket-userspace`, removed by `cargo clean`); later
+builds reuse it. `ROCKETNPU_AUTO=0` disables the auto-build (warn only) and
+`ROCKETNPU_SRC=<checkout>` builds offline from an existing checkout.
+
+Run the script directly to install the archive into `vendor/rocketnpu/` (gitignored) —
+for the docker image, a fixed deployment artifact, or a different pin:
 
 ```sh
 # aarch64 archive for the board (cross; the default)
@@ -70,10 +77,10 @@ scripts/build-rocketnpu.sh
 scripts/build-rocketnpu.sh --target host
 ```
 
-The script caches the upstream clone and cmake trees under
-`${XDG_CACHE_HOME:-~/.cache}/rocket-userspace/`, records the built commit and architecture
-in `vendor/rocketnpu/{COMMIT,ARCH}`, and skips the build when the directory already
-matches. `--commit <sha>` moves the pin; `ROCKETNPU_DIR` still overrides the directory.
+The script records the built commit and architecture in `vendor/rocketnpu/{COMMIT,ARCH}`
+and skips the build when the directory already matches. `--commit <sha>` moves the pin;
+`--cache <dir>` and `--profile <name>` (default `release`) control the cache location
+(`<target-dir>/<profile>/build/burn-rocket` for manual runs).
 
 ```sh
 # compile check, works on any target that has no NPU (no linking)

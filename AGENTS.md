@@ -78,8 +78,8 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `src/lib.rs` | FFI wrappers (`RocketCtx`/`RocketWeight`/`RocketStream`/`RocketFaCtx`, `pack_weight_seg`, `flash_attn`), driver/counter helpers, `Error`/`OpFailure` |
 | `src/ffi.rs` | raw `extern "C"` declarations for `librocketnpu` |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
-| `build.rs` | links `librocketnpu.a` for `npu` builds (`ROCKETNPU_DIR`, default `vendor/rocketnpu`); warns on a missing archive or an `ARCH` provenance mismatch |
-| `scripts/build-rocketnpu.sh` | builds `vendor/rocketnpu/` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); caches under `${XDG_CACHE_HOME:-~/.cache}/rocket-userspace` |
+| `build.rs` | links `librocketnpu.a` for `npu` builds; resolves `ROCKETNPU_DIR` → matching `vendor/rocketnpu` → `$OUT_DIR/rocketnpu` → auto-build via the script (`ROCKETNPU_AUTO=0` disables, failures warn and are stamped) |
+| `scripts/build-rocketnpu.sh` | builds `librocketnpu.a` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); cache: `$OUT_DIR/rocket-userspace` from build.rs, else `<target-dir>/<profile>/build/burn-rocket` |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs` | app CLI (`bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`), flags, model loading (f32 / `--quant q8` / `--npu` pack-and-drop), NPU packing (`load_npu_projections`), CPU projection loading for the NPU build (`load_cpu_projections`), intent model loading |
@@ -93,7 +93,7 @@ deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 | `examples/rocket-inference/docs/experiment-log.md` | all measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
 | `examples/rocket-inference-gemma/` | EmbeddingGemma 2 multimodal example (text/image/video/audio embeddings, OpenAI-compatible + multimodal server, `--quant q8`, NPU text backbone); layout, flags and deploy in its `README.md`, measurements in `docs/experiment-log.md` |
-| `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy) |
+| `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy); `build.rs` auto-builds a per-target copy into `$OUT_DIR` when it is absent |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
 ## EmbeddingGemma 2 example (`examples/rocket-inference-gemma`)
@@ -166,7 +166,8 @@ the vision/audio towers, 8k-context NPU attention memory.
 ## Rebuild + deploy to the board
 
 ```sh
-# once per checkout (and after an upstream bump): supply the aarch64 archive
+# optional: pre-build the aarch64 archive into vendor/rocketnpu (build.rs
+# auto-builds a per-target copy into $OUT_DIR when it is absent)
 scripts/build-rocketnpu.sh
 # NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
@@ -220,9 +221,9 @@ example's `src/model.rs` (`stage_stats`).
 
 - `$CARGO_TARGET_DIR` is a shared cache (`/home/royalcat/.cache/rust/target`); never
   assume a project-local `target/`.
-- `librocketnpu` source/build cache: `${XDG_CACHE_HOME:-~/.cache}/rocket-userspace/`
-  (`src/` clone + `build-<target>-<sha>/` cmake trees), managed by
-  `scripts/build-rocketnpu.sh`.
+- `librocketnpu` source/build cache: `$OUT_DIR/rocket-userspace/` when the script
+  runs from `build.rs`, else `<target-dir>/<profile>/build/burn-rocket/` (`src/`
+  clone + `build-<target>-<sha>/` cmake trees); removed by `cargo clean`.
 - Model: `~/models/qwen3-embedding-0.6b/` (HF bf16 safetensors + tokenizer.json).
 - Production reference: `~/projects/ik_llama.cpp/build/bin/llama-embedding` +
   `~/models/qwen3-embedding-0.6b-q8_0.gguf` (patched skip-lm-head build).
@@ -277,6 +278,13 @@ example's `src/model.rs` (`stage_stats`).
   `vendor/rocketnpu/librocketnpu.a` (built by `scripts/build-rocketnpu.sh`; override with
   `ROCKETNPU_DIR`). aarch64 only: the dep is target-gated in
   `examples/rocket-inference/Cargo.toml`.
+- `build.rs` supplies the archive without a manual step: `ROCKETNPU_DIR` (explicit;
+  never auto-built) → matching `vendor/rocketnpu` (an absent `ARCH` counts as aarch64)
+  → `$OUT_DIR/rocketnpu` → auto-build `scripts/build-rocketnpu.sh --out
+  $OUT_DIR/rocketnpu` (`ROCKETNPU_AUTO=0` disables; `ROCKETNPU_SRC=<checkout>` is the
+  offline path; cross vs native is picked from the target arch). A failed auto-build
+  only warns, and a stamp in `$OUT_DIR` (keyed by the script's size+mtime) blocks
+  retries until the script changes or `cargo clean -p burn-rocket`.
 - The cross archive must be built against the aarch64 uapi headers: with the host's
   `/usr/include` first, `asm/posix_types.h` takes its non-x86 branch, `__kernel_size_t`
   becomes 32-bit and `struct drm_version` 56 bytes, so the wrong `DRM_IOCTL_VERSION`
