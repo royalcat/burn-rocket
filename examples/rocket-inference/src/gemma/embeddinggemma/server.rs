@@ -4,10 +4,9 @@
 //! The model is behind one mutex (a forward is CPU-bound and single-flight);
 //! panics inside a forward are contained so the server survives them.
 
-use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -17,15 +16,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use base64::Engine;
 use burn::prelude::*;
 use burn::tensor::DType;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::config::Emb2Config;
-use crate::inputs::{self, DebugPaths, MediaInputs};
-use crate::model::Emb2Model;
+use crate::gemma::config::Emb2Config;
+use crate::gemma::embeddinggemma::model::Emb2Model;
+use crate::gemma::inputs::{self, DebugPaths, MediaInputs};
+use crate::gemma::media::resolve_media;
+use crate::util::http::{lock_or_recover, panic_message};
 
 pub struct ServeOptions {
     pub addr: String,
@@ -60,23 +60,6 @@ struct Inner {
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     settings: Arc<Settings>,
-}
-
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(g) => g,
-        Err(PoisonError { .. }) => mutex.lock().unwrap_or_else(|e| e.into_inner()),
-    }
-}
-
-fn panic_message(payload: Box<dyn Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
 }
 
 pub fn serve(
@@ -280,36 +263,6 @@ async fn embed_native(State(state): State<AppState>, Json(req): Json<NativeReque
     }
 }
 
-/// A media value is either a filesystem path or a `data:<mime>;base64,<payload>`
-/// blob (written to a temp file so ffmpeg/hound can read it).
-pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<PathBuf, String> {
-    let Some(rest) = value.strip_prefix("data:") else {
-        return Ok(PathBuf::from(value));
-    };
-    let (mime, b64) = rest
-        .split_once(";base64,")
-        .ok_or("bad data URI (expected data:<mime>;base64,<payload>)")?;
-    // The decoders pick their backend by file extension, so take it from the MIME
-    // type (`image/jpeg` -> jpg, `audio/wav` -> wav) instead of a generic name.
-    let ext = match mime.split('/').nth(1) {
-        Some("jpeg") => "jpg",
-        Some(other) if !other.is_empty() => other,
-        _ => ext,
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|e| format!("base64: {e}"))?;
-    let dir = std::env::temp_dir().join("rocket-inference-gemma");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let path = dir.join(format!("upload-{}-{nanos}.{ext}", std::process::id()));
-    std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
-}
-
 fn embed_one(
     inner: &mut Inner,
     settings: &Settings,
@@ -355,7 +308,7 @@ fn embed_one(
             .model
             .embed_ids(input, &rope, settings.attn_chunk, prepared.soft)
     }))
-    .map_err(|payload| format!("forward panicked: {}", panic_message(payload)))?;
+    .map_err(|payload| format!("forward panicked: {}", panic_message(&payload)))?;
     let mut v: Vec<f32> = out
         .cast(DType::F32)
         .into_data()

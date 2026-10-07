@@ -13,8 +13,8 @@ use burn::tensor::{DType, TensorData};
 use burn_store::bridge::to_data;
 use burn_store::{ModuleStore, SafetensorsStore};
 
-use crate::intent_model::{DeltaNet, GatedAttention, IntentModel, IntentTextConfig, Mixer};
-use crate::model::Proj;
+use crate::qwen35_intent::model::{DeltaNet, GatedAttention, IntentModel, IntentTextConfig, Mixer};
+use crate::util::proj::Proj;
 
 pub struct IntentLoadOptions {
     /// Pack projections into resident NPU weights (aarch64 + `npu` feature only).

@@ -13,12 +13,12 @@ use burn::tensor::activation::gelu_approximate;
 
 use std::collections::HashMap;
 
-use crate::config::VisionConfig;
-use crate::layers::ClipBounds;
-use crate::layers::ClippableLinear;
-use crate::media::PreparedImage;
-use crate::layers::lin;
-use crate::model::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::gemma::config::VisionConfig;
+use crate::gemma::layers::ClipBounds;
+use crate::gemma::layers::ClippableLinear;
+use crate::gemma::media::PreparedImage;
+use crate::gemma::layers::lin;
+use crate::gemma::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
 
 /// Plain-data vision geometry.
 #[derive(Debug, Clone)]
@@ -390,7 +390,7 @@ impl VisionTower {
                 pos[i * d + c] = table[xr + c] + table[yr + c];
             }
         }
-        let dtype = crate::layers::weight_dtype(&self.patch_embedder.input_proj.weight);
+        let dtype = crate::gemma::layers::weight_dtype(&self.patch_embedder.input_proj.weight);
         Tensor::<2>::from_data(TensorData::new(pos, [p, d]), device).cast(dtype)
     }
 
@@ -408,7 +408,7 @@ impl VisionTower {
         let d = spec.hidden;
         let device = self.patch_embedder.position_embedding_table.val().device();
 
-        let dtype = crate::layers::weight_dtype(&self.patch_embedder.input_proj.weight);
+        let dtype = crate::gemma::layers::weight_dtype(&self.patch_embedder.input_proj.weight);
         let pixels = Tensor::<2>::from_data(
             TensorData::new(img.patches.clone(), [p, spec.patch_pixels()]),
             &device,

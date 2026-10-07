@@ -10,7 +10,7 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -26,7 +26,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
-use crate::intent_model::IntentModel;
+use crate::qwen35_intent::model::IntentModel;
+use crate::util::http::lock_or_recover;
 
 pub struct OllamaOptions {
     pub addr: String,
@@ -58,10 +59,6 @@ struct Inner {
 struct AppState {
     inner: Arc<Mutex<Inner>>,
     settings: Arc<Settings>,
-}
-
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // ---------------------------------------------------------------------------

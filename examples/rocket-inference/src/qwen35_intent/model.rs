@@ -21,7 +21,8 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::{AttentionModuleOptions, PadMode};
 use burn::tensor::{Bool, DType, Int, TensorData, s};
 
-use crate::model::{Proj, RopeCache};
+use crate::util::proj::Proj;
+use crate::util::rope::RopeCache;
 
 /// Model hyper-parameters, deserialized from the HF `config.json` `text_config`.
 #[derive(Debug, Clone, serde::Deserialize)]

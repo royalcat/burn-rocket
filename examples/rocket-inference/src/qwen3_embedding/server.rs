@@ -2,7 +2,7 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
 use axum::{
@@ -18,7 +18,9 @@ use burn::tensor::{DType, Int, TensorData};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
-use crate::model::{Qwen3Config, Qwen3Embedding, RopeCache};
+use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
+use crate::util::http::{lock_or_recover, panic_message};
+use crate::util::rope::RopeCache;
 
 pub struct ServeOptions {
     pub addr: String,
@@ -58,10 +60,6 @@ struct AppState {
 /// poisoned lock must not wedge the server until restart.
 fn lock_inner(state: &AppState) -> MutexGuard<'_, Inner> {
     lock_or_recover(&state.inner)
-}
-
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Deserialize)]
@@ -294,16 +292,6 @@ fn panic_to_api(payload: Box<dyn Any + Send>) -> ApiError {
         StatusCode::INTERNAL_SERVER_ERROR,
         format!("internal error: {}", panic_message(&*payload)),
     )
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "see server log".to_string()
-    }
 }
 
 /// One request's tokenization + forward, with the model lock held.

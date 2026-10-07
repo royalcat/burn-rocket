@@ -1,11 +1,13 @@
 //! Gemma 4 chat template rendering and the generation loop.
 
+use std::path::Path;
+
 use anyhow::Result;
 use burn::prelude::*;
 use burn::tensor::DType;
 use tokenizers::Tokenizer;
 
-use crate::gen_model::{GenKv, GenRopes, GenRoot};
+use crate::gemma::gemma4::model::{GenKv, GenRopes, GenRoot};
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -259,9 +261,9 @@ pub fn generate_with_media(
 
     let t0 = std::time::Instant::now();
     // NPU prefill: the packed weights are used only inside this call.
-    crate::layers::set_prefill_mode(true);
+    crate::gemma::layers::set_prefill_mode(true);
     let logits = model.prefill(ids, soft, &ropes, &mut kv, lm_head, chunk, pad_id);
-    crate::layers::set_prefill_mode(false);
+    crate::gemma::layers::set_prefill_mode(false);
     stats.top8.push(top_k(&logits, 8));
     let mut next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
@@ -273,7 +275,7 @@ pub fn generate_with_media(
         if opts.eos.contains(&next) {
             break;
         }
-        let input = crate::inputs::make_input(&[next], device);
+        let input = crate::gemma::inputs::make_input(&[next], device);
         let seq_start = kv.len;
         let h = model.text().forward(input, &ropes, &mut kv, seq_start, chunk);
         let logits = model.text().logits(h, lm_head);
@@ -283,4 +285,25 @@ pub fn generate_with_media(
     stats.decode_s = t1.elapsed().as_secs_f64();
     stats.generated = out.len();
     Ok((out, stats))
+}
+
+/// EOS ids from the checkpoint's `generation_config.json` (fallback: 1, 106, 50).
+pub(crate) fn gen_eos(model_dir: &Path) -> Vec<u32> {
+    let mut eos = vec![1u32, 106, 50];
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("generation_config.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            match json.get("eos_token_id") {
+                Some(serde_json::Value::Number(n)) => {
+                    if let Some(v) = n.as_u64() {
+                        eos = vec![v as u32];
+                    }
+                }
+                Some(serde_json::Value::Array(a)) => {
+                    eos = a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+                }
+                _ => {}
+            }
+        }
+    }
+    eos
 }

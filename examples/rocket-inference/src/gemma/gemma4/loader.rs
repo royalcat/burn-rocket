@@ -17,25 +17,14 @@
 use anyhow::{Context, Result};
 use burn::prelude::*;
 use burn::tensor::DType;
-use burn::tensor::quantization::{
-    Calibration, QuantScheme, QuantValue, ScaleDtype, compute_q_params, compute_range,
-};
 use burn_store::burn_pack::Tensor as PackTensor;
 use burn_store::{
-    FloatCastAdapter, ModuleAdapter, ModuleContext, ModuleSnapshot, PyTorchToBurnAdapter,
-    SafetensorsStore, bridge,
+    ModuleAdapter, ModuleContext, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore, bridge,
 };
 
-use crate::config::Emb2Config;
-use crate::layers::ClipBounds;
-use crate::gen_model::{GenRoot, GenTextModel};
-
-/// Q8_0 (llama.cpp layout: symmetric int8, 32-value blocks, f16 scales).
-pub fn q8_scheme() -> QuantScheme {
-    QuantScheme::default()
-        .with_value(QuantValue::Q8S)
-        .per_block([32], ScaleDtype::F16)
-}
+use crate::gemma::config::Emb2Config;
+use crate::gemma::gemma4::model::{GenRoot, GenTextModel};
+use crate::gemma::layers::ClipBounds;
 
 /// Per-tensor dtype selection, applied during loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,47 +105,14 @@ impl ModuleAdapter for LoadDtypeAdapter {
 /// Q8-resident projections (Q8_0: symmetric int8, 32-value blocks, f16 scales),
 /// applied after loading; `lin` dequantizes each weight per call.
 pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
-    use burn::module::{ModuleMapper, Param, ParamGroup};
+    use crate::util::quant::{LowRam, param_group};
     let t0 = std::time::Instant::now();
-    let scheme = q8_scheme();
-    let group = ParamGroup::from_regex(
+    let proj_group = param_group(
         r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection)\.weight$",
-    )
-    .map_err(|e| anyhow::anyhow!("bad param group regex: {e:?}"))?;
-
-    struct LowRam {
-        scheme: QuantScheme,
-        group: ParamGroup,
-        path: Vec<String>,
-    }
-    impl ModuleMapper for LowRam {
-        fn enter_module(&mut self, name: &str, _container_type: &str) {
-            self.path.push(name.to_string());
-        }
-        fn exit_module(&mut self, _name: &str, _container_type: &str) {
-            self.path.pop();
-        }
-        fn map_float<const D: usize>(&mut self, param: Param<Tensor<D>>) -> Param<Tensor<D>> {
-            let path = self.path.join(".");
-            if self.group.matches(&param.id, Some(&path)) {
-                param.map(|tensor| {
-                    let tensor = tensor.cast(DType::F32);
-                    let range = compute_range(&self.scheme, &tensor, &Calibration::MinMax);
-                    let qparams = compute_q_params(&self.scheme, range);
-                    tensor.quantize(&self.scheme, qparams)
-                })
-            } else {
-                param
-            }
-        }
-    }
-    let mut mapper = LowRam {
-        scheme,
-        group,
-        path: Vec::new(),
-    };
+    )?;
+    let mut mapper = LowRam::new(vec![proj_group], Vec::new());
     let model = model.map(&mut mapper);
-    crate::layers::set_quantized(true);
+    crate::gemma::layers::set_quantized(true);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
@@ -284,7 +240,7 @@ pub fn load_gen_model(
     // weights are packed INT2/4/8 with scales and SRQ activation rounding.
     let cfg_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
-    let qat = crate::qat::QatConfig::from_json(&cfg_json)?;
+    let qat = crate::gemma::qat::QatConfig::from_json(&cfg_json)?;
     if qat.is_some() {
         // The PLE table is read packed; stub the parameter first so the
         // dequantized table is never allocated.
@@ -294,7 +250,7 @@ pub fn load_gen_model(
         .allow_partial(true);
     let scales = match &qat {
         Some(_) => {
-            let scales = crate::qat::read_scales(&mut store)?;
+            let scales = crate::gemma::qat::read_scales(&mut store)?;
             println!("QAT checkpoint: {} quantized modules", scales.len());
             Some(std::sync::Arc::new(scales))
         }
@@ -346,7 +302,7 @@ pub fn load_gen_model(
             .as_ref()
             .and_then(|q| q.bits_for("model.language_model.embed_tokens_per_layer"))
             .unwrap_or(4);
-        let table = crate::qat::read_packed_table(
+        let table = crate::gemma::qat::read_packed_table(
             &mut store,
             "model.language_model.embed_tokens_per_layer",
             bits,
@@ -392,7 +348,7 @@ pub fn load_gen_model(
     let model = match dtype {
         LoadDtype::Q8 => quantize_gen(model)?,
         LoadDtype::F16 => {
-            crate::layers::set_f16_weights(true);
+            crate::gemma::layers::set_f16_weights(true);
             model
         }
         LoadDtype::F32 => model,
@@ -430,14 +386,14 @@ fn rss_mib() -> f64 {
 /// ordinary float tensors while the store applies them, so the model tree sees
 /// the same `Linear`/`Embedding` fields as for a bf16 checkpoint.
 pub struct QatAdapter {
-    qat: std::sync::Arc<crate::qat::QatConfig>,
-    scales: std::sync::Arc<std::collections::HashMap<String, crate::qat::ModuleScales>>,
+    qat: std::sync::Arc<crate::gemma::qat::QatConfig>,
+    scales: std::sync::Arc<std::collections::HashMap<String, crate::gemma::qat::ModuleScales>>,
     dtype: LoadDtype,
 }
 
 impl ModuleAdapter for QatAdapter {
     fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
-        use crate::qat::{dequantize_weight, values_per_byte};
+        use crate::gemma::qat::{dequantize_weight, values_per_byte};
         use burn_store::burn_pack::Shape;
 
         let name = tensor.name.clone();
@@ -511,7 +467,7 @@ impl ModuleAdapter for QatAdapter {
 /// `ParamId` (the visitor path matches the checkpoint's module paths).
 fn register_srq_scales(
     model: &GenRoot,
-    scales: &std::collections::HashMap<String, crate::qat::ModuleScales>,
+    scales: &std::collections::HashMap<String, crate::gemma::qat::ModuleScales>,
 ) -> usize {
     use burn::module::{ModuleVisitor, Param};
 
@@ -548,7 +504,7 @@ fn register_srq_scales(
         let key = path.strip_suffix(".weight").unwrap_or(&path);
         if let Some(s) = scales.get(key) {
             if s.in_scale != 0.0 || s.out_scale != 0.0 {
-                crate::layers::register_srq(id, s.in_scale, s.out_scale);
+                crate::gemma::layers::register_srq(id, s.in_scale, s.out_scale);
                 n += 1;
             }
         }

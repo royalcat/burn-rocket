@@ -4,18 +4,20 @@
 //! decoder-only transformer, pre-norm, GQA (16 q heads / 8 kv heads), head_dim 128,
 //! QK-RMSNorm, RoPE theta 1e6, SwiGLU MLP, final RMSNorm, last-token pooling.
 
-use burn::module::{
-    Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault, ModuleMapper, ModuleVisitor,
-    Param, ParamId,
-};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
+use burn::module::Module;
+use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::activation::silu;
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{DType, Int, TensorData, s};
+use burn::tensor::{DType, Int, s};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use crate::util::proj::Proj;
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+use crate::util::proj::{FusedGroup, ProjKind};
+use crate::util::rope::RopeCache;
 
 // Stage wall-time instrumentation (microseconds): attention (projections + attention
 // kernel), MLP (projections + activations) and the norms. Three atomic adds per layer.
@@ -39,54 +41,6 @@ pub fn stage_stats_reset() {
     T_NORM_US.store(0, Ordering::Relaxed);
 }
 
-/// Which projection of a transformer layer (loader + `Proj` handles).
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjKind {
-    Q = 0,
-    K = 1,
-    V = 2,
-    O = 3,
-    Gate = 4,
-    Up = 5,
-    Down = 6,
-}
-
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-impl ProjKind {
-    pub const ALL: [ProjKind; 7] = [
-        Self::Q,
-        Self::K,
-        Self::V,
-        Self::O,
-        Self::Gate,
-        Self::Up,
-        Self::Down,
-    ];
-
-    /// Safetensors key suffix within `model.layers.{i}`.
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Q => "self_attn.q_proj.weight",
-            Self::K => "self_attn.k_proj.weight",
-            Self::V => "self_attn.v_proj.weight",
-            Self::O => "self_attn.o_proj.weight",
-            Self::Gate => "mlp.gate_proj.weight",
-            Self::Up => "mlp.up_proj.weight",
-            Self::Down => "mlp.down_proj.weight",
-        }
-    }
-}
-
-/// Projection groups that share one input activation and run as one NPU matmul
-/// (their weights are packed concatenated along N).
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FusedGroup {
-    Qkv = 0,
-    GateUp = 1,
-}
-
 /// Model hyper-parameters, deserialized from the HF `config.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Qwen3Config {
@@ -106,58 +60,6 @@ impl Qwen3Config {
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Ok(serde_json::from_str(&text)?)
-    }
-}
-
-/// Precomputed RoPE cos/sin tables, `[max_seq, head_dim / 2]`.
-pub struct RopeCache {
-    cos: Tensor<2>,
-    sin: Tensor<2>,
-    half: usize,
-}
-
-impl RopeCache {
-    pub fn new(max_seq: usize, head_dim: usize, theta: f64, dtype: DType, device: &Device) -> Self {
-        let half = head_dim / 2;
-        let inv_freq: Vec<f32> = (0..half)
-            .map(|i| (1.0 / theta.powf(2.0 * i as f64 / head_dim as f64)) as f32)
-            .collect();
-        let mut cos = Vec::with_capacity(max_seq * half);
-        let mut sin = Vec::with_capacity(max_seq * half);
-        for pos in 0..max_seq {
-            for f in &inv_freq {
-                let angle = pos as f32 * *f;
-                cos.push(angle.cos());
-                sin.push(angle.sin());
-            }
-        }
-        let cos = Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
-        let sin = Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
-        Self { cos, sin, half }
-    }
-
-    /// Applies RoPE to `x` of shape `[batch, seq, heads, head_dim]`, starting at position
-    /// `seq_start`. Both q and k use the same table (no partial rotation, no freq scaling).
-    pub fn apply(&self, x: Tensor<4>, seq_start: usize) -> Tensor<4> {
-        let [_, s, _, d] = x.dims();
-        let half = self.half;
-        let cos = self
-            .cos
-            .clone()
-            .slice(s![seq_start..seq_start + s, ..])
-            .reshape([1, s, 1, half])
-            .cast(x.dtype());
-        let sin = self
-            .sin
-            .clone()
-            .slice(s![seq_start..seq_start + s, ..])
-            .reshape([1, s, 1, half])
-            .cast(x.dtype());
-        let x1 = x.clone().slice(s![.., .., .., 0..half]);
-        let x2 = x.slice(s![.., .., .., half..d]);
-        let o1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
-        let o2 = x2 * cos + x1 * sin;
-        Tensor::cat(vec![o1, o2], 3)
     }
 }
 
@@ -283,17 +185,6 @@ impl Qwen3Embedding {
     }
 }
 
-/// Linear forward that also supports Q8-resident weights: the weight is dequantized
-/// to f32 on the fly and used through the normal float linear path. Only the current
-/// layer's weights are materialized, so the resident model stays ~0.6 GB smaller.
-fn linear_forward(lin: &Linear, x: Tensor<3>, quantized: bool) -> Tensor<3> {
-    if !quantized {
-        return lin.forward(x);
-    }
-    let weight = lin.weight.val().dequantize(); // [in, out] f32
-    burn::tensor::module::linear(x, weight, lin.bias.as_ref().map(|b| b.val()))
-}
-
 #[derive(Module, Debug)]
 struct Qwen3Layer {
     self_attn: Qwen3Attention,
@@ -346,117 +237,6 @@ impl Qwen3Layer {
         let out = self.mlp.forward(h, quantized) + residual;
         T_MLP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
-    }
-}
-
-/// A projection weight: a regular CPU `Linear`, or (with `--npu`) a handle to a
-/// weight resident on the RK3588 NPU. The NPU variant holds no CPU-side weights.
-///
-/// `Proj` is a transparent module wrapper: on the CPU path the store loads (and
-/// `--quant q8` quantizes) the inner `Linear` under the usual `..._proj.weight`
-/// key; in the NPU build the fields are `#[module(skip)]` and the weights are
-/// packed straight from the store instead.
-#[derive(Debug, Clone)]
-pub enum Proj {
-    Cpu(Linear),
-    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    Npu(burn_rocket::WeightId),
-}
-
-impl Module for Proj {
-    fn visit<V: ModuleVisitor>(&self, visitor: &mut V) {
-        match self {
-            Proj::Cpu(l) => l.visit(visitor),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(_) => {}
-        }
-    }
-
-    fn map<M: ModuleMapper>(self, mapper: &mut M) -> Self {
-        match self {
-            Proj::Cpu(l) => Proj::Cpu(l.map(mapper)),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Proj::Npu(id),
-        }
-    }
-
-    fn to_device(self, device: &Device) -> Self {
-        match self {
-            Proj::Cpu(l) => Proj::Cpu(l.to_device(device)),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Proj::Npu(id),
-        }
-    }
-
-    fn fork(self, device: &Device) -> Self {
-        match self {
-            Proj::Cpu(l) => Proj::Cpu(l.fork(device)),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Proj::Npu(id),
-        }
-    }
-
-    fn collect_devices(&self, devices: Devices) -> Devices {
-        match self {
-            Proj::Cpu(l) => l.collect_devices(devices),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(_) => devices,
-        }
-    }
-
-    fn valid(&self) -> Self {
-        match self {
-            Proj::Cpu(l) => Proj::Cpu(l.valid()),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Proj::Npu(*id),
-        }
-    }
-
-    fn train(self) -> Self {
-        match self {
-            Proj::Cpu(l) => Proj::Cpu(l.train()),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Proj::Npu(id),
-        }
-    }
-}
-
-impl ModuleDisplayDefault for Proj {
-    fn content(&self, content: Content) -> Option<Content> {
-        match self {
-            Proj::Cpu(l) => ModuleDisplayDefault::content(l, content),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => Some(content.add_formatted(&format!("WeightId({})", id.id()))),
-        }
-    }
-}
-
-impl ModuleDisplay for Proj {}
-
-impl Proj {
-    /// A CPU linear whose weight is uninitialized until the store loads it (or
-    /// the NPU loader replaces the whole `Proj`). In the NPU build the projection
-    /// fields are `#[module(skip)]`, so only the NPU loader touches them.
-    pub fn stub(input: usize, output: usize, device: &Device) -> Self {
-        Proj::Cpu(Linear {
-            weight: Param::uninitialized(
-                ParamId::new(),
-                move |device, _| Tensor::zeros([input, output], device),
-                device.clone(),
-                false,
-                Shape::new([input, output]),
-            ),
-            bias: None,
-        })
-    }
-
-    #[inline]
-    pub fn forward(&self, x: Tensor<3>, quantized: bool) -> Tensor<3> {
-        match self {
-            Proj::Cpu(l) => linear_forward(l, x, quantized),
-            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            Proj::Npu(id) => burn_rocket::matmul(x, id),
-        }
     }
 }
 

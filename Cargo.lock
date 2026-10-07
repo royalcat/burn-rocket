@@ -5485,23 +5485,6 @@ dependencies = [
  "burn",
  "burn-rocket",
  "burn-store",
- "libc",
- "serde",
- "serde_json",
- "tokenizers",
- "tokio",
-]
-
-[[package]]
-name = "rocket-inference-gemma"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "burn",
- "burn-rocket",
- "burn-store",
  "fancy-regex",
  "hound",
  "image",

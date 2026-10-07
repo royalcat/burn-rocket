@@ -10,9 +10,9 @@ use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
 
-use crate::audio_frontend::{self, AudioFeatures};
-use crate::media::{self, PreparedImage};
-use crate::vision::VisionSpec;
+use crate::gemma::audio_frontend::{self, AudioFeatures};
+use crate::gemma::media::{self, PreparedImage};
+use crate::gemma::vision::VisionSpec;
 
 /// Soft-token budgets from `processor_config.json` (image and video processor
 /// sections), matching the saved checkpoint configuration.

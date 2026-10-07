@@ -27,14 +27,14 @@ use burn::tensor::{DType, Int, s};
 
 use std::collections::HashMap;
 
-use crate::audio::AudioTower;
-use crate::audio_frontend::{AudioFeatures, subsample_mask};
-use crate::config::{AudioConfig, TextConfig, VisionConfig};
-use crate::layers::ClipBounds;
-use crate::media::PreparedImage;
-use crate::vision::{MultimodalEmbedder, VisionSpec, VisionTower};
-use crate::layers::lin;
-use crate::model::{linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::gemma::audio::AudioTower;
+use crate::gemma::audio_frontend::{AudioFeatures, subsample_mask};
+use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
+use crate::gemma::layers::ClipBounds;
+use crate::gemma::media::PreparedImage;
+use crate::gemma::vision::{MultimodalEmbedder, VisionSpec, VisionTower};
+use crate::gemma::layers::lin;
+use crate::gemma::{linear_cfg, repeat_kv, rms_norm_noscale};
 
 // Stage wall-time instrumentation (microseconds) for the generation path.
 static T_ATTN_US: AtomicU64 = AtomicU64::new(0);
@@ -444,7 +444,7 @@ impl GenAttention {
         };
 
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if s > 1 && crate::layers::prefill_mode() {
+        if s > 1 && crate::gemma::layers::prefill_mode() {
             // Generation prefill on the NPU: causal (full layers) or causal +
             // sliding window (sliding layers); decode stays on the CPU.
             let window = if spec.sliding {
@@ -602,7 +602,7 @@ pub struct GenTextModel {
     /// QAT checkpoints: the PLE table stays packed and rows are dequantized on
     /// lookup (bit-identical values, a fraction of the memory).
     #[module(skip)]
-    packed_ple: Option<crate::qat::PackedTable>,
+    packed_ple: Option<crate::gemma::qat::PackedTable>,
     per_layer_model_projection: Linear,
     per_layer_projection_norm: RmsNorm,
     layers: Vec<GenLayer>,
@@ -642,7 +642,7 @@ impl GenTextModel {
     }
 
     /// Install a packed PLE table (QAT checkpoints) and drop the f16/f32 copy.
-    pub fn set_packed_ple(&mut self, table: crate::qat::PackedTable) {
+    pub fn set_packed_ple(&mut self, table: crate::gemma::qat::PackedTable) {
         self.packed_ple = Some(table);
     }
 
@@ -916,7 +916,7 @@ impl GenRoot {
     }
 }
 
-impl crate::inputs::MediaModel for GenRoot {
+impl crate::gemma::inputs::MediaModel for GenRoot {
     fn vision_spec(&self) -> &VisionSpec {
         self.model.vision_tower.spec()
     }

@@ -2,7 +2,7 @@
 //! generation model (text content only for now; media parts are a later phase).
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -17,10 +17,11 @@ use burn::tensor::DType;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-use crate::chat::{self, GenOptions};
-use crate::inputs;
-use crate::gen_model::GenRoot;
-use crate::server::resolve_media;
+use crate::gemma::gemma4::chat::{self, GenOptions};
+use crate::gemma::inputs;
+use crate::gemma::gemma4::model::GenRoot;
+use crate::gemma::media::resolve_media;
+use crate::util::http::lock_or_recover;
 
 pub struct ChatServeOptions {
     pub addr: String,
@@ -54,13 +55,6 @@ struct AppState {
     settings: Arc<Settings>,
 }
 
-fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(g) => g,
-        Err(PoisonError { .. }) => mutex.lock().unwrap_or_else(|e| e.into_inner()),
-    }
-}
-
 pub fn serve(
     model: GenRoot,
     lm_head: Tensor<2>,
@@ -82,7 +76,7 @@ pub fn serve(
         max_new_tokens: opts.max_new_tokens,
         image_soft_tokens,
         video_soft_tokens,
-        eos: crate::gen_eos(&opts.model_dir),
+        eos: crate::gemma::gemma4::chat::gen_eos(&opts.model_dir),
     });
     let state = AppState {
         inner: Arc::new(Mutex::new(Inner {

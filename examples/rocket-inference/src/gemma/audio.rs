@@ -14,12 +14,12 @@ use burn::nn::PaddingConfig2d;
 use burn::prelude::*;
 use burn::tensor::DType;
 
-use crate::layers::lin;
+use crate::gemma::layers::lin;
 use burn::tensor::activation::{relu, sigmoid, silu, softplus};
 
-use crate::audio_frontend::{AudioFeatures, MEL_BINS, subsample_mask};
-use crate::config::AudioConfig;
-use crate::layers::{ClipBounds, ClippableLinear};
+use crate::gemma::audio_frontend::{AudioFeatures, MEL_BINS, subsample_mask};
+use crate::gemma::config::AudioConfig;
+use crate::gemma::layers::{ClipBounds, ClippableLinear};
 
 /// Plain-data audio geometry.
 #[derive(Debug, Clone)]
@@ -490,7 +490,7 @@ impl AudioTower {
                 data[r * spec.hidden + half + c] = a.cos();
             }
         }
-        let dtype = crate::layers::weight_dtype(&self.output_proj.weight);
+        let dtype = crate::gemma::layers::weight_dtype(&self.output_proj.weight);
         Tensor::<2>::from_data(TensorData::new(data, [rows, spec.hidden]), device).cast(dtype)
     }
 
@@ -503,7 +503,7 @@ impl AudioTower {
     pub fn forward_debug(&self, feats: &AudioFeatures, debug_dir: Option<&std::path::Path>) -> Tensor<2> {
         let device = self.output_proj.weight.val().device();
         let t = feats.frames;
-        let dtype = crate::layers::weight_dtype(&self.output_proj.weight);
+        let dtype = crate::gemma::layers::weight_dtype(&self.output_proj.weight);
         let x = Tensor::<2>::from_data(TensorData::new(feats.mel.clone(), [t, MEL_BINS]), &device)
             .cast(dtype);
         let mut h = self.subsample_conv_projection.forward(x);

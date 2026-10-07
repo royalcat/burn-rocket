@@ -6,10 +6,11 @@
 //! rescale to [0, 1], patchify channel-last within each patch, and emit the
 //! (x, y) patch position ids.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use image::RgbImage;
 
 
@@ -514,4 +515,34 @@ pub fn patchify(
         soft_h: patch_h / k,
         soft_w: patch_w / k,
     })
+}
+
+/// A media value is either a filesystem path or a `data:<mime>;base64,<payload>`
+/// blob (written to a temp file so ffmpeg/hound can read it).
+pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<PathBuf, String> {
+    let Some(rest) = value.strip_prefix("data:") else {
+        return Ok(PathBuf::from(value));
+    };
+    let (mime, b64) = rest
+        .split_once(";base64,")
+        .ok_or("bad data URI (expected data:<mime>;base64,<payload>)")?;
+    // The decoders pick their backend by file extension, so take it from the MIME
+    // type (`image/jpeg` -> jpg, `audio/wav` -> wav) instead of a generic name.
+    let ext = match mime.split('/').nth(1) {
+        Some("jpeg") => "jpg",
+        Some(other) if !other.is_empty() => other,
+        _ => ext,
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64: {e}"))?;
+    let dir = std::env::temp_dir().join("rocket-inference");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("upload-{}-{nanos}.{ext}", std::process::id()));
+    std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
 }
