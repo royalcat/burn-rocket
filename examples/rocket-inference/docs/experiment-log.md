@@ -712,6 +712,10 @@ Keep `shutdown`/supervision in mind: the service holds ~2.6 GB anon + ~1.7 GB NP
 after a 1.7k-token prompt (the original ~3.3 GB steady figure was the bare 32-token
 measurement), so give the container ≥6 GB.
 
+Deployment status: this wiring ran live 2026-10-06 → reverted 2026-10-07 (the planner
+is back on OpenCode Zen and the model was removed from the board); the recipe above
+stands if it is ever re-enabled.
+
 ### 14.5 Open items
 
 - Re-run the A/B on an idle board (NPU contention with `embeddings-fast`; other
