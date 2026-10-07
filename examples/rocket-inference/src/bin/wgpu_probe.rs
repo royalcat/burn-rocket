@@ -77,13 +77,19 @@ fn smoke(device: &Device) {
     let t0 = Instant::now();
     let a = Tensor::<2>::from_data(TensorData::zeros::<f32, _>([256, 256]), device);
     sync(device);
-    println!("[smoke] from_data 256x256: {:.3}s", t0.elapsed().as_secs_f64());
+    println!(
+        "[smoke] from_data 256x256: {:.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let t0 = Instant::now();
     let b = a.clone().cast(DType::F16).cast(DType::F32);
     let _ = b.to_data();
     sync(device);
-    println!("[smoke] cast f32->f16->f32: {:.3}s", t0.elapsed().as_secs_f64());
+    println!(
+        "[smoke] cast f32->f16->f32: {:.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let t0 = Instant::now();
     let c = a.clone() + b.clone();
@@ -101,7 +107,10 @@ fn smoke(device: &Device) {
     let e = a.clone().cast(DType::F16).matmul(b.cast(DType::F16)).sum();
     let _ = e.to_data();
     sync(device);
-    println!("[smoke] matmul f16 256^3 + sum: {:.3}s", t0.elapsed().as_secs_f64());
+    println!(
+        "[smoke] matmul f16 256^3 + sum: {:.3}s",
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 fn gemm(device: &Device, label: &str, m: usize, k: usize, n: usize, dtype: DType, reps: usize) {
@@ -160,7 +169,11 @@ fn attention_bench(
         sync(device);
         let dt = t0.elapsed().as_secs_f64();
         best = best.min(dt);
-        let tag = if i == 0 { " (warmup, includes tuning)" } else { "" };
+        let tag = if i == 0 {
+            " (warmup, includes tuning)"
+        } else {
+            ""
+        };
         println!(
             "[attn] {dtype:?}: {dt:.3}s => {:.1} GFLOPS{tag}",
             flops / dt / 1e9
@@ -264,7 +277,8 @@ fn arg_usize(name: &str, default: usize) -> usize {
     if v.is_empty() {
         default
     } else {
-        v.parse().unwrap_or_else(|_| panic!("bad value for {name}: '{v}'"))
+        v.parse()
+            .unwrap_or_else(|_| panic!("bad value for {name}: '{v}'"))
     }
 }
 

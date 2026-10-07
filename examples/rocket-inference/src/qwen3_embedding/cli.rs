@@ -20,9 +20,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let cmd = it.next().unwrap_or_default();
     match cmd.as_str() {
         "bench" | "embed" | "gemm" | "tokenize" => {}
-        other => bail!(
-            "unknown qwen3 command '{other}' (expected bench|embed|gemm|tokenize)"
-        ),
+        other => bail!("unknown qwen3 command '{other}' (expected bench|embed|gemm|tokenize)"),
     }
     let args = Args::parse(&cmd, FlagArgs::new(it))?;
     match cmd.as_str() {

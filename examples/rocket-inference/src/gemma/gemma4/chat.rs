@@ -7,7 +7,7 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use tokenizers::Tokenizer;
 
-use crate::gemma::gemma4::model::{GenKv, GenRopes, GenRoot};
+use crate::gemma::gemma4::model::{GenKv, GenRoot, GenRopes};
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -190,7 +190,11 @@ fn sample(logits: &Tensor<2>, opts: &GenOptions, rng: &mut SplitMix64) -> Result
     // Top-p: keep the smallest prefix (by probability) whose cumulative mass
     // reaches top_p, always keeping the argmax.
     let mut order: Vec<usize> = (0..probs.len()).collect();
-    order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut cum = 0.0f32;
     let mut keep = vec![false; probs.len()];
     for (rank, &idx) in order.iter().enumerate() {
@@ -267,7 +271,9 @@ pub fn generate_with_media(
         }
         let input = crate::gemma::inputs::make_input(&[next], device);
         let seq_start = kv.len;
-        let h = model.text().forward(input, &ropes, &mut kv, seq_start, chunk);
+        let h = model
+            .text()
+            .forward(input, &ropes, &mut kv, seq_start, chunk);
         let logits = model.text().logits(h, lm_head);
         if opts.collect_top8 {
             stats.top8.push(top_k(&logits, 8));
@@ -293,7 +299,11 @@ pub(crate) fn gen_eos(model_dir: &Path) -> Vec<u32> {
                 }
             }
             Some(serde_json::Value::Array(a)) => {
-                eos = a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect();
+                eos = a
+                    .iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .collect();
             }
             _ => {}
         }

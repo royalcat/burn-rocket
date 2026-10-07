@@ -31,9 +31,9 @@ use crate::gemma::audio::AudioTower;
 use crate::gemma::audio_frontend::{AudioFeatures, subsample_mask};
 use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
 use crate::gemma::layers::ClipBounds;
+use crate::gemma::layers::lin;
 use crate::gemma::media::PreparedImage;
 use crate::gemma::vision::{MultimodalEmbedder, VisionSpec, VisionTower};
-use crate::gemma::layers::lin;
 use crate::gemma::{linear_cfg, repeat_kv, rms_norm_noscale};
 
 // Stage wall-time instrumentation (microseconds) for the generation path.
@@ -209,10 +209,8 @@ impl GenRopeTable {
                 sin.push(angle.sin());
             }
         }
-        let cos =
-            Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
-        let sin =
-            Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
+        let cos = Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
+        let sin = Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
         Self { cos, sin, half }
     }
 
@@ -337,8 +335,12 @@ pub(crate) fn causal_attention(
         if sc.dtype() != DType::F32 {
             sc = sc.cast(DType::F32);
         }
-        let rows = Tensor::arange(pos_first as i64..(pos_last as i64 + 1), &device)
-            .reshape([1, 1, q1 - q0, 1]);
+        let rows = Tensor::arange(pos_first as i64..(pos_last as i64 + 1), &device).reshape([
+            1,
+            1,
+            q1 - q0,
+            1,
+        ]);
         let cols = Tensor::arange(k0 as i64..k1 as i64, &device).reshape([1, 1, 1, k1 - k0]);
         let mut keep = cols.clone().lower_equal(rows.clone());
         if let Some(w) = window {
@@ -414,11 +416,7 @@ impl GenAttention {
             };
             let kk = rope.apply(self.k_norm.forward(kk), seq_start);
             let vv = rms_norm_noscale(raw_v, gspec.eps);
-            let (kk, vv) = kv.append(
-                layer,
-                kk.swap_dims(1, 2),
-                vv.swap_dims(1, 2),
-            );
+            let (kk, vv) = kv.append(layer, kk.swap_dims(1, 2), vv.swap_dims(1, 2));
             if spec.stores_shared_kv {
                 kv.shared[spec.type_idx] = Some((kk.clone(), vv.clone()));
             }
@@ -499,7 +497,9 @@ impl GenLayer {
     fn new(cfg: &TextConfig, spec: &GenLayerSpec, device: &Device) -> Self {
         let eps = cfg.rms_norm_eps;
         Self {
-            input_layernorm: RmsNormConfig::new(cfg.hidden_size).with_epsilon(eps).init(device),
+            input_layernorm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(eps)
+                .init(device),
             self_attn: GenAttention::new(cfg, spec, device),
             post_attention_layernorm: RmsNormConfig::new(cfg.hidden_size)
                 .with_epsilon(eps)
@@ -633,11 +633,11 @@ impl GenTextModel {
     /// materialized (4.7 GiB in f16, 9.4 GiB in f32).
     pub fn shrink_ple_table(&mut self) {
         let dev = self.embed_tokens.weight.val().device();
-        self.embed_tokens_per_layer.weight =
-            self.embed_tokens_per_layer
-                .weight
-                .clone()
-                .map(|_| Tensor::zeros([1, 1], &dev));
+        self.embed_tokens_per_layer.weight = self
+            .embed_tokens_per_layer
+            .weight
+            .clone()
+            .map(|_| Tensor::zeros([1, 1], &dev));
     }
 
     pub fn spec(&self) -> &GenSpec {
@@ -671,11 +671,7 @@ impl GenTextModel {
         let [b, s, _] = x.dims();
         let token = match &self.packed_ple {
             Some(table) => {
-                let row_ids: Vec<i32> = ids
-                    .clone()
-                    .into_data()
-                    .try_to_vec()
-                    .expect("token ids");
+                let row_ids: Vec<i32> = ids.clone().into_data().try_to_vec().expect("token ids");
                 let row_ids: Vec<u32> = row_ids.iter().map(|&v| v as u32).collect();
                 let values = table.gather_f32(&row_ids);
                 let device = ids.device();
@@ -758,8 +754,7 @@ impl GenTextModel {
         } else {
             last
         };
-        let mut logits = burn::tensor::module::linear(last, lm_head.clone(), None)
-            .cast(DType::F32);
+        let mut logits = burn::tensor::module::linear(last, lm_head.clone(), None).cast(DType::F32);
         if let Some(c) = self.spec.logit_softcap {
             logits = (logits / c).tanh() * c;
         }

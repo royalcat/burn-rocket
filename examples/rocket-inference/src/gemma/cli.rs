@@ -9,8 +9,6 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     match cmd.as_str() {
         "embed" | "bench" | "tokenize" => super::embeddinggemma::cli::run(&cmd, it),
         "gen" => super::gemma4::cli::run(&cmd, it),
-        other => bail!(
-            "unknown gemma command '{other}' (expected embed|bench|tokenize|gen)"
-        ),
+        other => bail!("unknown gemma command '{other}' (expected embed|bench|tokenize|gen)"),
     }
 }

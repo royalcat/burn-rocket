@@ -93,14 +93,18 @@ static SRQ: std::sync::Mutex<Option<std::collections::HashMap<u64, (f32, f32)>>>
 
 /// Register the SRQ scales of a quantized linear (a scale of 0 is a no-op).
 pub fn register_srq(id: burn::module::ParamId, in_scale: f32, out_scale: f32) {
-    let mut guard = SRQ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = SRQ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(id.val(), (in_scale, out_scale));
 }
 
 fn srq_lookup<const D: usize>(w: &Param<Tensor<D>>) -> Option<(f32, f32)> {
-    let guard = SRQ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = SRQ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.as_ref().and_then(|m| m.get(&w.id.val()).copied())
 }
 
@@ -129,8 +133,9 @@ pub(crate) fn apply_srq<const D: usize>(x: Tensor<D>, scale: f32) -> Tensor<D> {
 
 /// Packed NPU weights by `ParamId` value.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-static NPU_WEIGHTS: std::sync::Mutex<Option<std::collections::HashMap<u64, burn_rocket::WeightId>>> =
-    std::sync::Mutex::new(None);
+static NPU_WEIGHTS: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, burn_rocket::WeightId>>,
+> = std::sync::Mutex::new(None);
 
 /// Register a packed weight for `param` (the caller drops the CPU copy).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -180,11 +185,7 @@ pub fn prefill_mode() -> bool {
 /// `keep_cpu` the f32 copy stays (prefill-only mode), otherwise it is shrunk to
 /// a `[1, 1]` placeholder (the id is preserved so `lin` still finds the weight).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub fn pack_linear_into_npu(
-    lin: &mut Linear,
-    device: &Device,
-    keep_cpu: bool,
-) -> (usize, usize) {
+pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -> (usize, usize) {
     let w = lin.weight.val();
     let [k, n] = w.shape().dims::<2>();
     let values: Vec<f32> = w

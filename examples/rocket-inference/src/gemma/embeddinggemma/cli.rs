@@ -216,8 +216,8 @@ impl Args {
             return Ok(String::new());
         }
         let path = self.model_dir.join("config_sentence_transformers.json");
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let json: serde_json::Value = serde_json::from_str(&text)?;
         let prompts = json
             .get("prompts")

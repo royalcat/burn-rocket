@@ -11,13 +11,15 @@ use crate::cli::FlagArgs;
 use crate::gemma::embeddinggemma::load as emb2_load;
 use crate::gemma::gemma4::loader::{self as gen_loader, LoadDtype};
 use crate::gemma::inputs;
+use crate::qwen3_embedding::load as qwen3_load;
 use crate::qwen35_intent::loader as intent_loader;
 use crate::qwen35_intent::loader::IntentLoadOptions;
-use crate::qwen3_embedding::load as qwen3_load;
 use crate::util::device;
 
 use super::Settings;
-use super::engine::{Capabilities, Emb2Engine, Engine, Family, Gemma4Engine, IntentEngine, Qwen3Engine};
+use super::engine::{
+    Capabilities, Emb2Engine, Engine, Family, Gemma4Engine, IntentEngine, Qwen3Engine,
+};
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let args = Args::parse(FlagArgs::new(it))?;
@@ -150,7 +152,12 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             let (mut model, cfg) = gen_loader::load_gen_model(&model_dir, dtype, &device)?;
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
             if args.npu.unwrap_or(false) {
-                gen_loader::pack_text_for_prefill(&mut model, args.npu_threads.unwrap_or(5), &device, true)?;
+                gen_loader::pack_text_for_prefill(
+                    &mut model,
+                    args.npu_threads.unwrap_or(5),
+                    &device,
+                    true,
+                )?;
             }
             #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
             if args.npu.unwrap_or(false) {
@@ -192,7 +199,11 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         max_new_tokens,
         temperature,
     };
-    super::serve(&format!("0.0.0.0:{}", args.port.unwrap_or(8383)), engine, settings)
+    super::serve(
+        &format!("0.0.0.0:{}", args.port.unwrap_or(8383)),
+        engine,
+        settings,
+    )
 }
 
 fn dir_name(dir: &Path) -> String {
@@ -306,9 +317,7 @@ impl Args {
         f.finish("serve")?;
         // Defaults that are not family-specific.
         if args.model_dir.is_none() {
-            args.model_dir = Some(PathBuf::from(format!(
-                "{home}/models/qwen3-embedding-0.6b"
-            )));
+            args.model_dir = Some(PathBuf::from(format!("{home}/models/qwen3-embedding-0.6b")));
         }
         Ok(args)
     }
@@ -329,23 +338,70 @@ impl Args {
     fn validate(&self, family: Family) -> Result<()> {
         let allowed: &[&str] = match family {
             Family::Qwen3Embed => &[
-                "model-dir", "family", "backend", "port", "model-name", "max-tokens",
-                "max-new-tokens", "temperature", "dtype", "quant", "npu", "npu-threads",
-                "npu-attn", "chunk", "key-block", "attn",
+                "model-dir",
+                "family",
+                "backend",
+                "port",
+                "model-name",
+                "max-tokens",
+                "max-new-tokens",
+                "temperature",
+                "dtype",
+                "quant",
+                "npu",
+                "npu-threads",
+                "npu-attn",
+                "chunk",
+                "key-block",
+                "attn",
             ],
             Family::Emb2 => &[
-                "model-dir", "family", "backend", "port", "model-name", "max-tokens",
-                "max-new-tokens", "temperature", "dtype", "quant", "npu", "npu-threads",
-                "npu-attn", "attn-chunk", "video-fps", "video-max-frames",
+                "model-dir",
+                "family",
+                "backend",
+                "port",
+                "model-name",
+                "max-tokens",
+                "max-new-tokens",
+                "temperature",
+                "dtype",
+                "quant",
+                "npu",
+                "npu-threads",
+                "npu-attn",
+                "attn-chunk",
+                "video-fps",
+                "video-max-frames",
             ],
             Family::Intent => &[
-                "model-dir", "family", "backend", "port", "model-name", "max-tokens",
-                "max-new-tokens", "temperature", "npu", "npu-threads", "delta-chunk",
-                "embed-f16", "pure-npu", "npu-decode",
+                "model-dir",
+                "family",
+                "backend",
+                "port",
+                "model-name",
+                "max-tokens",
+                "max-new-tokens",
+                "temperature",
+                "npu",
+                "npu-threads",
+                "delta-chunk",
+                "embed-f16",
+                "pure-npu",
+                "npu-decode",
             ],
             Family::Gemma4 => &[
-                "model-dir", "family", "backend", "port", "model-name", "max-tokens",
-                "max-new-tokens", "temperature", "quant", "npu", "npu-threads", "f16",
+                "model-dir",
+                "family",
+                "backend",
+                "port",
+                "model-name",
+                "max-tokens",
+                "max-new-tokens",
+                "temperature",
+                "quant",
+                "npu",
+                "npu-threads",
+                "f16",
                 "attn-chunk",
             ],
         };

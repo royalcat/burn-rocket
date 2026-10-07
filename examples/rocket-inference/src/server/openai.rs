@@ -270,10 +270,9 @@ pub(crate) async fn chat_completions(
         });
     }
     if images.len() > 1 || audios.len() > 1 {
-        return Err(ApiError::bad_request(
-            "at most one image and one audio per request for now",
-        )
-        .into());
+        return Err(
+            ApiError::bad_request("at most one image and one audio per request for now").into(),
+        );
     }
     let model_name = state.settings.model_name.clone();
     let turn = ChatTurn {

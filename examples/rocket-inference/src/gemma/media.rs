@@ -13,7 +13,6 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use image::RgbImage;
 
-
 /// One preprocessed image, ready for the vision tower.
 pub struct PreparedImage {
     /// Patch pixels, `[num_patches, 3 * patch_size^2]`, channel-last within each patch.
@@ -59,9 +58,7 @@ pub fn aspect_ratio_preserving_size(
     let mut target_width = (ideal_width / side_mult as f64).floor() as usize * side_mult;
 
     if target_height == 0 && target_width == 0 {
-        bail!(
-            "cannot resize {height}x{width} to a nonzero size divisible by {side_mult}"
-        );
+        bail!("cannot resize {height}x{width} to a nonzero size divisible by {side_mult}");
     }
 
     let max_side_length = (max_patches / (pooling_kernel_size * pooling_kernel_size)) * side_mult;
@@ -141,9 +138,7 @@ pub fn video_info(path: &Path) -> Result<VideoInfo> {
 }
 
 fn parse_rate(rate: &str) -> Result<f64> {
-    let (num, den) = rate
-        .split_once('/')
-        .context("unexpected r_frame_rate")?;
+    let (num, den) = rate.split_once('/').context("unexpected r_frame_rate")?;
     let num: f64 = num.parse()?;
     let den: f64 = den.parse()?;
     if den == 0.0 {
@@ -226,7 +221,12 @@ pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Resul
 pub fn load_image(path: &Path) -> Result<RgbImage> {
     let is_jpeg = path
         .extension()
-        .map(|e| matches!(e.to_string_lossy().to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        .map(|e| {
+            matches!(
+                e.to_string_lossy().to_ascii_lowercase().as_str(),
+                "jpg" | "jpeg"
+            )
+        })
         .unwrap_or(false);
     if is_jpeg {
         match load_jpeg(path) {

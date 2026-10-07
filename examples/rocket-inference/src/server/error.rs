@@ -152,7 +152,11 @@ mod tests {
     fn catch_compute_turns_panics_into_server_errors() {
         let err = catch_compute::<()>(|| panic!("boom")).unwrap_err();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.message.contains("boom"), "message was {:?}", err.message);
+        assert!(
+            err.message.contains("boom"),
+            "message was {:?}",
+            err.message
+        );
 
         let ok = catch_compute(|| Ok::<_, ApiError>(3)).unwrap();
         assert_eq!(ok, 3);

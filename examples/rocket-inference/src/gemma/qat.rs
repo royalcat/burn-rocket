@@ -182,7 +182,9 @@ pub fn read_scales(
         } else {
             continue;
         };
-        let Some(entry) = out.get_mut(path) else { continue };
+        let Some(entry) = out.get_mut(path) else {
+            continue;
+        };
         if entry.blocks != 0 {
             continue;
         }

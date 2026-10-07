@@ -12,8 +12,8 @@ use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
 use crate::gemma::gemma4::model::GenRoot;
 use crate::gemma::inputs::{self, DebugPaths, MediaInputs};
-use crate::qwen35_intent::model::IntentModel;
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
+use crate::qwen35_intent::model::IntentModel;
 use crate::util::rope::RopeCache;
 
 use super::error::ApiError;
@@ -47,9 +47,9 @@ impl Family {
             "embeddinggemma" => Ok(Self::Emb2),
             "intent" => Ok(Self::Intent),
             "gemma4" => Ok(Self::Gemma4),
-            other => bail!(
-                "unknown family '{other}' (expected auto|qwen3|embeddinggemma|intent|gemma4)"
-            ),
+            other => {
+                bail!("unknown family '{other}' (expected auto|qwen3|embeddinggemma|intent|gemma4)")
+            }
         }
     }
 
@@ -67,10 +67,10 @@ impl Family {
 /// Detect the model family from a checkpoint's `config.json` (`model_type`).
 pub fn detect_family(model_dir: &Path) -> Result<Family> {
     let path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     detect_from_value(&json)
         .with_context(|| format!("detect the model family in {}", model_dir.display()))
 }
@@ -85,7 +85,9 @@ fn detect_from_value(json: &serde_json::Value) -> Result<Family> {
             "unsupported model_type '{other}' \
              (pass --family qwen3|embeddinggemma|intent|gemma4)"
         ),
-        None => bail!("config.json has no model_type (pass --family qwen3|embeddinggemma|intent|gemma4)"),
+        None => bail!(
+            "config.json has no model_type (pass --family qwen3|embeddinggemma|intent|gemma4)"
+        ),
     }
 }
 
@@ -245,9 +247,9 @@ impl Engine {
         match self {
             Self::Qwen3(engine) => engine.embed_texts(req),
             Self::Emb2(engine) => engine.embed_texts(req),
-            Self::Intent(_) | Self::Gemma4(_) => {
-                Err(ApiError::bad_request("this model does not produce embeddings"))
-            }
+            Self::Intent(_) | Self::Gemma4(_) => Err(ApiError::bad_request(
+                "this model does not produce embeddings",
+            )),
         }
     }
 
@@ -323,9 +325,14 @@ impl Qwen3Engine {
     /// last token itself and returns the embedding vector directly).
     fn embed_tokens(&self, ids: Vec<i64>) -> Vec<f32> {
         let n = ids.len();
-        let input =
-            Tensor::<2, Int>::from_data(TensorData::new(ids, [1, n]), &self.device);
-        let rope = RopeCache::new(n, self.cfg.head_dim, self.cfg.rope_theta, DType::F32, &self.device);
+        let input = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, n]), &self.device);
+        let rope = RopeCache::new(
+            n,
+            self.cfg.head_dim,
+            self.cfg.rope_theta,
+            DType::F32,
+            &self.device,
+        );
         let out = self
             .model
             .forward(input, &rope, self.chunk, self.key_block, self.attn_fused);
@@ -367,8 +374,7 @@ impl Emb2Engine {
         let mut vectors = Vec::with_capacity(inputs.len());
         let mut tokens = 0;
         for text in inputs {
-            let (vector, n) =
-                self.embed_one(Some(text), None, None, None, &prefix, req.dim)?;
+            let (vector, n) = self.embed_one(Some(text), None, None, None, &prefix, req.dim)?;
             tokens += n;
             vectors.push(vector);
         }
@@ -377,14 +383,8 @@ impl Emb2Engine {
 
     fn embed_media(&mut self, req: EmbedMediaRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
-        let (vector, tokens) = self.embed_one(
-            req.text,
-            req.image,
-            req.video,
-            req.audio,
-            &prefix,
-            req.dim,
-        )?;
+        let (vector, tokens) =
+            self.embed_one(req.text, req.image, req.video, req.audio, &prefix, req.dim)?;
         Ok(EmbedResult {
             vectors: vec![vector],
             tokens,
@@ -409,7 +409,11 @@ impl Emb2Engine {
             video,
             audio,
             prompt_prefix: prompt_prefix.to_string(),
-            max_tokens: if has_media { None } else { Some(self.max_tokens) },
+            max_tokens: if has_media {
+                None
+            } else {
+                Some(self.max_tokens)
+            },
             image_soft_tokens: self.image_soft_tokens,
             video_soft_tokens: self.video_soft_tokens,
             video_fps: self.video_fps,
@@ -497,9 +501,13 @@ impl IntentEngine {
             return Err(ApiError::bad_request("empty prompt"));
         }
 
-        let (new_ids, stats) = self
-            .model
-            .generate(&ids, turn.max_new_tokens, &self.stop_ids, turn.temperature, turn.seed);
+        let (new_ids, stats) = self.model.generate(
+            &ids,
+            turn.max_new_tokens,
+            &self.stop_ids,
+            turn.temperature,
+            turn.seed,
+        );
         let mut text = self
             .tokenizer
             .decode(&new_ids, false)

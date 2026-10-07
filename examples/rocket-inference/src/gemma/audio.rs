@@ -8,9 +8,9 @@
 use std::collections::HashMap;
 
 use burn::module::Param;
+use burn::nn::PaddingConfig2d;
 use burn::nn::conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig};
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
-use burn::nn::PaddingConfig2d;
 use burn::prelude::*;
 use burn::tensor::DType;
 
@@ -145,7 +145,12 @@ pub struct AudioAttention {
 }
 
 impl AudioAttention {
-    fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
+    fn new(
+        cfg: &AudioConfig,
+        bounds: &HashMap<String, ClipBounds>,
+        path: &str,
+        device: &Device,
+    ) -> Self {
         let spec = AudioSpec::from_config(cfg);
         let clip = |name: &str| -> Option<ClipBounds> {
             // Checkpoints without clipped linears (the QAT export) carry no
@@ -161,9 +166,24 @@ impl AudioAttention {
             )
         };
         Self {
-            q_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("q_proj"), device),
-            k_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("k_proj"), device),
-            v_proj: ClippableLinear::with_clip(spec.hidden, spec.heads * spec.head_dim, clip("v_proj"), device),
+            q_proj: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.heads * spec.head_dim,
+                clip("q_proj"),
+                device,
+            ),
+            k_proj: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.heads * spec.head_dim,
+                clip("k_proj"),
+                device,
+            ),
+            v_proj: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.heads * spec.head_dim,
+                clip("v_proj"),
+                device,
+            ),
             post: ClippableLinear::with_clip(spec.hidden, spec.hidden, clip("post"), device),
             relative_k_proj: LinearConfig::new(spec.hidden, spec.heads * spec.head_dim)
                 .with_bias(false)
@@ -192,17 +212,15 @@ impl AudioAttention {
 
         let q_scale = (d as f64).powf(-0.5) / std::f64::consts::LN_2;
         let k_scale = (1.0 + std::f64::consts::E).ln() / std::f64::consts::LN_2;
-        let q = q * (softplus(self.per_dim_scale.val().reshape([1, 1, d]), 1.0).mul_scalar(q_scale));
+        let q =
+            q * (softplus(self.per_dim_scale.val().reshape([1, 1, d]), 1.0).mul_scalar(q_scale));
         let k = k.mul_scalar(k_scale);
 
         // Queries: pad to a whole number of blocks, then [blocks, chunk, H, D].
         let blocks = t.div_ceil(c);
         let tp = blocks * c;
         let q_pad = if tp > t {
-            Tensor::cat(
-                vec![q, Tensor::zeros([tp - t, h, d], &device)],
-                0,
-            )
+            Tensor::cat(vec![q, Tensor::zeros([tp - t, h, d], &device)], 0)
         } else {
             q
         };
@@ -240,10 +258,12 @@ impl AudioAttention {
         // Relative-position scores via the relative key projection and rel-shift.
         let relk = lin(&self.relative_k_proj, pos.clone())
             .reshape([ctx / 2 + 1, h, d])
-            .permute([1, 2, 0]);        let bd = q_blocks
-            .reshape([h, blocks * c, d])
-            .matmul(relk)
-            .reshape([h, blocks, c, ctx / 2 + 1]);
+            .permute([1, 2, 0]);
+        let bd =
+            q_blocks
+                .reshape([h, blocks * c, d])
+                .matmul(relk)
+                .reshape([h, blocks, c, ctx / 2 + 1]);
         let rows = ctx / 2 + 1;
         let bd = Tensor::cat(
             vec![bd, Tensor::zeros([h, blocks, c, ctx + 1 - rows], &device)],
@@ -277,7 +297,12 @@ pub struct AudioFeedForward {
 }
 
 impl AudioFeedForward {
-    fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
+    fn new(
+        cfg: &AudioConfig,
+        bounds: &HashMap<String, ClipBounds>,
+        path: &str,
+        device: &Device,
+    ) -> Self {
         let spec = AudioSpec::from_config(cfg);
         let clip = |name: &str| -> Option<ClipBounds> {
             // Checkpoints without clipped linears (the QAT export) carry no
@@ -293,10 +318,24 @@ impl AudioFeedForward {
             )
         };
         Self {
-            ffw_layer_1: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("ffw_layer_1"), device),
-            ffw_layer_2: ClippableLinear::with_clip(spec.inter, spec.hidden, clip("ffw_layer_2"), device),
-            pre_layer_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
-            post_layer_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
+            ffw_layer_1: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.inter,
+                clip("ffw_layer_1"),
+                device,
+            ),
+            ffw_layer_2: ClippableLinear::with_clip(
+                spec.inter,
+                spec.hidden,
+                clip("ffw_layer_2"),
+                device,
+            ),
+            pre_layer_norm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
+            post_layer_norm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
         }
     }
 
@@ -321,7 +360,12 @@ pub struct AudioLightConv1d {
 }
 
 impl AudioLightConv1d {
-    fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, path: &str, device: &Device) -> Self {
+    fn new(
+        cfg: &AudioConfig,
+        bounds: &HashMap<String, ClipBounds>,
+        path: &str,
+        device: &Device,
+    ) -> Self {
         let spec = AudioSpec::from_config(cfg);
         let clip = |name: &str| -> Option<ClipBounds> {
             // Checkpoints without clipped linears (the QAT export) carry no
@@ -337,14 +381,28 @@ impl AudioLightConv1d {
             )
         };
         Self {
-            linear_start: ClippableLinear::with_clip(spec.hidden, spec.hidden * 2, clip("linear_start"), device),
-            linear_end: ClippableLinear::with_clip(spec.hidden, spec.hidden, clip("linear_end"), device),
+            linear_start: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.hidden * 2,
+                clip("linear_start"),
+                device,
+            ),
+            linear_end: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.hidden,
+                clip("linear_end"),
+                device,
+            ),
             depthwise_conv1d: Conv1dConfig::new(spec.hidden, spec.hidden, spec.conv_kernel)
                 .with_groups(spec.hidden)
                 .with_bias(false)
                 .init(device),
-            pre_layer_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
-            conv_norm: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
+            pre_layer_norm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
+            conv_norm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
         }
     }
 
@@ -385,17 +443,38 @@ pub struct AudioLayer {
 }
 
 impl AudioLayer {
-    fn new(cfg: &AudioConfig, bounds: &HashMap<String, ClipBounds>, index: usize, device: &Device) -> Self {
+    fn new(
+        cfg: &AudioConfig,
+        bounds: &HashMap<String, ClipBounds>,
+        index: usize,
+        device: &Device,
+    ) -> Self {
         let spec = AudioSpec::from_config(cfg);
         let base = format!("layers.{index}");
         Self {
-            feed_forward1: AudioFeedForward::new(cfg, bounds, &format!("{base}.feed_forward1"), device),
-            feed_forward2: AudioFeedForward::new(cfg, bounds, &format!("{base}.feed_forward2"), device),
+            feed_forward1: AudioFeedForward::new(
+                cfg,
+                bounds,
+                &format!("{base}.feed_forward1"),
+                device,
+            ),
+            feed_forward2: AudioFeedForward::new(
+                cfg,
+                bounds,
+                &format!("{base}.feed_forward2"),
+                device,
+            ),
             self_attn: AudioAttention::new(cfg, bounds, &format!("{base}.self_attn"), device),
             lconv1d: AudioLightConv1d::new(cfg, bounds, &format!("{base}.lconv1d"), device),
-            norm_pre_attn: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
-            norm_post_attn: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
-            norm_out: RmsNormConfig::new(spec.hidden).with_epsilon(spec.eps).init(device),
+            norm_pre_attn: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
+            norm_post_attn: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
+            norm_out: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(spec.eps)
+                .init(device),
         }
     }
 
@@ -486,7 +565,11 @@ impl AudioTower {
 
     /// `[frames, MEL_BINS]` log-mel features -> `[T/4, out_dims]` soft tokens
     /// (all frames; callers keep only the valid ones).
-    pub fn forward_debug(&self, feats: &AudioFeatures, debug_dir: Option<&std::path::Path>) -> Tensor<2> {
+    pub fn forward_debug(
+        &self,
+        feats: &AudioFeatures,
+        debug_dir: Option<&std::path::Path>,
+    ) -> Tensor<2> {
         let device = self.output_proj.weight.val().device();
         let t = feats.frames;
         let dtype = crate::gemma::layers::weight_dtype(&self.output_proj.weight);
@@ -521,7 +604,8 @@ impl AudioTower {
                 }
             }
         }
-        let mask = Tensor::<4, Bool>::from_data(TensorData::new(mask_data, [1, blocks, c, ctx]), &device);
+        let mask =
+            Tensor::<4, Bool>::from_data(TensorData::new(mask_data, [1, blocks, c, ctx]), &device);
 
         let pos = self.pos_embeddings(&device);
         if let Some(dir) = debug_dir {

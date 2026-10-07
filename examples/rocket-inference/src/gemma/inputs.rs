@@ -213,8 +213,7 @@ pub fn prepare<M: MediaModel>(
     if let Some(path) = &req.video {
         let vspec = model.vision_spec();
         let info = media::video_info(path)?;
-        let indices =
-            media::sample_frame_indices(&info, req.video_fps, req.video_max_frames);
+        let indices = media::sample_frame_indices(&info, req.video_fps, req.video_max_frames);
         let frames = media::extract_frames(path, &info, &indices)?;
         println!(
             "video: {:.2}s at {:.2} fps, {} frames -> sampled {} at {} fps",

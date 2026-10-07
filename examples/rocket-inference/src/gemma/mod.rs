@@ -38,7 +38,9 @@ pub(crate) fn repeat_kv(x: Tensor<4>, n: usize) -> Tensor<4> {
         return x;
     }
     let [b, kv, s, d] = x.dims();
-    x.unsqueeze_dim::<5>(2).repeat_dim(2, n).reshape([b, kv * n, s, d])
+    x.unsqueeze_dim::<5>(2)
+        .repeat_dim(2, n)
+        .reshape([b, kv * n, s, d])
 }
 
 /// Bidirectional attention with an optional symmetric sliding window
@@ -73,10 +75,8 @@ pub(crate) fn chunked_attention(
             sc = sc.cast(DType::F32);
         }
         if let Some(w) = window {
-            let rows =
-                Tensor::arange(q0 as i64..q1 as i64, &device).reshape([1, 1, q1 - q0, 1]);
-            let cols =
-                Tensor::arange(k0 as i64..k1 as i64, &device).reshape([1, 1, 1, k1 - k0]);
+            let rows = Tensor::arange(q0 as i64..q1 as i64, &device).reshape([1, 1, q1 - q0, 1]);
+            let cols = Tensor::arange(k0 as i64..k1 as i64, &device).reshape([1, 1, 1, k1 - k0]);
             let w = w as i64;
             let keep = cols
                 .clone()

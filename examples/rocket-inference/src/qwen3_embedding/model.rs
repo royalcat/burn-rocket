@@ -123,12 +123,7 @@ impl Qwen3Embedding {
 
     /// Install a fused projection-group weight on one layer (`--npu` mode).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    pub fn set_fused_handle(
-        &mut self,
-        layer: usize,
-        group: FusedGroup,
-        id: burn_rocket::WeightId,
-    ) {
+    pub fn set_fused_handle(&mut self, layer: usize, group: FusedGroup, id: burn_rocket::WeightId) {
         let l = &mut self.layers[layer];
         match group {
             FusedGroup::Qkv => l.self_attn.qkv_fused = Some(id),
@@ -321,8 +316,14 @@ impl Qwen3Attention {
             return (q, k, v);
         }
 
-        let q = self.q_proj.forward(x.clone(), quantized).reshape([b, s, h, d]);
-        let k = self.k_proj.forward(x.clone(), quantized).reshape([b, s, kv, d]);
+        let q = self
+            .q_proj
+            .forward(x.clone(), quantized)
+            .reshape([b, s, h, d]);
+        let k = self
+            .k_proj
+            .forward(x.clone(), quantized)
+            .reshape([b, s, kv, d]);
         let v = self.v_proj.forward(x, quantized).reshape([b, s, kv, d]);
 
         let q = rope.apply(self.q_norm.forward(q), 0);

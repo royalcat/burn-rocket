@@ -38,9 +38,7 @@ pub struct FlagArgs {
 
 impl FlagArgs {
     pub fn new(it: impl Iterator<Item = String>) -> Self {
-        Self {
-            args: it.collect(),
-        }
+        Self { args: it.collect() }
     }
 
     /// Remove and return the last value of `--flag value`.
@@ -137,7 +135,12 @@ mod tests {
         let mut f = args(&["--npu", "--quant", "q8", "--transb"]);
         assert!(f.take_bool("--npu"));
         assert!(!f.take_bool("--pure-npu"));
-        assert_eq!(f.take_choice("--quant", &["none", "q8"]).unwrap().as_deref(), Some("q8"));
+        assert_eq!(
+            f.take_choice("--quant", &["none", "q8"])
+                .unwrap()
+                .as_deref(),
+            Some("q8")
+        );
         assert!(f.take_bool("--transb"));
         f.finish("test").unwrap();
     }

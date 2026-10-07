@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use crate::gemma::config::VisionConfig;
 use crate::gemma::layers::ClipBounds;
 use crate::gemma::layers::ClippableLinear;
-use crate::gemma::media::PreparedImage;
 use crate::gemma::layers::lin;
+use crate::gemma::media::PreparedImage;
 use crate::gemma::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
 
 /// Plain-data vision geometry.
@@ -103,9 +103,8 @@ impl AxialRope {
                 sy.push(ay.sin());
             }
         }
-        let t2 = |v: Vec<f32>| {
-            Tensor::<2>::from_data(TensorData::new(v, [p, n]), device).cast(dtype)
-        };
+        let t2 =
+            |v: Vec<f32>| Tensor::<2>::from_data(TensorData::new(v, [p, n]), device).cast(dtype);
         Self {
             cos_x: t2(cx),
             sin_x: t2(sx),
@@ -177,12 +176,22 @@ impl VisionAttention {
             k_proj: ClippableLinear::with_clip(spec.hidden, kv * d, clip("k_proj"), device),
             v_proj: ClippableLinear::with_clip(spec.hidden, kv * d, clip("v_proj"), device),
             o_proj: ClippableLinear::with_clip(h * d, spec.hidden, clip("o_proj"), device),
-            q_norm: RmsNormConfig::new(d).with_epsilon(cfg.rms_norm_eps).init(device),
-            k_norm: RmsNormConfig::new(d).with_epsilon(cfg.rms_norm_eps).init(device),
+            q_norm: RmsNormConfig::new(d)
+                .with_epsilon(cfg.rms_norm_eps)
+                .init(device),
+            k_norm: RmsNormConfig::new(d)
+                .with_epsilon(cfg.rms_norm_eps)
+                .init(device),
         }
     }
 
-    fn forward(&self, x: Tensor<2>, rope: &AxialRope, spec: &VisionSpec, chunk: usize) -> Tensor<2> {
+    fn forward(
+        &self,
+        x: Tensor<2>,
+        rope: &AxialRope,
+        spec: &VisionSpec,
+        chunk: usize,
+    ) -> Tensor<2> {
         let p = x.dims()[0];
         let (h, kv, d) = (spec.heads, spec.kv_heads, spec.head_dim);
         let q = self.q_proj.forward(x.clone()).reshape([p, h, d]);
@@ -227,9 +236,19 @@ impl VisionMlp {
             }
         };
         Self {
-            gate_proj: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("gate_proj"), device),
+            gate_proj: ClippableLinear::with_clip(
+                spec.hidden,
+                spec.inter,
+                clip("gate_proj"),
+                device,
+            ),
             up_proj: ClippableLinear::with_clip(spec.hidden, spec.inter, clip("up_proj"), device),
-            down_proj: ClippableLinear::with_clip(spec.inter, spec.hidden, clip("down_proj"), device),
+            down_proj: ClippableLinear::with_clip(
+                spec.inter,
+                spec.hidden,
+                clip("down_proj"),
+                device,
+            ),
         }
     }
 
@@ -261,7 +280,9 @@ impl VisionLayer {
         let eps = cfg.rms_norm_eps;
         let base = format!("layers.{index}");
         Self {
-            input_layernorm: RmsNormConfig::new(spec.hidden).with_epsilon(eps).init(device),
+            input_layernorm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(eps)
+                .init(device),
             self_attn: VisionAttention::new(
                 cfg,
                 spec,
@@ -269,7 +290,9 @@ impl VisionLayer {
                 &format!("{base}.self_attn"),
                 device,
             ),
-            post_attention_layernorm: RmsNormConfig::new(spec.hidden).with_epsilon(eps).init(device),
+            post_attention_layernorm: RmsNormConfig::new(spec.hidden)
+                .with_epsilon(eps)
+                .init(device),
             pre_feedforward_layernorm: RmsNormConfig::new(spec.hidden)
                 .with_epsilon(eps)
                 .init(device),

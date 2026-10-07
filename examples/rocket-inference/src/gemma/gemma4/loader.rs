@@ -37,8 +37,7 @@ pub fn pack_text_for_prefill(
     keep_cpu: bool,
 ) -> Result<()> {
     use crate::gemma::layers;
-    burn_rocket::init(threads)
-        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    burn_rocket::init(threads).map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
     layers::set_npu_prefill_only(keep_cpu);
     let t0 = std::time::Instant::now();
     let mut count = 0usize;
@@ -281,8 +280,8 @@ pub fn load_gen_model(
         // dequantized table is never allocated.
         model.text_mut().shrink_ple_table();
     }
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
-        .allow_partial(true);
+    let mut store =
+        SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
     let scales = match &qat {
         Some(_) => {
             let scales = crate::gemma::qat::read_scales(&mut store)?;
@@ -298,10 +297,7 @@ pub fn load_gen_model(
                 scales: scales.clone().expect("scales"),
                 dtype,
             }
-            .chain(
-                LoadDtypeAdapter::new(device, dtype)
-                    .with_f32_tables(dtype == LoadDtype::F32),
-            )
+            .chain(LoadDtypeAdapter::new(device, dtype).with_f32_tables(dtype == LoadDtype::F32))
             .chain(PyTorchToBurnAdapter),
         ),
         None => store
@@ -316,9 +312,7 @@ pub fn load_gen_model(
         .text_config
         .num_hidden_layers
         .saturating_sub(cfg.text_config.num_kv_shared_layers);
-    crate::util::store::check_load_report(&result, |name| {
-        is_shared_kv_param(name, first_shared)
-    })?;
+    crate::util::store::check_load_report(&result, |name| is_shared_kv_param(name, first_shared))?;
     let tolerated = result.missing.len();
     if qat.is_some() {
         let bits = qat
@@ -383,7 +377,11 @@ pub fn load_gen_model(
 /// default (parity); f16 in q8 mode, where logits are computed in f16 like the
 /// bf16 reference.
 pub fn build_lm_head(text: &GenTextModel, low_precision: bool, device: &Device) -> Tensor<2> {
-    let dtype = if low_precision { DType::F16 } else { DType::F32 };
+    let dtype = if low_precision {
+        DType::F16
+    } else {
+        DType::F32
+    };
     text.embed_table()
         .val()
         .cast(dtype)
@@ -395,7 +393,12 @@ fn rss_mib() -> f64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in s.lines() {
         if let Some(v) = line.strip_prefix("RssAnon:") {
-            return v.trim().trim_end_matches(" kB").parse::<f64>().unwrap_or(0.0) / 1024.0;
+            return v
+                .trim()
+                .trim_end_matches(" kB")
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                / 1024.0;
         }
     }
     0.0
@@ -513,7 +516,11 @@ fn register_srq_scales(
     let mut paths = Paths::default();
     model.visit(&mut paths);
     if std::env::var("DUMP_SRQ").is_ok() {
-        eprintln!("debug: {} param paths, {} scale keys", paths.out.len(), scales.len());
+        eprintln!(
+            "debug: {} param paths, {} scale keys",
+            paths.out.len(),
+            scales.len()
+        );
         for (p, _) in paths.out.iter().take(6) {
             eprintln!("  param: {p}");
         }
@@ -548,9 +555,14 @@ fn is_shared_kv_param(name: &str, first_shared: usize) -> bool {
         return false;
     };
     i >= first_shared
-        && ["self_attn.k_proj", "self_attn.k_norm", "self_attn.v_proj", "self_attn.v_norm"]
-            .iter()
-            .any(|p| tail.starts_with(p))
+        && [
+            "self_attn.k_proj",
+            "self_attn.k_norm",
+            "self_attn.v_proj",
+            "self_attn.v_norm",
+        ]
+        .iter()
+        .any(|p| tail.starts_with(p))
 }
 
 /// Debug: dump one loaded parameter as raw f32 + dims (compare with the
@@ -590,7 +602,9 @@ fn dump_param(model: &GenRoot, want: &str) -> Result<()> {
         ..Default::default()
     };
     model.visit(&mut find);
-    let (path, dims, values) = find.found.ok_or_else(|| anyhow::anyhow!("no param matching {want}"))?;
+    let (path, dims, values) = find
+        .found
+        .ok_or_else(|| anyhow::anyhow!("no param matching {want}"))?;
     let out = std::env::var("DUMP_PARAM_OUT").unwrap_or_else(|_| "/tmp/param.bin".into());
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in &values {

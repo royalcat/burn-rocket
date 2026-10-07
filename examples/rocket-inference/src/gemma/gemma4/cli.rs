@@ -209,8 +209,7 @@ fn run_gen(args: &Args) -> Result<()> {
             video_max_frames: args.video_max_frames,
             attn_chunk: args.attn_chunk,
         };
-        let prepared =
-            inputs::prepare(&model, &tokenizer, &req, &inputs::DebugPaths::default())?;
+        let prepared = inputs::prepare(&model, &tokenizer, &req, &inputs::DebugPaths::default())?;
         (prepared.ids, prepared.soft)
     } else {
         (chat::encode(&tokenizer, &rendered)?, None)
@@ -261,7 +260,11 @@ fn run_gen(args: &Args) -> Result<()> {
             .collect();
         std::fs::write(path, serde_json::to_string(&dump)?)
             .with_context(|| format!("write {}", path.display()))?;
-        println!("dumped {} steps of top-8 logits to {}", stats.top8.len(), path.display());
+        println!(
+            "dumped {} steps of top-8 logits to {}",
+            stats.top8.len(),
+            path.display()
+        );
     }
     let (attn, mlp, ple, norms) = gen_stage_stats();
     println!(
@@ -271,10 +274,15 @@ fn run_gen(args: &Args) -> Result<()> {
     let text = tokenizer
         .decode(&out, false)
         .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    println!("prompt {} tokens, generated {} in {:.2}s (prefill {:.2}s, decode {:.2}s = {:.2} tok/s)",
-        stats.prompt_tokens, stats.generated, stats.prefill_s + stats.decode_s,
-        stats.prefill_s, stats.decode_s,
-        stats.generated as f64 / stats.decode_s.max(1e-9));
+    println!(
+        "prompt {} tokens, generated {} in {:.2}s (prefill {:.2}s, decode {:.2}s = {:.2} tok/s)",
+        stats.prompt_tokens,
+        stats.generated,
+        stats.prefill_s + stats.decode_s,
+        stats.prefill_s,
+        stats.decode_s,
+        stats.generated as f64 / stats.decode_s.max(1e-9)
+    );
     println!("ids: {out:?}");
     println!("text: {text}");
     if let Some(path) = &args.out {

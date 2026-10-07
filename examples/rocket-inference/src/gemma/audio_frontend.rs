@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use rustfft::num_complex::Complex32;
-use rustfft::{FftPlanner, Fft};
+use rustfft::{Fft, FftPlanner};
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const FRAME_LENGTH: usize = 320;
@@ -76,8 +76,8 @@ pub fn load_waveform(path: &Path) -> Result<Vec<f32>> {
 }
 
 fn read_wav(path: &Path) -> Result<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("open wav {}", path.display()))?;
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("open wav {}", path.display()))?;
     let spec = reader.spec();
     if spec.sample_rate != SAMPLE_RATE as u32 {
         bail!("wav sample rate is {} (need 16000)", spec.sample_rate);
@@ -127,7 +127,10 @@ fn window() -> &'static [f32] {
     static W: OnceLock<Vec<f32>> = OnceLock::new();
     W.get_or_init(|| {
         (0..FRAME_LENGTH)
-            .map(|n| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / FRAME_LENGTH as f64).cos()) as f32)
+            .map(|n| {
+                (0.5 - 0.5 * (2.0 * std::f64::consts::PI * n as f64 / FRAME_LENGTH as f64).cos())
+                    as f32
+            })
             .collect()
     })
 }

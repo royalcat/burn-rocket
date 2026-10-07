@@ -203,10 +203,10 @@ struct FaState {
     /// Cached causal sliding-window mask for the current `n`.
     cw: usize,
     cw_mask: Vec<f16>, // [n][n] additive: 0 for t-w<j<=t, -inf otherwise
-    q: Vec<f16>,    // [n_head][n][head_dim]
-    k: Vec<f16>,    // [n_kv][n][head_dim]
-    v: Vec<f16>,    // [n_kv][head_dim][n]  (per-head transposed)
-    out: Vec<f16>,  // [n_head][n][head_dim]
+    q: Vec<f16>,       // [n_head][n][head_dim]
+    k: Vec<f16>,       // [n_kv][n][head_dim]
+    v: Vec<f16>,       // [n_kv][head_dim][n]  (per-head transposed)
+    out: Vec<f16>,     // [n_head][n][head_dim]
 }
 
 struct Engine {
@@ -309,7 +309,11 @@ impl RocketOps for Flex {
             head_dim,
             scale,
             softcap,
-            if is_causal { MaskMode::Causal } else { MaskMode::None },
+            if is_causal {
+                MaskMode::Causal
+            } else {
+                MaskMode::None
+            },
         )
     }
 
@@ -783,9 +787,6 @@ fn f16_to_f32_par(src: &[f16]) -> Vec<f32> {
         });
     out
 }
-
-
-
 
 /// `src` is `[n, heads*d]` row-major; writes `dst[head][n][d]`.
 fn fill_heads(src: &[f32], n: usize, heads: usize, d: usize, dst: &mut [f16]) {

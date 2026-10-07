@@ -67,7 +67,11 @@ impl ModuleMapper for LowRam {
                 let qparams = compute_q_params(&self.scheme, range);
                 tensor.quantize(&self.scheme, qparams)
             })
-        } else if self.to_f16.iter().any(|g| g.matches(&param.id, Some(&path))) {
+        } else if self
+            .to_f16
+            .iter()
+            .any(|g| g.matches(&param.id, Some(&path)))
+        {
             param.map(|tensor| tensor.cast(DType::F16))
         } else {
             param

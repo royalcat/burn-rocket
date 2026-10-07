@@ -99,8 +99,7 @@ fn load_npu_text(
     npu_attn: bool,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
-    burn_rocket::init(threads)
-        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    burn_rocket::init(threads).map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
     let t0 = Instant::now();
     let mut count = 0usize;
     let mut bytes = 0usize;

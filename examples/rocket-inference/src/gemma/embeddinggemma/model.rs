@@ -134,10 +134,8 @@ impl RopeTable {
                 sin.push(angle.sin());
             }
         }
-        let cos =
-            Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
-        let sin =
-            Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
+        let cos = Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
+        let sin = Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
         Self { cos, sin, half }
     }
 
@@ -203,7 +201,11 @@ impl TextAttention {
         if self.npu_attn {
             // NPU attention takes the [1, S, H*D] layout; sliding layers get the
             // symmetric band mask, full layers no mask.
-            let window = if spec.sliding { sliding_window as i64 } else { -1 };
+            let window = if spec.sliding {
+                sliding_window as i64
+            } else {
+                -1
+            };
             let o = burn_rocket::attention_window(
                 q.reshape([b, s, h * d]),
                 k.reshape([b, s, kv * d]),
@@ -336,7 +338,9 @@ impl TextLayer {
         let d = spec.head_dim;
         let eps = cfg.rms_norm_eps;
         Self {
-            input_layernorm: RmsNormConfig::new(cfg.hidden_size).with_epsilon(eps).init(device),
+            input_layernorm: RmsNormConfig::new(cfg.hidden_size)
+                .with_epsilon(eps)
+                .init(device),
             self_attn: TextAttention {
                 q_proj: linear_cfg(cfg.hidden_size, h * d).init(device),
                 k_proj: linear_cfg(cfg.hidden_size, kv * d).init(device),
@@ -448,11 +452,7 @@ impl Emb2Model {
         Self {
             language_model: TextModel::new(text_cfg, device),
             vision_tower: VisionTower::new(vision_cfg, device),
-            embed_vision: MultimodalEmbedder::new(
-                vision_hidden,
-                text_hidden,
-                device,
-            ),
+            embed_vision: MultimodalEmbedder::new(vision_hidden, text_hidden, device),
             audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
             embed_audio: MultimodalEmbedder::new(audio_dims, text_hidden, device),
         }
@@ -663,15 +663,7 @@ impl TextModel {
             } else {
                 rope.full.as_ref().expect("full rope table")
             };
-            h = layer.forward(
-                h,
-                ple_i,
-                rope,
-                ls,
-                spec.sliding_window,
-                spec.eps,
-                chunk,
-            );
+            h = layer.forward(h, ple_i, rope, ls, spec.sliding_window, spec.eps, chunk);
         }
         lin(&self.embedding_projection, self.norm.forward(h))
     }
