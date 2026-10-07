@@ -277,6 +277,12 @@ example's `src/model.rs` (`stage_stats`).
   `vendor/rocketnpu/librocketnpu.a` (built by `scripts/build-rocketnpu.sh`; override with
   `ROCKETNPU_DIR`). aarch64 only: the dep is target-gated in
   `examples/rocket-inference/Cargo.toml`.
+- The cross archive must be built against the aarch64 uapi headers: with the host's
+  `/usr/include` first, `asm/posix_types.h` takes its non-x86 branch, `__kernel_size_t`
+  becomes 32-bit and `struct drm_version` 56 bytes, so the wrong `DRM_IOCTL_VERSION`
+  makes `rocket_open` fail with ENODEV on the board (found 2026-10-07 by the board A/B
+  of the fresh archive). `scripts/build-rocketnpu.sh` shims libdrm for the cross build
+  and keeps the host include dirs out; each build runs a `_Static_assert` ABI guard.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
   one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls

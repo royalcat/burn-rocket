@@ -95,6 +95,10 @@ command -v cmake >/dev/null || die "cmake not found"
 command -v pkg-config >/dev/null || die "pkg-config not found"
 pkg-config --exists libdrm \
     || die "libdrm development files not found (pkg-config --exists libdrm)"
+DRM_INCLUDEDIR="$(pkg-config --variable=includedir libdrm 2>/dev/null || true)"
+[ -n "$DRM_INCLUDEDIR" ] || DRM_INCLUDEDIR=/usr/include
+LIBDRM_INC="$DRM_INCLUDEDIR/libdrm"
+[ -d "$LIBDRM_INC" ] || die "libdrm headers not found at $LIBDRM_INC"
 command -v ar >/dev/null || die "ar not found (binutils)"
 command -v file >/dev/null || die "file not found"
 if [ "$TARGET" = aarch64 ]; then
@@ -134,20 +138,62 @@ COMMIT="$(git -C "$SRC_ABS" rev-parse --verify "${COMMIT}^{commit}")"
 # source directory, so `--src` must not reuse a tree configured for the clone.
 SRC_KEY="$(printf '%s' "$SRC_ABS" | cksum | cut -d' ' -f1)"
 BUILD="$CACHE_BASE/build-$TARGET-${COMMIT:0:12}-$SRC_KEY"
-if [ ! -f "$BUILD/CMakeCache.txt" ]; then
-    echo "==> configuring ($TARGET) in $BUILD"
-    cmake_args=(-S "$SRC_ABS" -B "$BUILD" -DROCKETNPU_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release)
-    if [ "$TARGET" = aarch64 ]; then
-        cmake_args+=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64
-                    -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc)
-    fi
-    cmake "${cmake_args[@]}"
+
+# The aarch64 sysroot carries the target uapi headers (linux/, asm/,
+# drm/rocket_accel.h) but no libdrm. A plain pkg-config build adds the host's
+# -I/usr/include first, where asm/posix_types.h takes its non-x86 branch and
+# makes __kernel_size_t 32-bit: struct drm_version becomes 56 bytes instead of
+# 64, DRM_IOCTL_VERSION encodes the wrong size, the kernel never fills the name
+# and rocket_open fails with ENODEV on the board. Build against a shim that
+# exposes only libdrm/ and let <linux/*>, <asm/*> and <drm/rocket_accel.h>
+# resolve from the cross sysroot. (The native host build needs no shim: its
+# compiler defines __x86_64__, so the host uapi headers are consistent.)
+if [ "$TARGET" = aarch64 ]; then
+    SHIM="$BUILD/shim"
+    DRM_VERSION="$(pkg-config --modversion libdrm)"
+    mkdir -p "$SHIM/include" "$SHIM/pkgconfig"
+    ln -sfn "$LIBDRM_INC" "$SHIM/include/libdrm"
+    cat > "$SHIM/pkgconfig/libdrm.pc" <<EOF
+prefix=/usr
+includedir=$SHIM/include
+Name: libdrm
+Description: userspace interface to kernel DRM services (burn-rocket cross shim)
+Version: $DRM_VERSION
+Libs: -ldrm
+Cflags: -I\${includedir}
+EOF
+    export PKG_CONFIG_LIBDIR="$SHIM/pkgconfig"
 fi
+
+# Configure on every run: the flags depend on the shim and on pkg-config, and
+# an existing tree must pick them up after a script change. -U drops the cached
+# pkg-config results (pkg_check_modules would otherwise reuse them on a
+# reconfigure of an existing build dir).
+echo "==> configuring ($TARGET) in $BUILD"
+cmake_args=(-S "$SRC_ABS" -B "$BUILD" -DROCKETNPU_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+            -U 'DRM_*')
+if [ "$TARGET" = aarch64 ]; then
+    cmake_args+=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64
+                -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc)
+fi
+cmake "${cmake_args[@]}"
 echo "==> building (jobs=$JOBS)"
 cmake --build "$BUILD" -j "$JOBS"
 
 LIB="$BUILD/librocketnpu.a"
 [ -s "$LIB" ] || die "build did not produce $LIB"
+
+# --- ABI guard --------------------------------------------------------------
+# The DRM ioctl ABI must match the board kernel; the guard catches a header
+# leak (see the shim comment above) before anything is installed.
+printf '#include <libdrm/drm.h>\n_Static_assert(sizeof(struct drm_version) == 64, "drm_version ABI");\n' > "$BUILD/abi_guard.c"
+if [ "$TARGET" = aarch64 ]; then
+    aarch64-linux-gnu-gcc -I"$SHIM/include" -c "$BUILD/abi_guard.c" -o /dev/null \
+        || die "DRM ABI guard failed: struct drm_version is not 64 bytes with the cross headers"
+else
+    cc -c "$BUILD/abi_guard.c" -o /dev/null \
+        || die "DRM ABI guard failed: struct drm_version is not 64 bytes with the host headers"
+fi
 
 # --- sanity + install -------------------------------------------------------
 tmp="$(mktemp)"

@@ -6,7 +6,7 @@
 //! `<repo>/vendor/rocketnpu` together with `COMMIT`/`ARCH` provenance files.
 //! Set `ROCKETNPU_DIR` to override the directory holding `librocketnpu.a`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -27,6 +27,10 @@ fn main() {
     };
 
     let lib = dir.join("librocketnpu.a");
+    // Watch the archive: `scripts/build-rocketnpu.sh` replaces it in place and
+    // the crate must relink when it changes. A missing file counts as changed,
+    // so its creation is picked up too.
+    println!("cargo:rerun-if-changed={}", lib.display());
     if !lib.exists() {
         println!(
             "cargo:warning=librocketnpu.a not found at {}; run scripts/build-rocketnpu.sh \
@@ -75,6 +79,4 @@ fn main() {
     println!("cargo:rustc-link-lib=m");
     println!("cargo:rustc-link-lib=pthread");
 
-    // Keep the archive's mtime visible to cargo.
-    let _ = Path::new(&lib).metadata();
 }
