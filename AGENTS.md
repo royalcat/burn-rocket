@@ -19,7 +19,11 @@ package.
 The inversion is verified on the dev host: `cargo check -p burn-rocket` (plain / `flex` /
 `npu`) and `-p rocket-inference` (default `cpu` and `--no-default-features`), aarch64
 cross-builds of the example (`--features npu`) and of `--example probe`, plus a tokenize +
-q8 embed smoke run. The git remote is still `embeddings-fast.git`. Board artifacts
+q8 embed smoke run. The git remotes changed on 2026-10-07: `origin` is GitHub
+`royalcat/burn-rocket.git` and is the push target (current through `41a4d62`); the old
+Gitea remote is kept as `self-hosted` (`git.kmsign.org/royalcat/embeddings-fast.git`,
+further behind). `main` still *tracks* `self-hosted/main`, so push explicitly with
+`git push origin main`. Board artifacts
 deployed before that date live under `/root/embeddings-fast/`; new deploys go to
 `/root/rocket-inference/`.
 
