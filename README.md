@@ -24,10 +24,15 @@ standard clients work unchanged:
 
 | model | API | command |
 |---|---|---|
-| Qwen3-Embedding-0.6B | OpenAI `/v1/embeddings`, `/v1/models`, `/health` | `rocket-inference qwen3 serve` |
-| Qwen3.5-0.8B intent/query planner | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference intent serve-ollama` |
-| EmbeddingGemma 2 (text/image/video/audio) | OpenAI `/v1/embeddings` + native multimodal `/embed` | `rocket-inference gemma serve` |
-| Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions` | `rocket-inference gemma serve-chat` |
+| Qwen3-Embedding-0.6B | OpenAI `/v1/embeddings`, `/v1/models`, `/health` | `rocket-inference serve --model-dir /models/qwen3-embedding-0.6b` |
+| Qwen3.5-0.8B intent/query planner | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/ov-intent-analysis-sft` |
+| EmbeddingGemma 2 (text/image/video/audio) | OpenAI `/v1/embeddings` + native multimodal `/embed` | `rocket-inference serve --model-dir /models/embeddinggemma-2` |
+| Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/gemma-4-E2B-it` |
+
+One `serve` command covers every model: it detects the checkpoint's family and
+registers exactly the endpoints that model supports (embedding models get
+`/v1/embeddings`/`/embed`, chat models get both the OpenAI chat and the Ollama
+APIs).
 
 The Qwen3 embedding server is the configuration running in production on a Rock 5B+
 (OpenViking's embedding backend, `--npu --npu-attn cpu --max-tokens 8192`): a
@@ -126,13 +131,11 @@ reverts on reboot. Everything works at the stock clock.
 
 [`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
 built on this library: one binary, four model families, selected by the first argument
-(`qwen3`, `intent`, `gemma`). It serves the Qwen3-Embedding-0.6B embedding model (CLI
-`qwen3 bench|embed|gemm|serve|tokenize`; OpenAI-compatible `/v1/embeddings`), the
-Qwen3.5-0.8B intent/query-planner model (`intent gen|serve-ollama`; Ollama-compatible
-`/api/chat`, `/api/generate`), the multimodal EmbeddingGemma 2 (`gemma embed|bench|
-tokenize|serve`; OpenAI `/v1/embeddings` plus a native `/embed` for image, video and
-audio) and Gemma 4 E2B-it generation (`gemma gen|serve-chat`;
-`/v1/chat/completions`), with measurements from the Rock 5B+ in
+(`serve`, `qwen3`, `intent`, `gemma`). One `serve` command loads any of the models and
+exposes its compatible endpoints; the Qwen3-Embedding-0.6B embedding model (CLI
+`qwen3 bench|embed|gemm|tokenize`), the Qwen3.5-0.8B intent/query-planner model
+(`intent gen`), the multimodal EmbeddingGemma 2 (`gemma embed|bench|tokenize`) and
+Gemma 4 E2B-it generation (`gemma gen`) are one-shot CLI paths, with measurements from the Rock 5B+ in
 `docs/experiment-log.md` and `docs/experiment-log-gemma.md` there.
 
 On the board the Qwen3 embedding NPU path runs the 3,633-token input at 45 tok/s while

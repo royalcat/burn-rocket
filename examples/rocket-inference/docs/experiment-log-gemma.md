@@ -297,7 +297,7 @@ is a memory-only mode here.
 
 ### Multimodal prefill (2026-10-07)
 
-`gen`/`serve-chat` accept `<|image|>` / `<|audio|>` placeholders in the rendered
+`gemma gen` and the served chat endpoints accept `<|image|>` / `<|audio|>` placeholders in the rendered
 conversation; `inputs::prepare` expands them (BOI/BOA + soft tokens + EOI/EOA)
 and encodes the media with the checkpoint's own towers, then the text model runs
 over the scattered embeddings. The PLE token-table lookup uses the media-pad ids
@@ -319,7 +319,7 @@ The audio case diverges from the bf16 reference at token 20 ("vehicle" vs
 not a numerical bug (the same caveat as the `--f16` text mode). Memory with the
 towers loaded: f32 ~16.5 GiB resident (text 12.5 + towers ~4).
 
-`serve-chat` accepts the same media as OpenAI content parts: `image_url` with a
+The served chat endpoints accept the same media as OpenAI content parts: `image_url` with a
 data URI or path, `input_audio` with base64 `data` + `format` (at most one of
 each per request). The placeholders are inserted by the server, so clients send
 plain text. Smoke-tested on the dev host: the image request returns the CLI's

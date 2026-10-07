@@ -7,7 +7,7 @@
 # embedding server.
 #
 # aarch64 only: the `npu` feature links the aarch64-only static librocketnpu,
-# and `qwen3 serve --npu` offloads the projections to the RK3588 NPU through the
+# and `serve --npu` offloads the projections to the RK3588 NPU through the
 # mainline `rocket` driver (needs /dev/accel/accel0 at run time). Without
 # `--npu` the same image serves the flex CPU path.
 #
@@ -49,6 +49,6 @@ ENTRYPOINT ["rocket-inference"]
 # deployment finding, 2026-10-05) and an 8192-token cap (OpenViking's client
 # times out at 600 s). Mount the weights at /models/qwen3-embedding-0.6b and
 # pass --device /dev/accel/accel0.
-CMD ["qwen3", "serve", "--backend", "flex", "--dtype", "f32", "--npu", "--npu-attn", "cpu", "--port", "8383", \
+CMD ["serve", "--backend", "flex", "--dtype", "f32", "--npu", "--npu-attn", "cpu", "--port", "8383", \
      "--max-tokens", "8192", "--model-dir", "/models/qwen3-embedding-0.6b", \
      "--model-name", "qwen3-embedding"]

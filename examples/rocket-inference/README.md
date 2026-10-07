@@ -4,19 +4,21 @@ Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](../..)
 library: one binary, four model families, `flex` CPU backend by default with
 optional RK3588 NPU offload (`--npu`).
 
-| family | model | commands | API |
+| family | model | CLI commands | served endpoints |
 |---|---|---|---|
-| `qwen3` | Qwen3-Embedding-0.6B | `bench`, `embed`, `gemm`, `serve`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
-| `intent` | Qwen3.5-0.8B intent/query-planner (`guoxuter/ov_intent_analysis_sft:v7_q8`) | `gen`, `serve-ollama` | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
-| `gemma` | EmbeddingGemma 2 (text/image/video/audio) | `embed`, `bench`, `tokenize`, `serve` | OpenAI `/v1/embeddings` + native multimodal `/embed` |
-| `gemma` | Gemma 4 E2B-it chat (text/image/audio) | `gen`, `serve-chat` | OpenAI `/v1/chat/completions` |
+| `qwen3` | Qwen3-Embedding-0.6B | `bench`, `embed`, `gemm`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
+| `intent` | Qwen3.5-0.8B intent/query-planner (`guoxuter/ov_intent_analysis_sft:v7_q8`) | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| `gemma` | EmbeddingGemma 2 (text/image/video/audio) | `embed`, `bench`, `tokenize` | OpenAI `/v1/embeddings` + native multimodal `/embed` |
+| `gemma` | Gemma 4 E2B-it chat (text/image/audio) | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
 
 ```
 usage: rocket-inference <family> <command> [flags]
 ```
 
-The families are separate model architectures and share only generic
-infrastructure; every command's flags are documented below. See
+Serving is one command for every model: `rocket-inference serve --model-dir <dir>`
+detects the checkpoint's family and exposes exactly the endpoints it supports
+(see [Serving](#serving)). The families are separate model architectures and
+share only generic infrastructure; every command's flags are documented below. See
 `docs/experiment-log.md` (Qwen3-Embedding + intent) and
 `docs/experiment-log-gemma.md` (EmbeddingGemma 2 + Gemma 4) for the full
 measurements and verification results.
@@ -25,13 +27,14 @@ measurements and verification results.
 
 | path | contents |
 |---|---|
-| `src/main.rs`, `src/cli.rs` | family-first dispatch, shared flag parser, usage |
+| `src/main.rs`, `src/cli.rs` | dispatch (`serve` + the four families), shared flag parser, usage |
+| `src/server/` | the one server: model detection, capability routing, OpenAI + multimodal + Ollama endpoints |
 | `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache` |
-| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loaders (f32/Q8/NPU), `/v1/embeddings` server, CLI |
-| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, safetensors loader + NPU pack-and-drop, Ollama server, CLI |
+| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loaders (f32/Q8/NPU), CLI |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, safetensors loader + NPU pack-and-drop, CLI |
 | `src/gemma/` | shared Gemma 4 building blocks: config schemas, low-RAM/NPU linear helpers (`layers`), QAT (`qat`), media decoding, USM audio frontend, vision/audio towers, input assembly |
-| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders, multimodal server, CLI |
-| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, `/v1/chat/completions`, CLI |
+| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders, CLI |
+| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, CLI |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
 | `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
@@ -56,6 +59,71 @@ relative `data/bench_text.txt`). The NPU build is self-contained
 (`librocketnpu` is statically linked) and needs `/dev/accel/accel0` at run time
 for `--npu`.
 
+## Serving
+
+One command serves every model:
+
+```sh
+rocket-inference serve [--model-dir <dir>] [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
+```
+
+`--family auto` (the default) reads `config.json` `model_type` and picks the
+loader: `qwen3`, `embedding_gemma2`, `qwen3_5` or `gemma4`. Use `--family <name>`
+to override (e.g. a plain generative Qwen3 checkpoint).
+
+The routes follow the loaded model — incompatible paths are not registered
+(404), and `/v1/models` reports a `capabilities` array:
+
+| | `qwen3` | `embeddinggemma` | `intent` | `gemma4` |
+|---|---|---|---|---|
+| `/health`, `/v1/models` | ✓ | ✓ | ✓ | ✓ |
+| `/v1/embeddings` (string/list; ids/base64 for qwen3; `dim`/`prompt` for Gemma) | ✓ | ✓ | — | — |
+| `/embed` (text/image/video/audio, paths or data URIs) | — | ✓ | — | — |
+| `/v1/chat/completions` (OpenAI; `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, stream=false) | — | — | ✓ | ✓ |
+| `/`, `/api/version`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` (Ollama) | — | — | ✓ | ✓ |
+
+```sh
+# embedding server (OpenAI): /v1/embeddings
+$B serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 --max-tokens 30000
+curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"Hello world","encoding_format":"float"}'
+
+# multimodal embedding server (OpenAI + native /embed)
+$B serve --model-dir ~/models/embeddinggemma-2 --quant q8 --port 8390
+curl -s localhost:8390/embed -H 'Content-Type: application/json' -d '{"image":"/path/to/cat.jpeg"}'
+
+# query-planner server (OpenAI chat + Ollama, litellm/OpenViking-compatible)
+$B serve --model-dir ~/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 \
+    --model-name guoxuter/ov_intent_analysis_sft:v7_q8 --max-tokens 4096 --max-new-tokens 256
+curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
+curl -s localhost:11434/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+
+# generation server (OpenAI chat + Ollama)
+$B serve --model-dir ~/models/gemma-4-E2B-it --port 8391
+curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+```
+
+Serving flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`),
+`--family`, `--backend`, `--port` (default 8383), `--model-name` (default: the
+model directory name), `--max-tokens` (prompt/context cap), `--max-new-tokens`
+(default generation cap), `--temperature`, plus the loading flags of the
+detected family (e.g. `--dtype`/`--quant`/`--npu`/`--npu-attn`/`--chunk`/
+`--key-block`/`--attn` for qwen3; `--quant`/`--npu`/`--npu-attn`/`--attn-chunk`/
+`--video-fps`/`--video-max-frames` for EmbeddingGemma 2; `--npu`/`--npu-threads`/
+`--delta-chunk`/`--embed-f16`/`--pure-npu`/`--npu-decode` for the intent model;
+`--f16`/`--quant`/`--npu`/`--attn-chunk` for Gemma 4). A flag that does not
+apply to the detected model is rejected.
+
+Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
+as before); Ollama `stream: true` returns one NDJSON content line plus the final
+`done` line; the Ollama endpoints accept any request `Content-Type`
+(application/octet-stream included), while OpenAI chat parts accept
+`image_url` / `input_audio` (one of each per request). Requests serialize on the
+model; panicking forwards are contained (500) instead of poisoning the server.
+
 ## Qwen3-Embedding-0.6B (`qwen3`)
 
 Embedding-only Qwen3 (no `lm_head`): 28 layers, hidden 1024, GQA 16/8 heads,
@@ -71,18 +139,14 @@ taskset -c 2 $B qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --
 
 # embed one text (writes a JSON float array)
 $B qwen3 embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out out.json
-
-# OpenAI-compatible server
-$B qwen3 serve --backend flex --dtype f32 --quant q8 --port 8383 --max-tokens 30000
-curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
-  -d '{"input":"Hello world","encoding_format":"float"}'
 ```
 
 Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
 `--dtype f32|f16` (bf16 is broken in flex), `--quant none|q8` (q8 = Q8-resident
 low-RAM mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
-attention only), `--tokens`, `--text`, `--text-file`, `--out`, `--port`,
-`--max-tokens`, `--model-name`; `gemm` adds `--m/--n/--k/--transb`.
+attention only), `--tokens`, `--text`, `--text-file`, `--out`; `gemm` adds
+`--m/--n/--k/--transb`. Serving uses the flags of the [Serving](#serving)
+section.
 
 Two attention paths, both causal and numerically identical: `fused` (default,
 flex's tiled flash-attention kernel; best for long inputs and multi-thread) and
@@ -148,8 +212,8 @@ run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
 
 `guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder
 (18 Gated DeltaNet linear-attention layers + 6 gated full-attention layers) —
-a different family from Qwen3. It serves OpenViking's query-planner role behind
-an Ollama-compatible API. The HF safetensors (`model.language_model.*`; the
+a different family from Qwen3. It serves OpenViking's query-planner role (both the
+Ollama API and OpenAI chat; see [Serving](#serving)). The HF safetensors (`model.language_model.*`; the
 vision tower is skipped) load through the family's loader; `--npu` packs the
 projection groups into resident NPU weights for prefill and keeps f16 CPU copies
 for single-token decode.
@@ -158,21 +222,14 @@ for single-token decode.
 M=~/models/ov-intent-analysis-sft
 # one-shot greedy generation (raw prompt; drop --raw to wrap in the ChatML template)
 $B intent gen --model-dir $M --text "Hello!" --raw --max-new-tokens 32
-
-# Ollama-compatible server (OpenViking query planner)
-$B intent serve-ollama --model-dir $M --npu --npu-threads 3 --port 11434 \
-    --max-tokens 4096 --max-new-tokens 256
-curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
 ```
 
 Flags: `--model-dir` (default `~/models/ov-intent-analysis-sft`), `--backend`,
 `--text`, `--text-file`, `--raw`, `--max-tokens`, `--max-new-tokens`,
 `--temperature`, `--delta-chunk`, `--npu`, `--npu-threads`, `--embed-f16`,
-`--pure-npu`, `--npu-decode`, `--dump-hidden`, `--dump-steps`, `--port`,
-`--model-name`.
+`--pure-npu`, `--npu-decode`, `--dump-hidden`, `--dump-steps`.
 
-The JSON endpoints accept any request `Content-Type` (like Ollama itself):
+The Ollama endpoints accept any request `Content-Type` (like Ollama itself):
 litellm's Ollama client posts its bodies as `application/octet-stream` (litellm
 1.83) and axum's `Json` extractor would otherwise reject them with 415. litellm
 routes `ollama/…` through `/api/generate` and `ollama_chat/…` through
@@ -218,43 +275,25 @@ $B gemma embed --model-dir $M --image data/cat.jpeg --out img.json
 $B gemma embed --model-dir $M --video data/test.mp4 --out vid.json
 $B gemma embed --model-dir $M --audio data/speech5s.wav --out audio.json
 
-# timings, token ids, server
+# timings and token ids
 $B gemma bench --model-dir $M --text-file data/one_long.txt --reps 2
 $B gemma tokenize --model-dir $M --text "hello"
-$B gemma serve --model-dir $M --port 8390
 ```
 
 Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
 `--dtype f32` (f16 is rejected — RMSNorm/softmax/PLE need f32), `--text`,
 `--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
-`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--port`,
-`--model-name`, `--max-tokens`, `--quant none|q8`, `--npu`, `--npu-threads`,
-`--npu-attn npu|cpu`, plus `--dump-*` debug hooks.
+`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--quant none|q8`,
+`--npu`, `--npu-threads`, `--npu-attn npu|cpu`, plus `--dump-*` debug hooks.
 
 Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
 `code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`
 for no prefix (`--prompt none` is also accepted).
 
-### Server
-
-```sh
-curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
-  -d '{"input":"what is the capital of france?"}'
-curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
-  -d '{"input":["a","b"],"dim":256,"prompt":"query"}'
-# native multimodal endpoint: paths, or data: URIs with base64 payloads
-curl -s localhost:8390/embed -H 'Content-Type: application/json' \
-  -d '{"image":"/path/to/cat.jpeg"}'
-curl -s localhost:8390/embed -H 'Content-Type: application/json' \
-  -d '{"audio":"/path/to/speech.wav","text":"task: sentence similarity | query: <|audio|>"}'
-curl -s localhost:8390/health; curl -s localhost:8390/v1/models
-```
-
-`/v1/embeddings` accepts a string or an array of strings; `/embed` accepts
-`text`/`image`/`video`/`audio` (media values are filesystem paths or
-`data:<mime>;base64,<payload>` blobs). Every embedding is L2-normalized; `dim`
-applies MRL truncation before normalization.
+Server examples (and the `/embed` request shapes) are in
+[Serving](#serving). Every embedding is L2-normalized; `dim` applies MRL
+truncation before normalization.
 
 ### Verification and memory
 
@@ -280,7 +319,7 @@ Known limits: audio resampling is exact for 16 kHz mono WAV (other rates go
 through ffmpeg, ~0.994 cosine vs librosa/soxr); batch inputs are processed one
 at a time.
 
-## Gemma 4 E2B-it (`gemma gen|serve-chat`)
+## Gemma 4 E2B-it (`gemma gen`)
 
 `google/gemma-4-E2B-it` (10.25 GB BF16 checkpoint): the causal Gemma 4 decoder
 with KV sharing (layers 15-34 reuse the K/V of layer 13/14 and use double-wide
@@ -300,11 +339,6 @@ $B gemma gen --gen-model-dir $G \
 # image / audio input (the placeholder expands to the tower's soft tokens)
 $B gemma gen --gen-model-dir $G --text "What is in this image? <|image|>" --image data/cat.jpeg
 $B gemma gen --gen-model-dir $G --text "What do you hear? <|audio|>" --audio data/speech5s.wav
-
-# non-streaming OpenAI-compatible server
-$B gemma serve-chat --gen-model-dir $G --port 8391
-curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
 ```
 
 Flags: `--gen-model-dir` (default `/mnt/hub/models/gemma-4-E2B-it`), `--backend`,
@@ -312,9 +346,10 @@ Flags: `--gen-model-dir` (default `/mnt/hub/models/gemma-4-E2B-it`), `--backend`
 `--video-fps`, `--video-max-frames`, `--messages`, `--max-new-tokens`,
 `--sample`, `--temperature`, `--top-k`, `--top-p`, `--enable-thinking`, `--f16`,
 `--quant none|q8`, `--npu`, `--npu-threads`, `--attn-chunk`, `--dump-logits`,
-`--out`, `--port`, `--model-name`.
+`--out`. Serving uses `--model-dir` and the flags of the [Serving](#serving)
+section.
 
-Precision modes (`gen`/`serve-chat`), measured on the dev host (32 threads,
+Precision modes (`gen` and serving), measured on the dev host (32 threads,
 16-token prompt / 9-token answer):
 
 | mode | flags | resident | decode | notes |
@@ -323,10 +358,11 @@ Precision modes (`gen`/`serve-chat`), measured on the dev host (32 threads,
 | f16 | `--f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
 | Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call |
 
-`serve-chat` is non-streaming and takes OpenAI-style `messages` (string or
-text-part content), plus `image_url` (data URI or path) and `input_audio`
-(base64 + format) parts — one of each per request; the server inserts the
-placeholder tokens itself.
+The served chat endpoints are non-streaming (OpenAI) / single-line NDJSON
+(Ollama); OpenAI content parts accept `image_url` (data URI or path) and
+`input_audio` (base64 + format) — one of each per request; the server inserts
+the `<|image|>` / `<|audio|>` placeholder tokens itself, so do not include them
+in the text part.
 
 ### QAT mobile checkpoint
 

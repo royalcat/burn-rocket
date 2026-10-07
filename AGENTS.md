@@ -41,6 +41,14 @@ cosine 0.99928 at 82 tokens, intent 10/10 tokens vs the HF oracle, EmbeddingGemm
 text/image cosine ~1.0 vs the f32 reference, Gemma 4 gen token-identical to the
 pre-merge binary.
 
+The per-family servers were then unified (2026-10-07) into one top-level `serve`
+command (`src/server/`): it detects the checkpoint family from `config.json`
+(`--family` overrides), loads one model, and registers only the compatible routes
+(`/v1/embeddings` + `/embed` for embedding models; `/v1/chat/completions` plus the
+Ollama API for chat models; `/health` + `/v1/models` always). The old commands
+`qwen3 serve`, `intent serve-ollama`, `gemma serve` and `gemma serve-chat` are gone;
+the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API.
+
 ## Status (2026-10-06)
 
 - **Library**: `burn-rocket` exposes the NPU as a Burn backend extension
@@ -74,8 +82,8 @@ pre-merge binary.
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
-  (`src/qwen35_intent/{model,loader,ollama}.rs`; commands `intent gen` and
-  `intent serve-ollama`, an Ollama-compatible API on port 11434). Greedy output is
+  (`src/qwen35_intent/{model,loader}.rs`; one-shot CLI `intent gen`; served via the
+  unified `serve`, OpenAI chat + Ollama API). Greedy output is
   token-identical to HF transformers 5.19 on two prompts (32/32 on the v7 planner
   prompt; per-layer hidden cosine 1.0). Board (166-token prompt, 32 tokens, busy board):
   CPU f32 89.96 s vs `--npu` 11.65 s (prefill 2.94 s, decode 8.71 s) — decode stays on
@@ -107,13 +115,14 @@ pre-merge binary.
 | `scripts/build-rocketnpu.sh` | builds `librocketnpu.a` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); cache: `$OUT_DIR/rocket-userspace` from build.rs, else `<target-dir>/<profile>/build/burn-rocket` |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | family-first dispatch (`qwen3`/`intent`/`gemma`), shared flag parser and usage text |
+| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
+| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`) |
-| `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), OpenAI `/v1/embeddings` server, CLI |
-| `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop), Ollama-compatible API, CLI |
+| `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
+| `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
 | `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs` |
-| `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, loaders, `/v1/embeddings` + `/embed` server, CLI |
-| `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, `/v1/chat/completions` server, CLI |
+| `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, loaders, CLI |
+| `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`), CLI |
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
@@ -143,7 +152,7 @@ Model `/mnt/hub/models/embeddinggemma-2`, reference venv
 torch/torchvision CPU wheels). Board deploy at `/root/rocket-inference/`
 (aarch64 `--features npu` build; model at `/root/models/embeddinggemma-2/`).
 
-Generation round (2026-10-07, log §11): `gemma gen` / `gemma serve-chat` run
+Generation round (2026-10-07, log §11): `gemma gen` and the served chat endpoints run
 `google/gemma-4-E2B-it` (10.25 GB BF16, `/mnt/hub/models/gemma-4-E2B-it`) with a
 causal Gemma 4 decoder: KV sharing (layers 15-34 reuse layer 13/14 K/V, double-
 wide MLPs), PLE with the token table, proportional p-RoPE on full layers,
@@ -153,8 +162,9 @@ multi-turn chat and a 631-token prompt; the template renders token-exactly.
 Loading streams each tensor to its final dtype (f16 tables, f32 projections by
 default; `--f16` = 8.9 GiB/3.5 tok/s decode, `--quant q8` = 7.3 GiB but 0.09
 tok/s because flex has no int8 GEMM and `lin` dequantizes per call). f32 =
-12.5 GiB/2.8 tok/s and is the parity mode; `serve-chat` is a non-streaming
-OpenAI `/v1/chat/completions` (text + `image_url`/`input_audio` parts).
+12.5 GiB/2.8 tok/s and is the parity mode; the served chat endpoints are
+non-streaming OpenAI `/v1/chat/completions` and the Ollama API (text +
+`image_url`/`input_audio` parts on the OpenAI side).
 
 QAT mobile checkpoint (log §11): `google/gemma-4-E2B-it-qat-mobile-transformers`
 (2.46 GB) is supported natively — packed INT2/4/8 weights + per-channel scales +
@@ -340,8 +350,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - Resident weights are packed for the M>=256 tiling; requests with fewer rows are padded
   to 256 rows (the extra rows are ignored on readback). One pack serves all lengths.
 - Failures panic with a structured `OpFailure { error, m, k, n }` payload (detail logged
-  by `op_failure` before the panic). `serve` maps `ROCKET_E_NOMEM` -> 503, shape/tiling ->
-  500, device/unsupported -> log + `exit(1)` for a supervisor restart. Matmuls chunk above
+  by `op_failure` before the panic). `serve` (via `src/server/error.rs`) maps
+  `ROCKET_E_NOMEM` -> 503, shape/tiling -> 500, device/unsupported -> log + `exit(1)`
+  for a supervisor restart. Matmuls chunk above
   `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, 0 disables) so the per-call input-BO
   scratch stays bounded; rows are independent, so chunking is bit-identical.
 - Failures/logs aside, a panic in an op can no longer poison the server's model lock
@@ -478,7 +489,8 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   mask, prefix keys, ~half the causal MACs). Deferred from the robustness round; board
   work required. Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev
   threads).
-- Board service: run `qwen3 serve --npu --max-tokens 30000` under a supervisor, and decide
+- Board service: run `serve --model-dir /models/qwen3-embedding-0.6b --npu --max-tokens 30000`
+  under a supervisor, and decide
   whether the CPU-relief mode should be the default there (it is now).
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak in
   `--quant q8` mode; re-pack small-M weights lazily instead of padding to 256 rows.
@@ -501,8 +513,8 @@ taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tok
 cargo run --release -- qwen3 bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
 # embedding + cosine against a reference JSON
 cargo run --release -- qwen3 embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
-# server smoke test
-cargo run --release -- qwen3 serve --backend flex --dtype f32 --quant q8 --port 8383 &
+# server smoke test (one command for every model; family auto-detected)
+cargo run --release -- serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 &
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"hi"}'
 # robustness: a panicking forward (invalid token id) must 500 and leave the server alive
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
@@ -540,6 +552,11 @@ taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --token
 # Gemma family (models at /root/models/embeddinggemma-2, /root/models/gemma-4-E2B-it)
 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
 ./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it --text "What is the capital of France?" --max-new-tokens 16
+# servers (detected per model; ports are examples)
+./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --quant q8 --npu --port 8383 --max-tokens 8192
+./rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 --max-new-tokens 256
+./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --port 8390
+./rocket-inference serve --model-dir /root/models/gemma-4-E2B-it --port 8391
 ```
 
 Vulkan/wgpu GPU probe (separate binary; built with

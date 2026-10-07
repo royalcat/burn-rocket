@@ -633,7 +633,8 @@ Port: `src/qwen35_intent/model.rs` (chunked gated delta rule for prefill, recurr
 decode, KV/conv/recurrent caches, explicit single-query attention for decode),
 `src/qwen35_intent/loader.rs` (safetensors loader + NPU pack-and-drop), `src/qwen35_intent/ollama.rs`
 (Ollama-compatible `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`), wired into
-the binary as `intent gen` and `intent serve-ollama`. The chat template matches the model's
+the binary as `intent gen` and as the served OpenAI chat + Ollama endpoints (the
+top-level `serve`). The chat template matches the model's
 Ollama template exactly (`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`,
 stops `<|im_end|>`/`<|endoftext|>`).
 
@@ -674,7 +675,7 @@ board for a production decision.
   f16 LM head flips near-ties: the greedy stream diverges from the f32 reference after
   ~10 tokens (both outputs are valid JSON; the f32 default keeps exact parity).
 - Resident NPU memory: 96 packed weights (497 M params f16 ≈ 1 GB logical) show up as
-  ~1.2 GB of shared/BO memory; a `serve-ollama --npu` process holds ~2.06 GB anon +
+  ~1.2 GB of shared/BO memory; a `serve --model-dir <intent> --npu` process holds ~2.06 GB anon +
   ~1.2 GB shared while serving.
 - Server smoke test on the board (port 11434): `/api/chat` returns the same
   `"Hello! How can I assist you today?"`, `/health` answers in ~1 ms while the model is
