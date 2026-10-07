@@ -1,29 +1,97 @@
 # rocket-inference
 
-Burn inference examples for the [`burn-rocket`](../..) library on a Rock 5B+ (RK3588,
-4×Cortex-A76): the Qwen3-Embedding-0.6B embedding server (production `ik_llama.cpp` Q8_0
-reference) and the Qwen3.5-0.8B intent/query-planner model behind an Ollama-compatible
-API (`guoxuter/ov_intent_analysis_sft:v7_q8`). CPU-only by default (`flex` backend),
-with optional RK3588 NPU offload via `--npu`.
+Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](../..)
+library: one binary, four model families, `flex` CPU backend by default with
+optional RK3588 NPU offload (`--npu`).
 
-Current status: **working models, CLI, and servers**. The embedding path is deployed
-and numerically faithful but 2.3× slower than production `ik_llama.cpp` (2026-10-05);
-the intent model matches the HF reference token-for-token and runs the real v7 planner
-prompt in 11.7 s on the board with `--npu` (89.9 s CPU-only) — see "Board results" and
-`docs/experiment-log.md` §14.
+| family | model | commands | API |
+|---|---|---|---|
+| `qwen3` | Qwen3-Embedding-0.6B | `bench`, `embed`, `gemm`, `serve`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
+| `intent` | Qwen3.5-0.8B intent/query-planner (`guoxuter/ov_intent_analysis_sft:v7_q8`) | `gen`, `serve-ollama` | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| `gemma` | EmbeddingGemma 2 (text/image/video/audio) | `embed`, `bench`, `tokenize`, `serve` | OpenAI `/v1/embeddings` + native multimodal `/embed` |
+| `gemma` | Gemma 4 E2B-it chat (text/image/audio) | `gen`, `serve-chat` | OpenAI `/v1/chat/completions` |
 
-## Results so far
+```
+usage: rocket-inference <family> <command> [flags]
+```
 
-Dev host: AMD Ryzen 9 5950X (Zen3, AVX2+FMA, no AVX-512), Burn 0.22.0-pre.4, `flex` backend.
+The families are separate model architectures and share only generic
+infrastructure; every command's flags are documented below. See
+`docs/experiment-log.md` (Qwen3-Embedding + intent) and
+`docs/experiment-log-gemma.md` (EmbeddingGemma 2 + Gemma 4) for the full
+measurements and verification results.
 
-Two attention paths are available (`--attn fused|blocked`):
+## Layout
 
-- **`fused` (default)** — the backend's fused attention kernel
-  (`burn::tensor::module::attention`; flex selects a tiled flash-attention path with
-  online softmax for long sequences, and parallelizes over heads).
-- **`blocked`** — a portable tensor-op implementation of the same blocked online
-  softmax, tuned with `--chunk`/`--key-block` (defaults 256/256). Faster
-  single-threaded at short/medium lengths; slower for long inputs and with many threads.
+| path | contents |
+|---|---|
+| `src/main.rs`, `src/cli.rs` | family-first dispatch, shared flag parser, usage |
+| `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache` |
+| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loaders (f32/Q8/NPU), `/v1/embeddings` server, CLI |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, safetensors loader + NPU pack-and-drop, Ollama server, CLI |
+| `src/gemma/` | shared Gemma 4 building blocks: config schemas, low-RAM/NPU linear helpers (`layers`), QAT (`qat`), media decoding, USM audio frontend, vision/audio towers, input assembly |
+| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders, multimodal server, CLI |
+| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, `/v1/chat/completions`, CLI |
+| `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
+| `data/` | bench/embedding fixtures, image/audio/video inputs |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
+
+## Build
+
+```sh
+# dev host (flex backend; `--no-default-features` skips the CubeCL LLVM backend)
+cargo build --release -p rocket-inference --no-default-features
+# default build (adds the CubeCL/LLVM `cpu` backend)
+cargo build --release -p rocket-inference
+# aarch64 cross-build (board); `--features npu` links librocketnpu
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu
+```
+
+The aarch64 binaries and models on the board live under `/root/rocket-inference/`
+(binary) and `/root/models/`; run from the deploy dir (the qwen bench uses the
+relative `data/bench_text.txt`). The NPU build is self-contained
+(`librocketnpu` is statically linked) and needs `/dev/accel/accel0` at run time
+for `--npu`.
+
+## Qwen3-Embedding-0.6B (`qwen3`)
+
+Embedding-only Qwen3 (no `lm_head`): 28 layers, hidden 1024, GQA 16/8 heads,
+head_dim 128, QK-RMSNorm, RoPE θ=1e6, SwiGLU, final RMSNorm, last-token
+pooling. Reference: production `ik_llama.cpp` Q8_0 (`--pooling last`).
+
+```sh
+M=~/models/qwen3-embedding-0.6b
+B=target/release/rocket-inference
+
+# single-core benchmark on a fixed text
+taskset -c 2 $B qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
+
+# embed one text (writes a JSON float array)
+$B qwen3 embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out out.json
+
+# OpenAI-compatible server
+$B qwen3 serve --backend flex --dtype f32 --quant q8 --port 8383 --max-tokens 30000
+curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"Hello world","encoding_format":"float"}'
+```
+
+Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
+`--dtype f32|f16` (bf16 is broken in flex), `--quant none|q8` (q8 = Q8-resident
+low-RAM mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
+attention only), `--tokens`, `--text`, `--text-file`, `--out`, `--port`,
+`--max-tokens`, `--model-name`; `gemm` adds `--m/--n/--k/--transb`.
+
+Two attention paths, both causal and numerically identical: `fused` (default,
+flex's tiled flash-attention kernel; best for long inputs and multi-thread) and
+`blocked` (portable blocked online softmax; best single-threaded). Single-core
+runs are fastest with `--attn blocked --chunk 256 --key-block 256`.
+
+### Dev-host results
+
+AMD Ryzen 9 5950X (Zen3, AVX2+FMA), Burn 0.22.0-pre.4, all rows Q8 weights:
 
 | Attention | Tokens | Threads | Time | Speed |
 |---|---|---|---|---|
@@ -32,78 +100,38 @@ Two attention paths are available (`--attn fused|blocked`):
 | blocked | 3633 | 4 | 25.6 s | 141.8 tok/s |
 | fused | 3633 | 4 | 25.6 s | 142.1 tok/s |
 | blocked | 6501 | 1 | 125.5 s | 51.8 tok/s |
-| fused | 6501 | 1 | 180.2 s | 36.1 tok/s |
-| blocked | 6501 | 4 | 68.5 s | 94.9 tok/s |
 | fused | 6501 | 4 | 61.6 s | **105.6 tok/s** |
 | blocked (chunk 512/key 1024) | 30000 | 32 | 973.9 s | 30.8 tok/s |
 | fused | 30000 | 32 | 572.8 s | **52.4 tok/s** |
 | low-RAM `--quant q8` (blocked) | 3633 | 1 | 53.1 s | 68.5 tok/s |
 | low-RAM `--quant q8` (fused) | 3633 | 4 | 22.4 s | 162.3 tok/s |
 
-Thread scaling (3633 tokens, blocked, chunk/key 256): 1→70.2, 2→105.9, 4→141.8,
-8→155.0, 16→155.4, 32→144.2 tok/s (saturates around 8 threads; ~2.2× total — the
-non-GEMM share of the work is largely memory-bound).
+Numerical parity vs production (`ik_llama.cpp` Q8_0, last-token pooling,
+unnormalized), cosine on newline-free text: 0.999375 (f32, 82 tokens), 0.999280
+(Q8, 82), 0.999411/0.999126 (955), 0.999485/0.999209 (6501).
 
-All rows use Q8 weights (Q8_0-quantized, production-parity numerics). Rows without the
-"low-RAM" tag were measured with the older f32-resident Q8 mode; the low-RAM mode costs
-~2 s per forward (see Memory). f16 weights are a regression on this CPU (flex's f16 path
-is ~2× slower than f32 at model level, despite near-parity in the GEMM microbenchmark),
-so f32 is the only configuration used.
+### Board results (rock-5b-plus, 2026-10-05)
 
-Target was ≥50 tok/s single-core; the board's current production path (patched
-`ik_llama.cpp` Q8_0, 4 threads) does the same 3633-token input in 33.7 s.
+Deployed and measured against the production server, both on cores 4-7 with
+4 threads:
 
-Numerical parity vs production (`ik_llama.cpp` Q8_0, last-token pooling, unnormalized),
-cosine similarity on newline-free text (llama-embedding splits prompts on `\n`):
-
-| Tokens | f32 weights | Q8 weights |
-|---|---|---|
-| 82 | 0.999375 | 0.999280 |
-| 955 | 0.999411 | 0.999126 |
-| 6501 | 0.999485 | 0.999209 |
-
-Both attention paths produce identical embeddings (cosine 1.000000 between them).
-
-## Board results (rock-5b-plus, 2026-10-05)
-
-Deployed to the board (`/root/rocket-inference/` + `/root/models/qwen3-embedding-0.6b/`)
-and measured against the production `ik_llama.cpp` Q8_0 server, both on the A76 cores 4-7
-with 4 threads, identical text (the 2026-10-05 runs used `/root/embeddings-fast/`, the
-deploy dir's pre-inversion name):
-
-| Input | Production ik_llama.cpp | rocket-inference (flex f32, low-RAM) |
+| Input | Production `ik_llama.cpp` | rocket-inference (flex f32, low-RAM) |
 |---|---|---|
 | 3,633 tokens | **46.7 s / 77.8 tok/s** | 106.2 s / 34.2 tok/s |
 | 6,501 tokens | 124.2 s / 52.3 tok/s | 262.2 s / 24.8 tok/s |
 
-- The 50 tok/s target is **not met** on the board (34.2 tok/s at 4 threads, 38.6 at 8;
-  f16 36.1, blocked 29.1). Production is 2.28× faster on the same input.
-- Scaling: 1 core 11.4, 2 cores 20.6, 4 cores 34.2, 8 cores 38.6 tok/s. Our single-core
-  is 35% of the A76 f32 peak; production achieves ~30% of the int8 SDOT peak — it wins by
-  using int8 kernels, which flex does not have.
-- Numerics: board cosine vs the unquantized reference is 0.99928 at 82 tokens, identical
-  to the dev host. Against the live server the number is lower only because production
-  runs a Q8_0 KV cache (`-ctk q8_0 -ctv q8_0`): ours vs server-f16-KV 0.99906, server
-  q8_0-KV vs f16-KV 0.99781.
-- Memory: 771 MiB resident in low-RAM mode vs ~4 GB RSS for the production server at
-  `-c 32768`.
-- Verdict: production stays on `ik_llama.cpp`; see `docs/experiment-log.md` §9 for the
-  full analysis. Closing the gap needs int8 GEMM, which flex lacks.
+- The 50 tok/s target is **not met** on the board; production is 2.28× faster
+  because it uses int8 kernels (flex has no int8 GEMM). Production stays on
+  `ik_llama.cpp`.
+- Memory: 771 MiB resident in low-RAM mode vs ~4 GB for the production server.
+- Numerics: board cosine 0.99928 at 82 tokens vs the unquantized reference,
+  identical to the dev host.
 
-## NPU offload (RK3588 `rocket` driver, `--npu`)
+### NPU offload
 
-The projection matmuls (and optionally attention) can run on the RK3588 NPU through the
-mainline `rocket` driver, via the [`burn-rocket`](../..) library at the repo root, which
-wraps `librocketnpu` (gregordinary/rocket-userspace) and exposes the operations as a Burn
-**backend extension** (`#[backend_extension(Flex)]`; the model calls
-`burn_rocket::matmul` / `burn_rocket::attention`). Build with `--features npu` (aarch64);
-`build.rs` auto-builds the pinned archive into `$OUT_DIR` when `vendor/rocketnpu/` is
-absent (or run `scripts/build-rocketnpu.sh` to install it there; `ROCKETNPU_DIR=<dir>`
-overrides). The NPU path is aarch64-only and links the static
-archive. Weights are **pack-and-drop**: all 196 projections are packed straight
-into resident fp16 NPU buffers (0.82 GiB; q|k|v and gate|up are each one segmented
-weight, so a layer is 4 matmuls) and the CPU keeps only an f16 embedding table
-(**298 MiB resident**).
+All 196 projections are packed into resident fp16 NPU buffers (0.82 GiB; q|k|v
+and gate|up are each one segmented weight) and the CPU keeps only an f16
+embedding table (**298 MiB resident**).
 
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
@@ -111,68 +139,44 @@ weight, so a layer is 4 matmuls) and the CPU keeps only an f16 embedding table
 | `--npu --npu-attn cpu` | 86.9 s | 41.8 tok/s | 409 (-34%) |
 | `--npu` (NPU attention, default) | 80.8 s | 45.0 tok/s | **302 (-51%)** |
 
-Re-verified after the backend-extension refactor (`docs/experiment-log.md` §11); the
-earlier CPU-only row (99.9 s / 677 CPU-s) ran with uninitialized projections because of a
-loading bug fixed there — wall time is unaffected (GEMM cost is data-independent), but the
-fixed path is the one worth comparing against.
+Numerics: cosine 0.999365 vs the production Q8_0 reference; the NPU attention
+run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
+`rocket` module on the board (contained; reboot reverts). `--npu` requires
+`--dtype f32` and excludes `--quant q8`.
 
-- `--npu-attn npu` (default) offloads attention too: it frees ~100 more CPU-seconds for
-  about the same wall time as `--npu-attn cpu` (the library brings the score matrix
-  host-side for the causal mask + softmax). `--npu-attn cpu` is the slightly faster-wall
-  alternative.
-- Numerics: cosine 0.999365 vs the production Q8_0 reference (CPU f32 0.999375, q8
-  0.999280); the NPU attention run is 0.999997 vs the CPU-attention NPU run.
-- Requirements: the 600 MHz-patched `rocket` module on the board
-  (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`, contained; reboot reverts to the
-  stock 200 MHz module). At the stock clock everything still works, ~2-3x slower.
-- See `docs/experiment-log.md` §10-11 for the shape sweep, breakdown and trade-offs.
+## Qwen3.5-0.8B intent (`intent`)
 
-### Memory
-
-`--quant q8` keeps the projection weights Q8_0-quantized in memory and dequantizes each
-weight on the fly (only the current layer's f32 weights are materialized, ~62 MB). The
-token-embedding table is kept in f16. Resident footprint:
-
-| Mode | Anonymous RAM (after load) | Notes |
-|---|---|---|
-| `--quant none` (f32 weights) | ~2.4 GB | fastest for short inputs |
-| `--quant q8` (low-RAM) | **~0.78 GB** | +~2 s per forward (flex dequantizes single-threaded) |
-
-Peak RSS during load is ~2.3 GB even in low-RAM mode (the safetensors file is converted
-to f32 before quantization); the resident figure is the steady state a server keeps. At
-30k tokens activations dominate: peak 3,003 MiB anon in low-RAM mode vs 3,971 MiB in f32
-mode. `libc::malloc_trim` is called after quantization because glibc otherwise retains
-the freed f32 weight pages in its arenas.
-
-## Intent model (`guoxuter/ov_intent_analysis_sft:v7_q8` = Qwen3.5-0.8B, Ollama API)
-
-The same binary also serves OpenViking's recommended local **query planner**:
-`guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder (18 Gated
-DeltaNet linear-attention layers + 6 gated full-attention layers), implemented in
-`src/intent_model.rs` and served through an Ollama-compatible API (`src/ollama.rs`)
-so OpenViking's `query_planner` config works unchanged. The HF safetensors
-(`model.language_model.*`; the vision tower is skipped) load through
-`src/intent_loader.rs`; `--npu` packs the projection groups into resident NPU weights
-for prefill and keeps f16 CPU copies for single-token decode (the NPU matmul pads every
-request to `M >= 256`, which is wasteful per decode step).
+`guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder
+(18 Gated DeltaNet linear-attention layers + 6 gated full-attention layers) —
+a different family from Qwen3. It serves OpenViking's query-planner role behind
+an Ollama-compatible API. The HF safetensors (`model.language_model.*`; the
+vision tower is skipped) load through the family's loader; `--npu` packs the
+projection groups into resident NPU weights for prefill and keeps f16 CPU copies
+for single-token decode.
 
 ```sh
+M=~/models/ov-intent-analysis-sft
 # one-shot greedy generation (raw prompt; drop --raw to wrap in the ChatML template)
-cargo run --release -- gen --model-dir ~/models/ov-intent-analysis-sft \
-  --text "Hello!" --raw --max-new-tokens 32
+$B intent gen --model-dir $M --text "Hello!" --raw --max-new-tokens 32
 
 # Ollama-compatible server (OpenViking query planner)
-cargo run --release -- serve-ollama --model-dir ~/models/ov-intent-analysis-sft \
-  --npu --npu-threads 3 --port 11434 --max-tokens 4096 --max-new-tokens 256
+$B intent serve-ollama --model-dir $M --npu --npu-threads 3 --port 11434 \
+    --max-tokens 4096 --max-new-tokens 256
 curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
 ```
 
-The JSON endpoints accept any request `Content-Type` (like Ollama itself): litellm's
-Ollama client posts its bodies as `application/octet-stream` (litellm 1.83) and axum's
-`Json` extractor would otherwise reject them with 415. litellm routes `ollama/…` through
-`/api/generate` (plain-prompt formatting, then templated here) and `ollama_chat/…`
-through `/api/chat` (ChatML directly).
+Flags: `--model-dir` (default `~/models/ov-intent-analysis-sft`), `--backend`,
+`--text`, `--text-file`, `--raw`, `--max-tokens`, `--max-new-tokens`,
+`--temperature`, `--delta-chunk`, `--npu`, `--npu-threads`, `--embed-f16`,
+`--pure-npu`, `--npu-decode`, `--dump-hidden`, `--dump-steps`, `--port`,
+`--model-name`.
+
+The JSON endpoints accept any request `Content-Type` (like Ollama itself):
+litellm's Ollama client posts its bodies as `application/octet-stream` (litellm
+1.83) and axum's `Json` extractor would otherwise reject them with 415. litellm
+routes `ollama/…` through `/api/generate` and `ollama_chat/…` through
+`/api/chat`.
 
 On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
 
@@ -183,95 +187,199 @@ On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
 | `--npu --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
 
 The CPU f32 and NPU f32-table outputs are token-identical to the HF transformers
-reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0). The table's decode
-column is per 32 greedy tokens: at ~3.7 tok/s a full v7 planner plan (~185 tokens, as
-the model emits for the bundled prompt) takes ~55–60 s — size OpenViking's planner and
-query-expansion timeouts with that in mind. `--embed-f16` is
-faster and smaller but its f16 LM head flips near-ties (the greedy stream diverges after
-~10 tokens); use it when memory matters more than exact parity. `--pure-npu` drops the
-CPU copies entirely (1.29 GB anon) and runs decode on the NPU too — slower (1.5 tok/s),
-useful only when CPU should be left alone. OpenViking wiring and caveats:
-`docs/experiment-log.md` §14.
+reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0).
+`--embed-f16` is faster and smaller but its f16 LM head flips near-ties.
+`--pure-npu` drops the CPU copies entirely and runs decode on the NPU too
+(1.5 tok/s), useful only when CPU should be left alone.
 
-## Usage
+## EmbeddingGemma 2 (`gemma embed|bench|tokenize|serve`)
 
-```sh
-# run from examples/rocket-inference (the bench reads data/bench_text.txt)
-cd examples/rocket-inference
-
-# single-core benchmark on a fixed text
-taskset -c 2 cargo run --release -- bench --backend flex --dtype f32 --tokens 3633 --reps 2 --chunk 256
-
-# embed one text (writes a JSON float array)
-cargo run --release -- embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out out.json
-
-# OpenAI-compatible server
-cargo run --release -- serve --backend flex --dtype f32 --quant q8 --port 8383 --max-tokens 30000
-curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
-  -d '{"input":"Hello world","encoding_format":"float"}'
-```
-
-Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
-`--dtype f32|f16` (bf16 is broken in flex), `--quant none|q8` (q8 = Q8-resident low-RAM
-mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked attention only),
-`--tokens`, `--text`, `--text-file`, `--out`, `--port`, `--max-tokens`, `--model-name`.
-Subcommands: `bench`, `embed`, `gemm`, `serve`, `tokenize`, `gen`, `serve-ollama`
-(the last two are the Qwen3.5 intent model; they take `--max-new-tokens`,
-`--temperature`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`, `--raw`
-and default `--model-dir` to `~/models/ov-intent-analysis-sft`).
-
-Single-core runs are fastest with `--attn blocked --chunk 256 --key-block 256`; the
-default `fused` path is better for long inputs and for multi-threaded serving.
-
-### Cross-compiling for the board (aarch64)
+[EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) is a
+multimodal embedding model built from the Gemma 4 family: a 270M-parameter
+bidirectional text decoder, a 170M vision tower and a 300M audio tower,
+projected into one 768-d embedding space (MRL: 128/256/512/768), with per-layer
+embeddings (PLE) and an 8192-token context. The full checkpoint — text, image,
+video and audio — is implemented, reproducing the HF reference numerics
+(`docs/experiment-log-gemma.md`).
 
 ```sh
-# from the repo root; add --features npu for the NPU build (links librocketnpu)
-cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
-    --no-default-features --features npu
+M=~/models/embeddinggemma-2
+
+# text embedding (768-d, L2-normalized; --dim for MRL truncation, --prompt for task prefixes)
+$B gemma embed --model-dir $M --text "what is the capital of france?" --out out.json
+$B gemma embed --model-dir $M --prompt query --dim 256 --text-file data/one_long.txt --out out.json
+
+# low-RAM mode: Q8-resident projections, dequantized per call (1216 MiB vs 2845 MiB)
+$B gemma embed --model-dir $M --quant q8 --text-file data/one_long.txt --out out.json
+
+# image (the placeholder <|image|> is expanded to BOI + soft tokens + EOI)
+$B gemma embed --model-dir $M --image data/cat.jpeg --out img.json
+# video (1 fps, at most 32 frames) and audio (16 kHz mono WAV; else ffmpeg)
+$B gemma embed --model-dir $M --video data/test.mp4 --out vid.json
+$B gemma embed --model-dir $M --audio data/speech5s.wav --out audio.json
+
+# timings, token ids, server
+$B gemma bench --model-dir $M --text-file data/one_long.txt --reps 2
+$B gemma tokenize --model-dir $M --text "hello"
+$B gemma serve --model-dir $M --port 8390
 ```
 
-`--no-default-features` drops the CubeCL/LLVM `cpu` backend, whose prebuilt LLVM bundle is
-host-architecture and cannot link for aarch64. The `flex` backend (NEON on aarch64) is
-always available and is the one this project uses. The linker is configured in
-`.cargo/config.toml`. The resulting binary was smoke-tested under `qemu-aarch64`:
-tokenizer ids and embeddings match the x86 build exactly (cosine 1.0).
+Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
+`--dtype f32` (f16 is rejected — RMSNorm/softmax/PLE need f32), `--text`,
+`--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
+`--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
+`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--port`,
+`--model-name`, `--max-tokens`, `--quant none|q8`, `--npu`, `--npu-threads`,
+`--npu-attn npu|cpu`, plus `--dump-*` debug hooks.
 
-## Design
+Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
+`code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`
+for no prefix (`--prompt none` is also accepted).
 
-- **Embedding-only model** (`src/model.rs`): 28 layers, GQA 16/8 heads, head_dim 128,
-  QK-RMSNorm, RoPE θ=1e6, SwiGLU MLP, final RMSNorm + last-token pooling. `lm_head` is
-  skipped, matching the patched production `ik_llama.cpp`.
-- **Attention**: two interchangeable paths, both causal and numerically identical:
-  - `fused` (default): `burn::tensor::module::attention` with `is_causal: true`; flex
-    dispatches to a tiled flash-attention kernel (online softmax, `TILE_KV=64`) that
-    parallelizes over heads and handles GQA natively (16 q heads vs 8 kv heads, no
-    repeat needed). Wins on long inputs and multi-threaded runs.
-  - `blocked`: a portable tensor-op implementation of the same blocked online softmax
-    (`--chunk`/`--key-block`, defaults 256/256). Large GEMM shapes make it faster
-    single-threaded at short/medium lengths.
-- **Weights**: HF safetensors loaded through `SafetensorsStore` +
-  `PyTorchToBurnAdapter` (Linear `[out,in]` → Burn `[in,out]`).
-- **Q8 (low-RAM mode)**: `QuantScheme::default().with_value(Q8S).per_block([32], F16)`
-  reproduces llama.cpp's Q8_0 quantization (scale = max_abs/127 per 32-value block).
-  `--quant q8` keeps projection weights quantized and dequantizes each weight per
-  forward (`Qwen3Embedding::quantized` / `linear_forward` in `src/model.rs`), which cuts
-  resident RAM from ~2.4 GB to ~0.78 GB at a cost of ~2 s per forward — flex's
-  `dequantize` is a single-threaded scalar loop and flex has no fused quantized GEMM.
-  The embedding table is kept in f16 (flex's bf16 gather is broken; f16 is exact for
-  bf16-sourced values in range). `libc::malloc_trim` releases the freed f32 pages.
-- **Server** (`src/server.rs`): axum, `/v1/embeddings` (string, string list, token ids,
-  base64), `/v1/models`, `/health`; requests are serialized on the model (the flex backend
-  and NPU engine are already serialized), but `/health` and `/v1/models` never take that
-  lock, and a panicking forward is contained (500) instead of poisoning the server. Raw
-  token ids over `--max-tokens` are rejected; text is truncated as before.
+### Server
+
+```sh
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"what is the capital of france?"}'
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":["a","b"],"dim":256,"prompt":"query"}'
+# native multimodal endpoint: paths, or data: URIs with base64 payloads
+curl -s localhost:8390/embed -H 'Content-Type: application/json' \
+  -d '{"image":"/path/to/cat.jpeg"}'
+curl -s localhost:8390/embed -H 'Content-Type: application/json' \
+  -d '{"audio":"/path/to/speech.wav","text":"task: sentence similarity | query: <|audio|>"}'
+curl -s localhost:8390/health; curl -s localhost:8390/v1/models
+```
+
+`/v1/embeddings` accepts a string or an array of strings; `/embed` accepts
+`text`/`image`/`video`/`audio` (media values are filesystem paths or
+`data:<mime>;base64,<payload>` blobs). Every embedding is L2-normalized; `dim`
+applies MRL truncation before normalization.
+
+### Verification and memory
+
+Summary against the HF f32 reference (transformers 5.19; full table in the log):
+
+| input | cosine |
+|---|---|
+| text (9 tok, 2594 tok; dims 768/256) | 1.00000000 |
+| image (PNG/JPEG), video (4 frames), audio (5 s/30 s) | 1.00000000 |
+| text + image / text + audio | 1.00000000 |
+| any modality, `--quant q8` | 0.9996-0.9999 |
+| any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
+
+Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
+1068 MiB; all share a ~4.2 GiB load peak. The text backbone on the NPU packs 218
+projections into 0.25 GiB of resident fp16 weights with windowed attention: on
+the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
+user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
+33% less CPU. The vision/audio towers, norms, RoPE and the embedding table stay
+on the CPU.
+
+Known limits: audio resampling is exact for 16 kHz mono WAV (other rates go
+through ffmpeg, ~0.994 cosine vs librosa/soxr); batch inputs are processed one
+at a time.
+
+## Gemma 4 E2B-it (`gemma gen|serve-chat`)
+
+`google/gemma-4-E2B-it` (10.25 GB BF16 checkpoint): the causal Gemma 4 decoder
+with KV sharing (layers 15-34 reuse the K/V of layer 13/14 and use double-wide
+MLPs), per-layer embeddings with the token table, proportional p-RoPE on the
+full layers and a soft-capped tied LM head. Greedy output is **token-identical**
+to the HF 5.19 reference (see the log).
+
+```sh
+G=/mnt/hub/models/gemma-4-E2B-it   # dev host; ~/models/gemma-4-E2B-it elsewhere
+
+# greedy generation (f32 parity mode)
+$B gemma gen --gen-model-dir $G --text "What is the capital of France?" --max-new-tokens 64
+# chat-style messages and sampling
+$B gemma gen --gen-model-dir $G \
+    --messages '[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}]' \
+    --sample --temperature 0.7 --top-k 64 --top-p 0.95
+# image / audio input (the placeholder expands to the tower's soft tokens)
+$B gemma gen --gen-model-dir $G --text "What is in this image? <|image|>" --image data/cat.jpeg
+$B gemma gen --gen-model-dir $G --text "What do you hear? <|audio|>" --audio data/speech5s.wav
+
+# non-streaming OpenAI-compatible server
+$B gemma serve-chat --gen-model-dir $G --port 8391
+curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+```
+
+Flags: `--gen-model-dir` (default `/mnt/hub/models/gemma-4-E2B-it`), `--backend`,
+`--text`, `--text-file`, `--image`, `--audio`, `--max-soft-tokens`,
+`--video-fps`, `--video-max-frames`, `--messages`, `--max-new-tokens`,
+`--sample`, `--temperature`, `--top-k`, `--top-p`, `--enable-thinking`, `--f16`,
+`--quant none|q8`, `--npu`, `--npu-threads`, `--attn-chunk`, `--dump-logits`,
+`--out`, `--port`, `--model-name`.
+
+Precision modes (`gen`/`serve-chat`), measured on the dev host (32 threads,
+16-token prompt / 9-token answer):
+
+| mode | flags | resident | decode | notes |
+|---|---|---|---|---|
+| f32 (default) | - | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
+| f16 | `--f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
+| Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call |
+
+`serve-chat` is non-streaming and takes OpenAI-style `messages` (string or
+text-part content), plus `image_url` (data URI or path) and `input_audio`
+(base64 + format) parts — one of each per request; the server inserts the
+placeholder tokens itself.
+
+### QAT mobile checkpoint
+
+`google/gemma-4-E2B-it-qat-mobile-transformers` (2.46 GB) is supported natively
+— no conversion step. Weights are packed INT2/INT4/INT8 with per-output-channel
+scales (per-row block scales for the token tables) and the checkpoint's SRQ
+activation rounding is applied around the affected linears. `--f16` is the
+useful configuration:
+
+```sh
+$B gemma gen --gen-model-dir ~/models/gemma-4-E2B-it-qat-mobile --f16 \
+    --text "What is the capital of France?" --max-new-tokens 16
+```
+
+| mode | resident | short decode | notes |
+|---|---|---|---|
+| f32 | 12.0 GiB | 3.9 tok/s | parity mode (f32 projections) |
+| `--f16` | 6.6 GiB | 4.9 tok/s | 12/12 tokens identical to the f32 reference on the 631-token prompt |
+| `--quant q8` | 6.1 GiB | 0.07 tok/s | memory-only |
+
+The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
+2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the
+631-token prompt is 12/12 with `--f16`. The PLE table stays packed (rows
+dequantized on lookup, 1.13 GiB instead of 8.75 GiB f32). SRQ makes long-context
+near-ties sensitive; `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks.
+
+### NPU prefill
+
+`--npu` packs the used text projections into resident fp16 NPU weights and runs
+prefill matmuls + `attention_causal_window` on the NPU, while decode keeps the
+CPU f32 copies. Board measurement pending an idle board (the model needs
+~9.5 GB host + 2.1 GiB NPU; the 2026-10-07 attempt was OOM-killed on a busy
+board). Not yet done: streaming, video input.
+
+## Cross-compiling for the board (aarch64)
+
+`--no-default-features` drops the CubeCL/LLVM `cpu` backend, whose prebuilt LLVM
+bundle is host-architecture and cannot link for aarch64; `flex` (NEON on
+aarch64) is always available. The linker is configured in `.cargo/config.toml`.
+`--features npu` links `librocketnpu.a`: `build.rs` uses `ROCKETNPU_DIR` when
+set, else a matching `vendor/rocketnpu/`, else builds one into `$OUT_DIR` with
+`scripts/build-rocketnpu.sh`.
 
 ## Notes
 
-- `Device::sync()` is required before reading wall-clock times; `to_data()` alone does not
-  wait for execution.
-- Tokenization uses the HF `tokenizer.json` with `add_special_tokens=true`, which appends
-  the EOS token (151643) exactly like `llama-embedding` does.
-- Backend choice: `flex` (AVX2/NEON CPU kernels, no JIT) is measurably faster here than
-  `cpu` (CubeCL/LLVM) for small-batch inference; `cpu` pays a 3–8 s JIT cost per process
-  and a ~3.3× penalty on transposed-B GEMM.
+- `Device::sync()` is required before reading wall-clock times; `to_data()`
+  alone does not wait for execution.
+- Tokenization uses the HF `tokenizer.json`; the qwen path uses
+  `add_special_tokens=true`, matching `llama-embedding` token counts.
+- All servers serialize requests on the model (flex already parallelizes
+  internally; the NPU engine is serialized by design), contain panicking
+  forwards instead of poisoning the server, and keep `/health`/`/v1/models`
+  lock-free.
+- `--quant q8` keeps projection weights Q8_0-quantized (symmetric int8,
+  32-value blocks, f16 block scales = llama.cpp's Q8_0) and dequantizes each
+  weight per forward; `libc::malloc_trim` releases the freed f32 pages.

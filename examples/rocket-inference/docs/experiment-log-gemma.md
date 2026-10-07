@@ -1,7 +1,7 @@
 # EmbeddingGemma 2 — experiment log
 
 Dev host: 32-thread x86_64, f32, `flex` backend, release build
-(`cargo build --release -p rocket-inference-gemma --no-default-features`),
+(`cargo build --release -p rocket-inference --no-default-features`),
 model `google/embeddinggemma-2` (1.49 GB safetensors, 1376 tensors).
 Reference stack: `/mnt/hub/venvs/emb2` (transformers 5.19.0,
 sentence-transformers 6.1.0, torch 2.14.0+cpu, torchvision 0.29.1+cpu).
@@ -141,9 +141,9 @@ wedge the model lock).
 
 ```sh
 # text (compare with the HF reference)
-B=$CARGO_TARGET_DIR/release/rocket-inference-gemma
+B=$CARGO_TARGET_DIR/release/rocket-inference
 M=/mnt/hub/models/embeddinggemma-2
-$B embed --model-dir $M --prompt query --text-file data/one_long.txt --out /tmp/ours.json
+$B gemma embed --model-dir $M --prompt query --text-file data/one_long.txt --out /tmp/ours.json
 /mnt/hub/venvs/emb2/bin/python tools/ref_embeddinggemma2.py embed \
     --prompt query --text-file data/one_long.txt --out /tmp/ref.json
 python3 -c "import json,math;a=json.load(open('/tmp/ours.json'));b=json.load(open('/tmp/ref.json'));\
@@ -355,7 +355,7 @@ kill to the scoped process; the board's other services were unaffected.
 On an idle board the configuration fits (15.8 GB total RAM vs ~9.5 GB host +
 2.1 GiB NPU + system), so the A/B only needs a free board. The model is
 deployed at `/root/models/gemma-4-E2B-it/` and the aarch64 `--features npu`
-binary at `/root/rocket-inference-gemma/`; the same NPU machinery measured 1.61x
+binary at `/root/rocket-inference/` (the merged app; `gemma gen`); the same NPU machinery measured 1.61x
 on prefill for the embedding model (log §9), and decode throughput is unchanged
 by design.
 

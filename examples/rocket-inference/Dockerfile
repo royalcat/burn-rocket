@@ -1,11 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# rocket-inference — Qwen3-Embedding-0.6B OpenAI-compatible embedding server
-# (Rust/Burn, flex backend) for the openviking stack on rock-5b-plus. Built on
-# the burn-rocket library at the repo root; see examples/rocket-inference.
+# rocket-inference — the merged inference app (Qwen3-Embedding-0.6B, Qwen3.5-0.8B
+# intent, EmbeddingGemma 2, Gemma 4 E2B-it; Rust/Burn, flex backend) for the
+# openviking stack on rock-5b-plus. Built on the burn-rocket library at the repo
+# root; see examples/rocket-inference. The default command is the Qwen3
+# embedding server.
 #
 # aarch64 only: the `npu` feature links the aarch64-only static librocketnpu,
-# and `serve --npu` offloads the projections to the RK3588 NPU through the
+# and `qwen3 serve --npu` offloads the projections to the RK3588 NPU through the
 # mainline `rocket` driver (needs /dev/accel/accel0 at run time). Without
 # `--npu` the same image serves the flex CPU path.
 #
@@ -47,6 +49,6 @@ ENTRYPOINT ["rocket-inference"]
 # deployment finding, 2026-10-05) and an 8192-token cap (OpenViking's client
 # times out at 600 s). Mount the weights at /models/qwen3-embedding-0.6b and
 # pass --device /dev/accel/accel0.
-CMD ["serve", "--backend", "flex", "--dtype", "f32", "--npu", "--npu-attn", "cpu", "--port", "8383", \
+CMD ["qwen3", "serve", "--backend", "flex", "--dtype", "f32", "--npu", "--npu-attn", "cpu", "--port", "8383", \
      "--max-tokens", "8192", "--model-dir", "/models/qwen3-embedding-0.6b", \
      "--model-name", "qwen3-embedding"]

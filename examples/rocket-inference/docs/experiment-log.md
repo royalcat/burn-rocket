@@ -46,7 +46,7 @@ Findings:
 
 ## 2. Model implementation
 
-`src/model.rs`: embedding-only Qwen3 (no `lm_head`), 28 layers, hidden 1024, 16/8 heads,
+`src/qwen3_embedding/model.rs`: embedding-only Qwen3 (no `lm_head`), 28 layers, hidden 1024, 16/8 heads,
 head_dim 128, intermediate 3072, QK-RMSNorm, RoPE θ=1e6, SwiGLU, final RMSNorm,
 last-token pooling. Chunked causal attention: query chunks of size `--chunk` attend to
 all preceding keys, so the score tensor stays `[1,16,chunk,seq]`.
@@ -143,7 +143,7 @@ Also verified: causal vs non-causal attention changes the embedding
 
 ## 5. Server
 
-`src/server.rs` (axum): `POST /v1/embeddings` with OpenAI-compatible request/response,
+`src/qwen3_embedding/server.rs` (axum): `POST /v1/embeddings` with OpenAI-compatible request/response,
 accepting a string, a list of strings, token ids, or a list of token id lists;
 `encoding_format: float|base64`; `GET /v1/models`, `GET /health`; inputs truncated at
 `--max-tokens` (default 30000). A mutex serializes requests because flex already
@@ -256,7 +256,7 @@ reclaimable), 3,462 MiB peak RSS; 3,971 MiB peak at 30k tokens (activations). Pr
 ### 8.1 Keeping weights quantized
 
 `--quant q8` now keeps projection weights Q8_0-quantized in memory and dequantizes each
-weight once per layer per forward (`linear_forward` in `src/model.rs`), so only the
+weight once per layer per forward (`linear_forward` in `src/util/proj.rs`), so only the
 current layer's f32 weights (~62 MB) are materialized. First attempt was numerically
 exact (cosine 1.000000 vs the f32-resident Q8 path) but had two problems:
 
@@ -473,7 +473,7 @@ extension* (`#[backend_extension(Flex)]`, the out-of-tree op hook of
 0.22.0-pre.4): the `RocketOps` trait declares `rocket_pack/pack2/pack3` (weights ->
 resident handles), `rocket_matmul` and `rocket_attention`; the safe wrappers `pack`,
 `pack2`, `pack3`, `matmul`, `attention` take ordinary `Tensor`s and do the
-`into_dispatch`/`from_dispatch` plumbing, so `src/model.rs` calls
+`into_dispatch`/`from_dispatch` plumbing, so `src/qwen3_embedding/model.rs` calls
 `burn_rocket::matmul` / `burn_rocket::attention` directly and `src/npu.rs` is gone.
 Handles are plain `u64`-backed `WeightId`s (no `ExtensionType` plumbing needed; an op
 without a tensor input cannot select a backend, so there is no `release`). One global
@@ -629,11 +629,11 @@ of Qwen3-Embedding.
   `sigmoid(gate)` before `o_proj`), hidden 1024, intermediate 3584, vocab 248320,
   embeddings tied, zero-centered RMSNorm (`1 + w`).
 
-Port: `src/intent_model.rs` (chunked gated delta rule for prefill, recurrent form for
+Port: `src/qwen35_intent/model.rs` (chunked gated delta rule for prefill, recurrent form for
 decode, KV/conv/recurrent caches, explicit single-query attention for decode),
-`src/intent_loader.rs` (safetensors loader + NPU pack-and-drop), `src/ollama.rs`
+`src/qwen35_intent/loader.rs` (safetensors loader + NPU pack-and-drop), `src/qwen35_intent/ollama.rs`
 (Ollama-compatible `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`), wired into
-the existing binary as `gen` and `serve-ollama`. The chat template matches the model's
+the binary as `intent gen` and `intent serve-ollama`. The chat template matches the model's
 Ollama template exactly (`<|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n`,
 stops `<|im_end|>`/`<|endoftext|>`).
 

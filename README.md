@@ -24,10 +24,10 @@ standard clients work unchanged:
 
 | model | API | command |
 |---|---|---|
-| Qwen3-Embedding-0.6B | OpenAI `/v1/embeddings`, `/v1/models`, `/health` | `rocket-inference serve` |
-| Qwen3.5-0.8B intent/query planner | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve-ollama` |
-| EmbeddingGemma 2 (text/image/video/audio) | OpenAI `/v1/embeddings` + native multimodal `/embed` | `rocket-inference-gemma serve` |
-| Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions` | `rocket-inference-gemma serve-chat` |
+| Qwen3-Embedding-0.6B | OpenAI `/v1/embeddings`, `/v1/models`, `/health` | `rocket-inference qwen3 serve` |
+| Qwen3.5-0.8B intent/query planner | Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference intent serve-ollama` |
+| EmbeddingGemma 2 (text/image/video/audio) | OpenAI `/v1/embeddings` + native multimodal `/embed` | `rocket-inference gemma serve` |
+| Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions` | `rocket-inference gemma serve-chat` |
 
 The Qwen3 embedding server is the configuration running in production on a Rock 5B+
 (OpenViking's embedding backend, `--npu --npu-attn cpu --max-tokens 8192`): a
@@ -125,23 +125,26 @@ reverts on reboot. Everything works at the stock clock.
 ## Example
 
 [`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
-built on this library. It serves the Qwen3-Embedding-0.6B embedding model (CLI `bench`,
-`embed`, `gemm`, `serve`, `tokenize`; OpenAI-compatible `/v1/embeddings`) and the
-Qwen3.5-0.8B intent/query-planner model (`gen`, `serve-ollama`; Ollama-compatible
-`/api/chat`, `/api/generate`), with measurements from the Rock 5B+
-(`docs/experiment-log.md` there). On the board the embedding NPU path runs the
-3,633-token input at 45 tok/s while using ~51% fewer CPU-seconds than the CPU-only flex
-path (the CPU path remains ~2.3× slower than the production `ik_llama.cpp` Q8_0 server);
-the intent model is token-identical to the HF reference and runs a 166-token v7 planner
-prompt in 11.7 s with `--npu` (89.9 s CPU-only, 7.7× wall).
+built on this library: one binary, four model families, selected by the first argument
+(`qwen3`, `intent`, `gemma`). It serves the Qwen3-Embedding-0.6B embedding model (CLI
+`qwen3 bench|embed|gemm|serve|tokenize`; OpenAI-compatible `/v1/embeddings`), the
+Qwen3.5-0.8B intent/query-planner model (`intent gen|serve-ollama`; Ollama-compatible
+`/api/chat`, `/api/generate`), the multimodal EmbeddingGemma 2 (`gemma embed|bench|
+tokenize|serve`; OpenAI `/v1/embeddings` plus a native `/embed` for image, video and
+audio) and Gemma 4 E2B-it generation (`gemma gen|serve-chat`;
+`/v1/chat/completions`), with measurements from the Rock 5B+ in
+`docs/experiment-log.md` and `docs/experiment-log-gemma.md` there.
 
-[`examples/rocket-inference-gemma`](examples/rocket-inference-gemma) is a second,
-multimodal app: EmbeddingGemma 2 (text, image, video and audio embeddings, plus an
-OpenAI-compatible `/v1/embeddings` and a native multimodal `/embed`), with all
-modalities matching the HF f32 reference (cosine 1.0; `--quant q8` gives 0.9996-0.9999
-at 1216 MiB resident). Its text backbone runs on the NPU: 218 projections packed into
-0.25 GiB of resident fp16 weights plus windowed attention, for 1.61x wall and -33 %
-user CPU vs the CPU baseline on the board (2587-token text).
+On the board the Qwen3 embedding NPU path runs the 3,633-token input at 45 tok/s while
+using ~51% fewer CPU-seconds than the CPU-only flex path (the CPU path remains ~2.3×
+slower than the production `ik_llama.cpp` Q8_0 server); the intent model is
+token-identical to the HF reference and runs a 166-token v7 planner prompt in 11.7 s
+with `--npu` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 reference
+on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident)
+and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
+fp16 weights plus windowed attention, for 1.61x wall and -33 % user CPU vs the CPU
+baseline (2587-token text). Gemma 4 E2B-it greedily reproduces the HF reference
+token-for-token, and its QAT mobile checkpoints load bit-exactly.
 
 ## License
 
