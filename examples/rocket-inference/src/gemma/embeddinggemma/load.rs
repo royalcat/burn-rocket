@@ -29,6 +29,13 @@ pub struct NpuOpts {
     pub attn: bool,
     /// Pack the text projections as resident group-wise int8 (W8A8) instead of fp16.
     pub int8: bool,
+    /// K-group width for the resident int8 weights (`--npu-int8-group`).
+    ///
+    /// The library pins the group-wise K-tile to a divisor of this group and
+    /// reads every K-tile's `M x N` int32 partial back to the host, so the
+    /// readback (and thus the speed) scales with `K / group`. 32 is the most
+    /// accurate; wider groups trade accuracy for speed.
+    pub i8_group: usize,
 }
 
 pub fn load_model(
@@ -108,7 +115,7 @@ pub fn load_model(
 
 /// Pack the text backbone's projections into resident NPU buffers (HF `[N, K]`
 /// layout, one pack per weight) and drop the f32 copies. `opts.int8` packs
-/// group-wise int8 resident weights (W8A8, group 32) instead of fp16.
+/// group-wise int8 resident weights (W8A8, group `opts.i8_group`) instead of fp16.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn load_npu_text(
     mut model: Emb2Model,
@@ -116,9 +123,6 @@ fn load_npu_text(
     opts: NpuOpts,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
-    /// K-group width for the resident int8 weights.
-    const I8_GROUP: usize = 32;
-
     burn_rocket::init(opts.threads)
         .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
     let t0 = Instant::now();
@@ -147,7 +151,7 @@ fn load_npu_text(
         }
         let tensor = Tensor::<2>::from_data(TensorData::new(t, [n, k]), device);
         let id = if opts.int8 {
-            burn_rocket::pack_i8(tensor, I8_GROUP)
+            burn_rocket::pack_i8(tensor, opts.i8_group)
         } else {
             burn_rocket::pack(tensor)
         };

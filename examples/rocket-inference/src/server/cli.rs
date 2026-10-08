@@ -87,6 +87,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     threads: args.npu_threads.unwrap_or(5),
                     attn: args.npu_attn.unwrap_or(true),
                     int8: false,
+                    i8_group: 32,
                 }),
                 &device,
             )?;

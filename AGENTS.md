@@ -54,7 +54,7 @@ name), `--max-tokens`, `--max-new-tokens`, `--temperature`, plus the detected
 family's loading flags:
 
 - qwen3: `--dtype`, `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--chunk`, `--key-block`, `--attn`
-- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
+- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--npu-int8-group`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
 - intent: `--npu`, `--npu-threads`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`
 - Gemma 4: `--f16`, `--quant`, `--npu`, `--npu-threads`, `--attn-chunk`
 
@@ -106,7 +106,8 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   timing plumbing is `AppState::compute` (`src/server/mod.rs`), the line format
   `src/server/log.rs`; dev-verified for embeddings (qwen3 q8) and chat (Gemma 4 QAT).
 - **EmbeddingGemma 2 performance round** (2026-10-08, log §12): four changes,
-  numerically validated on the board (timing pending an idle board).
+  validated on the board (timings in log §12.5: canonical ~2x on short input,
+  fused glue -12 %, int8 g32 readback-bound and 2.4x slower than fp16).
   (1) *Canonical tiling*: `init` now uses `rocket_ctx_create_ex(threads,
   ROCKET_CTX_TILING_CANONICAL)` so resident weights serve any `M >= 4` and small
   requests no longer pad every matmul to 256 rows (`ROCKET_CTX_CANONICAL=0`
@@ -116,7 +117,11 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   2587-token cosine vs HF f32 0.99985 (fp16 0.9999997, the deployed q8
   0.9996467), text weights 0.11 GiB vs 0.25. A torch probe
   (`tools/w8a8_probe.py`) gates the convention: per-32-group activations cost
-  almost nothing (0.99986), whole-K row scales much more (0.99964).
+  almost nothing (0.99986), whole-K row scales much more (0.99964). The group-wise
+  path is readback-bound — at g32 it is 2.4x slower than fp16, so int8 is a
+  numerics/memory option, not a speed one; the width is configurable
+  (`--npu-int8-group`), and wider groups buy speed back at a monotone numerics
+  cost (g512 = fp16 speed at 0.9992, log §12.5).
   (3) *Chunked banded attention* for the 20 sliding layers
   (`--attn-chunk`, default 1024, keys `[q0-w, q1+w)`) through the new
   `attention_window_block` op + `masks::build_window_mask_block`; 2.6k full-vs-
@@ -574,8 +579,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   idea applies (per-chunk `[C, q1]` causal masks, prefix keys), plus a 30k measurement
   of the emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
 - Board service: the emb2 backend runs the pre-round `c951944` image. Redeploy on
-  this build (canonical tiling + chunked attention + glue; consider `--npu-int8` as
-  the default — better numerics *and* faster) and re-measure the served latencies.
+  this build (canonical tiling + chunked attention + glue; keep fp16 `--npu` as the
+  speed config — the int8 g32 path is 2.4x slower, readback-bound) and re-measure
+  the served latencies.
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak
   in `--quant q8` mode.
 - Intent model: with canonical tiling the `M = 1` decode no longer pads to 256 rows,

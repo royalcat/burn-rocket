@@ -300,7 +300,8 @@ Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
 `--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
 `--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--quant none|q8`,
-`--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`, plus `--dump-*`
+`--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`,
+`--npu-int8-group` (default 32), plus `--dump-*`
 debug hooks. On the NPU build, `ROCKET_CTX_CANONICAL=0` restores the legacy
 pad-to-256 tiling and `ROCKET_GLUE=0/1` toggles the fused host kernels
 (`--npu` enables them; `=1` forces them in CPU modes).
@@ -333,10 +334,11 @@ user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster
 33% less CPU. The vision/audio towers, norms, RoPE and the embedding table stay
 on the CPU.
 
-Performance round (2026-10-08, log §12; board timings pending an idle board):
+Performance round (2026-10-08, log §12; board timings in §12.5):
 canonical tiling (short requests no longer pad every matmul to 256 rows),
 resident int8 text projections (`--npu-int8`; cosine 0.99985 vs HF f32 — better
-than the q8 path's 0.99965 — and 0.11 GiB resident), chunked banded attention
+than the q8 path's 0.99965 — at 0.11 GiB resident; readback-bound, so a
+numerics/memory option rather than a speed one), chunked banded attention
 for the 20 sliding layers (a 7764-token run sits at 1068 MiB anon and matches
 the full path's numerics, where the full-matrix path OOM-kills inside a 3 GB
 cgroup), and fused host kernels for gelu·up/RMSNorm/RoPE (`ROCKET_GLUE=0/1` A/B;

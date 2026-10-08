@@ -60,6 +60,7 @@ struct Args {
     npu_threads: usize,
     npu_attn: bool,
     npu_int8: bool,
+    npu_int8_group: usize,
 }
 
 impl Args {
@@ -97,6 +98,7 @@ impl Args {
             npu_threads: 5,
             npu_attn: true,
             npu_int8: false,
+            npu_int8_group: 32,
         };
         if let Some(v) = f.take("--model-dir")? {
             args.model_dir = PathBuf::from(v);
@@ -185,6 +187,15 @@ impl Args {
         args.npu_int8 = f.take_bool("--npu-int8");
         if args.npu_int8 && !args.npu {
             bail!("--npu-int8 requires --npu");
+        }
+        if let Some(g) = f.take_parsed::<usize>("--npu-int8-group")? {
+            if !args.npu_int8 {
+                bail!("--npu-int8-group requires --npu-int8");
+            }
+            if g == 0 || g % 32 != 0 {
+                bail!("--npu-int8-group must be a positive multiple of 32 (got {g})");
+            }
+            args.npu_int8_group = g;
         }
         if let Some(v) = f.take_parsed("--npu-threads")? {
             args.npu_threads = v;
@@ -295,6 +306,7 @@ fn run_embed(args: &Args) -> Result<()> {
             threads: args.npu_threads,
             attn: args.npu_attn,
             int8: args.npu_int8,
+            i8_group: args.npu_int8_group,
         }),
         &device,
     )?;
@@ -350,6 +362,7 @@ fn run_bench(args: &Args) -> Result<()> {
             threads: args.npu_threads,
             attn: args.npu_attn,
             int8: args.npu_int8,
+            i8_group: args.npu_int8_group,
         }),
         &device,
     )?;

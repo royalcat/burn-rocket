@@ -443,13 +443,14 @@ short queries and the intent model's `--pure-npu` M = 1 decode.
 
 `burn-rocket` gained the library's resident group-wise int8 path
 (`rocket_i8_ctx_create` / `rocket_i8_weights_pack_gw` /
-`rocket_matmul_int8_prepacked_gw`): symmetric int8, group 32, one weight scale
-per output channel per K-group (`b_scale[N, K/32]`, verified against the
-library's `rocket_prepacked_int8.c`), one activation scale per row per K-group;
-the A rows are padded to `M % 4` caller-side. The codes live on the NPU
-permanently; the host drops the f32 copies like the fp16 pack does. The
-`--npu-int8` flag (gemma emb2; requires `--npu`) selects it; `--quant q8` is
-ignored with it (the int8 pack quantizes straight from f32).
+`rocket_matmul_int8_prepacked_gw`): symmetric int8, group configurable via
+`--npu-int8-group` (default 32), one weight scale per output channel per K-group
+(`b_scale[N, K/group]`, verified against the library's `rocket_prepacked_int8.c`),
+one activation scale per row per K-group; the A rows are padded to `M % 4`
+caller-side. The codes live on the NPU permanently; the host drops the f32
+copies like the fp16 pack does. The `--npu-int8` flag (gemma emb2; requires
+`--npu`) selects it; `--quant q8` is ignored with it (the int8 pack quantizes
+straight from f32).
 
 The torch probe (`tools/w8a8_probe.py`) ran before any Rust, simulating the
 library's conventions on the 2594-token text: per-32-group weights + per-32-group
@@ -463,8 +464,10 @@ scales lose much more (0.99964). Board results match the probe:
 | `--quant q8 --npu` (the deployed config) | 0.999646657 | 0.25 GiB |
 | 9-token text, int8 vs fp16 | 0.999916317 | — |
 
-So int8 is *more* accurate than the deployed q8 path while being the fastest
-matmul path the library offers (int8 is ~2x the fp16 rate on this part).
+So int8 is *more* accurate than the deployed q8 path at the default group. Its
+speed is another matter: the group-wise path is readback-bound, and the group
+width trades accuracy for speed — see the sweep in §12.5 (g32 is 2.4x slower
+than fp16; g512 matches fp16 speed at 0.9992).
 
 ### 12.3 Chunked banded attention for the sliding layers
 
@@ -508,16 +511,78 @@ the composite ops, `ROCKET_GLUE=1` forces the kernels in CPU modes for the A/B).
 Pure-CPU modes keep the composite ops, so their bit-parity with the HF reference
 is untouched.
 
-### 12.5 Timing (pending)
+### 12.5 Timing (board, 2026-10-08)
 
-`/root/rocket-inference/validate.sh` holds the full A/B (canonical on/off short
-and long, fp16 vs int8, full vs chunked, glue on/off with stage and NPU
-breakdowns). Run it on an idle board and fold the numbers in here.
+All runs on the shared board (load avg 19-24 from docker churn, `tstor-scan` and
+the production `openviking-embed-1` service, which shares cores 4-7 and the NPU),
+so absolute walls are lower bounds; each comparison was run back-to-back. The
+spread of identical repeats is ±20 %: the q8+npu 2587-token run ranged
+12.6-19.5 s across the round.
+
+Canonical tiling (P1) — short input is where it pays; the long input does the
+same padded work either way (bit-identical output, the 12.6 vs 17.7 s gap is
+board noise):
+
+| 16-token text, `--quant q8 --npu` | rep 0 | rep 1 | rep 2 |
+|---|---|---|---|
+| `ROCKET_CTX_CANONICAL=0` | 0.73 s | 0.58 s | 0.60 s |
+| canonical (default) | 0.41 s | 0.31 s | 0.28 s |
+
+Int8 vs fp16 (P2, 2587 tokens, no q8): fp16 17.15 s (attn 10.18, mlp 3.78,
+ple 0.96; NPU 10.96 s) vs **int8 g32 41.85 s** (attn 18.66, mlp 17.46, ple 3.44;
+NPU 35.54 s). The group-wise path pins the K-tile to a divisor of the group, so
+g32 makes 448 K-tiles at K=14336 and reads every tile's full `M x N` int32
+partial back to the host (~1.5 GB per MLP layer at 2587 tokens) — it is
+readback-bound, not compute-bound, and 2.4x slower than fp16 at g32. Wider
+groups cut the readback linearly (`--npu-int8-group`):
+
+| group | wall (pass 1 / 2) | NPU time (pass 1 / 2) | cosine vs HF f32 |
+|---|---|---|---|
+| fp16 | 15.23 / 15.93 s | 9.33 / 9.25 s | 0.999999749 |
+| 32 | 38.96 / 34.64 s | 32.63 / 29.21 s | 0.999850521 |
+| 128 | 22.57 / 18.29 s | 15.68 / 12.69 s | 0.999682960 |
+| 256 | 17.66 / 15.07 s | 11.18 / 10.25 s | 0.999553430 |
+| 512 | 13.89 / 14.03 s | 8.86 / 8.80 s | 0.999204856 |
+
+The NPU time tracks `K / group` almost exactly (32.6 -> 8.9 s from g32 to g512),
+confirming the readback diagnosis. At g512 the int8 path edges past fp16
+(13.9-14.0 vs 15.2-15.9 s) but at 0.9992 cosine, well below the deployed q8's
+0.99965; g256 is fp16-speed within noise at 0.99955. The int8 compute is ~2x
+fp16, so the readback still eats most of the theoretical win (an ~4.7 s NPU
+floor plus ~2-3 s of readback).
+
+Chunked banded attention (P3, 2587 tokens): full (chunk 4096) 13.90 s
+(attn 7.61) vs chunked 15.84 s (attn 9.73) — chunking costs ~14 % at 2.6k. Its
+value is memory: at 7.7k tokens the chunked path ran in 1068 MiB anon while the
+full-matrix path OOM-killed a 3 GB cgroup (§12.3).
+
+Fused glue (P4) — both modes ~12 % faster, the NPU build mostly in the CPU
+glue:
+
+| 2587-token text | glue off (`ROCKET_GLUE=0`) | glue on (default) |
+|---|---|---|
+| `--quant q8` (CPU) | 35.31 s (mlp 12.90, ple 2.94) | 31.16 s (mlp 8.74, ple 1.98) |
+| `--npu` | 19.47 s (flex+overhead 8.29) | 17.21 s (flex+overhead 3.50) |
+
+Short-input latency (P5, 16 tokens): q8+npu 0.25-0.34 s, fp16 `--npu`
+0.41-0.52 s, int8 g32 0.75-1.01 s, g128 0.47-0.53 s, g256 0.31-0.47 s. 8k text
+(P5b, int8 g32 + chunk 1024, 7757 tokens): 117.73 s / 65.9 tok/s (attn 57.47,
+mlp 45.10; NPU 95.76 s) — the q8+npu configuration ran the same input in 55.04 s
+(§12.3); the gap is the g32 readback again.
+
+Deployment verdict: fp16 `--npu` stays the speed configuration (near-lossless
+0.9999997 at the same wall as the deployed q8+npu); q8+npu remains the memory
+choice (1068 MiB vs ~2.3 GiB resident after pack); int8 is the numerics/memory
+middle — g32 beats q8's numerics at 2.4x the time, and wider groups buy speed
+back at a monotone numerics cost (`--npu-int8-group`).
 
 ## 13. Deferred
 
-- Timing A/B for §12 (board was busy with the production service).
 - 30k-token text with chunked attention (the old OOM point); needs the board.
-- Redeploy the production `openviking-embed-1` service on this build (it runs
-  the 2026-10-05-era `c951944` image, which predates chunking and int8).
+- Redeploy the production `openviking-embed-1` service on this build (it runs the
+  2026-10-05-era `c951944` image, which predates canonical tiling, chunking, int8
+  and the fused glue). fp16 `--npu` is the recommended speed config; the deployed
+  q8+npu config stays the memory choice.
+- Exposing `--npu-int8` / `--npu-int8-group` on `serve` (the server loads fp16
+  text weights today).
 - int8 for the vision/audio towers (small share of the work; text-only today).
