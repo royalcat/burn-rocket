@@ -5,7 +5,7 @@
 
 #![allow(non_camel_case_types)]
 
-use libc::{c_char, c_int, c_long, c_void};
+use libc::{c_char, c_int, c_long, c_uint, c_void};
 
 /// Element type of the `_Float16` buffers the library takes.
 pub type F16 = u16;
@@ -44,6 +44,11 @@ pub const ROCKET_E_NOMEM: c_int = -3;
 pub const ROCKET_E_DEVICE: c_int = -4;
 pub const ROCKET_E_UNSUPPORTED: c_int = -5;
 
+/// `rocket_ctx_create_ex` flag: canonical tiling, M-independent down to M = 4
+/// (one pack serves every M; small M no longer grows Kt / returns
+/// `ROCKET_E_TILING`). See `rocket_matmul.h` in the library.
+pub const ROCKET_CTX_TILING_CANONICAL: c_uint = 0x1;
+
 unsafe extern "C" {
     // Device.
     pub fn rocket_open() -> c_int;
@@ -56,7 +61,9 @@ unsafe extern "C" {
     pub fn rocket_submit_counters_reset();
 
     // Resident-weight path.
+    #[allow(dead_code)] // kept for A/B against the canonical-tiling context
     pub fn rocket_ctx_create(nthreads: c_int) -> *mut RocketCtxOpaque;
+    pub fn rocket_ctx_create_ex(nthreads: c_int, flags: c_uint) -> *mut RocketCtxOpaque;
     pub fn rocket_ctx_free(ctx: *mut RocketCtxOpaque);
     pub fn rocket_weights_pack(
         ctx: *mut RocketCtxOpaque,
@@ -121,6 +128,44 @@ unsafe extern "C" {
         mask: *const F16,
         out: *mut F16,
     ) -> c_int;
+
+    // Resident int8 (W8A8) group-wise path: pre-quantized int8 weights/A, per
+    // K-group scales applied on readback (`C[M,N] = sum_g a_scale[m,g] *
+    // b_scale[n,g] * int32_partial`). K % 32, N % 32, M % 4; the resident weight
+    // is M-independent (canonical tile), so one pack serves every M.
+    pub fn rocket_i8_ctx_create(nthreads: c_int) -> *mut RocketI8CtxOpaque;
+    pub fn rocket_i8_ctx_free(ctx: *mut RocketI8CtxOpaque);
+    pub fn rocket_i8_weights_pack_gw(
+        ctx: *mut RocketI8CtxOpaque,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        b: *const i8,
+        group: c_int,
+    ) -> *mut RocketI8WeightsOpaque;
+    pub fn rocket_i8_weights_free(ctx: *mut RocketI8CtxOpaque, w: *mut RocketI8WeightsOpaque);
+    #[allow(clippy::too_many_arguments)]
+    pub fn rocket_matmul_int8_prepacked_gw(
+        ctx: *mut RocketI8CtxOpaque,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        a: *const i8,
+        a_scale: *const f32,
+        b_scale: *const f32,
+        cf: *mut f32,
+        w: *mut RocketI8WeightsOpaque,
+    ) -> c_int;
+}
+
+#[repr(C)]
+pub struct RocketI8CtxOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct RocketI8WeightsOpaque {
+    _private: [u8; 0],
 }
 
 #[repr(C)]

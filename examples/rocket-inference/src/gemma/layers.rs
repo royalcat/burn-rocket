@@ -3,9 +3,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use burn::module::Param;
-use burn::nn::{Linear, LinearConfig};
+use burn::nn::{Linear, LinearConfig, RmsNorm};
 use burn::prelude::*;
 use burn::tensor::DType;
+use burn::tensor::activation::gelu_approximate;
+use burn::tensor::s;
 
 /// Process-wide low-RAM flag (`--quant q8`): projection weights stay
 /// Q8-resident and are dequantized per call, so only the current layer's f32
@@ -81,6 +83,80 @@ fn linear_body<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
         return out.cast(dt);
     }
     l.forward(x)
+}
+
+// ---------------------------------------------------------------------------
+// Fused CPU glue (NPU build, `--npu`): single-pass host kernels for the
+// elementwise chains flex runs as several single-threaded scalar passes.
+// ---------------------------------------------------------------------------
+
+/// Set with `--npu`: the CPU glue routes `gelu*up`, RMSNorm and RoPE through
+/// `burn-rocket`'s fused kernels. Off in the pure-CPU modes, whose f32 results
+/// are bit-comparable with the HF reference.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static NPU_GLUE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn set_npu_glue(on: bool) {
+    NPU_GLUE.store(on, Ordering::Relaxed);
+}
+
+/// Whether the fused glue kernels are active. `--npu` turns them on; the
+/// `ROCKET_GLUE` env var overrides both ways (`ROCKET_GLUE=0` for the composite
+/// ops — the A/B that validates the kernels against them; `ROCKET_GLUE=1` to
+/// test the kernels in a CPU mode).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn npu_glue() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| match std::env::var("ROCKET_GLUE") {
+        Ok(v) => v != "0",
+        Err(_) => NPU_GLUE.load(Ordering::Relaxed),
+    })
+}
+
+/// `gelu_approximate(gate) * up` (fused single pass with the NPU glue on).
+pub(crate) fn gelu_mul<const D: usize>(gate: Tensor<D>, up: Tensor<D>) -> Tensor<D> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_glue() {
+        return burn_rocket::gelu_mul(gate, up);
+    }
+    gelu_approximate(gate) * up
+}
+
+/// `RmsNorm::forward` (fused single pass with the NPU glue on).
+pub(crate) fn rms_norm<const D: usize>(norm: &RmsNorm, x: Tensor<D>) -> Tensor<D> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_glue() {
+        return burn_rocket::rms_norm(x, norm.gamma.val(), norm.epsilon);
+    }
+    norm.forward(x)
+}
+
+/// `rms_norm_noscale` (fused single pass with the NPU glue on).
+pub(crate) fn rms_norm_noscale<const D: usize>(x: Tensor<D>, eps: f64) -> Tensor<D> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_glue() {
+        return burn_rocket::rms_norm_noscale(x, eps);
+    }
+    crate::gemma::rms_norm_noscale(x, eps)
+}
+
+/// Rotate-half RoPE of `x` `[B, S, H, D]` with `cos`/`sin` `[S, D/2]`
+/// (fused single pass with the NPU glue on).
+pub(crate) fn rope_apply(x: Tensor<4>, cos: Tensor<2>, sin: Tensor<2>) -> Tensor<4> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_glue() {
+        return burn_rocket::rope_apply(x, cos, sin);
+    }
+    let [_, s, _, d] = x.dims();
+    let half = d / 2;
+    let cos = cos.reshape([1, s, 1, half]);
+    let sin = sin.reshape([1, s, 1, half]);
+    let x1 = x.clone().slice(s![.., .., .., 0..half]);
+    let x2 = x.slice(s![.., .., .., half..d]);
+    let o1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
+    let o2 = x2 * cos + x1 * sin;
+    Tensor::cat(vec![o1, o2], 3)
 }
 
 // ---------------------------------------------------------------------------

@@ -17,18 +17,32 @@ use crate::gemma::config::Emb2Config;
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::util::rss_mib;
 
-#[allow(clippy::too_many_arguments)]
+/// NPU offload options (`--npu` and its sub-flags).
+///
+/// The fields are read only by the aarch64 `npu` build; other builds still
+/// parse the flags and reject `--npu` with a clear message.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+pub struct NpuOpts {
+    pub threads: usize,
+    /// Attention on the NPU (`--npu-attn npu`, default) vs CPU.
+    pub attn: bool,
+    /// Pack the text projections as resident group-wise int8 (W8A8) instead of fp16.
+    pub int8: bool,
+}
+
 pub fn load_model(
     model_dir: &Path,
     dtype: DType,
     quant_q8: bool,
-    npu: bool,
-    npu_threads: usize,
-    npu_attn: bool,
+    npu: Option<NpuOpts>,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
-    let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    if npu.is_some() {
+        bail!("--npu requires an aarch64 build with --features npu");
+    }
     if dtype != DType::F32 {
         bail!(
             "--dtype f16 is not numerically supported (RMSNorm/softmax/PLE precision): \
@@ -68,38 +82,45 @@ pub fn load_model(
     );
     drop(store);
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if npu {
+    if let Some(opts) = npu {
         if dtype != DType::F32 {
             bail!("--npu needs --dtype f32 (NPU activations are f32 on the CPU side)");
         }
-        // With both flags the projections are quantized first and the text ones
-        // are then packed from their dequantized values (lowest-memory mode).
-        if quant_q8 {
+        // int8 packs straight from f32 (one quantization step, no dequant round
+        // trip); the q8 low-RAM mapper only feeds the fp16 pack.
+        if quant_q8 && opts.int8 {
+            eprintln!(
+                "note: --quant q8 is ignored with --npu-int8 \
+                 (the int8 resident path quantizes straight from f32)"
+            );
+        }
+        if quant_q8 && !opts.int8 {
             model = quantize_low_ram(model)?;
         }
-        return load_npu_text(model, cfg, npu_threads, npu_attn, device);
+        return load_npu_text(model, cfg, opts, device);
     }
-    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-    if npu {
-        bail!("--npu requires an aarch64 build with --features npu");
-    }
+    let _ = npu;
     if quant_q8 {
         model = quantize_low_ram(model)?;
     }
     Ok((model, cfg))
 }
 
-/// Pack the text backbone's projections into resident fp16 NPU buffers
-/// (HF `[N, K]` layout, one pack per weight) and drop the f32 copies.
+/// Pack the text backbone's projections into resident NPU buffers (HF `[N, K]`
+/// layout, one pack per weight) and drop the f32 copies. `opts.int8` packs
+/// group-wise int8 resident weights (W8A8, group 32) instead of fp16.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn load_npu_text(
     mut model: Emb2Model,
     cfg: Emb2Config,
-    threads: usize,
-    npu_attn: bool,
+    opts: NpuOpts,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
-    burn_rocket::init(threads).map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    /// K-group width for the resident int8 weights.
+    const I8_GROUP: usize = 32;
+
+    burn_rocket::init(opts.threads)
+        .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
     let t0 = Instant::now();
     let mut count = 0usize;
     let mut bytes = 0usize;
@@ -125,28 +146,35 @@ fn load_npu_text(
             }
         }
         let tensor = Tensor::<2>::from_data(TensorData::new(t, [n, k]), device);
-        let id = burn_rocket::pack(tensor);
+        let id = if opts.int8 {
+            burn_rocket::pack_i8(tensor, I8_GROUP)
+        } else {
+            burn_rocket::pack(tensor)
+        };
         crate::gemma::layers::register_npu_weight(&lin.weight, id);
         // Shrink the (now redundant) f32 copy in place: `Param::map` keeps the
         // parameter id, so the registry lookup in `lin` still hits.
         let dev = device.clone();
         lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
         count += 1;
-        bytes += n * k * 2;
+        bytes += n * k * if opts.int8 { 1 } else { 2 };
     });
-    if npu_attn {
+    if opts.attn {
         model.text_mut().set_npu_attn(true);
     }
+    crate::gemma::layers::set_npu_glue(true);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
     }
     println!(
-        "NPU: packed {count} text projections into resident fp16 weights ({:.2} GiB, {threads} threads) \
+        "NPU: packed {count} text projections into resident {} weights ({:.2} GiB, {} threads) \
          in {:.2}s; attention on the {} (resident {:.0} MiB anon)",
+        if opts.int8 { "int8 g32" } else { "fp16" },
         bytes as f64 / (1u64 << 30) as f64,
+        opts.threads,
         t0.elapsed().as_secs_f64(),
-        if npu_attn { "NPU" } else { "CPU" },
+        if opts.attn { "NPU" } else { "CPU" },
         rss_mib()
     );
     Ok((model, cfg))

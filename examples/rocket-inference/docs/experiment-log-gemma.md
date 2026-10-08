@@ -415,8 +415,109 @@ configuration was OOM-killed at 7.6 GB anon while `rock-5b-plus` was holding
 were contained to their systemd scope; the board's services were unaffected.
 With an idle board the 6.6 GiB working set fits comfortably.
 
-## 12. Deferred
+## 12. Performance round (2026-10-08): canonical tiling, int8, chunked attention, fused glue
 
-- Q8/low-RAM mode (the f32 resident model is 2.9 GB).
-- NPU offload of the text backbone (RK3588; needs a board round).
-- A libjpeg-turbo-parity decoder to close the JPEG gap.
+Status: implemented and numerically validated on the board; the timing A/B is
+pending (the board was running the production emb2 server — `openviking-embed-1`,
+NPU + cores 4-7 — throughout, so all numbers below are correctness/memory only).
+
+### 12.1 Canonical tiling (small-M)
+
+`burn_rocket::init` now creates the context with
+`rocket_ctx_create_ex(threads, ROCKET_CTX_TILING_CANONICAL)`: the resident
+weights are M-independent down to `M = 4`, so a request no longer pads every
+matmul to 256 rows. `ROCKET_CTX_CANONICAL=0` restores the legacy pad-to-256
+behaviour in the same binary (the A/B switch).
+
+| check | result |
+|---|---|
+| 2587-token text, `--quant q8 --npu`, canonical off vs on | **cosine 1.000000000, max\|d\| = 0** (bit-identical) |
+| 9-token text, same | **cosine 1.000000000, max\|d\| = 0** |
+| long text vs HF f32 (off) | 0.999646657 (the logged q8 value) |
+
+The tiling keeps the `M = 256` K/N tiling, so per-row results are unchanged
+bit-for-bit; only the discarded padding rows disappear. Also benefits qwen3
+short queries and the intent model's `--pure-npu` M = 1 decode.
+
+### 12.2 Resident int8 text projections (`--npu-int8`)
+
+`burn-rocket` gained the library's resident group-wise int8 path
+(`rocket_i8_ctx_create` / `rocket_i8_weights_pack_gw` /
+`rocket_matmul_int8_prepacked_gw`): symmetric int8, group 32, one weight scale
+per output channel per K-group (`b_scale[N, K/32]`, verified against the
+library's `rocket_prepacked_int8.c`), one activation scale per row per K-group;
+the A rows are padded to `M % 4` caller-side. The codes live on the NPU
+permanently; the host drops the f32 copies like the fp16 pack does. The
+`--npu-int8` flag (gemma emb2; requires `--npu`) selects it; `--quant q8` is
+ignored with it (the int8 pack quantizes straight from f32).
+
+The torch probe (`tools/w8a8_probe.py`) ran before any Rust, simulating the
+library's conventions on the 2594-token text: per-32-group weights + per-32-group
+activations keep cosine **0.99986** vs f32, while whole-K (per-row) activation
+scales lose much more (0.99964). Board results match the probe:
+
+| config (2587-token text) | cosine vs HF f32 | resident text weights |
+|---|---|---|
+| `--npu` (fp16 weights) | 0.999999749 | 0.25 GiB |
+| `--npu --npu-int8` | **0.999850521** | 0.11 GiB |
+| `--quant q8 --npu` (the deployed config) | 0.999646657 | 0.25 GiB |
+| 9-token text, int8 vs fp16 | 0.999916317 | — |
+
+So int8 is *more* accurate than the deployed q8 path while being the fastest
+matmul path the library offers (int8 is ~2x the fp16 rate on this part).
+
+### 12.3 Chunked banded attention for the sliding layers
+
+20 of 24 text layers are sliding (`|q - kv| <= 512`). They now run in query
+chunks (`--attn-chunk`, default 1024) against only the keys near the chunk
+(`[q0 - w, q1 + w)`), through the new
+`burn_rocket::attention_window_block` op and the
+`masks::build_window_mask_block` band mask; the full layers are unchanged. The
+library's FA already took separate `n_tokens`/`n_kv`; the wrapper previously
+asserted them equal.
+
+| check | result |
+|---|---|
+| 2587-token text, `--attn-chunk 4096` (full) vs `1024` (chunked) | cosine 0.999999742, max\|d\| 8.6e-5 |
+| 2587-token, chunked vs HF f32 | 0.999999749 (same as the full path) |
+| 7764-token text, chunk 1024 vs 2048 | cosine 0.999999867 |
+| 7764-token, chunked vs HF f32 | 0.999667372 (q8 weight error, as at 2.6k) |
+
+Memory is the bigger win: the chunked 7764-token run peaks at **1068 MiB anon**
+(flat vs 2.6k), while the full-matrix path at the same length was OOM-killed
+inside a 3 GB cgroup (anon-rss 2.1 GB, `Memory cgroup out of memory`). Chunked
+attention is what makes 8k deployable on the board; it also cuts the sliding
+layers' QK/PV, host softmax and score traffic.
+
+### 12.4 Fused CPU glue (NPU builds)
+
+`burn-rocket` gained four host kernels (`src/host.rs`, unit-tested on any host):
+fused `gelu_approximate(gate) * up`, weighted/scale-free RMSNorm, and rotate-half
+RoPE, each a single rayon pass instead of flex's several single-threaded scalar
+passes (`gelu_approximate` alone is ~9 passes with a `tanh`/`powf` per element).
+The emb2 model routes its call sites through `gemma::layers::{gelu_mul, rms_norm,
+rms_norm_noscale, rope_apply}`; `--npu` enables them (`ROCKET_GLUE=0` restores
+the composite ops, `ROCKET_GLUE=1` forces the kernels in CPU modes for the A/B).
+
+| check | result |
+|---|---|
+| `--quant q8` CPU mode, glue on vs off | cosine 1.000000000, max\|d\| 1.4e-7 |
+| `--npu`, glue on vs off | cosine 0.999999537 (f16 attention rounding) |
+| `--npu` (glue on) vs HF f32 | 0.999999749 (unchanged) |
+
+Pure-CPU modes keep the composite ops, so their bit-parity with the HF reference
+is untouched.
+
+### 12.5 Timing (pending)
+
+`/root/rocket-inference/validate.sh` holds the full A/B (canonical on/off short
+and long, fp16 vs int8, full vs chunked, glue on/off with stage and NPU
+breakdowns). Run it on an idle board and fold the numbers in here.
+
+## 13. Deferred
+
+- Timing A/B for §12 (board was busy with the production service).
+- 30k-token text with chunked attention (the old OOM point); needs the board.
+- Redeploy the production `openviking-embed-1` service on this build (it runs
+  the 2026-10-05-era `c951944` image, which predates chunking and int8).
+- int8 for the vision/audio towers (small share of the work; text-only today).

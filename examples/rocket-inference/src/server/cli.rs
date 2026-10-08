@@ -83,9 +83,11 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 &model_dir,
                 args.dtype.unwrap_or(DType::F32),
                 args.quant.unwrap_or(false),
-                args.npu.unwrap_or(false),
-                args.npu_threads.unwrap_or(5),
-                args.npu_attn.unwrap_or(true),
+                args.npu.unwrap_or(false).then_some(emb2_load::NpuOpts {
+                    threads: args.npu_threads.unwrap_or(5),
+                    attn: args.npu_attn.unwrap_or(true),
+                    int8: false,
+                }),
                 &device,
             )?;
             let tokenizer = tokenizer()?;

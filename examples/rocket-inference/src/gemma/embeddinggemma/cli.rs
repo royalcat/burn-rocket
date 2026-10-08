@@ -10,7 +10,7 @@ use burn::tensor::{DType, Int};
 use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
-use crate::gemma::embeddinggemma::load::load_model;
+use crate::gemma::embeddinggemma::load::{NpuOpts, load_model};
 use crate::gemma::embeddinggemma::model::{stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
 use crate::util::device;
@@ -59,6 +59,7 @@ struct Args {
     npu: bool,
     npu_threads: usize,
     npu_attn: bool,
+    npu_int8: bool,
 }
 
 impl Args {
@@ -95,6 +96,7 @@ impl Args {
             npu: false,
             npu_threads: 5,
             npu_attn: true,
+            npu_int8: false,
         };
         if let Some(v) = f.take("--model-dir")? {
             args.model_dir = PathBuf::from(v);
@@ -180,6 +182,10 @@ impl Args {
             args.quant_q8 = v == "q8";
         }
         args.npu = f.take_bool("--npu");
+        args.npu_int8 = f.take_bool("--npu-int8");
+        if args.npu_int8 && !args.npu {
+            bail!("--npu-int8 requires --npu");
+        }
         if let Some(v) = f.take_parsed("--npu-threads")? {
             args.npu_threads = v;
         }
@@ -285,9 +291,11 @@ fn run_embed(args: &Args) -> Result<()> {
         &args.model_dir,
         args.dtype,
         args.quant_q8,
-        args.npu,
-        args.npu_threads,
-        args.npu_attn,
+        args.npu.then_some(NpuOpts {
+            threads: args.npu_threads,
+            attn: args.npu_attn,
+            int8: args.npu_int8,
+        }),
         &device,
     )?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;
@@ -338,9 +346,11 @@ fn run_bench(args: &Args) -> Result<()> {
         &args.model_dir,
         args.dtype,
         args.quant_q8,
-        args.npu,
-        args.npu_threads,
-        args.npu_attn,
+        args.npu.then_some(NpuOpts {
+            threads: args.npu_threads,
+            attn: args.npu_attn,
+            int8: args.npu_int8,
+        }),
         &device,
     )?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;

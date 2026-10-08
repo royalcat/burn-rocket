@@ -29,6 +29,11 @@
 
 pub mod ffi;
 
+/// Fused host-side elementwise kernels for the NPU build's CPU glue
+/// (unit tested on any host; the callers live in the `npu`-gated extension).
+#[cfg_attr(not(feature = "npu"), allow(dead_code))]
+pub(crate) mod host;
+
 /// Host-side additive attention masks (unit tested on any host).
 pub(crate) mod masks;
 
@@ -38,14 +43,31 @@ pub mod ext;
 
 #[cfg(feature = "npu")]
 pub use ext::{
-    Stats, WeightId, attention, attention_causal_window, attention_window, init, matmul, pack,
-    pack2, pack3, stats, stats_reset,
+    Stats, WeightId, attention, attention_causal_window, attention_window, attention_window_block,
+    gelu_mul, init, matmul, pack, pack_i8, pack2, pack3, rms_norm, rms_norm_noscale, rope_apply,
+    stats, stats_reset,
 };
 
 pub use half;
 use half::f16;
 use std::ffi::CStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
+
+/// Canonical tiling for resident weights (default **on**): the NPU plans every
+/// packed weight at the canonical mature tile, so one pack serves *any* M down
+/// to 4 and small inputs are computed at their true M instead of being padded
+/// up to the M >= 256 tiling. `ROCKET_CTX_CANONICAL=0` restores the legacy
+/// behavior (small M padded to 256) for A/B runs without a rebuild.
+pub fn canonical_tiling() -> bool {
+    static ONCE: OnceLock<bool> = OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var("ROCKET_CTX_CANONICAL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Error from a librocketnpu call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
@@ -160,6 +182,9 @@ pub struct RocketCtx {
 
 impl RocketCtx {
     /// Open the device and create a context with `nthreads` worker threads/fds.
+    ///
+    /// The context requests the library's canonical tiling (M-independent down
+    /// to 4) unless `ROCKET_CTX_CANONICAL=0` selects the legacy tiling.
     pub fn new(nthreads: usize) -> Result<Self, Error> {
         let fd = unsafe { ffi::rocket_open() };
         if fd < 0 {
@@ -168,11 +193,16 @@ impl RocketCtx {
                 rc: fd,
             });
         }
-        let ctx = unsafe { ffi::rocket_ctx_create(nthreads as i32) };
+        let flags = if canonical_tiling() {
+            ffi::ROCKET_CTX_TILING_CANONICAL
+        } else {
+            0
+        };
+        let ctx = unsafe { ffi::rocket_ctx_create_ex(nthreads as i32, flags) };
         if ctx.is_null() {
             unsafe { ffi::rocket_close(fd) };
             return Err(Error {
-                op: "rocket_ctx_create",
+                op: "rocket_ctx_create_ex",
                 rc: ffi::ROCKET_E_DEVICE,
             });
         }
@@ -182,8 +212,10 @@ impl RocketCtx {
     }
 
     /// Pack a weight matrix `B` of shape `[N, K]` (row-major fp16) into resident
-    /// NPU buffers, once. `m` is the warm-up row count used for tiling; the
-    /// resulting handle can be reused for any `M >= 256` with the same `K`/`N`.
+    /// NPU buffers, once. `m` is the warm-up row count used for tiling; with the
+    /// canonical tiling (the default) the resulting handle can be reused for any
+    /// `M >= 4` with the same `K`/`N`; the legacy tiling only serves `M >= 256`
+    /// (smaller calls must be padded).
     pub fn pack_weight(
         &self,
         m: usize,
@@ -428,6 +460,127 @@ impl RocketFaCtx {
 impl Drop for RocketFaCtx {
     fn drop(&mut self) {
         unsafe { ffi::rocket_fa_ctx_free(self.c) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resident int8 (W8A8) group-wise weights
+// ---------------------------------------------------------------------------
+
+struct I8CtxInner {
+    ctx: *mut ffi::RocketI8CtxOpaque,
+}
+
+// Like `CtxInner`, the int8 context mutates shared per-shape scratch and is not
+// thread-safe; the extension engine serializes every access.
+
+impl Drop for I8CtxInner {
+    fn drop(&mut self) {
+        unsafe { ffi::rocket_i8_ctx_free(self.ctx) }
+    }
+}
+
+/// A persistent int8 matmul context (worker fds plus per-shape scratch).
+///
+/// Weights packed through it must be freed before it; [`RocketI8Weight`] holds
+/// its own handle to the context, so that order holds for any drop order.
+pub struct RocketI8Ctx {
+    inner: Arc<I8CtxInner>,
+}
+
+impl RocketI8Ctx {
+    /// Create a context with `nthreads` workers.
+    pub fn new(nthreads: usize) -> Result<Self, Error> {
+        let ctx = unsafe { ffi::rocket_i8_ctx_create(nthreads as i32) };
+        if ctx.is_null() {
+            return Err(Error {
+                op: "rocket_i8_ctx_create",
+                rc: ffi::ROCKET_E_DEVICE,
+            });
+        }
+        Ok(Self {
+            inner: Arc::new(I8CtxInner { ctx }),
+        })
+    }
+
+    /// Pack a group-wise int8 weight `B` `[N, K]` (row-major int8 codes) and the
+    /// per-channel per-group scales that go with it. `m` is the warm-up row count;
+    /// the resident layout is M-independent, so one pack serves every `M >= 4`
+    /// with the same `K`/`N`. `group % 32 == 0` must divide `K`.
+    pub fn pack_weight_gw(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        b: &[i8],
+        group: usize,
+    ) -> Result<RocketI8Weight, Error> {
+        assert_eq!(b.len(), n * k, "weight buffer must be [N, K]");
+        let w = unsafe {
+            ffi::rocket_i8_weights_pack_gw(
+                self.inner.ctx,
+                m as i32,
+                k as i32,
+                n as i32,
+                b.as_ptr(),
+                group as i32,
+            )
+        };
+        if w.is_null() {
+            return Err(Error {
+                op: "rocket_i8_weights_pack_gw",
+                rc: ffi::ROCKET_E_SHAPE,
+            });
+        }
+        Ok(RocketI8Weight {
+            w,
+            ctx: self.inner.clone(),
+        })
+    }
+
+    /// `C[M, N] = sum_g a_scale[m, g] * b_scale[n, g] * (int32 partial of K-group g)`,
+    /// accumulated in f32. `a` is `[M, K]` int8 (pre-quantized), `a_scale` `[M, K/group]`,
+    /// `b_scale` `[N, K/group]`, `cf` `[M, N]` f32. `M % 4 == 0` (pad single rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_gw(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[i8],
+        a_scale: &[f32],
+        b_scale: &[f32],
+        cf: &mut [f32],
+        w: &RocketI8Weight,
+    ) -> Result<(), Error> {
+        assert_eq!(a.len(), m * k, "A must be [M, K]");
+        assert_eq!(cf.len(), m * n, "C must be [M, N]");
+        let rc = unsafe {
+            ffi::rocket_matmul_int8_prepacked_gw(
+                self.inner.ctx,
+                m as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                a_scale.as_ptr(),
+                b_scale.as_ptr(),
+                cf.as_mut_ptr(),
+                w.w,
+            )
+        };
+        check("rocket_matmul_int8_prepacked_gw", rc)
+    }
+}
+
+/// A group-wise int8 weight resident in NPU buffers.
+pub struct RocketI8Weight {
+    w: *mut ffi::RocketI8WeightsOpaque,
+    ctx: Arc<I8CtxInner>,
+}
+
+impl Drop for RocketI8Weight {
+    fn drop(&mut self) {
+        unsafe { ffi::rocket_i8_weights_free(self.ctx.ctx, self.w) }
     }
 }
 

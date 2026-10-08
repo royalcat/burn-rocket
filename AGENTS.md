@@ -54,7 +54,7 @@ name), `--max-tokens`, `--max-new-tokens`, `--temperature`, plus the detected
 family's loading flags:
 
 - qwen3: `--dtype`, `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--chunk`, `--key-block`, `--attn`
-- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
+- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
 - intent: `--npu`, `--npu-threads`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`
 - Gemma 4: `--f16`, `--quant`, `--npu`, `--npu-threads`, `--attn-chunk`
 
@@ -105,6 +105,27 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   from the model's own timings. Errors and `/health`/`/v1/models` are not logged. The
   timing plumbing is `AppState::compute` (`src/server/mod.rs`), the line format
   `src/server/log.rs`; dev-verified for embeddings (qwen3 q8) and chat (Gemma 4 QAT).
+- **EmbeddingGemma 2 performance round** (2026-10-08, log §12): four changes,
+  numerically validated on the board (timing pending an idle board).
+  (1) *Canonical tiling*: `init` now uses `rocket_ctx_create_ex(threads,
+  ROCKET_CTX_TILING_CANONICAL)` so resident weights serve any `M >= 4` and small
+  requests no longer pad every matmul to 256 rows (`ROCKET_CTX_CANONICAL=0`
+  restores legacy padding; off-vs-on is bit-identical at 9 and 2587 tokens).
+  (2) *Resident int8* (`--npu-int8`, gemma emb2): the library's W8A8 group-wise
+  path (group 32, per-row/per-channel per-group scales, A padded to `M % 4`);
+  2587-token cosine vs HF f32 0.99985 (fp16 0.9999997, the deployed q8
+  0.9996467), text weights 0.11 GiB vs 0.25. A torch probe
+  (`tools/w8a8_probe.py`) gates the convention: per-32-group activations cost
+  almost nothing (0.99986), whole-K row scales much more (0.99964).
+  (3) *Chunked banded attention* for the 20 sliding layers
+  (`--attn-chunk`, default 1024, keys `[q0-w, q1+w)`) through the new
+  `attention_window_block` op + `masks::build_window_mask_block`; 2.6k full-vs-
+  chunked cosine 0.9999997, 7.7k chunk 1024-vs-2048 0.9999999, 7.7k vs HF
+  0.99967; memory 1068 MiB anon at 7.7k where the full path OOM-kills in 3 GB.
+  (4) *Fused CPU glue* (`src/host.rs`, `burn_rocket::{gelu_mul, rms_norm,
+  rms_norm_noscale, rope_apply}`): single rayon passes instead of flex's serial
+  scalar chains; q8 CPU glue on-vs-off cosine 1.0 (max|d| 1.4e-7), `--npu` glue
+  on/off equivalent vs HF; `ROCKET_GLUE=0/1` is the A/B switch.
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
@@ -125,10 +146,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
   Fixed-strategy kernels are 3.8 GF/s. The flex+NPU configuration remains the fastest; the
   GPU lever is closed until CubeCL/panvk improve.
-- Not done: int8 GEMM (the only lever that would close the speed gap; flex lacks it, and
-  burn-cpu/CubeCL quantized matmul is unverified and cannot cross-compile) and deploying
-  the current build as the board service — the live OpenViking embedding backend still
-  runs the 2026-10-05 image (`embeddings-fast:0c99eed`).
+- Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
+  the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
+  unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
+  emb2 (above). The live OpenViking embedding backend (`openviking-embed-1`) runs
+  EmbeddingGemma 2 on the `c951944` image, which predates the performance round
+  (canonical tiling, chunked attention, int8, glue).
 
 ## Repo layout
 
@@ -137,6 +160,8 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/lib.rs` | FFI wrappers (`RocketCtx`/`RocketWeight`/`RocketStream`/`RocketFaCtx`, `pack_weight_seg`, `flash_attn`), driver/counter helpers, `Error`/`OpFailure` |
 | `src/ffi.rs` | raw `extern "C"` declarations for `librocketnpu` |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
+| `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
+| `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `build.rs` | links `librocketnpu.a` for `npu` builds; resolves `ROCKETNPU_DIR` → matching `vendor/rocketnpu` → `$OUT_DIR/rocketnpu` → auto-build via the script (`ROCKETNPU_AUTO=0` disables, failures warn and are stamped) |
 | `scripts/build-rocketnpu.sh` | builds `librocketnpu.a` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); cache: `$OUT_DIR/rocket-userspace` from build.rs, else `<target-dir>/<profile>/build/burn-rocket` |
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
@@ -311,15 +336,16 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   `/root/models/qwen3-embedding-0.6b/`. New deploys go to `/root/rocket-inference/`;
   the old directory is left in place. Run from the deploy dir (the bench uses the
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
-- **Live service**: since 2026-10-05 the example also runs as OpenViking's embedding
-  backend (Komodo `openviking` stack): container image
-  `git.kmsign.org/royalcat/embeddings-fast:0c99eed` (project `9264f92` + Dockerfile
-  `0c99eed` — older than `main` and predating the repo inversion; the service name
-  stayed `embeddings-fast`), `serve --backend flex --dtype f32 --npu --npu-attn cpu
-  --port 8383 --max-tokens 8192`, CPUs 4-7, `mem_limit`/`memswap_limit` 8g, weights
-  read-only at `/root/models/qwen3-embedding-0.6b`; OpenViking's `dense.api_base` is
-  `http://embeddings-fast:8383/v1`. `examples/rocket-inference/docker/build.sh` now
-  pushes `git.kmsign.org/royalcat/rocket-inference:<sha>` instead.
+- **Live service**: OpenViking's embedding backend. Since 2026-10-08 it is
+  EmbeddingGemma 2: container `openviking-embed-1` (image
+  `git.kmsign.org/royalcat/rocket-inference:c951944`) runs `serve --backend flex
+  --dtype f32 --quant q8 --npu --npu-attn npu --port 8383 --max-tokens 8192
+  --model-dir /models/embeddinggemma-2`, CPUs 4-7, NPU. Any board run shares the
+  NPU and cores 4-7 with it. Historically (2026-10-05) the backend was qwen3 on
+  `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7, `mem_limit`
+  8g, weights at `/root/models/qwen3-embedding-0.6b`; that image predates the
+  repo inversion. `examples/rocket-inference/docker/build.sh` pushes
+  `git.kmsign.org/royalcat/rocket-inference:<sha>`.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
   --embedding --pooling last -c 32768 -b 32768 -ub 32768 -np 1 -ctk q8_0 -ctv q8_0 -t 4
@@ -375,14 +401,35 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
   serialize. `attention_window(q, k, v, h, kv, d, scale, softcap, window)` (added
   2026-10-07 for EmbeddingGemma 2) applies a bidirectional band mask
-  (`|q - kv| <= window`; `window < 0` = no mask); both attention ops cache their
-  `[n, n]` f16 mask per sequence length in the engine.
+  (`|q - kv| <= window`; `window < 0` = no mask); `attention_window_block(..., window,
+  q_start, kv_start)` (2026-10-08) runs a query chunk against a *subset* of keys
+  (`n_kv != n_q`; key `kv_start + j` visible to query `q_start + i` iff
+  `|(q_start + i) - (kv_start + j)| <= window`) — the sliding layers' chunked path,
+  with the block mask cached on the translation-invariant offset. Both attention ops
+  cache their f16 masks per shape in the engine.
+- Canonical tiling (2026-10-08, default): `init` creates the context with
+  `rocket_ctx_create_ex(threads, ROCKET_CTX_TILING_CANONICAL)`, so a resident weight
+  serves any `M >= 4` and small requests no longer pad every matmul to 256 rows
+  (`ROCKET_CTX_CANONICAL=0` restores the legacy pad for A/B; off-vs-on is
+  bit-identical). The int8 ctx is always canonical.
+- Resident int8 (W8A8, emb2 `--npu-int8`): `pack_i8(t, group)` quantizes host-side
+  (symmetric int8, `group % 32`, weight scale per output channel per K-group, layout
+  `[N, K/group]` — matches the library's `rocket_prepacked_int8.c`) and scatters the
+  codes into NPU BOs once; `matmul` routes by `WeightId` to
+  `rocket_matmul_int8_prepacked_gw`, quantizing A per row per group and padding rows
+  to `M % 4` (an unaligned M miscomputes on HW — the library rejects it). The int8
+  ctx owns its own fds (created lazily at the first int8 pack).
+- Fused CPU glue (2026-10-08, emb2 `--npu`): `burn_rocket::{gelu_mul, rms_norm,
+  rms_norm_noscale, rope_apply}` are host rayon kernels (single pass where flex runs
+  several serial scalar passes); `ROCKET_GLUE=0` restores the composite ops,
+  `ROCKET_GLUE=1` forces the kernels in CPU modes.
 - `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
   f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
   attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (within ~1 s on
   wall, ~40% more CPU). `--npu` requires `--dtype f32` and excludes `--quant q8`.
-- Resident weights are packed for the M>=256 tiling; requests with fewer rows are padded
-  to 256 rows (the extra rows are ignored on readback). One pack serves all lengths.
+- With canonical tiling (default) resident weights serve any `M >= 4`; only the
+  `M % 4` alignment pad remains. `ROCKET_CTX_CANONICAL=0` restores the legacy
+  `M >= 256` pad (A/B only). One pack serves all lengths.
 - Failures panic with a structured `OpFailure { error, m, k, n }` payload (detail logged
   by `op_failure` before the panic). `serve` (via `src/server/error.rs`) maps
   `ROCKET_E_NOMEM` -> 503, shape/tiling -> 500, device/unsupported -> log + `exit(1)`
@@ -417,8 +464,11 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   flex's fused flash kernel (within ~1 s) while using far less CPU. `ROCKET_FA_TILE_KV`
   (tiled path, opt-in — 0 is the default) engages above `ROCKET_FA_TILE_MIN_KV` (8192) and
   is *worse* at 3.6k (96.9 s vs 79.5 s); it bounds the score scratch but not the `[n][n]`
-  mask, and NPU attention OOMs the board at ~30k (deployment finding). The mask +
-  head-major f16 scratch are cached per sequence length in the crate's engine
+  mask, and the full-matrix NPU attention OOMs the board at ~30k (deployment finding).
+  EmbeddingGemma 2's sliding layers now avoid that entirely with the chunked banded
+  path (`attention_window_block`, keys `[q0-w, q1+w)`): at 7.7k tokens it runs at
+  1068 MiB anon where the full-matrix path OOM-kills inside a 3 GB cgroup (log §12.3).
+  The mask + head-major f16 scratch are cached per shape in the crate's engine
   (`ext::FaState`).
 - Safetensors keys in `model.safetensors` have **no `model.` prefix**
   (`layers.0.self_attn.q_proj.weight`, `embed_tokens.weight`); the loader reads the
@@ -509,30 +559,30 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ## Future work
 
-- **int8 GEMM** is the only lever that would close the speed gap with production (example
-  CPU path). flex has none; the candidates are the `burn-cpu` (CubeCL/LLVM) backend (CPU
-  quantized matmul unverified, cannot cross-compile — would need a native build + JIT on
-  the board) or a custom int8 microkernel (upstream contribution).
+- **int8 GEMM on the flex CPU path** is the only lever that would close the qwen3
+  speed gap with production. flex has none; the candidates are the `burn-cpu`
+  (CubeCL/LLVM) backend (CPU quantized matmul unverified, cannot cross-compile — would
+  need a native build + JIT on the board) or a custom int8 microkernel (upstream
+  contribution). The NPU int8 path (emb2) is done (log §12.2).
 - **Vulkan/GPU path is closed** (log §13): measured 3.8-79 GF/s with CubeCL on panvk,
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
   stack.
-- Long-context NPU attention: the `[n][n]` mask + host score matrices OOM at ~30k. The
-  library's `ROCKET_FA_TILE_KV` bounds the score scratch but not the mask and loses on
-  speed; the candidate is app-side bounded-causal query blocking (per-block `[C, q1]`
-  mask, prefix keys, ~half the causal MACs). Deferred from the robustness round; board
-  work required. Measure 30k tokens with `--npu` (the CPU path does 52.4 tok/s at 32 dev
-  threads).
-- Board service: run `serve --model-dir /models/qwen3-embedding-0.6b --npu --max-tokens 30000`
-  under a supervisor, and decide
-  whether the CPU-relief mode should be the default there (it is now).
-- Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak in
-  `--quant q8` mode; re-pack small-M weights lazily instead of padding to 256 rows.
-- Intent model: re-run the CPU/NPU A/B on an idle board (the 2026-10-06 numbers were
-  taken while `tstor-scan`/OpenViking ran, and `embeddings-fast` shares the NPU); probe a
-  small-`M` resident pack (`rocket_weights_pack(m < 256)` documents a `-2` re-pack
-  fallback) to move single-token decode onto the NPU; decide the production
-  `query_planner` wiring (memory is ~2.06 GB anon + ~1.2 GB NPU BOs with f32 table).
+- Long-context NPU attention: emb2's sliding layers now use chunked banded attention
+  (log §12.3), which fixes the memory blow-up there. The *causal* models (qwen3,
+  gemma4 prefill) still build `[n][n]` masks and OOM at ~30k; the same query-chunking
+  idea applies (per-chunk `[C, q1]` causal masks, prefix keys), plus a 30k measurement
+  of the emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
+- Board service: the emb2 backend runs the pre-round `c951944` image. Redeploy on
+  this build (canonical tiling + chunked attention + glue; consider `--npu-int8` as
+  the default — better numerics *and* faster) and re-measure the served latencies.
+- Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak
+  in `--quant q8` mode.
+- Intent model: with canonical tiling the `M = 1` decode no longer pads to 256 rows,
+  so re-run the CPU/NPU A/B (the 2026-10-06 numbers were taken on a busy board) and
+  re-probe `--pure-npu` decode (was 1.5 tok/s when every matmul paid 256 rows); decide
+  the production `query_planner` wiring (memory is ~2.06 GB anon + ~1.2 GB NPU BOs
+  with f32 table).
 
 ## Verification commands
 
@@ -590,6 +640,10 @@ taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --token
 ./rocket-inference intent gen --model-dir /root/models/ov-intent-analysis-sft --text "Hello!" --raw --max-new-tokens 32
 # Gemma family (models at /root/models/embeddinggemma-2, /root/models/gemma-4-E2B-it)
 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
+# performance-round A/Bs (log §12; validate.sh runs the whole set)
+ROCKET_CTX_CANONICAL=0 ./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --prompt query --text-file data/one_long.txt --out /tmp/off.json
+./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --npu --npu-int8 --prompt query --text-file data/one_long.txt --out /tmp/i8.json
+ROCKET_GLUE=0 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --text-file data/one_long.txt --reps 1
 ./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it --text "What is the capital of France?" --max-new-tokens 16
 # servers (detected per model; ports are examples)
 ./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --quant q8 --npu --port 8383 --max-tokens 8192

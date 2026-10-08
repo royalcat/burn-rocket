@@ -28,7 +28,9 @@ use burn::tensor::{DType, Tensor, TensorData};
 use half::f16;
 
 use crate::masks::{build_causal_mask, build_causal_window_mask, build_window_mask};
-use crate::{Error, OpFailure, RocketCtx, RocketFaCtx, RocketWeight, pad_rows};
+use crate::{
+    Error, OpFailure, RocketCtx, RocketFaCtx, RocketI8Ctx, RocketI8Weight, RocketWeight, pad_rows,
+};
 
 /// The Flex backend's float primitive, the concrete type the ops execute on.
 type FlexTensor = FloatTensor<Flex>;
@@ -60,6 +62,22 @@ pub trait RocketOps: Backend {
     fn rocket_pack2(a: FloatTensor<Self>, b: FloatTensor<Self>) -> u64;
     /// Pack three weights sharing one input, concatenated along N.
     fn rocket_pack3(a: FloatTensor<Self>, b: FloatTensor<Self>, c: FloatTensor<Self>) -> u64;
+    /// Pack an int8 group-wise weight (`[N, K]` f32 quantized host-side at pack
+    /// time) into resident NPU memory; `group` is the K-group width (`% 32 == 0`).
+    fn rocket_pack_i8(t: FloatTensor<Self>, group: usize) -> u64;
+    /// Fused `gelu_approximate(a) * b` over equal-shaped f32 tensors, in one pass.
+    fn rocket_gelu_mul(a: FloatTensor<Self>, b: FloatTensor<Self>) -> FloatTensor<Self>;
+    /// Fused weighted RMSNorm over the last dim, in one pass:
+    /// `x * (mean(x^2) + eps)^-0.5 * w` (`w` has the last dim's size).
+    fn rocket_rms_norm(x: FloatTensor<Self>, w: FloatTensor<Self>, eps: f64) -> FloatTensor<Self>;
+    /// Fused scale-free RMSNorm over the last dim: `x * (mean(x^2) + eps)^-0.5`.
+    fn rocket_rms_norm_noscale(x: FloatTensor<Self>, eps: f64) -> FloatTensor<Self>;
+    /// Fused rotate-half RoPE: `x` is `[B, S, H, D]`, `cos`/`sin` are `[S, D/2]`.
+    fn rocket_rope(
+        x: FloatTensor<Self>,
+        cos: FloatTensor<Self>,
+        sin: FloatTensor<Self>,
+    ) -> FloatTensor<Self>;
     /// `[.., M, K] * [N, K]^T -> [.., M, N]` with a resident weight.
     fn rocket_matmul(x: FloatTensor<Self>, id: u64) -> FloatTensor<Self>;
     /// Masked grouped-query attention for `[1, S, H*D]` / `[1, S, KV*D]` inputs.
@@ -102,6 +120,24 @@ pub trait RocketOps: Backend {
         scale: f64,
         softcap: Option<f32>,
         window: i64,
+    ) -> FloatTensor<Self>;
+    /// Chunked bidirectional band attention: query `q_start + i` attends to key
+    /// `kv_start + j` iff `|(q_start + i) - (kv_start + j)| <= window` (`< 0` =
+    /// no mask). `q` is `[1, n_q, H*D]`, `k`/`v` are `[1, n_kv_len, KV*D]`; the
+    /// key window typically spans only the band around the query chunk.
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_window_block(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+        q_start: i64,
+        kv_start: i64,
     ) -> FloatTensor<Self>;
 }
 
@@ -147,12 +183,13 @@ pub fn stats_reset() {
 // goes through this mutex.
 // ---------------------------------------------------------------------------
 
-/// M warm-up row count at pack time; the resident weights are reused for any M
-/// (small requests are padded up to 256 rows, see `matmul_impl`).
+/// M warm-up row count at pack time; with canonical tiling the resident weights
+/// are reused for any M (>= 4).
 const PACK_M: usize = 512;
 
-/// Padding floor for the M dimension: resident weights are packed for the
-/// M >= 256 tiling and cannot serve smaller matmuls directly.
+/// Padding floor for the M dimension in *legacy* tiling mode (canonical tiling
+/// off): resident weights are packed for the M >= 256 tiling and cannot serve
+/// smaller matmuls directly. Canonical mode pads only to the M % 4 alignment.
 const MIN_M: usize = 256;
 
 /// Row chunks above this size are split into separate NPU matmuls: the per-call
@@ -190,12 +227,26 @@ struct Resident {
     n: usize,
 }
 
+/// A resident group-wise int8 weight plus the host-side weight scales the
+/// per-call API needs (`[N, K/group]`).
+struct I8Resident {
+    weight: RocketI8Weight,
+    k: usize,
+    n: usize,
+    group: usize,
+    b_scale: Vec<f32>,
+}
+
 struct FaState {
     fa: RocketFaCtx,
     n_head: usize,
     n_kv: usize,
     head_dim: usize,
+    /// Query length the buffers/masks are currently sized for.
     n: usize,
+    /// KV length the buffers are currently sized for (`== n` for the
+    /// full-sequence mask modes).
+    n_k: usize,
     mask: Vec<f16>, // [n][n] additive: 0 for j<=t, -inf otherwise
     /// Cached bidirectional band mask for the current `n` (`usize::MAX` = none).
     win: usize,
@@ -203,9 +254,12 @@ struct FaState {
     /// Cached causal sliding-window mask for the current `n`.
     cw: usize,
     cw_mask: Vec<f16>, // [n][n] additive: 0 for t-w<j<=t, -inf otherwise
+    /// Cached query-chunk band mask key: `(n_q, n_kv_len, window, q0 - k0)`.
+    wb: Option<(usize, usize, usize, usize)>,
+    wb_mask: Vec<f16>, // [n_q][n_kv_len] block band mask
     q: Vec<f16>,       // [n_head][n][head_dim]
-    k: Vec<f16>,       // [n_kv][n][head_dim]
-    v: Vec<f16>,       // [n_kv][head_dim][n]  (per-head transposed)
+    k: Vec<f16>,       // [n_kv_heads][n_k][head_dim]
+    v: Vec<f16>,       // [n_kv_heads][head_dim][n_k]  (per-head transposed)
     out: Vec<f16>,     // [n_head][n][head_dim]
 }
 
@@ -214,6 +268,10 @@ struct Engine {
     ctx: RocketCtx,
     fa: Option<FaState>,
     weights: HashMap<u64, Resident>,
+    /// Resident int8 weights (the context is created lazily at the first int8
+    /// pack; it owns its own worker fds).
+    i8_ctx: Option<RocketI8Ctx>,
+    i8_weights: HashMap<u64, I8Resident>,
     next_id: u64,
 }
 
@@ -252,6 +310,8 @@ pub fn init(threads: usize) -> Result<(), Error> {
         ctx,
         fa: None,
         weights: HashMap::new(),
+        i8_ctx: None,
+        i8_weights: HashMap::new(),
         next_id: 1,
     });
     Ok(())
@@ -282,6 +342,30 @@ impl RocketOps for Flex {
             ],
             "fused weight",
         )
+    }
+
+    fn rocket_pack_i8(t: FloatTensor<Self>, group: usize) -> u64 {
+        pack_i8_one(t, group)
+    }
+
+    fn rocket_gelu_mul(a: FloatTensor<Self>, b: FloatTensor<Self>) -> FloatTensor<Self> {
+        gelu_mul_impl(a, b)
+    }
+
+    fn rocket_rms_norm(x: FloatTensor<Self>, w: FloatTensor<Self>, eps: f64) -> FloatTensor<Self> {
+        rms_norm_impl(x, w, eps)
+    }
+
+    fn rocket_rms_norm_noscale(x: FloatTensor<Self>, eps: f64) -> FloatTensor<Self> {
+        rms_norm_noscale_impl(x, eps)
+    }
+
+    fn rocket_rope(
+        x: FloatTensor<Self>,
+        cos: FloatTensor<Self>,
+        sin: FloatTensor<Self>,
+    ) -> FloatTensor<Self> {
+        rope_impl(x, cos, sin)
     }
 
     fn rocket_matmul(x: FloatTensor<Self>, id: u64) -> FloatTensor<Self> {
@@ -356,6 +440,32 @@ impl RocketOps for Flex {
         };
         attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_window_block(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+        q_start: i64,
+        kv_start: i64,
+    ) -> FloatTensor<Self> {
+        let mode = if window < 0 {
+            MaskMode::None
+        } else {
+            MaskMode::WindowBlock {
+                window: window as usize,
+                q0: q_start.max(0) as usize,
+                k0: kv_start.max(0) as usize,
+            }
+        };
+        attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
+    }
 }
 
 /// `t` is a `[N, K]` f32 tensor; returns `(k, n, row-major [N, K] fp16)`.
@@ -409,6 +519,187 @@ fn pack_many(parts: Vec<(usize, usize, Vec<f16>)>, what: &str) -> u64 {
     })
 }
 
+/// Pack one `[N, K]` f32 weight as a resident group-wise int8 weight: the codes
+/// are quantized host-side (symmetric `max/127` per K-group) and scattered into
+/// NPU BOs once; the weight scales stay host-side for the per-call dequant.
+fn pack_i8_one(t: FlexTensor, group: usize) -> u64 {
+    assert_eq!(t.dtype(), DType::F32, "the NPU path needs f32 weights");
+    let [n, k] = t.shape().dims::<2>();
+    assert!(
+        group > 0 && group % 32 == 0 && k % group == 0,
+        "int8 group {group} must be a positive multiple of 32 dividing K={k}"
+    );
+    assert_eq!(k % 32, 0, "the int8 path needs K % 32 == 0 (K={k})");
+    assert_eq!(n % 32, 0, "the int8 path needs N % 32 == 0 (N={n})");
+    let values: Vec<f32> = t
+        .into_data()
+        .try_to_vec()
+        .expect("the NPU path needs f32 weights");
+    let (q, b_scale) = quantize_i8_weight(&values, n, k, group);
+    with_engine(|e| {
+        let threads = e.threads;
+        let ctx = e.i8_ctx.get_or_insert_with(|| {
+            RocketI8Ctx::new(threads)
+                .unwrap_or_else(|err| op_failure("rocket_i8_ctx_create", err.rc, 0, k, n))
+        });
+        let weight = ctx
+            .pack_weight_gw(PACK_M, k, n, &q, group)
+            .unwrap_or_else(|err| op_failure("rocket_i8_weights_pack_gw", err.rc, PACK_M, k, n));
+        let id = e.next_id;
+        e.next_id += 1;
+        e.i8_weights.insert(
+            id,
+            I8Resident {
+                weight,
+                k,
+                n,
+                group,
+                b_scale,
+            },
+        );
+        id
+    })
+}
+
+/// Quantize a `[N, K]` f32 weight into symmetric per-K-group int8 codes; returns
+/// `(codes, scales [N, K/group])`, rayon-parallel over output channels.
+fn quantize_i8_weight(values: &[f32], n: usize, k: usize, group: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
+
+    let n_groups = k / group;
+    let mut q = vec![0i8; n * k];
+    let mut scales = vec![0f32; n * n_groups];
+    q.par_chunks_mut(k)
+        .zip(scales.par_chunks_mut(n_groups))
+        .zip(values.par_chunks(k))
+        .for_each(|((qrow, srow), xrow)| crate::host::quantize_row_groups(xrow, qrow, srow, group));
+    (q, scales)
+}
+
+/// Quantize `m` rows of `k` f32 values into int8 with per-row per-group scales;
+/// the tail is padded to `M % 4 == 0` (zero codes, scales 1), because the int8
+/// resident path has no `M == 1` pad and requires `M % 4 == 0`.
+fn quantize_i8_rows(values: &[f32], m: usize, k: usize, group: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
+
+    let n_groups = k / group;
+    let m4 = m.div_ceil(4) * 4;
+    let mut q = vec![0i8; m4 * k];
+    let mut scales = vec![1.0f32; m4 * n_groups];
+    q.par_chunks_mut(k)
+        .zip(scales.par_chunks_mut(n_groups))
+        .zip(values.par_chunks(k))
+        .for_each(|((qrow, srow), xrow)| crate::host::quantize_row_groups(xrow, qrow, srow, group));
+    (q, scales)
+}
+
+/// `t` must be f32; returns its shape and values.
+fn to_host_f32(t: FlexTensor, what: &str) -> (Vec<usize>, Vec<f32>) {
+    assert_eq!(t.dtype(), DType::F32, "{what} must be f32");
+    let dims: Vec<usize> = t.shape().into();
+    let values: Vec<f32> = t
+        .into_data()
+        .try_to_vec()
+        .unwrap_or_else(|e| panic!("{what}: expected f32 data ({e})"));
+    (dims, values)
+}
+
+/// Fused `gelu_approximate(a) * b`: one rayon pass instead of the composite's
+/// ~9 single-threaded flex ops (with a `tanh` and a `powf` per element).
+fn gelu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
+    use rayon::prelude::*;
+    const CHUNK: usize = 8192;
+
+    let (dims, av) = to_host_f32(a, "gelu_mul input a");
+    let (bdims, bv) = to_host_f32(b, "gelu_mul input b");
+    assert_eq!(dims, bdims, "gelu_mul inputs must share a shape");
+    let mut out = vec![0f32; av.len()];
+    out.par_chunks_mut(CHUNK)
+        .zip(av.par_chunks(CHUNK))
+        .zip(bv.par_chunks(CHUNK))
+        .for_each(|((o, g), u)| crate::host::gelu_mul(g, u, o));
+    FlexTensor::from_data(TensorData::new(out, dims))
+}
+
+/// Fused weighted RMSNorm over the last dim: one pass per row instead of the
+/// composite `square / mean / add / sqrt / div / mul` chain.
+fn rms_norm_impl(x: FlexTensor, w: FlexTensor, eps: f64) -> FlexTensor {
+    use rayon::prelude::*;
+
+    let (dims, xv) = to_host_f32(x, "rms_norm input");
+    let d = *dims.last().expect("rms_norm needs at least one dim");
+    let (_, wv) = to_host_f32(w, "rms_norm weight");
+    assert_eq!(wv.len(), d, "rms_norm: the weight has the last dim's size");
+    let mut out = vec![0f32; xv.len()];
+    out.par_chunks_mut(d)
+        .zip(xv.par_chunks(d))
+        .for_each(|(o, row)| crate::host::rms_norm_row(row, &wv, eps as f32, o));
+    FlexTensor::from_data(TensorData::new(out, dims))
+}
+
+/// Fused scale-free RMSNorm over the last dim (`x * (mean(x^2) + eps)^-0.5`).
+fn rms_norm_noscale_impl(x: FlexTensor, eps: f64) -> FlexTensor {
+    use rayon::prelude::*;
+
+    let (dims, xv) = to_host_f32(x, "rms_norm_noscale input");
+    let d = *dims
+        .last()
+        .expect("rms_norm_noscale needs at least one dim");
+    let mut out = vec![0f32; xv.len()];
+    out.par_chunks_mut(d)
+        .zip(xv.par_chunks(d))
+        .for_each(|(o, row)| crate::host::rms_norm_row(row, &[], eps as f32, o));
+    FlexTensor::from_data(TensorData::new(out, dims))
+}
+
+/// Fused rotate-half RoPE: one pass instead of slice/mul/sub/add/cat chains.
+fn rope_impl(x: FlexTensor, cos: FlexTensor, sin: FlexTensor) -> FlexTensor {
+    use rayon::prelude::*;
+
+    let (dims, xv) = to_host_f32(x, "rope input");
+    assert_eq!(dims.len(), 4, "rope: x must be [B, S, H, D]");
+    let (s, h, d) = (dims[1], dims[2], dims[3]);
+    assert_eq!(d % 2, 0, "rope: the head dim must be even");
+    let half = d / 2;
+    let (_, cv) = to_host_f32(cos, "rope cos");
+    let (_, sv) = to_host_f32(sin, "rope sin");
+    assert_eq!(cv.len(), s * half, "rope: cos must be [S, D/2]");
+    assert_eq!(sv.len(), s * half, "rope: sin must be [S, D/2]");
+    let mut out = vec![0f32; xv.len()];
+    out.par_chunks_mut(d).enumerate().for_each(|(row, o)| {
+        let si = (row / h) % s;
+        crate::host::rope_row(
+            &xv[row * d..(row + 1) * d],
+            &cv[si * half..(si + 1) * half],
+            &sv[si * half..(si + 1) * half],
+            half,
+            o,
+        );
+    });
+    FlexTensor::from_data(TensorData::new(out, dims))
+}
+
+/// How a registry id is executed; resolved before the host-side conversion so
+/// the (parallel) conversion runs outside the engine lock.
+enum WeightKind {
+    F16,
+    I8 { group: usize },
+}
+
+fn weight_kind(id: u64, k: usize) -> WeightKind {
+    with_engine(|e| {
+        if let Some(r) = e.weights.get(&id) {
+            assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
+            WeightKind::F16
+        } else if let Some(r) = e.i8_weights.get(&id) {
+            assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
+            WeightKind::I8 { group: r.group }
+        } else {
+            panic!("NPU weight id {id} is not packed");
+        }
+    })
+}
+
 fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
     let dims: Vec<usize> = x.shape().into();
     assert!(dims.len() >= 2, "NPU matmul needs at least [M, K]");
@@ -420,22 +711,33 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
         .try_to_vec()
         .expect("the NPU path needs f32 activations");
 
-    let t_conv = Instant::now();
-    let a16 = f32_to_f16_par(&values);
-    T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+    match weight_kind(id, k) {
+        WeightKind::F16 => {
+            let t_conv = Instant::now();
+            let a16 = f32_to_f16_par(&values);
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+            matmul_f16(dims, m, k, id, &a16)
+        }
+        WeightKind::I8 { group } => {
+            let t_conv = Instant::now();
+            let (q, a_scale) = quantize_i8_rows(&values, m, k, group);
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+            matmul_i8(dims, m, k, id, group, &q, &a_scale)
+        }
+    }
+}
 
+fn matmul_f16(dims: Vec<usize>, m: usize, k: usize, id: u64, a16: &[f16]) -> FlexTensor {
     with_engine(|e| {
         let r = e
             .weights
             .get(&id)
             .unwrap_or_else(|| panic!("NPU weight id {id} is not packed"));
-        assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
         let n = r.n;
         let chunk_m = matmul_chunk_m();
 
-        // Rows are independent, so M is safe to split: full chunks are matmul'd
-        // at their exact size (bounded NPU scratch), the tail keeps the old
-        // small-request padding (extra rows are ignored on readback).
+        // Rows are independent, so M is safe to split into bounded chunks
+        // (extra pad rows are ignored on readback).
         let mut c32: Vec<f32> = Vec::with_capacity(m * n);
         let mut off = 0;
         while off < m {
@@ -444,7 +746,15 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
             } else {
                 (m - off).min(chunk_m)
             };
-            let padded_m = (rows.div_ceil(4) * 4).max(MIN_M);
+            // Rows are independent, so M is safe to split: full chunks are
+            // matmul'd at their exact size (bounded NPU scratch). With the
+            // canonical tiling the resident weight serves any M, so only the
+            // M % 4 alignment pad remains; the legacy tiling needs the floor.
+            let padded_m = if crate::canonical_tiling() {
+                (rows.div_ceil(4) * 4).max(4)
+            } else {
+                (rows.div_ceil(4) * 4).max(MIN_M)
+            };
             let src = &a16[off * k..(off + rows) * k];
 
             let t_conv = Instant::now();
@@ -474,6 +784,59 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
     })
 }
 
+/// Group-wise int8 matmul with a resident weight. The output buffer is sized to
+/// the `M % 4` pad (`ceil4(m)`) so chunks write straight into it; the pad rows
+/// are truncated before the tensor is built.
+fn matmul_i8(
+    dims: Vec<usize>,
+    m: usize,
+    k: usize,
+    id: u64,
+    group: usize,
+    q: &[i8],
+    a_scale: &[f32],
+) -> FlexTensor {
+    debug_assert_eq!(q.len(), m.div_ceil(4) * 4 * k);
+    let n_groups = k / group;
+    with_engine(|e| {
+        let r = e
+            .i8_weights
+            .get(&id)
+            .unwrap_or_else(|| panic!("NPU weight id {id} is not packed"));
+        let n = r.n;
+        // Chunk starts stay % 4 (the int8 path has no M == 1 pad and needs
+        // M % 4 == 0); the `m % 4` tail is covered by `q`'s zero pad rows.
+        let chunk_m = matmul_chunk_m();
+        let chunk = if chunk_m == 0 { m } else { chunk_m.max(4) & !3 };
+        let mut c32: Vec<f32> = vec![0f32; m.div_ceil(4) * 4 * n];
+        let mut off = 0;
+        while off < m {
+            let rows = (m - off).min(chunk);
+            let padded_m = (rows + 3) & !3;
+            let a = &q[off * k..(off + padded_m) * k];
+            let sa = &a_scale[off * n_groups..(off + padded_m) * n_groups];
+            let cf = &mut c32[off * n..(off + padded_m) * n];
+
+            let t_npu = Instant::now();
+            e.i8_ctx
+                .as_ref()
+                .expect("the int8 context exists once an int8 weight is packed")
+                .matmul_gw(padded_m, k, n, a, sa, &r.b_scale, cf, &r.weight)
+                .unwrap_or_else(|err| {
+                    op_failure("rocket_matmul_int8_prepacked_gw", err.rc, rows, k, n)
+                });
+            T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+            NPU_CALLS.fetch_add(1, Ordering::Relaxed);
+            off += rows;
+        }
+        c32.truncate(m * n);
+
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = n;
+        FlexTensor::from_data(TensorData::new(c32, out_dims))
+    })
+}
+
 /// Additive-mask selection for the NPU attention op.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MaskMode {
@@ -485,6 +848,9 @@ enum MaskMode {
     Window(usize),
     /// Causal sliding window: `t - window < j <= t`.
     CausalWindow(usize),
+    /// Band over a query chunk at absolute offset `q0`, against keys starting at
+    /// `k0`: keep key `j` iff `|(q0 + i) - (k0 + j)| <= window`.
+    WindowBlock { window: usize, q0: usize, k0: usize },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -509,16 +875,23 @@ fn attention_impl(
         "q width must be n_head * head_dim"
     );
     let (k_dims, v_dims): (Vec<usize>, Vec<usize>) = (k.shape().into(), v.shape().into());
+    let n_k = k_dims[1];
     assert_eq!(
         k_dims,
-        vec![1, n, n_kv * head_dim],
+        vec![1, n_k, n_kv * head_dim],
         "NPU attention: k must be [1, S, KV*D]"
     );
     assert_eq!(
         v_dims,
-        vec![1, n, n_kv * head_dim],
+        vec![1, n_k, n_kv * head_dim],
         "NPU attention: v must be [1, S, KV*D]"
     );
+    if !matches!(mode, MaskMode::WindowBlock { .. }) {
+        assert_eq!(
+            n_k, n,
+            "the full-sequence mask modes need equal query/key lengths"
+        );
+    }
 
     let qf: Vec<f32> = q
         .into_data()
@@ -540,18 +913,21 @@ fn attention_impl(
         };
         if recreate {
             let fa = RocketFaCtx::new(e.threads)
-                .unwrap_or_else(|err| op_failure("rocket_fa_ctx_create", err.rc, n, n, head_dim));
+                .unwrap_or_else(|err| op_failure("rocket_fa_ctx_create", err.rc, n, n_k, head_dim));
             e.fa = Some(FaState {
                 fa,
                 n_head,
                 n_kv,
                 head_dim,
                 n: 0,
+                n_k: 0,
                 mask: Vec::new(),
                 win: usize::MAX,
                 win_mask: Vec::new(),
                 cw: usize::MAX,
                 cw_mask: Vec::new(),
+                wb: None,
+                wb_mask: Vec::new(),
                 q: Vec::new(),
                 k: Vec::new(),
                 v: Vec::new(),
@@ -559,16 +935,19 @@ fn attention_impl(
             });
         }
         let st = e.fa.as_mut().unwrap();
-        if st.n != n {
+        if st.n != n || st.n_k != n_k {
             st.n = n;
+            st.n_k = n_k;
             st.mask = build_causal_mask(n);
             st.win = usize::MAX;
             st.win_mask.clear();
             st.cw = usize::MAX;
             st.cw_mask.clear();
+            st.wb = None;
+            st.wb_mask.clear();
             st.q = vec![f16::ZERO; n_head * n * head_dim];
-            st.k = vec![f16::ZERO; n_kv * n * head_dim];
-            st.v = vec![f16::ZERO; n_kv * head_dim * n];
+            st.k = vec![f16::ZERO; n_kv * n_k * head_dim];
+            st.v = vec![f16::ZERO; n_kv * head_dim * n_k];
             st.out = vec![f16::ZERO; n_head * n * head_dim];
         }
 
@@ -585,11 +964,22 @@ fn attention_impl(
                 st.cw = w;
             }
         }
+        if let MaskMode::WindowBlock { window, q0, k0 } = mode {
+            // The block mask depends only on the relative offset (translation
+            // invariant), so a chunk run rebuilds it only when the key length or
+            // offset changes (first / interior / last chunk).
+            let key = (n, n_k, window, q0 - k0);
+            if st.wb != Some(key) {
+                st.wb_mask = crate::masks::build_window_mask_block(n, n_k, q0, k0, window);
+                st.wb = Some(key);
+            }
+        }
         let FaState {
             fa,
             mask,
             win_mask,
             cw_mask,
+            wb_mask,
             q,
             k,
             v,
@@ -597,8 +987,8 @@ fn attention_impl(
             ..
         } = st;
         fill_heads(&qf, n, n_head, head_dim, q);
-        fill_heads(&kf, n, n_kv, head_dim, k);
-        fill_heads_transposed(&vf, n, n_kv, head_dim, v);
+        fill_heads(&kf, n_k, n_kv, head_dim, k);
+        fill_heads_transposed(&vf, n_k, n_kv, head_dim, v);
         T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t_npu = Instant::now();
@@ -607,10 +997,11 @@ fn attention_impl(
             MaskMode::Causal => Some(&mask[..]),
             MaskMode::Window(_) => Some(&win_mask[..]),
             MaskMode::CausalWindow(_) => Some(&cw_mask[..]),
+            MaskMode::WindowBlock { .. } => Some(&wb_mask[..]),
         };
         fa.flash_attn(
             n,
-            n,
+            n_k,
             head_dim,
             head_dim,
             n_head,
@@ -623,7 +1014,7 @@ fn attention_impl(
             mask,
             out,
         )
-        .unwrap_or_else(|err| op_failure("rocket_flash_attn_fp16_ctx", err.rc, n, n, head_dim));
+        .unwrap_or_else(|err| op_failure("rocket_flash_attn_fp16_ctx", err.rc, n, n_k, head_dim));
         T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
         NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -660,6 +1051,18 @@ pub fn pack3(a: Tensor<2>, b: Tensor<2>, c: Tensor<2>) -> WeightId {
         a.into_dispatch(),
         b.into_dispatch(),
         c.into_dispatch(),
+    ))
+}
+
+/// Pack a `[N, K]` f32 weight into resident int8 NPU memory (W8A8): the weight
+/// is quantized host-side (symmetric int8, one scale per `group`-wide K block,
+/// `group % 32 == 0`) and the codes are scattered into NPU BOs once; `matmul`
+/// routes to the int8 path for weights packed this way. The host tensor is
+/// consumed and its memory dropped.
+pub fn pack_i8(w: Tensor<2>, group: usize) -> WeightId {
+    WeightId(<Dispatch as RocketOps>::rocket_pack_i8(
+        w.into_dispatch(),
+        group,
     ))
 }
 
@@ -751,6 +1154,75 @@ pub fn attention_causal_window<const D: usize>(
         scale,
         softcap,
         window,
+    ))
+}
+
+/// Chunked bidirectional band grouped-query attention on the NPU: `q` is
+/// `[1, n_q, H*D]`, `k`/`v` are `[1, n_kv_len, KV*D]`, and query `q_start + i`
+/// attends to key `kv_start + j` iff `|(q_start + i) - (kv_start + j)| <= window`
+/// (`window < 0` = no mask). Lets a sliding layer attend a query chunk against
+/// only the keys near it; same input layout as [`attention`].
+#[allow(clippy::too_many_arguments)]
+pub fn attention_window_block<const D: usize>(
+    q: Tensor<D>,
+    k: Tensor<D>,
+    v: Tensor<D>,
+    n_head: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    softcap: Option<f32>,
+    window: i64,
+    q_start: i64,
+    kv_start: i64,
+) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_window_block(
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
+        n_head,
+        n_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        window,
+        q_start,
+        kv_start,
+    ))
+}
+
+/// Fused `gelu_approximate(a) * b` (one pass; the NPU build's CPU glue).
+pub fn gelu_mul<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_gelu_mul(
+        a.into_dispatch(),
+        b.into_dispatch(),
+    ))
+}
+
+/// Fused weighted RMSNorm over the last dim
+/// (`x * (mean(x^2) + eps)^-0.5 * w`; `w` has the last dim's size).
+pub fn rms_norm<const D: usize>(x: Tensor<D>, w: Tensor<1>, eps: f64) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_rms_norm(
+        x.into_dispatch(),
+        w.into_dispatch(),
+        eps,
+    ))
+}
+
+/// Fused scale-free RMSNorm over the last dim (`x * (mean(x^2) + eps)^-0.5`).
+pub fn rms_norm_noscale<const D: usize>(x: Tensor<D>, eps: f64) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_rms_norm_noscale(
+        x.into_dispatch(),
+        eps,
+    ))
+}
+
+/// Fused rotate-half RoPE: `x` is `[B, S, H, D]`, `cos`/`sin` are `[S, D/2]`.
+pub fn rope_apply(x: Tensor<4>, cos: Tensor<2>, sin: Tensor<2>) -> Tensor<4> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_rope(
+        x.into_dispatch(),
+        cos.into_dispatch(),
+        sin.into_dispatch(),
     ))
 }
 

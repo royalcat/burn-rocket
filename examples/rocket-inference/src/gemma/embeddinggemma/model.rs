@@ -10,7 +10,6 @@ use std::time::Instant;
 use burn::module::Param;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::activation::gelu_approximate;
 use burn::tensor::{DType, Int, s};
 
 use crate::gemma::audio::AudioTower;
@@ -19,7 +18,7 @@ use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
 use crate::gemma::layers::{ClipBounds, lin};
 use crate::gemma::media::PreparedImage;
 use crate::gemma::vision::{MultimodalEmbedder, VisionTower};
-use crate::gemma::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::gemma::{chunked_attention, linear_cfg, repeat_kv};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -116,7 +115,6 @@ impl TextSpec {
 pub struct RopeTable {
     cos: Tensor<2>,
     sin: Tensor<2>,
-    half: usize,
 }
 
 impl RopeTable {
@@ -136,30 +134,15 @@ impl RopeTable {
         }
         let cos = Tensor::<2>::from_data(TensorData::new(cos, [max_seq, half]), device).cast(dtype);
         let sin = Tensor::<2>::from_data(TensorData::new(sin, [max_seq, half]), device).cast(dtype);
-        Self { cos, sin, half }
+        Self { cos, sin }
     }
 
     /// Applies RoPE to `x` of shape `[batch, seq, heads, head_dim]`.
     pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
-        let [_, s, _, d] = x.dims();
-        let half = self.half;
-        let cos = self
-            .cos
-            .clone()
-            .slice(s![0..s, ..])
-            .reshape([1, s, 1, half])
-            .cast(x.dtype());
-        let sin = self
-            .sin
-            .clone()
-            .slice(s![0..s, ..])
-            .reshape([1, s, 1, half])
-            .cast(x.dtype());
-        let x1 = x.clone().slice(s![.., .., .., 0..half]);
-        let x2 = x.slice(s![.., .., .., half..d]);
-        let o1 = x1.clone() * cos.clone() - x2.clone() * sin.clone();
-        let o2 = x2 * cos + x1 * sin;
-        Tensor::cat(vec![o1, o2], 3)
+        let [_, s, _, _] = x.dims();
+        let cos = self.cos.clone().slice(s![0..s, ..]);
+        let sin = self.sin.clone().slice(s![0..s, ..]);
+        crate::gemma::layers::rope_apply(x, cos, sin)
     }
 }
 
@@ -193,30 +176,46 @@ impl TextAttention {
         let k = lin(&self.k_proj, x.clone()).reshape([b, s, kv, d]);
         let v = lin(&self.v_proj, x).reshape([b, s, kv, d]);
 
-        let q = rope.apply(self.q_norm.forward(q));
-        let k = rope.apply(self.k_norm.forward(k));
-        let v = rms_norm_noscale(v, eps);
+        let q = rope.apply(crate::gemma::layers::rms_norm(&self.q_norm, q));
+        let k = rope.apply(crate::gemma::layers::rms_norm(&self.k_norm, k));
+        let v = crate::gemma::layers::rms_norm_noscale(v, eps);
 
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
         if self.npu_attn {
             // NPU attention takes the [1, S, H*D] layout; sliding layers get the
             // symmetric band mask, full layers no mask.
+            let qf = q.reshape([b, s, h * d]);
+            let kf = k.reshape([b, s, kv * d]);
+            let vf = v.reshape([b, s, kv * d]);
+            if spec.sliding && s > chunk {
+                // Chunked band attention: a query chunk only attends to the keys
+                // within `sliding_window` of it, so the score matrix, the host
+                // softmax and the mask stay O(s * (chunk + 2*window)) instead of
+                // O(s^2) (which OOMs the board around 30k).
+                let w = sliding_window;
+                let chunk = chunk.max(1);
+                let mut outs: Vec<Tensor<3>> = Vec::new();
+                let mut q0 = 0;
+                while q0 < s {
+                    let q1 = (q0 + chunk).min(s);
+                    let k0 = q0.saturating_sub(w);
+                    let k1 = (q1 + w).min(s);
+                    let qc = qf.clone().slice(s![.., q0..q1, ..]);
+                    let kc = kf.clone().slice(s![.., k0..k1, ..]);
+                    let vc = vf.clone().slice(s![.., k0..k1, ..]);
+                    outs.push(burn_rocket::attention_window_block(
+                        qc, kc, vc, h, kv, d, 1.0, None, w as i64, q0 as i64, k0 as i64,
+                    ));
+                    q0 = q1;
+                }
+                return lin(&self.o_proj, Tensor::cat(outs, 1));
+            }
             let window = if spec.sliding {
                 sliding_window as i64
             } else {
                 -1
             };
-            let o = burn_rocket::attention_window(
-                q.reshape([b, s, h * d]),
-                k.reshape([b, s, kv * d]),
-                v.reshape([b, s, kv * d]),
-                h,
-                kv,
-                d,
-                1.0,
-                None,
-                window,
-            );
+            let o = burn_rocket::attention_window(qf, kf, vf, h, kv, d, 1.0, None, window);
             return lin(&self.o_proj, o);
         }
 
@@ -247,9 +246,9 @@ impl TextMlp {
     }
 
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let gate = gelu_approximate(lin(&self.gate_proj, x.clone()));
+        let gate = lin(&self.gate_proj, x.clone());
         let up = lin(&self.up_proj, x);
-        lin(&self.down_proj, gate * up)
+        lin(&self.down_proj, crate::gemma::layers::gelu_mul(gate, up))
     }
 }
 
@@ -278,10 +277,10 @@ impl TextPleBlock {
     /// Returns the PLE contribution (residual add and `layer_scalar` are applied
     /// by the caller, matching the reference).
     fn forward(&self, x: Tensor<3>, per_layer_input: Tensor<3>) -> Tensor<3> {
-        let h = gelu_approximate(lin(&self.per_layer_input_gate, x));
-        let h = h * per_layer_input;
+        let gate = lin(&self.per_layer_input_gate, x);
+        let h = crate::gemma::layers::gelu_mul(gate, per_layer_input);
         let h = lin(&self.per_layer_projection, h);
-        self.post_per_layer_input_norm.forward(h)
+        crate::gemma::layers::rms_norm(&self.post_per_layer_input_norm, h)
     }
 }
 
@@ -313,7 +312,7 @@ impl TextPle {
         let scale = (spec.hidden_size as f64).powf(-0.5);
         let p = lin(&self.per_layer_model_projection, x).mul_scalar(scale);
         let p = p.reshape([b, s, spec.num_layers, spec.ple_dim]);
-        self.per_layer_projection_norm.forward(p)
+        crate::gemma::layers::rms_norm(&self.per_layer_projection_norm, p)
     }
 }
 
@@ -379,7 +378,7 @@ impl TextLayer {
     ) -> Tensor<3> {
         let residual = x.clone();
         let t = Instant::now();
-        let h = self.input_layernorm.forward(x);
+        let h = crate::gemma::layers::rms_norm(&self.input_layernorm, x);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -389,13 +388,13 @@ impl TextLayer {
         T_ATTN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
-        let h = self.post_attention_layernorm.forward(h);
+        let h = crate::gemma::layers::rms_norm(&self.post_attention_layernorm, h);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let x = residual + h;
 
         let residual = x.clone();
         let t = Instant::now();
-        let h = self.pre_feedforward_layernorm.forward(x);
+        let h = crate::gemma::layers::rms_norm(&self.pre_feedforward_layernorm, x);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -403,7 +402,7 @@ impl TextLayer {
         T_MLP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
-        let h = self.post_feedforward_layernorm.forward(h);
+        let h = crate::gemma::layers::rms_norm(&self.post_feedforward_layernorm, h);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let x = residual + h;
 
@@ -665,7 +664,10 @@ impl TextModel {
             };
             h = layer.forward(h, ple_i, rope, ls, spec.sliding_window, spec.eps, chunk);
         }
-        lin(&self.embedding_projection, self.norm.forward(h))
+        lin(
+            &self.embedding_projection,
+            crate::gemma::layers::rms_norm(&self.norm, h),
+        )
     }
 }
 
