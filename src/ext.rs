@@ -526,7 +526,7 @@ fn pack_i8_one(t: FlexTensor, group: usize) -> u64 {
     assert_eq!(t.dtype(), DType::F32, "the NPU path needs f32 weights");
     let [n, k] = t.shape().dims::<2>();
     assert!(
-        group > 0 && group % 32 == 0 && k % group == 0,
+        group > 0 && group.is_multiple_of(32) && k.is_multiple_of(group),
         "int8 group {group} must be a positive multiple of 32 dividing K={k}"
     );
     assert_eq!(k % 32, 0, "the int8 path needs K % 32 == 0 (K={k})");
@@ -952,17 +952,17 @@ fn attention_impl(
         }
 
         let t_conv = Instant::now();
-        if let MaskMode::Window(w) = mode {
-            if st.win != w {
-                st.win_mask = build_window_mask(n, w);
-                st.win = w;
-            }
+        if let MaskMode::Window(w) = mode
+            && st.win != w
+        {
+            st.win_mask = build_window_mask(n, w);
+            st.win = w;
         }
-        if let MaskMode::CausalWindow(w) = mode {
-            if st.cw != w {
-                st.cw_mask = build_causal_window_mask(n, w);
-                st.cw = w;
-            }
+        if let MaskMode::CausalWindow(w) = mode
+            && st.cw != w
+        {
+            st.cw_mask = build_causal_window_mask(n, w);
+            st.cw = w;
         }
         if let MaskMode::WindowBlock { window, q0, k0 } = mode {
             // The block mask depends only on the relative offset (translation

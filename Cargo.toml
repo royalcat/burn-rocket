@@ -9,7 +9,12 @@ license = "GPL-3.0-or-later"
 members = ["examples/rocket-inference"]
 
 [features]
-default = []
+# NPU offload is the first-class target: `librocketnpu` builds on the host through
+# build.rs (cross for aarch64, native for link checks), so the default build is the
+# real one. Secondary targets: `--no-default-features` = FFI-only (no Burn, no
+# archive), `--no-default-features --features flex` = Burn dependency without the
+# extension/archive (feature-graph check).
+default = ["npu"]
 # Burn's `#[backend_extension(Flex)]` catalog cfg is evaluated in this crate, so
 # the feature selecting the `Flex` backend must be named exactly `flex`.
 flex = ["dep:burn", "dep:rayon"]
@@ -20,7 +25,7 @@ npu = ["flex"]
 libc = "0.2"
 half = "2"
 rayon = { version = "1", optional = true }
-burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+burn = { version = "=0.22.0", default-features = false, features = [
     "std",
     "flex",
     "extension",

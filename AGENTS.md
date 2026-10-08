@@ -19,8 +19,9 @@ structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
 `examples/rocket-inference/` (renamed from `examples/qwen3-embeddings/` on 2026-10-06 when it
 gained the Qwen3.5 intent-model server), the former `crates/burn-rocket` became the root
 package.
-The inversion is verified on the dev host: `cargo check -p burn-rocket` (plain / `flex` /
-`npu`) and `-p rocket-inference` (default `cpu` and `--no-default-features`), aarch64
+The inversion is verified on the dev host: `cargo check -p burn-rocket` (default `npu`,
+plus `--no-default-features` and `flex`) and `-p rocket-inference` (default `cpu` and
+`--no-default-features`), aarch64
 cross-builds of the example (`--features npu`) and of `--example probe`, plus a tokenize +
 q8 embed smoke run. The git remotes changed on 2026-10-07: `origin` is GitHub
 `royalcat/burn-rocket.git` and is the push target; the old Gitea remote is kept as
@@ -293,9 +294,10 @@ The binary is self-contained (`librocketnpu` is statically linked); the model li
 `/root/models/qwen3-embedding-0.6b/` on the board. On the board run from
 `/root/rocket-inference` (the bench uses the relative `data/bench_text.txt`).
 
-Library-only builds: `cargo check -p burn-rocket --features npu` compiles the extension
-on any host (no linking); `cargo build --release -p burn-rocket --features npu --target
-aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the FFI probe.
+Library-only builds: `cargo check -p burn-rocket` (the `npu` feature is the default)
+compiles the extension on any host (no linking); `cargo build --release -p burn-rocket
+--target aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the
+FFI probe. `--no-default-features` gives the FFI-only crate (no Burn, no archive).
 
 Container image: `examples/rocket-inference/docker/build.sh [git-ref]` stages the tree,
 builds the aarch64 image on the board and pushes
@@ -382,11 +384,14 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 ## NPU offload (`--npu`, aarch64)
 
 - `burn-rocket` (repo root) = FFI to `librocketnpu` (rocket-userspace) plus the `RocketOps`
-  Burn backend extension. Build the example with `--no-default-features --features npu`;
-  the crate's `npu` feature implies `flex` (required because Burn's
-  `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and links
-  `vendor/rocketnpu/librocketnpu.a` (built by `scripts/build-rocketnpu.sh`; override with
-  `ROCKETNPU_DIR`). aarch64 only: the dep is target-gated in
+  Burn backend extension. `npu` is the crate's **default** feature (first-class target: the
+  archive builds through `build.rs`); `--no-default-features` gives the FFI-only crate and
+  `--no-default-features --features flex` the Burn dependency without the extension or
+  archive (feature-graph check). `npu` implies
+  `flex` (required because Burn's `#[backend_extension(Flex)]` reads `feature = "flex"` in
+  the consuming crate) and links `vendor/rocketnpu/librocketnpu.a` (built by
+  `scripts/build-rocketnpu.sh`; override with `ROCKETNPU_DIR`). Build the example with
+  `--no-default-features --features npu`; aarch64 only: the dep is target-gated in
   `examples/rocket-inference/Cargo.toml`.
 - `build.rs` supplies the archive without a manual step: `ROCKETNPU_DIR` (explicit;
   never auto-built) → matching `vendor/rocketnpu` (an absent `ARCH` counts as aarch64)
@@ -505,7 +510,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ## Stack notes
 
-- `burn = "=0.22.0-pre.4"`, `burn-store = "=0.22.0-pre.4"`; `flex` backend is the primary
+- `burn = "=0.22.0"`, `burn-store = "=0.22.0"`; `flex` backend is the primary
   path (`cpu` = CubeCL LLVM pays JIT cost and has a transposed-B penalty).
 - `Device::sync()` is required before timing or reading results.
 - `Linear` weights are `[in, out]`; use `PyTorchToBurnAdapter` when loading HF
@@ -522,9 +527,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   quantization releases the freed f32 pages (glibc otherwise retains ~1.3 GB in arenas).
   Resident ~0.78 GB anon vs ~2.4 GB for f32, cost ~2 s per forward. Load peak is still
   ~2.3 GB (the file is materialized as f32 before quantization).
-- `--dtype bf16` panics in flex 0.22.0-pre.4 (bf16 embedding gather, "storage: dtype
-  mismatch (expected BF16, got F32)"); `load_model` bails with a clear message. f16 works
-  but is ~1.9× slower at model level.
+- `--dtype bf16` works on burn 0.22.0 (verified: 310 tensors load, an 82-token embed runs,
+  cosine 0.99983 vs f32). It is ~2× slower than f32 on flex, so it stays a memory mode;
+  the q8 path keeps its f16 embedding table.
 - Tokenizer must run with `add_special_tokens=true` (appends EOS 151643), matching
   `llama-embedding` token counts.
 - f16 weights are ~1.9× slower than f32 at model level on this CPU despite similar GEMM
@@ -594,8 +599,11 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ```sh
 B=$CARGO_TARGET_DIR/release/rocket-inference
-# library compile checks (npu needs aarch64 only for linking)
-cargo check -p burn-rocket --features npu
+# library compile checks (npu is the default; no linking on the host)
+cargo check -p burn-rocket
+# FFI-only and flex-only (no extension/archive) variants
+cargo check -p burn-rocket --no-default-features
+cargo check -p burn-rocket --no-default-features --features flex
 # example npu compile check (the dep is aarch64-gated, so use the target)
 cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
 # formatting + lint gates (both clean)

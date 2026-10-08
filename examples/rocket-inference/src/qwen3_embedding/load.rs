@@ -27,11 +27,6 @@ pub fn load_model(
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
     let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
-    if dtype == DType::BF16 {
-        bail!(
-            "--dtype bf16 is broken in burn-flex 0.22.0-pre.4 (bf16 embedding gather panics); use f32 (or f16 for a smaller model)"
-        );
-    }
     let mut model = Qwen3Embedding::new(&cfg, device);
     let t0 = Instant::now();
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
@@ -78,7 +73,7 @@ pub fn load_model(
         // each weight on the fly, so only the current layer's f32 weights are
         // materialized (~62 MB) instead of all 1.75 GB. The token-embedding table is
         // kept in f16 (exact for bf16-sourced values in range) and gathered rows are
-        // cast back to f32 per forward. flex's bf16 gather is broken (dtype panic).
+        // cast back to f32 per forward; bf16 is supported but ~2x slower on flex.
         let proj_group = param_group(r"\.(q|k|v|o|gate|up|down)_proj\.weight$")?;
         let embed_group = param_group(r"embed_tokens\.weight$")?;
         let mut mapper = LowRam::new(vec![proj_group], vec![embed_group]);
@@ -112,7 +107,7 @@ fn read_projection(
         .get_tensor(&key)?
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
     let data = burn_store::bridge::to_data(tensor)?.convert_dtype(DType::F32);
-    let [n, k] = data.shape.dims::<2>();
+    let [n, k] = data.shape().dims::<2>();
     Ok((k, n, data))
 }
 

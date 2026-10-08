@@ -458,7 +458,7 @@ impl ModuleAdapter for QatAdapter {
         let scales = scales.clone();
         let shape = Shape::new([rows, k]);
         bridge::map_data(tensor, target_name, target, shape, move |data| {
-            let bytes: Vec<u8> = if data.dtype == DType::U8 {
+            let bytes: Vec<u8> = if data.dtype() == DType::U8 {
                 data.try_to_vec().expect("packed u8")
             } else {
                 data.try_to_vec::<i8>()

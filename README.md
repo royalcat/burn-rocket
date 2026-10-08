@@ -44,7 +44,7 @@ than the CPU-only flex path (the default NPU attention is slightly faster: ~45 t
 
 ## What it provides
 
-- **Burn backend extension** (`#[backend_extension(Flex)]`, feature `npu`): ordinary
+- **Burn backend extension** (`#[backend_extension(Flex)]`, default `npu` feature): ordinary
   `Tensor`s in and out, no FFI in model code.
 
   ```rust,ignore
@@ -84,9 +84,13 @@ packed for the `M >= 256` tiling, smaller requests are padded.
 
 | feature | effect |
 |---|---|
-| `default` | none |
+| `default` | `npu` — NPU offload is the first-class target |
 | `flex` | compiles against Burn's `Flex` backend (required by the extension catalog; the feature name must stay exactly `flex`) |
-| `npu` | the `RocketOps` extension ops; links `librocketnpu.a` on aarch64 (implies `flex`) |
+| `npu` | the `RocketOps` extension ops; links `librocketnpu.a` (implies `flex`) |
+
+`--no-default-features` gives the FFI-only crate (no Burn, no archive);
+`--no-default-features --features flex` the Burn dependency without the extension or
+archive (feature-graph check).
 
 ## Building
 
@@ -115,11 +119,11 @@ and skips the build when the directory already matches. `--commit <sha>` moves t
 (`<target-dir>/<profile>/build/burn-rocket` for manual runs).
 
 ```sh
-# compile check, works on any target that has no NPU (no linking)
-cargo check -p burn-rocket --features npu
+# compile check (npu is the default; works on any target, no linking)
+cargo check -p burn-rocket
 
 # aarch64 build of the probe example (links vendor/rocketnpu/librocketnpu.a)
-cargo build --release -p burn-rocket --example probe --features npu \
+cargo build --release -p burn-rocket --example probe \
   --target aarch64-unknown-linux-gnu
 ```
 

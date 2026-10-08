@@ -170,7 +170,7 @@ runs are fastest with `--attn blocked --chunk 256 --key-block 256`.
 
 ### Dev-host results
 
-AMD Ryzen 9 5950X (Zen3, AVX2+FMA), Burn 0.22.0-pre.4, all rows Q8 weights:
+AMD Ryzen 9 5950X (Zen3, AVX2+FMA), Burn 0.22.0, all rows Q8 weights:
 
 | Attention | Tokens | Threads | Time | Speed |
 |---|---|---|---|---|

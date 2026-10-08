@@ -127,6 +127,14 @@ impl Module for Proj {
             Proj::Npu(id) => Proj::Npu(id),
         }
     }
+
+    fn materialize(self) -> Self {
+        match self {
+            Proj::Cpu(l) => Proj::Cpu(l.materialize()),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(id) => Proj::Npu(id),
+        }
+    }
 }
 
 impl ModuleDisplayDefault for Proj {

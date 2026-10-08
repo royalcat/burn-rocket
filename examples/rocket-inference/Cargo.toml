@@ -29,17 +29,17 @@ path = "src/bin/wgpu_probe.rs"
 required-features = ["gpu"]
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-burn-rocket = { path = "../..", optional = true }
+burn-rocket = { path = "../..", default-features = false, optional = true }
 
 [dependencies]
-burn = { version = "=0.22.0-pre.4", default-features = false, features = [
+burn = { version = "=0.22.0", default-features = false, features = [
     "std",
     "flex",
     "rayon",
     "simd",
     "store",
 ] }
-burn-store = { version = "=0.22.0-pre.4", default-features = false, features = [
+burn-store = { version = "=0.22.0", default-features = false, features = [
     "std",
     "safetensors",
     "memmap",

@@ -52,16 +52,16 @@ fn read_tensor(store: &mut SafetensorsStore, key: &str) -> Result<TensorData> {
 
 fn read2(store: &mut SafetensorsStore, key: &str, device: &Device) -> Result<Tensor<2>> {
     let data = read_tensor(store, key)?;
-    if data.shape.num_dims() != 2 {
-        bail!("{key}: expected a 2-D tensor, got {:?}", data.shape);
+    if data.shape().num_dims() != 2 {
+        bail!("{key}: expected a 2-D tensor, got {:?}", data.shape());
     }
     Ok(Tensor::<2>::from_data(data, device))
 }
 
 fn read1(store: &mut SafetensorsStore, key: &str, device: &Device) -> Result<Tensor<1>> {
     let data = read_tensor(store, key)?;
-    if data.shape.num_dims() != 1 {
-        bail!("{key}: expected a 1-D tensor, got {:?}", data.shape);
+    if data.shape().num_dims() != 1 {
+        bail!("{key}: expected a 1-D tensor, got {:?}", data.shape());
     }
     Ok(Tensor::<1>::from_data(data, device))
 }
@@ -228,7 +228,7 @@ fn load_linear(
     dn.conv_w = {
         let data = read_tensor(store, &p("linear_attn.conv1d.weight"))?;
         // Stored [conv_dim, 1, kernel] -> [conv_dim, kernel].
-        let [c, _, k] = data.shape.dims::<3>();
+        let [c, _, k] = data.shape().dims::<3>();
         Tensor::<3>::from_data(data, device).reshape([c, k])
     };
     dn.dt_bias = read1(store, &p("linear_attn.dt_bias"), device)?;

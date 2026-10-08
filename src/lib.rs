@@ -185,6 +185,9 @@ impl RocketCtx {
     ///
     /// The context requests the library's canonical tiling (M-independent down
     /// to 4) unless `ROCKET_CTX_CANONICAL=0` selects the legacy tiling.
+    // `CtxInner` is deliberately not Send/Sync (see above); the Arc shares the
+    // context among clones and callers serialize access themselves.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(nthreads: usize) -> Result<Self, Error> {
         let fd = unsafe { ffi::rocket_open() };
         if fd < 0 {
@@ -490,6 +493,9 @@ pub struct RocketI8Ctx {
 
 impl RocketI8Ctx {
     /// Create a context with `nthreads` workers.
+    // `I8CtxInner` is deliberately not Send/Sync (like `CtxInner`); the Arc only
+    // shares the context among clones, and callers serialize access.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(nthreads: usize) -> Result<Self, Error> {
         let ctx = unsafe { ffi::rocket_i8_ctx_create(nthreads as i32) };
         if ctx.is_null() {

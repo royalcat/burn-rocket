@@ -14,7 +14,7 @@ Environment:
 
 - Host: AMD Ryzen 9 5950X (Zen3, 16c/32t, AVX2+FMA, no AVX-512), Linux, rustc 1.98.1.
 - `CARGO_TARGET_DIR=/home/royalcat/.cache/rust/target` (shared).
-- Stack: `burn = "=0.22.0-pre.4"` with `flex` + `rayon` + `simd` features,
+- Stack: `burn = "=0.22.0"` with `flex` + `rayon` + `simd` features,
   `burn-store` safetensors, `tokenizers` 0.21, axum server.
 - Reference/production: patched `~/projects/ik_llama.cpp` (`embeddings-skip-lm-head`),
   `llama-embedding` with `~/models/qwen3-embedding-0.6b-q8_0.gguf`.
@@ -269,11 +269,10 @@ exact (cosine 1.000000 vs the f32-resident Q8 path) but had two problems:
 - **RSS didn't drop**: glibc retained the freed f32 pages in its arenas (~1.3 GB), so
   resident anon stayed at ~2.4 GB. Fix: `libc::malloc_trim(0)` after quantization.
 
-The embedding table is kept in f16 (155 M params, 0.31 GB): a bf16 table panics in flex
-0.22.0-pre.4 (`bf16 embedding gather: "storage: dtype mismatch (expected BF16, got
-F32)"` — flex bug, `float_select` dispatches bf16 but a lower layer reads f32 storage),
-while f16 works and is exact for bf16-sourced values in range. `load_model` now bails
-with a clear message for `--dtype bf16`.
+The embedding table is kept in f16 (155 M params, 0.31 GB): f16 is exact for bf16-sourced
+values in range, and gathered rows are cast back to f32 per forward. (A bf16 table
+panicked in flex 0.22.0-pre.4 — `bf16 embedding gather: "storage: dtype mismatch
+(expected BF16, got F32)"`; burn 0.22.0 fixed it, see §15.)
 
 ### 8.2 Results
 
@@ -470,7 +469,7 @@ reboot restores the stock 200 MHz in-tree module). The NPU deployment needs
 
 The NPU runtime moved out of the app into a separate `burn-rocket` crate as a Burn *backend
 extension* (`#[backend_extension(Flex)]`, the out-of-tree op hook of
-0.22.0-pre.4): the `RocketOps` trait declares `rocket_pack/pack2/pack3` (weights ->
+0.22.0): the `RocketOps` trait declares `rocket_pack/pack2/pack3` (weights ->
 resident handles), `rocket_matmul` and `rocket_attention`; the safe wrappers `pack`,
 `pack2`, `pack3`, `matmul`, `attention` take ordinary `Tensor`s and do the
 `into_dispatch`/`from_dispatch` plumbing, so `src/qwen3_embedding/model.rs` calls
@@ -725,3 +724,29 @@ stands if it is ever re-enabled.
   per layer (the library documents a `-2` re-pack fallback for small `M`) — probe first.
 - The server is one-at-a-time (a global model lock); quantify OpenViking's concurrent
   intent calls before a production switch.
+
+## 15. Maintenance round: burn 0.22.0 stable + bf16 re-enable (2026-10-09)
+
+Pins moved from `=0.22.0-pre.4` to `=0.22.0` (workspace and example; `burn-store` too).
+Three mechanical API changes in the example: `Module::materialize` became a required
+method (added to the manual `impl Module for Proj`), and `TensorData.shape`/`dtype`
+became private fields with accessor methods (7 call sites across the qwen3, intent and
+gemma loaders). The library needed no changes for the bump itself; it also gained the
+default-`npu` feature switch and a clippy cleanup (see below).
+
+Numerics: the f32 path matches the pre.4 build (cosine 1.000000000 at 82 tokens, max
+element difference 1.5e-5 — flex kernel changes between pre.4 and 0.22.0; the q8 path
+shows the same, cosine 1.000000000, max|d| 1.6e-5). `--dtype bf16` works again (the pre.4
+flex bf16 embedding panic is gone): 310 tensors load, an 82-token embed completes, cosine
+0.99983 vs the same build's f32 output; 100.5 tok/s vs 216.2 for f32 on the dev host, so
+bf16 stays a memory mode and f32 remains the parity/default mode.
+
+`npu` is now the burn-rocket crate's default feature: the archive builds through
+`build.rs` (cross for aarch64, native for host link checks), so no non-NPU build is
+needed for `cargo check` to work. `--no-default-features` gives the FFI-only crate (no
+Burn, no archive) and `--no-default-features --features flex` the Burn dependency without
+the extension (feature-graph check); both remain available for secondary targets.
+
+Checks: `cargo check` matrix (burn-rocket default / `--no-default-features` / `flex`;
+example flex / default cpu / aarch64 npu / gpu-wgsl probe), `cargo test -p burn-rocket`
+(11 unit tests + doctests) and the parity suite above.
