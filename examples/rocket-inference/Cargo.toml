@@ -51,6 +51,8 @@ libc = "0.2"
 anyhow = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 rustfft = "6"
 hound = "3"

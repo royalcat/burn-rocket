@@ -22,7 +22,8 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::engine::{ChatMessage, ChatTurn, Family};
-use super::error::{ApiError, OllamaError, blocking};
+use super::error::{ApiError, OllamaError};
+use super::log;
 
 /// ChatML template (intent model); Gemma 4 renders its own template, so
 /// `/api/show` reports it without one.
@@ -253,8 +254,8 @@ async fn chat(
         seed: seed_of(&req.options),
         num_ctx: resolve_num_ctx(&req.options, &state.settings),
     };
-    let state2 = state.clone();
-    let completion = blocking(move || state2.lock().chat(turn)).await?;
+    let (completion, timing) = state.compute(move |engine| engine.chat(turn)).await?;
+    log::chat(&state, "api.chat", &completion, &timing);
 
     let created = now_rfc3339();
     if stream {
@@ -326,8 +327,8 @@ async fn generate(
         seed: seed_of(&req.options),
         num_ctx: resolve_num_ctx(&req.options, &state.settings),
     };
-    let state2 = state.clone();
-    let completion = blocking(move || state2.lock().chat(turn)).await?;
+    let (completion, timing) = state.compute(move |engine| engine.chat(turn)).await?;
+    log::chat(&state, "api.generate", &completion, &timing);
 
     let created = now_rfc3339();
     if stream {

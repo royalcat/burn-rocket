@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use super::engine::{ChatMessage, ChatTurn, EmbedInput, EmbedTextsRequest};
-use super::error::{ApiError, OpenAiError, blocking};
+use super::error::{ApiError, OpenAiError};
+use super::log;
 
 // ---------------------------------------------------------------------------
 // /v1/embeddings
@@ -86,8 +87,11 @@ pub(crate) async fn embeddings(
         dim: req.dim,
     };
 
-    let state = state.clone();
-    let result = blocking(move || state.lock().embed_texts(request)).await?;
+    let inputs = request.inputs.len();
+    let (result, timing) = state
+        .compute(move |engine| engine.embed_texts(request))
+        .await?;
+    log::embedding(&state, "embeddings", inputs, result.tokens, &timing);
 
     let data: Vec<EmbeddingData> = result
         .vectors
@@ -293,8 +297,8 @@ pub(crate) async fn chat_completions(
         num_ctx: None,
     };
 
-    let state = state.clone();
-    let completion = blocking(move || state.lock().chat(turn)).await?;
+    let (completion, timing) = state.compute(move |engine| engine.chat(turn)).await?;
+    log::chat(&state, "chat.completions", &completion, &timing);
     let created = now_secs();
     Ok(Json(serde_json::json!({
         "id": format!("chatcmpl-{}", now_millis()),

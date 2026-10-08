@@ -6,16 +6,19 @@
 //! `/api/*`) for chat models. Incompatible paths are not registered (404).
 //!
 //! The model sits behind one mutex (a forward is CPU-bound and single-flight);
-//! panics are contained so the server survives them.
+//! panics are contained so the server survives them, and every inference
+//! request is timed and logged through [`log`].
 
 pub mod cli;
 pub mod engine;
 pub mod error;
+mod log;
 mod multimodal;
 mod ollama;
 mod openai;
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -26,6 +29,8 @@ use axum::{
 
 use crate::util::http::lock_or_recover;
 use engine::{Capabilities, Engine, Family};
+use error::{ApiError, blocking};
+use log::RequestTiming;
 
 /// Immutable settings, kept outside the model lock so `/health`, `/v1/models`
 /// and request routing never block behind a running forward.
@@ -48,13 +53,52 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn lock(&self) -> MutexGuard<'_, Engine> {
+    fn lock(&self) -> MutexGuard<'_, Engine> {
         lock_or_recover(&self.inner)
     }
+
+    /// Run one inference call: wait for the model lock, time the wait and the
+    /// call itself, and contain panics (through [`blocking`]). Every inference
+    /// endpoint goes through this so the request logs carry consistent timings.
+    pub(crate) async fn compute<T, F>(&self, f: F) -> Result<(T, RequestTiming), ApiError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Engine) -> Result<T, ApiError> + Send + 'static,
+    {
+        let state = self.clone();
+        let arrived = Instant::now();
+        blocking(move || {
+            let mut engine = state.lock();
+            let queue_s = arrived.elapsed().as_secs_f64();
+            let t0 = Instant::now();
+            let out = f(&mut engine)?;
+            let timing = RequestTiming {
+                queue_s,
+                compute_s: t0.elapsed().as_secs_f64(),
+            };
+            Ok((out, timing))
+        })
+        .await
+    }
+}
+
+/// Install the `tracing` subscriber: level from `RUST_LOG` (default `info`),
+/// timestamps, no ANSI when stdout is not a terminal (docker/systemd logs).
+fn init_logging() {
+    use std::io::IsTerminal;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
+        .try_init();
 }
 
 /// Serve one loaded model on `addr` until the process is stopped.
 pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
+    init_logging();
     let capabilities = settings.capabilities;
     let model_name = settings.model_name.clone();
     let state = AppState {
@@ -86,7 +130,7 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
-        println!("listening on http://{addr} (model '{model_name}')");
+        tracing::info!(addr = %addr, model = %model_name, "listening");
         axum::serve(listener, app).await?;
         Ok::<(), anyhow::Error>(())
     })

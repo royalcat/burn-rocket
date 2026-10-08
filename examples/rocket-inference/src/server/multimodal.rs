@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::engine::EmbedMediaRequest;
-use super::error::{ApiError, OpenAiError, blocking};
+use super::error::{ApiError, OpenAiError};
+use super::log;
 use crate::gemma::media::resolve_media;
 
 #[derive(Deserialize, Default)]
@@ -47,8 +48,10 @@ pub(crate) async fn embed(
         prompt: req.prompt,
         dim: req.dim,
     };
-    let state = state.clone();
-    let result = blocking(move || state.lock().embed_media(request)).await?;
+    let (result, timing) = state
+        .compute(move |engine| engine.embed_media(request))
+        .await?;
+    log::embedding(&state, "embed", 1, result.tokens, &timing);
     let vector = result.vectors.into_iter().next().unwrap_or_default();
     Ok(Json(serde_json::json!({
         "model": model_name,

@@ -5495,6 +5495,8 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

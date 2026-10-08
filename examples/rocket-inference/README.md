@@ -124,6 +124,21 @@ as before); Ollama `stream: true` returns one NDJSON content line plus the final
 `image_url` / `input_audio` (one of each per request). Requests serialize on the
 model; panicking forwards are contained (500) instead of poisoning the server.
 
+Every completed inference request is logged as one `tracing` line (level
+`info`, `RUST_LOG` controls it; default `info`). Embedding requests report the
+prompt token count, `compute_s`, `tok_s`, the model-lock wait `queue_s` and
+`rss_mib` (`RssAnon`); chat requests additionally split the model's own timings
+into `prefill_s`/`prefill_tok_s` and `decode_s`/`decode_tok_s`. Failed requests
+are not logged (they keep their HTTP error), and `/health`/`/v1/models` never
+touch the model:
+
+```text
+INFO embedding request endpoint=embeddings model=qwen3-embedding-0.6b inputs=2 tokens=13 queue_s=0.0 compute_s=6.335 tok_s=2.1 rss_mib=968.7
+INFO chat request endpoint=chat.completions model=gemma-4-E2B-it-qat-mobile prompt_tokens=15 prefill_s=1.56 prefill_tok_s=9.6 gen_tokens=2 decode_s=0.194 decode_tok_s=10.3 queue_s=0.0 compute_s=1.754 rss_mib=6783.9
+```
+
+Set `RUST_LOG=warn` to silence the per-request lines.
+
 ## Qwen3-Embedding-0.6B (`qwen3`)
 
 Embedding-only Qwen3 (no `lm_head`): 28 layers, hidden 1024, GQA 16/8 heads,

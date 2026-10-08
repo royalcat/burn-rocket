@@ -98,6 +98,13 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   for a container restart), and matmuls chunk above `ROCKET_MATMUL_CHUNK_M` (default 8192,
   0 disables). Board-verified for robustness only; long-context attention and performance
   are unchanged/deferred.
+- **Request speed logs** (2026-10-08): `serve` installs a `tracing` subscriber
+  (`RUST_LOG`, default `info`) and emits one `info` line per successful inference
+  request: `queue_s` (model-lock wait), `compute_s`, token counts + `tok_s`, `RssAnon`;
+  chat lines additionally split `prefill_s`/`prefill_tok_s` and `decode_s`/`decode_tok_s`
+  from the model's own timings. Errors and `/health`/`/v1/models` are not logged. The
+  timing plumbing is `AppState::compute` (`src/server/mod.rs`), the line format
+  `src/server/log.rs`; dev-verified for embeddings (qwen3 q8) and chat (Gemma 4 QAT).
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
@@ -135,7 +142,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
-| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
+| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), safetensors load-report checks (`store`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
