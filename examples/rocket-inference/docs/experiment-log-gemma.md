@@ -642,10 +642,11 @@ CPU copies kept, so the decode speed can be measured before switching to
   3.7 GiB anon plus ~1.2 GiB reclaimable table pages) and the
   `ROCKET_NPU_DECODE=1` decode-speed pre-gate (§13).
 - 30k-token text with chunked attention (the old OOM point); needs the board.
-- Redeploy the production `openviking-embed-1` service on this build (it runs the
-  2026-10-05-era `c951944` image, which predates canonical tiling, chunking, int8
-  and the fused glue). fp16 `--npu` is the recommended speed config; the deployed
-  q8+npu config stays the memory choice.
+- Production `openviking-embed-1` redeploy: **done** — `b09c082` on 2026-10-08
+  (canonical tiling, chunking, fused glue) and `4a8657b` on 2026-10-09 (burn 0.22
+  + native bf16). The deployed config stays `--dtype f32 --quant q8 --npu
+  --npu-attn npu --attn-chunk 1024`: the native-bf16 default loses ~20–25 % to
+  q8 on the board (log §18).
 - Exposing `--npu-int8` / `--npu-int8-group` on `serve` (the server loads fp16
   text weights today).
 - int8 for the vision/audio towers (small share of the work; text-only today).

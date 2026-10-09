@@ -859,4 +859,31 @@ bf16<->f32); emb2 bf16 is now *faster* than its f32 arm (+4.3 %) at ~60 % of the
 memory. The qwen3 glue A/B (`ROCKET_GLUE=0` vs default, bf16) is cosine 0.99975: the
 fused kernels compute in f32 while the composites round every step to bf16, so the
 glue-on path is the more precise one. `ROCKET_BF16_STREAM=1` reproduces the §16
-numerics (0.99982 vs the resident packing).
+numerics (0.99982 vs the resident packing). (The **deployed** emb2 service runs
+`--quant q8`, an arm this table does not include — see §18: there q8+f32 beats
+bf16 on the board.)
+
+## 18. Production emb2 A/B: q8+f32 vs native bf16 (2026-10-09)
+
+The `openviking-embed-1` service has always run `--quant q8` (the memory pick of
+§12.5/§16), so when build `4a8657b` (burn 0.22 + native bf16) was deployed the
+new bf16 default was checked against it on the same image — §17's table compared
+bf16 only against `--dtype f32`. A/B/A order (q8 → bf16 → q8, ~10 min apart,
+same requests, 3 reps per arm, `compute_s`, `queue_s` 0; a quiet board, two text
+payloads of 843 and 4203 tokens):
+
+| arm (image `4a8657b`) | 843 tok | 4203 tok | RSS after (4203 tok) |
+|---|---|---|---|
+| q8+f32, run 1 | 3.8–4.6 s / 185–223 tok/s | 24.6–25.9 s / 162–171 tok/s | 746–837 MiB |
+| native bf16 (resident pack) | 4.5–5.0 s / 168–188 tok/s | 29.3–30.8 s / 136–143 tok/s | 2129–2131 MiB |
+| q8+f32, run 2 | 3.6–4.0 s / 213–234 tok/s | 24.5–26.5 s / 159–172 tok/s | 2277–2301 MiB |
+
+The two q8 runs bracket the bf16 arm in time and agree with each other, so the
+~20–25 % bf16 deficit is real on this board: bf16's resident-fp16 pack gains CPU
+time against the f32 arm (§17) but not against q8, whose Q8-resident host weights
+plus fp16 NPU pack are the faster combination here. RSS is unstable across
+repeated runs of the *same* config (q8 reported 0.7–0.8 GiB in run 1 and
+2.3 GiB in run 2), so it gives no verdict between the arms; both stay far under
+the 8 GiB guard. **Decision: the deployed service keeps `--dtype f32 --quant q8
+--npu --npu-attn npu --attn-chunk 1024`** on `4a8657b` (q8's 0.99965 cosine;
+bf16's 0.999939 could be traded in if quality ever outweighs the ~20 % speed).

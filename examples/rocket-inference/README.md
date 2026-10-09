@@ -343,8 +343,12 @@ user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster
 33% less CPU. Native bf16 (the default) with `--npu` packs the same resident fp16
 weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) vs
 16.5 s (156.7 tok/s, 1893 MiB) for `--dtype f32` on the 2026-10-09 board A/B
-(log §17) — bf16 is now the faster arm at ~60 % of the memory, cosine 0.999939 vs
-f32. The vision/audio towers, norms, RoPE and the embedding table stay
+(log §17) — bf16 is faster than the f32 arm at ~60 % of the memory, cosine
+0.999939 vs f32. Against the deployed `--quant q8` arm, though, bf16 loses
+~20–25 % on the quiet board (log §18: 843 tok 4.5–5.0 s vs 3.6–4.0 s; 4203 tok
+29.3–30.8 s vs 24.5–26.5 s), so the production service keeps
+`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024`. The vision and
+audio towers, norms, RoPE and the embedding table stay
 on the CPU.
 
 Performance round (2026-10-08, log §12; board timings in §12.5):
