@@ -84,6 +84,9 @@ pub fn load_model(
         rss_mib()
     );
     drop(store);
+    if defer_towers {
+        println!("towers: deferred (load on the first media request)");
+    }
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(opts) = npu {
         // int8 packs straight from the model weights (one quantization step, no
@@ -108,9 +111,6 @@ pub fn load_model(
     }
     if !defer_towers {
         load_towers(&mut model, model_dir, dtype, quant_q8, device)?;
-    }
-    if defer_towers {
-        println!("towers: deferred (load on the first media request)");
     }
     Ok((model, cfg))
 }
