@@ -421,23 +421,24 @@ $B gemma gen --gen-model-dir ~/models/gemma-4-E2B-it-qat-mobile --f16 \
     --text "What is the capital of France?" --max-new-tokens 16
 ```
 
-| mode (text-only, `--defer-towers`) | resident | short decode | notes |
+| mode (text-only, `--defer-towers`) | peak anon | short decode | notes |
 |---|---|---|---|
-| f32 | 7.2 GiB | 3.9 tok/s | parity mode (f32 projections) |
-| `--f16` | 3.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
-| `--quant q8` | 2.1 GiB | 0.07 tok/s | memory-only |
+| f32 | 9.2 GiB | 3.9 tok/s | parity mode (f32 projections) |
+| `--f16` | 4.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
+| `--quant q8` | 3.7 GiB | 0.07 tok/s | memory-only |
 
 Both token tables stay packed in memory: the PLE table (as before) and the
 token table, whose rows are dequantized per gather with the LM head
 materialized from it once — the only full-size table copy. Both are file-backed
 views of the memory-mapped checkpoint, so their bytes are reclaimable page
-cache instead of anonymous memory. `--defer-towers` skips the vision/audio
-towers at load (~1.9 GiB f32) and installs them on the first media request
-(~4 s); `--f16 --defer-towers` is the low-memory serving configuration
-(3.7 GiB anon text-only, 5.6 GiB once towers are loaded; same numbers on the
-generation path, no per-request cost after the first). The towers always load
-f32 — the validated multimodal mode — while the text body keeps the selected
-dtype.
+cache instead of anonymous memory. The tables are stubbed to `[1, 1]` *without
+forcing the lazy initializer* before loading (the old stub ran the f32 table
+init — an 8.75 GiB write — which was the real load peak and ~30 s of load
+time; f16 load is now ~22 s). `--defer-towers` skips the vision/audio towers at
+load (~1.9 GiB f32) and installs them on the first media request (~4 s);
+`--f16 --defer-towers` is the low-memory serving configuration (4.7 GiB peak
+anon text-only, 6.5 GiB with towers). The towers always load f32 — the
+validated multimodal mode — while the text body keeps the selected dtype.
 
 The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
 2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the

@@ -585,6 +585,14 @@ Goal: the QAT mobile f16 profile (6.6 GiB anon) OOM-killed a busy
 `rock-5b-plus` at 7.6 GB, so text generation had to fit alongside the other
 board workloads. The round removes eager, anonymous copies from the load path:
 
+0. **Stop forcing the stubbed tables' lazy initializers** (the biggest win): the
+   pre-load stubs used `Param::map`, which materializes the parameter before
+   mapping — writing an 8.75 GiB f32 PLE table (and the 1.5 GiB token table)
+   and dropping it. That transient was the real load peak (10.3 GiB anon
+   measured) and ~30 s of the load. `Param::from_tensor` replaces the
+   parameter without consuming the old one: load peak 10.3 -> 4.7 GiB, load
+   51 -> 22 s on the dev host. The same transient explains the original board
+   OOM at 7.6 GB anon.
 1. **Pack the token table too** (`embed_tokens`): the 2-bit
    `embedding_quantized` is gathered per forward (the same path as the PLE
    table) and the transposed LM head is built from it once — one 0.77 GiB f16
@@ -605,15 +613,15 @@ board workloads. The round removes eager, anonymous copies from the load path:
    f32 towers), and the SRQ visitor registers the towers' 232 scales
    explicitly (they sit behind a `#[module(skip)]` field).
 
-Measured (dev host, `RssAnon` after load, short-prompt decode):
+Measured (dev host, peak `RssAnon` over the whole run):
 
-| config | resident | short decode |
+| config | peak anon | note |
 |---|---|---|
-| f16, eager towers | 5683 MiB | 5.2 tok/s |
-| f16 `--defer-towers` | **3742 MiB** | 5.2 tok/s |
-| f32 `--defer-towers` | 7389 MiB | 3.9 tok/s |
-| q8 `--defer-towers` | **2121 MiB** | 0.07 tok/s (memory-only) |
-| f16 baseline (pre-round) | 6630 MiB | 4.9 tok/s |
+| f16 baseline (pre-round) | ~10.3 GiB peak, 6630 MiB at loader end | forced PLE init |
+| f16 `--defer-towers` | **4721 MiB** | loader-end 3736 MiB, load 22 s |
+| f16, eager towers | 6536 MiB | towers +1.9 GiB |
+| f32 `--defer-towers` | 9240 MiB | |
+| q8 `--defer-towers` | 3758 MiB | 0.07 tok/s (memory-only) |
 
 The towers add ~1.9 GiB when loaded; text-only serving (the busy-board case)
 never pays it. Parity: f16 short output is token-identical to the pre-round

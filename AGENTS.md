@@ -230,15 +230,19 @@ scales registered per weight `ParamId` and applied in `lin()` (ties-to-even
 rounding). Both token tables stay packed (rows dequantized on lookup, bit-identical
 values) and are file-backed views of the mapped checkpoint: the PLE table (1.13 GiB
 vs 8.75 GiB f32) and the 2-bit `embed_tokens` table, from which the transposed LM
-head is built once (the only full-size table copy). `--defer-towers` skips the
+head is built once (the only full-size table copy). The table stubs replace the
+parameter directly (`Param::from_tensor`) — `Param::map` forced the lazy f32
+initializer and wrote an 8.75 GiB table before dropping it, which was the real
+load-time peak and ~30 s of the load. `--defer-towers` skips the
 vision/audio towers at load and installs them (always f32, the validated
 multimodal mode) on the first media request; `lin()` checks the weight dtype
 before the f16/bf16 cast path, and the towers' SRQ scales are registered in the
 towers pass (they sit behind a `#[module(skip)]` field). Weights are bit-exact
 vs HF; short prompts are token-identical, the 631-token prompt is 16/16 with
-`--f16` vs the HF bf16 reference. Text-only resident (dev host, `RssAnon`):
-`--f16 --defer-towers` 3.7 GiB / 5.2 tok/s (was 6.6 GiB), +~1.9 GiB once towers
-load; f32 7.2 GiB; q8 2.1 GiB (memory-only). SRQ makes long-context near-ties
+`--f16` vs the HF bf16 reference. Text-only profile (dev host, peak `RssAnon`
+over the whole run): `--f16 --defer-towers` 4.7 GiB / 5.2 tok/s (loader-end 3.7
+GiB, load 22 s; was 6630 MiB at loader end), +1.9 GiB once towers load; f32
+9.2 GiB; q8 3.7 GiB (memory-only). SRQ makes long-context near-ties
 sensitive (a full-quantum activation jump from f32 accumulation order);
 `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks. `ROCKET_NPU_DECODE=1` routes
 decode matmuls to the packed NPU weights (pre-gate for the pack-and-drop

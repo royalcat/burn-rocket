@@ -658,25 +658,20 @@ impl GenTextModel {
 
     /// Replace the PLE table parameter with a 1-element stub *before* loading:
     /// the packed table is read separately, so the dequantized copy is never
-    /// materialized (4.7 GiB in f16, 9.4 GiB in f32).
+    /// materialized (4.7 GiB in f16, 9.4 GiB in f32). The stub is a fresh
+    /// parameter: `Param::map` would force the lazy initializer first (a
+    /// 8.75 GiB f32 table written and dropped — the load-time peak).
     pub fn shrink_ple_table(&mut self) {
         let dev = self.embed_tokens.weight.val().device();
-        self.embed_tokens_per_layer.weight = self
-            .embed_tokens_per_layer
-            .weight
-            .clone()
-            .map(|_| Tensor::zeros([1, 1], &dev));
+        self.embed_tokens_per_layer.weight = Param::from_tensor(Tensor::zeros([1, 1], &dev));
     }
 
     /// Replace the token table parameter with a 1-element stub *before* loading
     /// (the packed copy is read separately; the head is materialized from it).
+    /// Fresh parameter, like [`Self::shrink_ple_table`].
     pub fn shrink_embed_table(&mut self) {
         let dev = self.embed_tokens.weight.val().device();
-        self.embed_tokens.weight = self
-            .embed_tokens
-            .weight
-            .clone()
-            .map(|_| Tensor::zeros([1, 1], &dev));
+        self.embed_tokens.weight = Param::from_tensor(Tensor::zeros([1, 1], &dev));
     }
 
     pub fn spec(&self) -> &GenSpec {
