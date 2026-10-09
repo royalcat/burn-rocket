@@ -44,6 +44,21 @@ pub fn native_dtype(path: &Path) -> DType {
 /// `missing_ok(name)` marks parameters a checkpoint may legitimately omit (for
 /// example KV-shared layers that never compute K/V).
 pub fn check_load_report(result: &ApplyResult, missing_ok: impl Fn(&str) -> bool) -> Result<()> {
+    check_missing(result, missing_ok)?;
+    if !result.unused.is_empty() {
+        let sample: Vec<&String> = result.unused.iter().take(8).collect();
+        println!(
+            "note: {} file tensors unused by the model tree (e.g. {sample:?})",
+            result.unused.len()
+        );
+    }
+    Ok(())
+}
+
+/// Fail on load errors and on parameters missing from the file. Unused file
+/// tensors are expected: a focused pass (for example the towers-only load) sees
+/// the rest of the checkpoint and ignores it.
+pub fn check_missing(result: &ApplyResult, missing_ok: impl Fn(&str) -> bool) -> Result<()> {
     if !result.errors.is_empty() {
         bail!("load errors: {:?}", result.errors);
     }
@@ -57,13 +72,6 @@ pub fn check_load_report(result: &ApplyResult, missing_ok: impl Fn(&str) -> bool
             "{} model parameters missing from file (first: {:?})",
             missing.len(),
             missing.first()
-        );
-    }
-    if !result.unused.is_empty() {
-        let sample: Vec<&String> = result.unused.iter().take(8).collect();
-        println!(
-            "note: {} file tensors unused by the model tree (e.g. {sample:?})",
-            result.unused.len()
         );
     }
     Ok(())

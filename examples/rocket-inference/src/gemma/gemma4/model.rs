@@ -585,6 +585,14 @@ pub struct GenTextModel {
     /// lookup (bit-identical values, a fraction of the memory).
     #[module(skip)]
     packed_ple: Option<crate::gemma::qat::PackedTable>,
+    /// QAT checkpoints: the token table stays packed too; the rows are
+    /// dequantized per forward and the only materialized copy is the transposed
+    /// LM head. `embed_round` reproduces the table dtype the old eager path
+    /// stored (f16/bf16 rounding), so the packed path keeps its numerics.
+    #[module(skip)]
+    packed_embed: Option<crate::gemma::qat::PackedTable>,
+    #[module(skip)]
+    embed_round: Option<DType>,
     per_layer_model_projection: Linear,
     per_layer_projection_norm: RmsNorm,
     layers: Vec<GenLayer>,
@@ -602,6 +610,8 @@ impl GenTextModel {
         Self {
             embed_tokens: EmbeddingConfig::new(cfg.vocab_size, cfg.hidden_size).init(device),
             packed_ple: None,
+            packed_embed: None,
+            embed_round: None,
             embed_tokens_per_layer: EmbeddingConfig::new(
                 cfg.vocab_size_per_layer_input,
                 cfg.num_hidden_layers * cfg.hidden_size_per_layer_input,
@@ -628,6 +638,24 @@ impl GenTextModel {
         self.packed_ple = Some(table);
     }
 
+    /// Install a packed token table (QAT checkpoints): embeddings are gathered
+    /// from it and the LM head is built from it, so no `[vocab, hidden]` copy is
+    /// materialized. `round` is the dtype the old eager table was stored in
+    /// (f16/bf16); the gathered rows are rounded the same way to keep parity.
+    pub fn set_packed_embed(
+        &mut self,
+        table: crate::gemma::qat::PackedTable,
+        round: Option<DType>,
+    ) {
+        self.packed_embed = Some(table);
+        self.embed_round = round;
+    }
+
+    /// The packed token table, when the checkpoint keeps it packed.
+    pub fn packed_embed(&self) -> Option<&crate::gemma::qat::PackedTable> {
+        self.packed_embed.as_ref()
+    }
+
     /// Replace the PLE table parameter with a 1-element stub *before* loading:
     /// the packed table is read separately, so the dequantized copy is never
     /// materialized (4.7 GiB in f16, 9.4 GiB in f32).
@@ -635,6 +663,17 @@ impl GenTextModel {
         let dev = self.embed_tokens.weight.val().device();
         self.embed_tokens_per_layer.weight = self
             .embed_tokens_per_layer
+            .weight
+            .clone()
+            .map(|_| Tensor::zeros([1, 1], &dev));
+    }
+
+    /// Replace the token table parameter with a 1-element stub *before* loading
+    /// (the packed copy is read separately; the head is materialized from it).
+    pub fn shrink_embed_table(&mut self) {
+        let dev = self.embed_tokens.weight.val().device();
+        self.embed_tokens.weight = self
+            .embed_tokens
             .weight
             .clone()
             .map(|_| Tensor::zeros([1, 1], &dev));
@@ -696,6 +735,41 @@ impl GenTextModel {
         (ctx + token).mul_scalar(std::f64::consts::FRAC_1_SQRT_2)
     }
 
+    /// Token embeddings `[B, S, hidden]` in f32: gathered from the packed table
+    /// when the checkpoint keeps it packed, else from the `Embedding` table (f16
+    /// rows cast back).
+    pub fn embed_ids(&self, ids: Tensor<2, Int>) -> Tensor<3> {
+        match &self.packed_embed {
+            Some(table) => {
+                let [b, s] = ids.dims();
+                let row_ids: Vec<i32> = ids.into_data().try_to_vec().expect("token ids");
+                let row_ids: Vec<u32> = row_ids.iter().map(|&v| v as u32).collect();
+                let mut values = table.gather_f32(&row_ids);
+                // The old eager path stored the table in this dtype, so the
+                // gathered rows were rounded to it; reproduce that exactly.
+                match self.embed_round {
+                    Some(DType::F16) => {
+                        for v in &mut values {
+                            *v = burn::tensor::f16::from_f32(*v).to_f32();
+                        }
+                    }
+                    Some(DType::BF16) => {
+                        for v in &mut values {
+                            *v = burn::tensor::bf16::from_f32(*v).to_f32();
+                        }
+                    }
+                    _ => {}
+                }
+                let device = self.embed_tokens.weight.val().device();
+                Tensor::<3>::from_data(
+                    TensorData::new(values, [b, s, table.k]),
+                    (&device, DType::F32),
+                )
+            }
+            None => self.embed_tokens.forward(ids).cast(DType::F32),
+        }
+    }
+
     /// Runs the decoder over `input_ids` (prefill when `seq_start == 0`, one
     /// token per call otherwise), updating `kv`.
     pub fn forward(
@@ -708,9 +782,7 @@ impl GenTextModel {
     ) -> Tensor<3> {
         let spec = &self.spec;
         let x = self
-            .embed_tokens
-            .forward(input_ids.clone())
-            .cast(DType::F32)
+            .embed_ids(input_ids.clone())
             .mul_scalar((spec.hidden as f64).sqrt());
         self.forward_embeds(input_ids, x, ropes, kv, seq_start, chunk)
     }
@@ -771,39 +843,65 @@ pub struct GenRoot {
 #[derive(Module, Debug)]
 pub struct GenInner {
     language_model: GenTextModel,
+    /// Vision/audio towers plus their embedders. `None` until loaded: text-only
+    /// runs never allocate them, and `--defer-towers` loads them on the first
+    /// media request.
+    #[module(skip)]
+    towers: Option<Towers>,
+}
+
+/// Gemma 4 vision and audio towers and the embedders projecting their outputs
+/// into the text hidden size. A separate module (behind `GenInner::towers`
+/// `#[module(skip)]`) so text-only loads never allocate it and a deferred load
+/// can fill it in one pass.
+#[derive(Module, Debug)]
+pub struct Towers {
     vision_tower: VisionTower,
     audio_tower: AudioTower,
     embed_vision: MultimodalEmbedder,
     embed_audio: MultimodalEmbedder,
 }
 
-impl GenRoot {
-    #[allow(clippy::too_many_arguments)]
+impl Towers {
     pub fn new(
-        text_cfg: &TextConfig,
         vision_cfg: &VisionConfig,
         audio_cfg: &AudioConfig,
         vision_bounds: &HashMap<String, ClipBounds>,
         audio_bounds: &HashMap<String, ClipBounds>,
+        text_hidden: usize,
         device: &Device,
     ) -> Self {
         Self {
+            vision_tower: VisionTower::new_with_clip(vision_cfg, vision_bounds, device),
+            audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
+            embed_vision: MultimodalEmbedder::new(vision_cfg.hidden_size, text_hidden, device),
+            embed_audio: MultimodalEmbedder::new(audio_cfg.output_proj_dims, text_hidden, device),
+        }
+    }
+}
+
+impl GenRoot {
+    pub fn new(text_cfg: &TextConfig, device: &Device) -> Self {
+        Self {
             model: GenInner {
                 language_model: GenTextModel::new(text_cfg, device),
-                vision_tower: VisionTower::new_with_clip(vision_cfg, vision_bounds, device),
-                audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
-                embed_vision: MultimodalEmbedder::new(
-                    vision_cfg.hidden_size,
-                    text_cfg.hidden_size,
-                    device,
-                ),
-                embed_audio: MultimodalEmbedder::new(
-                    audio_cfg.output_proj_dims,
-                    text_cfg.hidden_size,
-                    device,
-                ),
+                towers: None,
             },
         }
+    }
+
+    /// Whether the vision/audio towers are loaded (`--defer-towers` skips them
+    /// at startup; the loader installs them on the first media request).
+    pub fn has_towers(&self) -> bool {
+        self.model.towers.is_some()
+    }
+
+    pub fn towers(&self) -> Option<&Towers> {
+        self.model.towers.as_ref()
+    }
+
+    pub fn set_towers(&mut self, towers: Towers) {
+        self.model.towers = Some(towers);
     }
 
     pub fn text(&self) -> &GenTextModel {
@@ -816,10 +914,15 @@ impl GenRoot {
 
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
     pub fn image_soft_tokens(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
-        let pooled = self.model.vision_tower.forward(img, chunk, None);
-        self.model
+        let towers = self
+            .model
+            .towers
+            .as_ref()
+            .expect("vision tower not loaded (see --defer-towers)");
+        let pooled = towers.vision_tower.forward(img, chunk, None);
+        towers
             .embed_vision
-            .forward(pooled, self.model.vision_tower.spec().eps)
+            .forward(pooled, towers.vision_tower.spec().eps)
     }
 
     /// Soft tokens for one audio clip: valid frames only, matching the reference.
@@ -828,7 +931,12 @@ impl GenRoot {
         feats: &AudioFeatures,
         debug_dir: Option<&std::path::Path>,
     ) -> Tensor<2> {
-        let h = self.model.audio_tower.forward_debug(feats, debug_dir);
+        let towers = self
+            .model
+            .towers
+            .as_ref()
+            .expect("audio tower not loaded (see --defer-towers)");
+        let h = towers.audio_tower.forward_debug(feats, debug_dir);
         let device = h.device();
         let (m1, _) = subsample_mask(&feats.mask);
         let (m2, _) = subsample_mask(&m1);
@@ -841,9 +949,7 @@ impl GenRoot {
         let n = keep.len();
         let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
         let h = h.select(0, idx);
-        self.model
-            .embed_audio
-            .forward(h, self.model.audio_tower.spec().eps)
+        towers.embed_audio.forward(h, towers.audio_tower.spec().eps)
     }
 
     /// Prefill over `ids` with optional media soft tokens scattered into the
@@ -871,9 +977,7 @@ impl GenRoot {
         let ids_t = Tensor::<2, Int>::from_data(TensorData::new(ids_i64, [1, n]), &device);
         let text = self.text();
         let mut x = text
-            .embed_tokens
-            .forward(ids_t.clone())
-            .cast(DType::F32)
+            .embed_ids(ids_t.clone())
             .mul_scalar((text.spec().hidden as f64).sqrt());
         if let Some((positions, tokens)) = soft {
             let dtype = x.dtype();
@@ -897,7 +1001,10 @@ impl GenRoot {
 
 impl crate::gemma::inputs::MediaModel for GenRoot {
     fn vision_spec(&self) -> &VisionSpec {
-        self.model.vision_tower.spec()
+        self.towers()
+            .expect("vision tower not loaded (see --defer-towers)")
+            .vision_tower
+            .spec()
     }
 
     fn encode_image(
@@ -908,7 +1015,11 @@ impl crate::gemma::inputs::MediaModel for GenRoot {
         layers: Option<&std::path::Path>,
     ) -> Tensor<2> {
         if debug_dir.is_some() {
-            let _ = self.model.vision_tower.forward(img, chunk, layers);
+            let _ = self
+                .towers()
+                .expect("vision tower not loaded (see --defer-towers)")
+                .vision_tower
+                .forward(img, chunk, layers);
         }
         self.image_soft_tokens(img, chunk)
     }

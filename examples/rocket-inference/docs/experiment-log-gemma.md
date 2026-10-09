@@ -413,7 +413,10 @@ binary are deployed (`/root/models/gemma-4-E2B-it-qat-mobile/`), but the f16
 configuration was OOM-killed at 7.6 GB anon while `rock-5b-plus` was holding
 7.4 GB with other workloads plus 2.6 GB of shared memory. All three attempts
 were contained to their systemd scope; the board's services were unaffected.
-With an idle board the 6.6 GiB working set fits comfortably.
+With an idle board the (then) 6.6 GiB working set fits comfortably; the
+2026-10-09 memory round (§13) brings the text-only f16 profile to 3.7 GiB anon
+plus reclaimable table pages, so the busy-board constraint is materially
+relaxed (board re-run pending).
 
 ## 12. Performance round (2026-10-08): canonical tiling, int8, chunked attention, fused glue
 
@@ -576,8 +579,60 @@ choice (1068 MiB vs ~2.3 GiB resident after pack); int8 is the numerics/memory
 middle — g32 beats q8's numerics at 2.4x the time, and wider groups buy speed
 back at a monotone numerics cost (`--npu-int8-group`).
 
-## 13. Deferred
+## 13. QAT mobile memory round (dev host, 2026-10-09)
 
+Goal: the QAT mobile f16 profile (6.6 GiB anon) OOM-killed a busy
+`rock-5b-plus` at 7.6 GB, so text generation had to fit alongside the other
+board workloads. The round removes eager, anonymous copies from the load path:
+
+1. **Pack the token table too** (`embed_tokens`): the 2-bit
+   `embedding_quantized` is gathered per forward (the same path as the PLE
+   table) and the transposed LM head is built from it once — one 0.77 GiB f16
+   copy instead of the table plus the head (1.5 GiB). Gathered rows are rounded
+   to the dtype the eager table stored (f16/bf16; exact in f32 mode), which
+   keeps the validated numerics: the first attempt gathered exact f32 and
+   flipped a near-tie at token 10 of the 631-token prompt.
+2. **File-backed packed tables**: both tables are views into a `memmap2` map of
+   `model.safetensors` (`qat::PackedFile`), so their ~1.2 GiB are clean page
+   cache instead of anonymous memory. Row gathers touch only the rows used;
+   the f32 scales are copied out (the format gives no alignment guarantee).
+3. **Deferred towers** (`--defer-towers`): the vision/audio towers load in a
+   separate store pass on the first media request (~4 s) instead of at startup.
+   They always load f32 (the validated multimodal mode): loading them in the
+   text model's dtype made every media request panic on dtype-mixed ops
+   (pre-existing — only the f32 mode had ever exercised media). `lin()` now
+   checks the weight dtype before the f16/bf16 cast path (mixed f16 text +
+   f32 towers), and the SRQ visitor registers the towers' 232 scales
+   explicitly (they sit behind a `#[module(skip)]` field).
+
+Measured (dev host, `RssAnon` after load, short-prompt decode):
+
+| config | resident | short decode |
+|---|---|---|
+| f16, eager towers | 5683 MiB | 5.2 tok/s |
+| f16 `--defer-towers` | **3742 MiB** | 5.2 tok/s |
+| f32 `--defer-towers` | 7389 MiB | 3.9 tok/s |
+| q8 `--defer-towers` | **2121 MiB** | 0.07 tok/s (memory-only) |
+| f16 baseline (pre-round) | 6630 MiB | 4.9 tok/s |
+
+The towers add ~1.9 GiB when loaded; text-only serving (the busy-board case)
+never pays it. Parity: f16 short output is token-identical to the pre-round
+build; the 631-token prompt is **16/16 identical to the HF bf16 reference**
+(the pre-round build matches it too), and the image prompt is **8/8 identical
+to HF** with the lazily loaded towers (media works in f16 mode now; it used to
+panic on dtype-mixed ops). Top-8 logits drift only at GEMM
+accumulation-order scale (max |d| 0.15, no top-1 change; f32 mode 1e-5).
+
+Open: the board re-run (guarded scope) and the NPU-decode pre-gate —
+`ROCKET_NPU_DECODE=1` routes decode matmuls to the packed NPU weights with the
+CPU copies kept, so the decode speed can be measured before switching to
+`keep_cpu=false` (pack-and-drop, decode stays on the NPU).
+
+## 14. Deferred
+
+- QAT mobile board re-run (a guarded scope; the f16 text-only profile is now
+  3.7 GiB anon plus ~1.2 GiB reclaimable table pages) and the
+  `ROCKET_NPU_DECODE=1` decode-speed pre-gate (§13).
 - 30k-token text with chunked attention (the old OOM point); needs the board.
 - Redeploy the production `openviking-embed-1` service on this build (it runs the
   2026-10-05-era `c951944` image, which predates canonical tiling, chunking, int8

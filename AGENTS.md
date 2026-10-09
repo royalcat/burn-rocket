@@ -223,18 +223,28 @@ tok/s because flex has no int8 GEMM and `lin` dequantizes per call). f32 =
 non-streaming OpenAI `/v1/chat/completions` and the Ollama API (text +
 `image_url`/`input_audio` parts on the OpenAI side).
 
-QAT mobile checkpoint (log §11): `google/gemma-4-E2B-it-qat-mobile-transformers`
+QAT mobile checkpoint (log §11, memory round log-gemma §13): `google/gemma-4-E2B-it-qat-mobile-transformers`
 (2.46 GB) is supported natively — packed INT2/4/8 weights + per-channel scales +
 SRQ activation rounding, unpacked by a load adapter (`src/gemma/qat.rs`), with the SRQ
 scales registered per weight `ParamId` and applied in `lin()` (ties-to-even
-rounding). The PLE table stays packed (rows dequantized on lookup, bit-identical
-values, 1.13 GiB vs 8.75 GiB f32). Weights are bit-exact vs HF; short prompts
-are token-identical and the 631-token prompt is 12/12 with `--f16` (6.6 GiB
-resident, 4.9 tok/s). SRQ makes long-context near-ties sensitive (a
-full-quantum activation jump from f32 accumulation order); `NO_SRQ=1` /
-`DUMP_PARAM=<substr>` are debug hooks. Board attempt: deployed at
+rounding). Both token tables stay packed (rows dequantized on lookup, bit-identical
+values) and are file-backed views of the mapped checkpoint: the PLE table (1.13 GiB
+vs 8.75 GiB f32) and the 2-bit `embed_tokens` table, from which the transposed LM
+head is built once (the only full-size table copy). `--defer-towers` skips the
+vision/audio towers at load and installs them (always f32, the validated
+multimodal mode) on the first media request; `lin()` checks the weight dtype
+before the f16/bf16 cast path, and the towers' SRQ scales are registered in the
+towers pass (they sit behind a `#[module(skip)]` field). Weights are bit-exact
+vs HF; short prompts are token-identical, the 631-token prompt is 16/16 with
+`--f16` vs the HF bf16 reference. Text-only resident (dev host, `RssAnon`):
+`--f16 --defer-towers` 3.7 GiB / 5.2 tok/s (was 6.6 GiB), +~1.9 GiB once towers
+load; f32 7.2 GiB; q8 2.1 GiB (memory-only). SRQ makes long-context near-ties
+sensitive (a full-quantum activation jump from f32 accumulation order);
+`NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks. `ROCKET_NPU_DECODE=1` routes
+decode matmuls to the packed NPU weights (pre-gate for the pack-and-drop
+config). Board attempt: deployed at
 `/root/models/gemma-4-E2B-it-qat-mobile/`, OOM-killed at 7.6 GB (board busy);
-needs an idle board.
+a guarded re-run with `--defer-towers` is pending.
 
 NPU prefill (log §11): `--npu` packs the used text projections into resident
 fp16 NPU weights and runs prefill matmuls + `attention_causal_window` on the
@@ -615,6 +625,10 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   this build (canonical tiling + chunked attention + glue; keep fp16 `--npu` as the
   speed config — the int8 g32 path is 2.4x slower, readback-bound) and re-measure
   the served latencies.
+- QAT mobile board re-run (log-gemma §13): the f16 text-only profile is now 3.7 GiB
+  anon plus ~1.2 GiB reclaimable table pages (`--defer-towers`), so a guarded run
+  should fit a busy board; then the `ROCKET_NPU_DECODE=1` decode-speed pre-gate
+  and, if decode stays viable, the `keep_cpu=false` pack-and-drop config.
 - Optional: quantize tensor-by-tensor during load to remove the ~2.3 GB load-time peak
   in `--quant q8` mode.
 - Intent model: with canonical tiling the `M = 1` decode no longer pads to 256 rows,
@@ -687,6 +701,8 @@ ROCKET_CTX_CANONICAL=0 ./rocket-inference gemma embed --model-dir /root/models/e
 ./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --npu --npu-int8 --prompt query --text-file data/one_long.txt --out /tmp/i8.json
 ROCKET_GLUE=0 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --text-file data/one_long.txt --reps 1
 ./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it --text "What is the capital of France?" --max-new-tokens 16
+# QAT mobile, busy-board low-memory config (add --defer-towers; towers load on media)
+./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it-qat-mobile --f16 --defer-towers --text "What is the capital of France?" --max-new-tokens 16
 # servers (detected per model; ports are examples)
 ./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --quant q8 --npu --port 8383 --max-tokens 8192
 ./rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 --max-new-tokens 256

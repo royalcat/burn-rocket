@@ -68,7 +68,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )?;
             let tokenizer = tokenizer()?;
             (
-                Engine::Qwen3(Qwen3Engine {
+                Engine::Qwen3(Box::new(Qwen3Engine {
                     model,
                     cfg,
                     tokenizer,
@@ -78,7 +78,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     key_block: args.key_block.unwrap_or(256),
                     attn_fused: args.attn.unwrap_or(true),
                     max_tokens,
-                }),
+                })),
                 Capabilities {
                     embeddings: true,
                     multimodal: false,
@@ -102,7 +102,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             let tokenizer = tokenizer()?;
             let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&model_dir);
             (
-                Engine::Emb2(Emb2Engine {
+                Engine::Emb2(Box::new(Emb2Engine {
                     model,
                     tokenizer,
                     device,
@@ -114,7 +114,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     video_fps: args.video_fps.unwrap_or(1.0),
                     video_max_frames: args.video_max_frames.unwrap_or(32),
                     prompts: inputs::task_prompts(&model_dir),
-                }),
+                })),
                 Capabilities {
                     embeddings: true,
                     multimodal: true,
@@ -138,12 +138,12 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 args.npu_decode.unwrap_or(false),
             )?;
             (
-                Engine::Intent(IntentEngine {
+                Engine::Intent(Box::new(IntentEngine {
                     model: loaded.model,
                     tokenizer: loaded.tokenizer,
                     stop_ids: loaded.stop_ids,
                     max_tokens,
-                }),
+                })),
                 Capabilities {
                     embeddings: false,
                     multimodal: false,
@@ -168,7 +168,12 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 LoadDtype::from_native(&model_dir)
             };
             #[allow(unused_mut)]
-            let (mut model, cfg) = gen_loader::load_gen_model(&model_dir, dtype, &device)?;
+            let (mut model, cfg) = gen_loader::load_gen_model(
+                &model_dir,
+                dtype,
+                &device,
+                args.defer_towers.unwrap_or(false),
+            )?;
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
             if args.npu.unwrap_or(false) {
                 gen_loader::pack_text_for_prefill(
@@ -186,17 +191,18 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             let tokenizer = tokenizer()?;
             let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&model_dir);
             (
-                Engine::Gemma4(Gemma4Engine {
+                Engine::Gemma4(Box::new(Gemma4Engine {
                     model,
                     lm_head,
                     tokenizer,
                     device,
+                    model_dir: model_dir.clone(),
                     pad_id: cfg.text_config.pad_token_id.unwrap_or(0),
                     eos: crate::gemma::gemma4::chat::gen_eos(&model_dir),
                     attn_chunk: args.attn_chunk.unwrap_or(1024),
                     image_soft_tokens,
                     video_soft_tokens,
-                }),
+                })),
                 Capabilities {
                     embeddings: false,
                     multimodal: false,
@@ -258,6 +264,7 @@ struct Args {
     pure_npu: Option<bool>,
     npu_decode: Option<bool>,
     gen_f16: Option<bool>,
+    defer_towers: Option<bool>,
 }
 
 impl Args {
@@ -334,6 +341,7 @@ impl Args {
         args.pure_npu = f.take_flag("--pure-npu");
         args.npu_decode = f.take_flag("--npu-decode");
         args.gen_f16 = f.take_flag("--f16");
+        args.defer_towers = f.take_flag("--defer-towers");
         f.finish("serve")?;
         // Defaults that are not family-specific.
         if args.model_dir.is_none() {
@@ -423,9 +431,10 @@ impl Args {
                 "npu-threads",
                 "f16",
                 "attn-chunk",
+                "defer-towers",
             ],
         };
-        let set: [(&str, bool); 23] = [
+        let set: [(&str, bool); 25] = [
             ("model-dir", self.model_dir.is_some()),
             ("family", self.family.is_some()),
             ("backend", self.backend.is_some()),
@@ -449,6 +458,8 @@ impl Args {
             ("embed-f16", self.embed_f16.is_some()),
             ("pure-npu", self.pure_npu.is_some()),
             ("npu-decode", self.npu_decode.is_some()),
+            ("f16", self.gen_f16.is_some()),
+            ("defer-towers", self.defer_towers.is_some()),
         ];
         for (name, present) in set {
             if present && !allowed.contains(&name) {

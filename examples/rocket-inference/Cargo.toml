@@ -57,6 +57,7 @@ base64 = "0.22"
 rustfft = "6"
 hound = "3"
 fancy-regex = "0.16"
+memmap2 = "0.9"
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

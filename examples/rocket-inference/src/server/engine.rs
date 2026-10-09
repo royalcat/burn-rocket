@@ -10,6 +10,7 @@ use tokenizers::Tokenizer;
 
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
+use crate::gemma::gemma4::loader::load_towers;
 use crate::gemma::gemma4::model::GenRoot;
 use crate::gemma::inputs::{self, DebugPaths, MediaInputs};
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
@@ -191,10 +192,10 @@ pub struct EmbedResult {
 
 /// The loaded model and its runtime state.
 pub enum Engine {
-    Qwen3(Qwen3Engine),
-    Emb2(Emb2Engine),
-    Intent(IntentEngine),
-    Gemma4(Gemma4Engine),
+    Qwen3(Box<Qwen3Engine>),
+    Emb2(Box<Emb2Engine>),
+    Intent(Box<IntentEngine>),
+    Gemma4(Box<Gemma4Engine>),
 }
 
 pub struct Qwen3Engine {
@@ -236,6 +237,8 @@ pub struct Gemma4Engine {
     pub lm_head: Tensor<2>,
     pub tokenizer: Tokenizer,
     pub device: Device,
+    /// For deferred tower loads (`--defer-towers`).
+    pub model_dir: PathBuf,
     pub pad_id: u32,
     pub eos: Vec<u32>,
     pub attn_chunk: usize,
@@ -618,6 +621,9 @@ impl Gemma4Engine {
                 .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
             return Ok((ids, None));
         }
+        // Deferred towers (`--defer-towers`) load on the first media request.
+        load_towers(&mut self.model, &self.model_dir, &self.device)
+            .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
         let req = MediaInputs {
             text: Some(rendered),
             image,

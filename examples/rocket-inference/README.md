@@ -386,8 +386,9 @@ $B gemma gen --gen-model-dir $G --text "What do you hear? <|audio|>" --audio dat
 Flags: `--gen-model-dir` (default `/mnt/hub/models/gemma-4-E2B-it`), `--backend`,
 `--text`, `--text-file`, `--image`, `--audio`, `--max-soft-tokens`,
 `--video-fps`, `--video-max-frames`, `--messages`, `--max-new-tokens`,
-`--sample`, `--temperature`, `--top-k`, `--top-p`, `--enable-thinking`, `--f16`,
-`--quant none|q8`, `--npu`, `--npu-threads`, `--attn-chunk`, `--dump-logits`,
+`--sample`, `--temperature`, `--top-k`, `--top-p`, `--enable-thinking`,
+`--dtype f32|f16|bf16`, `--f16`, `--quant none|q8`, `--defer-towers`,
+`--npu`, `--npu-threads`, `--attn-chunk`, `--dump-logits`,
 `--out`. Serving uses `--model-dir` and the flags of the [Serving](#serving)
 section.
 
@@ -420,17 +421,29 @@ $B gemma gen --gen-model-dir ~/models/gemma-4-E2B-it-qat-mobile --f16 \
     --text "What is the capital of France?" --max-new-tokens 16
 ```
 
-| mode | resident | short decode | notes |
+| mode (text-only, `--defer-towers`) | resident | short decode | notes |
 |---|---|---|---|
-| f32 | 12.0 GiB | 3.9 tok/s | parity mode (f32 projections) |
-| `--f16` | 6.6 GiB | 4.9 tok/s | 12/12 tokens identical to the f32 reference on the 631-token prompt |
-| `--quant q8` | 6.1 GiB | 0.07 tok/s | memory-only |
+| f32 | 7.2 GiB | 3.9 tok/s | parity mode (f32 projections) |
+| `--f16` | 3.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
+| `--quant q8` | 2.1 GiB | 0.07 tok/s | memory-only |
+
+Both token tables stay packed in memory: the PLE table (as before) and the
+token table, whose rows are dequantized per gather with the LM head
+materialized from it once — the only full-size table copy. Both are file-backed
+views of the memory-mapped checkpoint, so their bytes are reclaimable page
+cache instead of anonymous memory. `--defer-towers` skips the vision/audio
+towers at load (~1.9 GiB f32) and installs them on the first media request
+(~4 s); `--f16 --defer-towers` is the low-memory serving configuration
+(3.7 GiB anon text-only, 5.6 GiB once towers are loaded; same numbers on the
+generation path, no per-request cost after the first). The towers always load
+f32 — the validated multimodal mode — while the text body keeps the selected
+dtype.
 
 The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
 2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the
-631-token prompt is 12/12 with `--f16`. The PLE table stays packed (rows
-dequantized on lookup, 1.13 GiB instead of 8.75 GiB f32). SRQ makes long-context
-near-ties sensitive; `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks.
+631-token prompt matched 16/16 with `--f16` (HF bf16 reference). SRQ makes
+long-context near-ties sensitive; `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug
+hooks.
 
 ### NPU prefill
 

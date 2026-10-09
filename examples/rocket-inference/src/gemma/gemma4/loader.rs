@@ -25,12 +25,13 @@ use burn_store::{
 };
 
 use crate::gemma::config::Emb2Config;
-use crate::gemma::gemma4::model::{GenRoot, GenTextModel};
+use crate::gemma::gemma4::model::{GenRoot, GenTextModel, Towers};
 use crate::gemma::layers::ClipBounds;
 
 /// Pack the generation model's text projections into resident fp16 NPU weights
 /// for the prefill pass. `keep_cpu` retains the f32 copies (decode runs on the
-/// CPU); with `keep_cpu == false` the CPU copies are dropped.
+/// CPU); with `keep_cpu == false` the CPU copies are dropped, and decode must
+/// also run on the NPU (set `ROCKET_NPU_DECODE=1` to test that path).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn pack_text_for_prefill(
     model: &mut GenRoot,
@@ -40,7 +41,11 @@ pub fn pack_text_for_prefill(
 ) -> Result<()> {
     use crate::gemma::layers;
     burn_rocket::init(threads).map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
-    layers::set_npu_prefill_only(keep_cpu);
+    // `ROCKET_NPU_DECODE=1` also routes decode matmuls to the packed weights
+    // (the pre-gate for the pack-and-drop config): with `keep_cpu=true` nothing
+    // else changes, so the decode speed can be measured before any memory work.
+    let npu_decode = std::env::var("ROCKET_NPU_DECODE").is_ok_and(|v| v != "0");
+    layers::set_npu_prefill_only(keep_cpu && !npu_decode);
     let t0 = std::time::Instant::now();
     let mut count = 0usize;
     let mut bytes = 0usize;
@@ -174,29 +179,6 @@ impl ModuleAdapter for LoadDtypeAdapter {
     }
 }
 
-/// Q8-resident projections (Q8_0: symmetric int8, 32-value blocks, f16 scales),
-/// applied after loading; `lin` dequantizes each weight per call.
-pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
-    use crate::util::quant::{LowRam, param_group};
-    let t0 = std::time::Instant::now();
-    let proj_group = param_group(
-        r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection)\.weight$",
-    )?;
-    let mut mapper = LowRam::new(vec![proj_group], Vec::new(), None);
-    let model = model.map(&mut mapper);
-    crate::gemma::layers::set_quantized(true);
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
-    println!(
-        "Q8-resident projections in {:.2}s (resident {:.0} MiB anon)",
-        t0.elapsed().as_secs_f64(),
-        rss_mib()
-    );
-    Ok(model)
-}
-
 /// Vision-tower `Gemma4ClippableLinear` paths (E2B ships clip bounds for these;
 /// EmbeddingGemma 2 does not).
 pub const VISION_LINEAR_NAMES: [&str; 7] = [
@@ -261,62 +243,29 @@ pub fn read_clip_bounds(
     Ok(bounds)
 }
 
-/// Load the E2B model: text backbone (`model.language_model.*`) plus the Gemma 4
-/// vision/audio towers (`model.vision_tower.*`, `model.audio_tower.*`).
+/// Load the E2B model text backbone (`model.language_model.*`) and, unless
+/// `defer_towers`, the Gemma 4 vision/audio towers (`model.vision_tower.*`,
+/// `model.audio_tower.*`). Deferred towers are installed by [`load_towers`] on
+/// the first media request (they cost ~1.9 GiB in f32).
 pub fn load_gen_model(
     model_dir: &std::path::Path,
     dtype: LoadDtype,
     device: &Device,
+    defer_towers: bool,
 ) -> Result<(GenRoot, Emb2Config)> {
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
-    let vision_cfg = cfg
-        .vision_config
-        .as_ref()
-        .context("checkpoint has no vision_config")?;
-    let audio_cfg = cfg
-        .audio_config
-        .as_ref()
-        .context("checkpoint has no audio_config")?;
     let t0 = std::time::Instant::now();
-    // Only checkpoints trained with clipped linears carry the bound scalars
-    // (the QAT export sets `use_clipped_linears: false` and has none).
-    let vision_bounds = if vision_cfg.use_clipped_linears {
-        read_clip_bounds(
-            model_dir,
-            "model.vision_tower.encoder.layers",
-            &VISION_LINEAR_NAMES,
-            vision_cfg.num_hidden_layers,
-        )?
-    } else {
-        Default::default()
-    };
-    let audio_bounds = if audio_cfg.use_clipped_linears {
-        read_clip_bounds(
-            model_dir,
-            "model.audio_tower.layers",
-            &AUDIO_LINEAR_NAMES,
-            audio_cfg.num_hidden_layers,
-        )?
-    } else {
-        Default::default()
-    };
-    let mut model = GenRoot::new(
-        &cfg.text_config,
-        vision_cfg,
-        audio_cfg,
-        &vision_bounds,
-        &audio_bounds,
-        device,
-    );
+    let mut model = GenRoot::new(&cfg.text_config, device);
     // Pre-quantized (QAT) checkpoints carry a `quantization_config`; their
     // weights are packed INT2/4/8 with scales and SRQ activation rounding.
     let cfg_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
     let qat = crate::gemma::qat::QatConfig::from_json(&cfg_json)?;
     if qat.is_some() {
-        // The PLE table is read packed; stub the parameter first so the
-        // dequantized table is never allocated.
+        // The packed token tables are read separately; stub the parameters
+        // first so the dequantized tables are never allocated.
         model.text_mut().shrink_ple_table();
+        model.text_mut().shrink_embed_table();
     }
     let mut store =
         SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
@@ -328,19 +277,7 @@ pub fn load_gen_model(
         }
         None => None,
     };
-    let mut store = match &qat {
-        Some(qat) => store.with_from_adapter(
-            QatAdapter {
-                qat: std::sync::Arc::new(qat.clone()),
-                scales: scales.clone().expect("scales"),
-                dtype,
-            }
-            .chain(LoadDtypeAdapter::new(device, dtype).with_f32_tables(dtype == LoadDtype::F32))
-            .chain(PyTorchToBurnAdapter),
-        ),
-        None => store
-            .with_from_adapter(PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, dtype))),
-    };
+    let mut store = with_load_adapters(store, qat.as_ref(), scales.as_ref(), dtype, device);
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
@@ -353,11 +290,28 @@ pub fn load_gen_model(
     crate::util::store::check_load_report(&result, |name| is_shared_kv_param(name, first_shared))?;
     let tolerated = result.missing.len();
     if qat.is_some() {
+        // Packed token tables are served as file-backed views of the mapped
+        // checkpoint: row lookups touch only the rows used, and the pages stay
+        // reclaimable instead of being an anonymous copy.
+        let file = crate::gemma::qat::PackedFile::open(&model_dir.join("model.safetensors")).ok();
+        let read_table = |store: &mut SafetensorsStore,
+                          base: &str,
+                          bits: u8|
+         -> Result<crate::gemma::qat::PackedTable> {
+            match &file {
+                Some(file) => crate::gemma::qat::read_packed_table_mapped(file, base, bits)
+                    .or_else(|e| {
+                        println!("QAT: {base}: file-backed view unavailable ({e}); owned copy");
+                        crate::gemma::qat::read_packed_table(store, base, bits)
+                    }),
+                None => crate::gemma::qat::read_packed_table(store, base, bits),
+            }
+        };
         let bits = qat
             .as_ref()
             .and_then(|q| q.bits_for("model.language_model.embed_tokens_per_layer"))
             .unwrap_or(4);
-        let table = crate::gemma::qat::read_packed_table(
+        let table = read_table(
             &mut store,
             "model.language_model.embed_tokens_per_layer",
             bits,
@@ -365,10 +319,32 @@ pub fn load_gen_model(
         println!(
             "QAT: PLE table kept packed ({} bits, {:.2} GiB vs {:.2} GiB dequantized)",
             table.bits,
-            (table.data.len() + table.scales.len() * 4) as f64 / (1u64 << 30) as f64,
+            table.mem_bytes() as f64 / (1u64 << 30) as f64,
             (table.rows * table.k * 4) as f64 / (1u64 << 30) as f64
         );
         model.text_mut().set_packed_ple(table);
+
+        let bits = qat
+            .as_ref()
+            .and_then(|q| q.bits_for("model.language_model.embed_tokens"))
+            .unwrap_or(2);
+        let table = read_table(&mut store, "model.language_model.embed_tokens", bits)?;
+        println!(
+            "QAT: token table kept packed ({} bits, {:.2} GiB vs {:.2} GiB dequantized)",
+            table.bits,
+            table.mem_bytes() as f64 / (1u64 << 30) as f64,
+            (table.rows * table.k * 4) as f64 / (1u64 << 30) as f64
+        );
+        // The eager table's dtype (the numerics the mode was validated with).
+        let round = match dtype {
+            LoadDtype::F16 | LoadDtype::Q8 => Some(DType::F16),
+            LoadDtype::Bf16 => Some(DType::BF16),
+            LoadDtype::F32 => None,
+        };
+        model.text_mut().set_packed_embed(table, round);
+    }
+    if !defer_towers {
+        load_towers_with(&mut model, model_dir, &qat, &scales, device)?;
     }
     if let Ok(want) = std::env::var("DUMP_PARAM") {
         dump_param(&model, &want)?;
@@ -417,9 +393,195 @@ pub fn load_gen_model(
     Ok((model, cfg))
 }
 
+/// QAT scale records by module path.
+pub type QatScales = std::collections::HashMap<String, crate::gemma::qat::ModuleScales>;
+
+/// Attach the per-dtype adapters shared by the main and towers-only load passes.
+fn with_load_adapters(
+    store: SafetensorsStore,
+    qat: Option<&crate::gemma::qat::QatConfig>,
+    scales: Option<&std::sync::Arc<QatScales>>,
+    dtype: LoadDtype,
+    device: &Device,
+) -> SafetensorsStore {
+    match qat {
+        Some(qat) => store.with_from_adapter(
+            QatAdapter {
+                qat: std::sync::Arc::new(qat.clone()),
+                scales: scales.expect("QAT scales").clone(),
+                dtype,
+            }
+            .chain(LoadDtypeAdapter::new(device, dtype).with_f32_tables(dtype == LoadDtype::F32))
+            .chain(PyTorchToBurnAdapter),
+        ),
+        None => store
+            .with_from_adapter(PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, dtype))),
+    }
+}
+
+/// Load the vision/audio towers and their embedders into `model` (a no-op once
+/// they are present). Deferred serving calls this on the first media request;
+/// it re-reads the QAT scales, which are not kept after the initial load.
+pub fn load_towers(
+    model: &mut GenRoot,
+    model_dir: &std::path::Path,
+    device: &Device,
+) -> Result<()> {
+    if model.has_towers() {
+        return Ok(());
+    }
+    let cfg_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let qat = crate::gemma::qat::QatConfig::from_json(&cfg_json)?;
+    let scales = match &qat {
+        Some(_) => {
+            let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
+                .allow_partial(true);
+            Some(std::sync::Arc::new(crate::gemma::qat::read_scales(
+                &mut store,
+            )?))
+        }
+        None => None,
+    };
+    load_towers_with(model, model_dir, &qat, &scales, device)?;
+    Ok(())
+}
+
+/// Temporary root for the towers-only load: wrapping the towers in a `model`
+/// field makes the file's `model.` prefix match the module tree without key
+/// remapping (the QAT scales are keyed by the full module path).
+#[derive(Module, Debug)]
+struct TowerRoot {
+    model: Towers,
+}
+
+/// The shared towers pass (eager and deferred): build the `Towers` module, load
+/// it, and quantize it in Q8 mode.
+fn load_towers_with(
+    model: &mut GenRoot,
+    model_dir: &std::path::Path,
+    qat: &Option<crate::gemma::qat::QatConfig>,
+    scales: &Option<std::sync::Arc<QatScales>>,
+    device: &Device,
+) -> Result<()> {
+    let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
+    let vision_cfg = cfg
+        .vision_config
+        .as_ref()
+        .context("checkpoint has no vision_config")?;
+    let audio_cfg = cfg
+        .audio_config
+        .as_ref()
+        .context("checkpoint has no audio_config")?;
+    // Only checkpoints trained with clipped linears carry the bound scalars
+    // (the QAT export sets `use_clipped_linears: false` and has none).
+    let vision_bounds = if vision_cfg.use_clipped_linears {
+        read_clip_bounds(
+            model_dir,
+            "model.vision_tower.encoder.layers",
+            &VISION_LINEAR_NAMES,
+            vision_cfg.num_hidden_layers,
+        )?
+    } else {
+        Default::default()
+    };
+    let audio_bounds = if audio_cfg.use_clipped_linears {
+        read_clip_bounds(
+            model_dir,
+            "model.audio_tower.layers",
+            &AUDIO_LINEAR_NAMES,
+            audio_cfg.num_hidden_layers,
+        )?
+    } else {
+        Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let mut root = TowerRoot {
+        model: Towers::new(
+            vision_cfg,
+            audio_cfg,
+            &vision_bounds,
+            &audio_bounds,
+            cfg.text_config.hidden_size,
+            device,
+        ),
+    };
+    // The towers compute with plain `Linear` forwards and were validated in
+    // f32; the text body's dtype (f16/bf16/q8) does not apply to them. Loading
+    // them in the model dtype made every media request panic on dtype-mixed
+    // ops, so they always load f32.
+    let tower_dtype = LoadDtype::F32;
+    let store =
+        SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
+    let mut store = with_load_adapters(store, qat.as_ref(), scales.as_ref(), tower_dtype, device);
+    let result = root
+        .load_from(&mut store)
+        .with_context(|| format!("load towers from {}", model_dir.display()))?;
+    // The pass sees the whole checkpoint; only the towers' own parameters are
+    // in the tree, so a missing one is an error.
+    crate::util::store::check_missing(&result, |_| false)?;
+    // The towers sit behind a `#[module(skip)]` field, so the main pass's
+    // visitor cannot see them: their SRQ scales are registered here (through
+    // the `model` wrapper so the paths match the checkpoint keys).
+    if let Some(scales) = scales
+        && std::env::var("NO_SRQ").is_err()
+    {
+        let n = register_srq_scales(&root, scales);
+        println!("QAT: SRQ activation rounding on {n} tower linears");
+    }
+    model.set_towers(root.model);
+    println!(
+        "towers: loaded (f32) in {:.2}s (resident {:.0} MiB anon)",
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok(())
+}
+
+/// The projection module paths `--quant q8` keeps Q8-resident (text only; the
+/// towers always stay f32).
+fn projection_group() -> Result<burn::module::ParamGroup> {
+    crate::util::quant::param_group(
+        r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection)\.weight$",
+    )
+}
+
+/// Q8-resident projections (Q8_0: symmetric int8, 32-value blocks, f16 scales),
+/// applied after loading; `lin` dequantizes each weight per call.
+pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
+    use crate::util::quant::LowRam;
+    let t0 = std::time::Instant::now();
+    let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
+    let model = model.map(&mut mapper);
+    crate::gemma::layers::set_quantized(true);
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    println!(
+        "Q8-resident projections in {:.2}s (resident {:.0} MiB anon)",
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok(model)
+}
+
 /// Transposed, tied LM head `[hidden, vocab]` for the logits path, in the
-/// projections' dtype (f32 parity; f16 in q8/f16 mode; native bf16).
+/// projections' dtype (f32 parity; f16 in q8/f16 mode; native bf16). QAT
+/// checkpoints build it from the packed token table, so it is the only
+/// full-size table copy (the `[vocab, hidden]` table stays packed).
 pub fn build_lm_head(text: &GenTextModel, dtype: DType, device: &Device) -> Tensor<2> {
+    use burn::tensor::{bf16, f16};
+    if let Some(table) = text.packed_embed() {
+        let shape = [table.k, table.rows];
+        let data = match dtype {
+            DType::F16 => TensorData::new(table.dequantize_transposed(f16::from_f32), shape),
+            DType::BF16 => TensorData::new(table.dequantize_transposed(bf16::from_f32), shape),
+            DType::F32 => TensorData::new(table.dequantize_transposed(|v| v), shape),
+            _ => TensorData::new(table.dequantize_transposed(|v| v), shape).convert_dtype(dtype),
+        };
+        return Tensor::<2>::from_data(data, (device, dtype));
+    }
     text.embed_table()
         .val()
         .cast(dtype)
@@ -470,8 +632,10 @@ impl ModuleAdapter for QatAdapter {
             // scale tensors and other auxiliaries: no target parameter
             return tensor;
         };
-        // The PLE table stays packed (rows are dequantized on lookup).
-        if module_path.ends_with("embed_tokens_per_layer") {
+        // The packed token tables stay packed (rows are dequantized on lookup;
+        // the token table's only materialized copy is the transposed LM head).
+        if module_path.ends_with("embed_tokens_per_layer") || module_path.ends_with("embed_tokens")
+        {
             use burn_store::burn_pack::Shape;
             return bridge::map_data(tensor, target_name, DType::F32, Shape::new([1, 1]), |_| {
                 TensorData::new(vec![0.0f32], [1, 1])
@@ -530,8 +694,8 @@ impl ModuleAdapter for QatAdapter {
 
 /// Register the SRQ scales of every quantized linear, keyed by the weight's
 /// `ParamId` (the visitor path matches the checkpoint's module paths).
-fn register_srq_scales(
-    model: &GenRoot,
+fn register_srq_scales<M: burn::module::Module>(
+    model: &M,
     scales: &std::collections::HashMap<String, crate::gemma::qat::ModuleScales>,
 ) -> usize {
     use burn::module::{ModuleVisitor, Param};

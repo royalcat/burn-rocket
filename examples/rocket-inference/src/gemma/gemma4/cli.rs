@@ -47,6 +47,8 @@ struct Args {
     gen_f16: bool,
     /// `None` = the checkpoint's native dtype.
     dtype: Option<LoadDtype>,
+    /// Skip the vision/audio towers at load; they load on first media use.
+    defer_towers: bool,
 }
 
 impl Args {
@@ -76,6 +78,7 @@ impl Args {
             enable_thinking: false,
             gen_f16: false,
             dtype: None,
+            defer_towers: false,
         };
         if let Some(v) = f.take("--gen-model-dir")? {
             args.gen_model_dir = PathBuf::from(v);
@@ -138,6 +141,7 @@ impl Args {
         }
         args.enable_thinking = f.take_bool("--enable-thinking");
         args.gen_f16 = f.take_bool("--f16");
+        args.defer_towers = f.take_bool("--defer-towers");
         if let Some(v) = f.take("--dtype")? {
             args.dtype = Some(match v.as_str() {
                 "f32" => LoadDtype::F32,
@@ -181,7 +185,8 @@ fn run_gen(args: &Args) -> Result<()> {
         LoadDtype::from_native(&args.gen_model_dir)
     };
     #[allow(unused_mut)]
-    let (mut model, cfg) = loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
+    let (mut model, cfg) =
+        loader::load_gen_model(&args.gen_model_dir, dtype, &device, args.defer_towers)?;
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if args.npu {
         loader::pack_text_for_prefill(&mut model, args.npu_threads, &device, true)?;
@@ -209,6 +214,8 @@ fn run_gen(args: &Args) -> Result<()> {
     // Media inputs expand their `<|image|>` / `<|audio|>` placeholders in the
     // rendered conversation and are encoded with the checkpoint's own towers.
     let (ids, soft) = if args.image.is_some() || args.audio.is_some() {
+        // Deferred towers (`--defer-towers`) load on first media use.
+        loader::load_towers(&mut model, &args.gen_model_dir, &device)?;
         let (img_soft, video_soft) = inputs::media_soft_tokens(&args.gen_model_dir);
         let req = inputs::MediaInputs {
             text: Some(rendered.clone()),

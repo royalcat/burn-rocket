@@ -13,8 +13,10 @@
 //!   the affected linears when the checkpoint's scale is calibrated (non-zero).
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use fancy_regex::Regex;
 
 /// Per-module bit-width selection from `quantization_config`.
@@ -106,6 +108,200 @@ pub fn values_per_byte(bits: u8) -> usize {
         4 => 2,
         _ => 1,
     }
+}
+
+/// Byte source of a packed table: owned (the store-based fallback) or a view
+/// into a memory-mapped safetensors file. The mapped variant keeps the packed
+/// bytes as clean file pages, which the kernel can reclaim under memory
+/// pressure instead of OOM-ing an anonymous copy (the `Arc` keeps the map
+/// alive as long as the table).
+#[derive(Clone)]
+pub enum TableBytes {
+    Owned(Vec<u8>),
+    Mapped {
+        map: Arc<memmap2::Mmap>,
+        start: usize,
+        end: usize,
+    },
+}
+
+impl TableBytes {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            TableBytes::Owned(v) => v,
+            TableBytes::Mapped { map, start, end } => &map[*start..*end],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[allow(dead_code)] // clippy: `len` without `is_empty`
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::fmt::Debug for TableBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableBytes::Owned(v) => write!(f, "Owned({} bytes)", v.len()),
+            TableBytes::Mapped { start, end, .. } => write!(f, "Mapped({} bytes)", end - start),
+        }
+    }
+}
+
+/// One safetensors tensor's location in the mapped file.
+struct FileEntry {
+    start: usize,
+    end: usize,
+    dtype: String,
+    shape: Vec<usize>,
+}
+
+/// A read-only memory map of a safetensors file with its header parsed, so
+/// packed token tables can be handed out as file-backed views (`TableBytes`
+/// `Mapped`) instead of anonymous copies. The map stays alive while any view
+/// references it.
+pub struct PackedFile {
+    map: Arc<memmap2::Mmap>,
+    entries: HashMap<String, FileEntry>,
+}
+
+impl PackedFile {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        // SAFETY: the map is read-only; the file is world-readable and its
+        // lifetime does not matter for a read-only mapping.
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        ensure!(map.len() >= 8, "safetensors header truncated");
+        let n = u64::from_le_bytes(map[..8].try_into().expect("8 bytes")) as usize;
+        ensure!(map.len() >= 8 + n, "safetensors header truncated");
+        let header: serde_json::Value =
+            serde_json::from_slice(&map[8..8 + n]).context("safetensors header")?;
+        let data_start = 8 + n;
+        let mut entries = HashMap::new();
+        for (name, v) in header.as_object().context("safetensors header")? {
+            if name == "__metadata__" {
+                continue;
+            }
+            let (Some(offsets), Some(dtype), Some(shape)) =
+                (v.get("data_offsets"), v.get("dtype"), v.get("shape"))
+            else {
+                continue;
+            };
+            let ofs = offsets.as_array().context("data_offsets")?;
+            let start = data_start + ofs[0].as_u64().unwrap_or(0) as usize;
+            let end = data_start + ofs[1].as_u64().unwrap_or(0) as usize;
+            let shape: Vec<usize> = shape
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect())
+                .unwrap_or_default();
+            entries.insert(
+                name.clone(),
+                FileEntry {
+                    start,
+                    end,
+                    dtype: dtype.as_str().unwrap_or_default().to_string(),
+                    shape,
+                },
+            );
+        }
+        Ok(Self {
+            map: Arc::new(map),
+            entries,
+        })
+    }
+
+    fn entry(&self, key: &str) -> Result<&FileEntry> {
+        self.entries
+            .get(key)
+            .with_context(|| format!("missing tensor {key}"))
+    }
+
+    pub fn shape(&self, key: &str) -> Result<&[usize]> {
+        Ok(&self.entry(key)?.shape)
+    }
+
+    /// A file-backed view of a `U8` tensor's bytes.
+    pub fn u8_view(&self, key: &str) -> Result<TableBytes> {
+        let e = self.entry(key)?;
+        ensure!(e.dtype == "U8", "{key}: dtype {} is not U8", e.dtype);
+        Ok(TableBytes::Mapped {
+            map: self.map.clone(),
+            start: e.start,
+            end: e.end,
+        })
+    }
+
+    /// The values of an `F32` tensor, copied out of the map (the packed tables'
+    /// scales are small and `f32` views would need an alignment guarantee the
+    /// safetensors format does not provide).
+    pub fn f32_values(&self, key: &str) -> Result<Vec<f32>> {
+        let e = self.entry(key)?;
+        ensure!(e.dtype == "F32", "{key}: dtype {} is not F32", e.dtype);
+        let bytes = &self.map[e.start..e.end];
+        ensure!(
+            bytes.len().is_multiple_of(4),
+            "{key}: f32 byte length not a multiple of 4"
+        );
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+}
+
+/// One packed-table element (signed code, bits [1:0]/[3:2]/[5:4]/[7:6] for
+/// 2-bit, low nibble first for 4-bit, raw i8 for 8-bit).
+#[inline]
+fn packed_code(row: &[u8], bits: u8, c: usize) -> i8 {
+    match bits {
+        2 => {
+            let byte = row[c / 4];
+            (((byte >> (2 * (c % 4))) & 0x03) as i8) - 2
+        }
+        4 => {
+            let byte = row[c / 2];
+            let v = if c.is_multiple_of(2) {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            v as i8 - 8
+        }
+        _ => row[c] as i8,
+    }
+}
+
+/// Read a packed token table (`*.embedding_quantized` + `*.embedding_scale`)
+/// with its data as a file-backed view of the mapped checkpoint.
+pub fn read_packed_table_mapped(file: &PackedFile, base: &str, bits: u8) -> Result<PackedTable> {
+    let quant_key = format!("{base}.embedding_quantized");
+    let scale_key = format!("{base}.embedding_scale");
+    let shape = file.shape(&quant_key)?.to_vec();
+    ensure!(shape.len() == 2, "{quant_key}: expected a 2-D tensor");
+    let (rows, packed_k) = (shape[0], shape[1]);
+    let data = file.u8_view(&quant_key)?;
+    ensure!(
+        data.len() == rows * packed_k,
+        "{quant_key}: {} bytes for a [{rows}, {packed_k}] tensor",
+        data.len()
+    );
+    let scales = file.f32_values(&scale_key)?;
+    let k = packed_k * values_per_byte(bits);
+    let blocks = (scales.len() / rows).max(1);
+    Ok(PackedTable {
+        bits,
+        rows,
+        k,
+        blocks,
+        data,
+        scales,
+    })
 }
 
 /// Dequantize a `[rows, packed_k]` integer weight into row-major f32 `[rows, k]`.
@@ -223,13 +419,14 @@ pub struct PackedTable {
     pub rows: usize,
     pub k: usize,
     pub blocks: usize,
-    pub data: Vec<u8>,
+    pub data: TableBytes,
     pub scales: Vec<f32>,
 }
 
 impl PackedTable {
     /// Dequantize the requested rows into row-major f32 `[ids.len(), k]`.
     pub fn gather_f32(&self, ids: &[u32]) -> Vec<f32> {
+        let data = self.data.as_slice();
         let vpb = values_per_byte(self.bits);
         let packed_k = self.k.div_ceil(vpb);
         let blocks = self.blocks.max(1);
@@ -237,26 +434,40 @@ impl PackedTable {
         let mut out = vec![0.0f32; ids.len() * self.k];
         for (i, &id) in ids.iter().enumerate() {
             let r = (id as usize).min(self.rows - 1);
-            let prow = &self.data[r * packed_k..(r + 1) * packed_k];
+            let prow = &data[r * packed_k..(r + 1) * packed_k];
             let srow = &self.scales[r * blocks..(r + 1) * blocks];
             let orow = &mut out[i * self.k..(i + 1) * self.k];
             for (c, o) in orow.iter_mut().enumerate() {
-                let q: i8 = match self.bits {
-                    2 => {
-                        let byte = prow[c / 4];
-                        ((byte >> (2 * (c % 4))) & 0x03) as i8 - 2
-                    }
-                    4 => {
-                        let byte = prow[c / 2];
-                        let v = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-                        v as i8 - 8
-                    }
-                    _ => prow[c] as i8,
-                };
-                *o = q as f32 * srow[(c / block).min(blocks - 1)];
+                *o = packed_code(prow, self.bits, c) as f32 * srow[(c / block).min(blocks - 1)];
             }
         }
         out
+    }
+
+    /// Dequantize the whole table transposed, `[k, rows]` (`out[c * rows + r]`),
+    /// which is the tied LM head's `[hidden, vocab]` layout. `convert` maps each
+    /// dequantized value into the head's storage dtype.
+    pub fn dequantize_transposed<T: Default + Copy>(&self, convert: impl Fn(f32) -> T) -> Vec<T> {
+        let data = self.data.as_slice();
+        let vpb = values_per_byte(self.bits);
+        let packed_k = self.k.div_ceil(vpb);
+        let blocks = self.blocks.max(1);
+        let block = self.k.div_ceil(blocks).max(1);
+        let mut out = vec![T::default(); self.k * self.rows];
+        for r in 0..self.rows {
+            let prow = &data[r * packed_k..(r + 1) * packed_k];
+            let srow = &self.scales[r * blocks..(r + 1) * blocks];
+            for c in 0..self.k {
+                let v = packed_code(prow, self.bits, c) as f32 * srow[(c / block).min(blocks - 1)];
+                out[c * self.rows + r] = convert(v);
+            }
+        }
+        out
+    }
+
+    /// Total bytes held by the table (data bytes plus f32 scales).
+    pub fn mem_bytes(&self) -> usize {
+        self.data.len() + self.scales.len() * 4
     }
 }
 
@@ -296,7 +507,7 @@ pub fn read_packed_table(
         rows,
         k,
         blocks,
-        data,
+        data: TableBytes::Owned(data),
         scales,
     })
 }

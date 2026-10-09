@@ -5547,6 +5547,7 @@ dependencies = [
  "hound",
  "image",
  "libc",
+ "memmap2",
  "mozjpeg",
  "rustfft",
  "serde",
