@@ -157,7 +157,8 @@ $B qwen3 embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out 
 ```
 
 Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
-`--dtype f32|f16` (bf16 is broken in flex), `--quant none|q8` (q8 = Q8-resident
+`--dtype f32|f16|bf16` (f32 is the parity mode; bf16/f16 are memory modes, slower on
+flex), `--quant none|q8` (q8 = Q8-resident
 low-RAM mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
 attention only), `--tokens`, `--text`, `--text-file`, `--out`; `gemm` adds
 `--m/--n/--k/--transb`. Serving uses the flags of the [Serving](#serving)

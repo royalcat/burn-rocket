@@ -464,6 +464,12 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   (`pack_weight_seg`, concatenated along N): 196 tensors -> 112 resident weights, 4
   matmuls per layer, one input conversion per group. The loader packs each weight straight
   from the store and drops the host copy (`pack-and-drop`).
+- librocketnpu's float matmul ladder (header): fp16 resident (`rocket_weights_pack` +
+  `rocket_matmul_fp16_prepacked`, what the extension uses; needs the per-row amax
+  scaling), bf16 (full-speed 2-byte geometry — same as fp16/int16 — fp32 accumulate and
+  NO scaling, but streaming-only: no resident-weight variant, so prefill-shaped), and
+  tf32 (the only 4-byte-input path, explicitly half-rate). bf16 on the NPU would run at
+  fp16 speed; the flex CPU bf16 penalty below does not apply there.
 - Projection fields are `#[cfg_attr(npu, module(skip))]` so the store never materializes
   CPU copies in the NPU build. For that build's CPU modes (`--quant q8`, no `--npu`),
   `load_cpu_projections` loads the same tensors explicitly (with the PyTorch `[out,in]` ->
@@ -527,13 +533,17 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   quantization releases the freed f32 pages (glibc otherwise retains ~1.3 GB in arenas).
   Resident ~0.78 GB anon vs ~2.4 GB for f32, cost ~2 s per forward. Load peak is still
   ~2.3 GB (the file is materialized as f32 before quantization).
-- `--dtype bf16` works on burn 0.22.0 (verified: 310 tensors load, an 82-token embed runs,
-  cosine 0.99983 vs f32). It is ~2× slower than f32 on flex, so it stays a memory mode;
-  the q8 path keeps its f16 embedding table.
+- `--dtype bf16` works on burn 0.22.0 (verified: 310 tensors load, an 82-token embed
+  runs, cosine 0.99983 vs f32). Its cost is length-dependent (dev host, 32 threads,
+  fused attention, bench with one warmup): 89.2 tok/s at 82 tokens and 222.7 at 3.6k vs
+  259.1/268.2 for f32 — 2.9x at 82 tokens but only 1.2x at 3.6k. The penalty is flex's
+  per-call bf16->f32 operand conversion before the f32 GEMM (bf16 has no native flex
+  GEMM); f32 stays the parity/default mode and f16 is the slowest 16-bit mode
+  (60.8/131.9 tok/s).
 - Tokenizer must run with `add_special_tokens=true` (appends EOS 151643), matching
   `llama-embedding` token counts.
-- f16 weights are ~1.9× slower than f32 at model level on this CPU despite similar GEMM
-  microbenchmarks — use f32.
+- 16-bit weights are slower than f32 at model level on this CPU (f16 2-4x, bf16 1.2-2.9x,
+  length-dependent; see the bf16 bullet) despite similar GEMM microbenchmarks — use f32.
 - Long inputs are attention-bound: at n=6501 tokens attention FLOPs ≈ all linear layers
   combined (28 layers × 4096 × n FLOP/token).
 - Attention has two paths (`--attn fused|blocked`), both causal and numerically identical:

@@ -738,8 +738,29 @@ Numerics: the f32 path matches the pre.4 build (cosine 1.000000000 at 82 tokens,
 element difference 1.5e-5 — flex kernel changes between pre.4 and 0.22.0; the q8 path
 shows the same, cosine 1.000000000, max|d| 1.6e-5). `--dtype bf16` works again (the pre.4
 flex bf16 embedding panic is gone): 310 tensors load, an 82-token embed completes, cosine
-0.99983 vs the same build's f32 output; 100.5 tok/s vs 216.2 for f32 on the dev host, so
-bf16 stays a memory mode and f32 remains the parity/default mode.
+0.99983 vs the same build's f32 output.
+
+bf16 cost re-measured (dev host, 32 threads, fused attention, bench with one warmup):
+
+| dtype | 82 tok | 3633 tok |
+|---|---|---|
+| f32 | 259.1 tok/s (0.317 s) | 268.2 tok/s (13.55 s) |
+| bf16 | 89.2 tok/s (0.919 s) | 222.7 tok/s (16.31 s) |
+| f16 | 60.8 tok/s (1.349 s) | 131.9 tok/s (27.54 s) |
+
+So the earlier "~2x slower" figure is a short-input artifact: 2.9x at 82 tokens but only
+1.2x at 3.6k. The mechanism is flex's `matmul_bf16` (bf16 has no native flex GEMM): every
+matmul call converts both operands bf16->f32 (scalar, single-threaded) and narrows the
+result, so the per-forward weight conversion dominates small M (mlp stage 3.1x slower at
+82 tokens, 1.05x at 3.6k). f16 is slower still at model level (its other ops and attention
+casts outweigh the native f16 GEMM). f32 remains the parity/default mode; bf16 is the
+better 16-bit memory mode, f16 the worst.
+
+NPU note: librocketnpu's float matmul ladder (vendored header) is fp16 resident (what the
+extension uses), bf16 (full-speed 2-byte geometry, same as fp16/int16, fp32 accumulate, no
+amax scaling — but streaming-only, no resident-weight variant, so prefill-shaped), and
+tf32 (the only 4-byte-input path, half-rate). bf16 on the NPU would run at fp16 speed;
+the flex CPU penalty above does not apply there.
 
 `npu` is now the burn-rocket crate's default feature: the archive builds through
 `build.rs` (cross for aarch64, native for host link checks), so no non-NPU build is
