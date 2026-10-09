@@ -189,6 +189,7 @@ fn load_npu_projections(
 
     burn_rocket::init(npu_threads)
         .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+    crate::util::glue::set_glue(true);
 
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
     let t_npu = Instant::now();
@@ -248,9 +249,11 @@ fn load_npu_projections(
          model ready in {:.2}s (resident {:.0} MiB anon)",
         cfg.num_hidden_layers * ProjKind::ALL.len(),
         if dtype == DType::F32 {
-            "resident fp16"
+            "resident fp16".to_string()
+        } else if burn_rocket::bf16_stream_mode() {
+            "native bf16 via the bf16 stream".to_string()
         } else {
-            "native bf16"
+            "native bf16 packed resident fp16".to_string()
         },
         bytes as f64 / (1u64 << 30) as f64,
         npu_threads,

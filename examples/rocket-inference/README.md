@@ -225,9 +225,10 @@ are each one segmented weight) and keeps only an f16 embedding table on the CPU
 Numerics: cosine 0.999365 vs the production Q8_0 reference; the NPU attention
 run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
 `rocket` module on the board (contained; reboot reverts). Native-bf16 `--npu`
-(2026-10-09 board A/B, log §16) is numerically at the f32 level (cosine 0.999845)
-but 26 % slower (46.6 vs 58.8 tok/s) — `--dtype f32` is the fast NPU config;
-`--npu` excludes `--quant q8`.
+(the default) packs the same resident fp16 weights via an exact bf16->f16
+conversion: 2026-10-09 board A/B (log §17) 54.4 vs 57.8 tok/s (`--dtype f32`) at
+cosine 0.999845 vs f32 — a 6 % gap, down from 26 % when bf16 used the library's
+stream; `--npu` excludes `--quant q8`.
 
 ## Qwen3.5-0.8B intent (`intent`)
 
@@ -339,11 +340,11 @@ Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 projections into 0.25 GiB of resident fp16 weights with windowed attention: on
 the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
 user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
-33% less CPU. Native bf16 (the default) with `--npu` keeps the weights host-native
-and streams them per call: 19.2 s (134.9 tok/s, 1423 MiB anon) vs 14.8 s
-(174.8 tok/s, 2321 MiB) for `--dtype f32` on the 2026-10-09 board A/B (log §16) —
-at the f32 numerics level (0.999905) but 30 % slower, so `--dtype f32` is the fast
-board config. The vision/audio towers, norms, RoPE and the embedding table stay
+33% less CPU. Native bf16 (the default) with `--npu` packs the same resident fp16
+weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) vs
+16.5 s (156.7 tok/s, 1893 MiB) for `--dtype f32` on the 2026-10-09 board A/B
+(log §17) — bf16 is now the faster arm at ~60 % of the memory, cosine 0.999939 vs
+f32. The vision/audio towers, norms, RoPE and the embedding table stay
 on the CPU.
 
 Performance round (2026-10-08, log §12; board timings in §12.5):

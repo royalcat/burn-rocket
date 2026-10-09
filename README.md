@@ -64,9 +64,9 @@ than the CPU-only flex path (the default NPU attention is slightly faster: ~45 t
   ```
 
   `pack`/`pack2`/`pack3` consume f32/f16 weights and keep fp16 resident copies in NPU
-  memory for the process lifetime (`WeightId` handles), or native bf16 weights (kept
-  host-side: the library has no resident bf16, so each matmul streams the weight
-  through `rocket_matmul_bf16_stream` with an f32 conversion per call). Fused packs
+  memory for the process lifetime (`WeightId` handles), and bf16 weights pack the same
+  way via an exact bf16->f16 conversion (the library's bf16 stream — no resident
+  variant, re-packs per call — is opt-in behind `ROCKET_BF16_STREAM=1`). Fused packs
   concatenate several weights that share one input along N, so one matmul produces all
   their outputs (the example packs q|k|v and gate|up that way). Matmuls are chunked
   above `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the

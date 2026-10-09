@@ -26,6 +26,17 @@ pub(crate) fn gelu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// `out = silu(gate) * up` with Burn's `silu(x) = x * sigmoid(x)`,
+/// `sigmoid(x) = 1 / (1 + exp(-x))`, elementwise (the Qwen MLP gate).
+pub(crate) fn silu_mul(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    for ((o, &g), &u) in out.iter_mut().zip(gate).zip(up) {
+        let sigmoid = 1.0 / (1.0 + (-g).exp());
+        *o = g * sigmoid * u;
+    }
+}
+
 /// One row of `x * (mean(x^2) + eps)^-0.5 * weight` in f32. An empty `weight`
 /// means no scale (the value-norm form).
 pub(crate) fn rms_norm_row(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
@@ -111,6 +122,24 @@ mod tests {
         gelu_mul(&gate, &up, &mut out);
         for i in 0..5 {
             assert_eq!(out[i], gelu_tanh(gate[i]) * up[i]);
+        }
+    }
+
+    #[test]
+    fn silu_mul_is_silu_times_up() {
+        let gate = [0.0f32, 1.0, -1.0, 3.7, -12.5];
+        let up = [2.0f32, -1.0, 0.5, 0.25, 8.0];
+        let mut out = [0f32; 5];
+        silu_mul(&gate, &up, &mut out);
+        for i in 0..5 {
+            let g = gate[i];
+            let sigmoid = 1.0 / (1.0 + (-g).exp());
+            let want = g * sigmoid * up[i];
+            assert!(
+                (out[i] - want).abs() <= 1e-6 * want.abs().max(1.0),
+                "silu_mul({g}) = {}, composite {want}",
+                out[i]
+            );
         }
     }
 

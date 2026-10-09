@@ -828,3 +828,35 @@ model-native-weight policy and the numerics story.
 Missing from this round: a `--npu` gemma4 bf16 A/B (the board had ~2.4 GB free —
 the model needs ~10 GB) and an intent re-check (that model is no longer deployed on
 the board).
+
+## 17. Resident bf16: bf16 weights pack the resident fp16 path + qwen3 fused glue (2026-10-09)
+
+Follow-up to §16: the bf16 stream's 26-30 % tax was its per-call weight re-pack and
+f32 conversion, not the MAC — the library documents bf16 as token-identical to fp16
+and the device ties. bf16 weights now convert to f16 (exact for in-range values) and
+pack the existing resident fp16 path, so bf16 models get the f32 path's NPU time and
+pack-and-drop memory back. `ROCKET_BF16_STREAM=1` keeps the library-truth bf16
+stream (host-native weights, `rocket_matmul_bf16_stream`) for A/B. Separately, the
+fused CPU glue now covers qwen3: RMSNorm + RoPE + a new `silu_mul` kernel (qwen3's
+MLP gates on SiLU, not GELU), behind the shared `util/glue.rs` gate the gemma
+families already used; `ROCKET_GLUE=0/1` still switches both ways.
+
+Board A/B (busy board, cores 4-7, NPU shared with the live emb2 service; §16 rows
+for comparison):
+
+| model | config | wall | tok/s | resident | cosine |
+|---|---|---|---|---|---|
+| qwen3 3633 tok | bf16 (resident pack + glue) | 66.8 s | 54.4 | 298 MiB anon | 0.999845 vs f32 |
+| qwen3 3633 tok | `--dtype f32` (glue) | 62.9 s | 57.8 | 298 MiB anon | — |
+| qwen3 §16 | bf16 stream | 78.0 s | 46.6 | 1138 MiB anon | 0.999845 vs f32 |
+| emb2 2587 tok | bf16 (resident pack) | 15.8 s | 163.4 | 1162 MiB anon | 0.999939 vs f32 |
+| emb2 2587 tok | `--dtype f32` | 16.5 s | 156.7 | 1893 MiB anon | — |
+| emb2 §16 | bf16 stream | 19.2 s | 134.9 | 1423 MiB | 0.999905 vs f32 |
+
+The qwen3 bf16 gap closed from 26.6 % to 6.2 % (the remainder is the bf16 body's CPU
+ops — the fused glue removes serial passes, but every glue/matmul call still converts
+bf16<->f32); emb2 bf16 is now *faster* than its f32 arm (+4.3 %) at ~60 % of the
+memory. The qwen3 glue A/B (`ROCKET_GLUE=0` vs default, bf16) is cosine 0.99975: the
+fused kernels compute in f32 while the composites round every step to bf16, so the
+glue-on path is the more precise one. `ROCKET_BF16_STREAM=1` reproduces the §16
+numerics (0.99982 vs the resident packing).

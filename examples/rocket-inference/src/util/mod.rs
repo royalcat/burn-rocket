@@ -1,6 +1,8 @@
 //! Generic, family-agnostic helpers shared by every model in this crate.
 
 pub mod device;
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub mod glue;
 pub mod http;
 pub mod mem;
 pub mod proj;

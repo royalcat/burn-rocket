@@ -127,11 +127,8 @@ fn linear_body<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
 /// `burn-rocket`'s fused kernels. Off in the pure-CPU modes, whose f32 results
 /// are bit-comparable with the HF reference.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-static NPU_GLUE: AtomicBool = AtomicBool::new(false);
-
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn set_npu_glue(on: bool) {
-    NPU_GLUE.store(on, Ordering::Relaxed);
+    crate::util::glue::set_glue(on);
 }
 
 /// Whether the fused glue kernels are active. `--npu` turns them on; the
@@ -140,11 +137,7 @@ pub fn set_npu_glue(on: bool) {
 /// test the kernels in a CPU mode).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn npu_glue() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| match std::env::var("ROCKET_GLUE") {
-        Ok(v) => v != "0",
-        Err(_) => NPU_GLUE.load(Ordering::Relaxed),
-    })
+    crate::util::glue::glue()
 }
 
 /// `gelu_approximate(gate) * up` (fused single pass with the NPU glue on).

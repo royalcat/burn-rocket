@@ -68,6 +68,8 @@ pub trait RocketOps: Backend {
     fn rocket_pack_i8(t: FloatTensor<Self>, group: usize) -> u64;
     /// Fused `gelu_approximate(a) * b` over equal-shaped f32 tensors, in one pass.
     fn rocket_gelu_mul(a: FloatTensor<Self>, b: FloatTensor<Self>) -> FloatTensor<Self>;
+    /// Fused `silu(a) * b` (`a * sigmoid(a) * b`) over equal-shaped tensors, in one pass.
+    fn rocket_silu_mul(a: FloatTensor<Self>, b: FloatTensor<Self>) -> FloatTensor<Self>;
     /// Fused weighted RMSNorm over the last dim, in one pass:
     /// `x * (mean(x^2) + eps)^-0.5 * w` (`w` has the last dim's size).
     fn rocket_rms_norm(x: FloatTensor<Self>, w: FloatTensor<Self>, eps: f64) -> FloatTensor<Self>;
@@ -358,6 +360,10 @@ impl RocketOps for Flex {
         gelu_mul_impl(a, b)
     }
 
+    fn rocket_silu_mul(a: FloatTensor<Self>, b: FloatTensor<Self>) -> FloatTensor<Self> {
+        silu_mul_impl(a, b)
+    }
+
     fn rocket_rms_norm(x: FloatTensor<Self>, w: FloatTensor<Self>, eps: f64) -> FloatTensor<Self> {
         rms_norm_impl(x, w, eps)
     }
@@ -508,38 +514,110 @@ fn to_host_bf16(t: FlexTensor, what: &str) -> (usize, usize, Vec<bf16>) {
     (k, n, values)
 }
 
+/// Whether bf16 weights use the library's bf16 streaming path (`ROCKET_BF16_STREAM=1`)
+/// instead of packing into the resident fp16 path.
+///
+/// The library has no resident bf16 weight, and its bf16 stream re-packs A and B
+/// on every call (measured 26-30% slower end-to-end on the board), while bf16's
+/// device math ties fp16. Packing bf16 -> f16 is exact for in-range values and
+/// keeps the resident weights, so it is the default; the env var selects the
+/// library-truth bf16 path for A/B.
+fn bf16_stream_enabled() -> bool {
+    static STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STREAM.get_or_init(|| std::env::var("ROCKET_BF16_STREAM").is_ok_and(|v| v != "0"))
+}
+
+/// Whether bf16 weights are routed to the library's bf16 streaming path
+/// (`ROCKET_BF16_STREAM=1`) rather than packed into resident fp16 weights. The
+/// loaders print the active mode; the env var is read once per process.
+pub fn bf16_stream_mode() -> bool {
+    bf16_stream_enabled()
+}
+
+/// bf16 -> f16 (exact for bf16 values inside f16's range), rayon-chunked.
+fn bf16_to_f16_par(src: &[bf16]) -> Vec<f16> {
+    use rayon::prelude::*;
+    const CHUNK: usize = 8192;
+    let mut out = vec![f16::ZERO; src.len()];
+    out.par_chunks_mut(CHUNK)
+        .zip(src.par_chunks(CHUNK))
+        .for_each(|(o, s)| {
+            for (d, &x) in o.iter_mut().zip(s) {
+                *d = f16::from_f32(x.to_f32());
+            }
+        });
+    out
+}
+
+/// Pack one `[N, K]` f16 weight into resident NPU memory.
+fn pack_resident(k: usize, n: usize, b: Vec<f16>) -> u64 {
+    with_engine(|e| {
+        let weight = e
+            .ctx
+            .pack_weight(PACK_M, k, n, &b)
+            .unwrap_or_else(|err| op_failure("rocket_weights_pack", err.rc, PACK_M, k, n));
+        let id = e.next_id;
+        e.next_id += 1;
+        e.weights.insert(id, Resident { weight, k, n });
+        id
+    })
+}
+
+/// Keep one bf16 weight on the host (the `ROCKET_BF16_STREAM=1` route).
+fn pack_bf16_host(k: usize, n: usize, data: Vec<bf16>) -> u64 {
+    with_engine(|e| {
+        let id = e.next_id;
+        e.next_id += 1;
+        e.bf16_weights.insert(id, Bf16Resident { data, k, n });
+        id
+    })
+}
+
+/// Pack a group of `[N_i, K]` f16 weights as one segmented resident weight
+/// (concatenated along N; the caller does not materialize the concatenation).
+fn pack_seg(hosts: Vec<(usize, usize, Vec<f16>)>, what: &str) -> u64 {
+    let k = hosts[0].0;
+    assert!(
+        hosts.iter().all(|(kk, _, _)| *kk == k),
+        "{what}: all parts must share K"
+    );
+    let bufs: Vec<&[f16]> = hosts.iter().map(|(_, _, b)| b.as_slice()).collect();
+    let n: usize = hosts.iter().map(|(_, n, _)| *n).sum();
+    with_engine(|e| {
+        let weight = e
+            .ctx
+            .pack_weight_seg(PACK_M, k, &bufs)
+            .unwrap_or_else(|err| op_failure("rocket_weights_pack_seg", err.rc, PACK_M, k, n));
+        let id = e.next_id;
+        e.next_id += 1;
+        e.weights.insert(id, Resident { weight, k, n });
+        id
+    })
+}
+
 fn pack_one(t: FlexTensor, what: &str) -> u64 {
     match t.dtype() {
         DType::F32 | DType::F16 => {
             let (k, n, b) = to_host(t, what);
-            with_engine(|e| {
-                let weight = e
-                    .ctx
-                    .pack_weight(PACK_M, k, n, &b)
-                    .unwrap_or_else(|err| op_failure("rocket_weights_pack", err.rc, PACK_M, k, n));
-                let id = e.next_id;
-                e.next_id += 1;
-                e.weights.insert(id, Resident { weight, k, n });
-                id
-            })
+            pack_resident(k, n, b)
         }
         DType::BF16 => {
             let (k, n, data) = to_host_bf16(t, what);
-            with_engine(|e| {
-                let id = e.next_id;
-                e.next_id += 1;
-                e.bf16_weights.insert(id, Bf16Resident { data, k, n });
-                id
-            })
+            if bf16_stream_enabled() {
+                pack_bf16_host(k, n, data)
+            } else {
+                pack_resident(k, n, bf16_to_f16_par(&data))
+            }
         }
         other => panic!("{what}: unsupported weight dtype {other:?} (f32/f16/bf16)"),
     }
 }
 
 /// Fused groups: every part is `[N_i, K]` with a shared `K`; the weight is the
-/// concatenation along N, so one matmul produces all outputs. f32 parts pack a
-/// segmented resident fp16 weight (no concat materialized); bf16 parts stay
-/// native and are concatenated host-side (the bf16 API takes one B buffer).
+/// concatenation along N, so one matmul produces all outputs. f32/f16 parts pack
+/// a segmented resident fp16 weight (no concat materialized); bf16 parts convert
+/// to f16 and pack the same way, or stay host-native under `ROCKET_BF16_STREAM=1`
+/// (the bf16 API takes one B buffer, so the concat is materialized host-side).
 fn pack_many(parts: Vec<FlexTensor>, what: &str) -> u64 {
     let dtype = parts[0].dtype();
     assert!(
@@ -550,25 +628,7 @@ fn pack_many(parts: Vec<FlexTensor>, what: &str) -> u64 {
         DType::F32 | DType::F16 => {
             let hosts: Vec<(usize, usize, Vec<f16>)> =
                 parts.into_iter().map(|p| to_host(p, what)).collect();
-            let k = hosts[0].0;
-            assert!(
-                hosts.iter().all(|(kk, _, _)| *kk == k),
-                "{what}: all parts must share K"
-            );
-            let bufs: Vec<&[f16]> = hosts.iter().map(|(_, _, b)| b.as_slice()).collect();
-            let n: usize = hosts.iter().map(|(_, n, _)| *n).sum();
-            with_engine(|e| {
-                let weight = e
-                    .ctx
-                    .pack_weight_seg(PACK_M, k, &bufs)
-                    .unwrap_or_else(|err| {
-                        op_failure("rocket_weights_pack_seg", err.rc, PACK_M, k, n)
-                    });
-                let id = e.next_id;
-                e.next_id += 1;
-                e.weights.insert(id, Resident { weight, k, n });
-                id
-            })
+            pack_seg(hosts, what)
         }
         DType::BF16 => {
             let hosts: Vec<(usize, usize, Vec<bf16>)> =
@@ -579,16 +639,19 @@ fn pack_many(parts: Vec<FlexTensor>, what: &str) -> u64 {
                 "{what}: all parts must share K"
             );
             let n: usize = hosts.iter().map(|(_, n, _)| *n).sum();
-            let mut data: Vec<bf16> = Vec::with_capacity(n * k);
-            for (_, _, b) in hosts {
-                data.extend_from_slice(&b);
+            if bf16_stream_enabled() {
+                let mut data: Vec<bf16> = Vec::with_capacity(n * k);
+                for (_, _, b) in hosts {
+                    data.extend_from_slice(&b);
+                }
+                pack_bf16_host(k, n, data)
+            } else {
+                let parts: Vec<(usize, usize, Vec<f16>)> = hosts
+                    .into_iter()
+                    .map(|(kk, nn, b)| (kk, nn, bf16_to_f16_par(&b)))
+                    .collect();
+                pack_seg(parts, what)
             }
-            with_engine(|e| {
-                let id = e.next_id;
-                e.next_id += 1;
-                e.bf16_weights.insert(id, Bf16Resident { data, k, n });
-                id
-            })
         }
         other => panic!("{what}: unsupported weight dtype {other:?} (f32/f16/bf16)"),
     }
@@ -729,6 +792,25 @@ fn gelu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
         .zip(av.par_chunks(CHUNK))
         .zip(bv.par_chunks(CHUNK))
         .for_each(|((o, g), u)| crate::host::gelu_mul(g, u, o));
+    floats_tensor(out, dims, out_dtype)
+}
+
+/// Fused `silu(a) * b` (`a * sigmoid(a) * b`): one rayon pass, same dtype rules
+/// as [`gelu_mul_impl`].
+fn silu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
+    use rayon::prelude::*;
+    const CHUNK: usize = 8192;
+
+    let out_dtype = a.dtype();
+    assert_eq!(b.dtype(), out_dtype, "silu_mul inputs must share a dtype");
+    let (dims, av) = to_host_f32(a, "silu_mul input a");
+    let (bdims, bv) = to_host_f32(b, "silu_mul input b");
+    assert_eq!(dims, bdims, "silu_mul inputs must share a shape");
+    let mut out = vec![0f32; av.len()];
+    out.par_chunks_mut(CHUNK)
+        .zip(av.par_chunks(CHUNK))
+        .zip(bv.par_chunks(CHUNK))
+        .for_each(|((o, g), u)| crate::host::silu_mul(g, u, o));
     floats_tensor(out, dims, out_dtype)
 }
 
@@ -1422,6 +1504,14 @@ pub fn attention_window_block<const D: usize>(
 /// Fused `gelu_approximate(a) * b` (one pass; the NPU build's CPU glue).
 pub fn gelu_mul<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> Tensor<D> {
     Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_gelu_mul(
+        a.into_dispatch(),
+        b.into_dispatch(),
+    ))
+}
+
+/// Fused `silu(a) * b` (one pass; the NPU build's CPU glue for Qwen MLPs).
+pub fn silu_mul<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_silu_mul(
         a.into_dispatch(),
         b.into_dispatch(),
     ))

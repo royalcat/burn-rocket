@@ -30,6 +30,19 @@ impl RopeCache {
         Self { cos, sin, half }
     }
 
+    /// The cos table rows `[start, start + len)` as `[len, head_dim/2]` — the
+    /// layout the fused `rope_apply` kernel takes.
+    #[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+    pub fn cos_rows(&self, start: usize, len: usize) -> Tensor<2> {
+        self.cos.clone().slice(s![start..start + len, ..])
+    }
+
+    /// The sin table rows `[start, start + len)` as `[len, head_dim/2]`.
+    #[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+    pub fn sin_rows(&self, start: usize, len: usize) -> Tensor<2> {
+        self.sin.clone().slice(s![start..start + len, ..])
+    }
+
     /// Applies RoPE to `x` of shape `[batch, seq, heads, head_dim]`, starting at position
     /// `seq_start`. Both q and k use the same table (no partial rotation, no freq scaling).
     pub fn apply(&self, x: Tensor<4>, seq_start: usize) -> Tensor<4> {

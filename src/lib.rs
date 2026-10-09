@@ -44,8 +44,8 @@ pub mod ext;
 #[cfg(feature = "npu")]
 pub use ext::{
     Stats, WeightId, attention, attention_causal_window, attention_window, attention_window_block,
-    gelu_mul, init, matmul, pack, pack_i8, pack2, pack3, rms_norm, rms_norm_noscale, rope_apply,
-    stats, stats_reset,
+    bf16_stream_mode, gelu_mul, init, matmul, pack, pack_i8, pack2, pack3, rms_norm,
+    rms_norm_noscale, rope_apply, silu_mul, stats, stats_reset,
 };
 
 pub use half;

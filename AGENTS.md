@@ -429,14 +429,18 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   `rocket_matmul_int8_prepacked_gw`, quantizing A per row per group and padding rows
   to `M % 4` (an unaligned M miscomputes on HW — the library rejects it). The int8
   ctx owns its own fds (created lazily at the first int8 pack).
-- Fused CPU glue (2026-10-08, emb2 `--npu`): `burn_rocket::{gelu_mul, rms_norm,
-  rms_norm_noscale, rope_apply}` are host rayon kernels (single pass where flex runs
-  several serial scalar passes); `ROCKET_GLUE=0` restores the composite ops,
-  `ROCKET_GLUE=1` forces the kernels in CPU modes.
-- `--npu` = pack-and-drop: 196 projections packed into resident fp16 NPU BOs (0.82 GiB),
-  f16 embedding table, 298 MiB CPU-resident. `--npu-attn npu` (default) also offloads
-  attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention (within ~1 s on
-  wall, ~40% more CPU). `--npu` requires `--dtype f32` and excludes `--quant q8`.
+- Fused CPU glue (2026-10-08 emb2, extended to qwen3 2026-10-09):
+  `burn_rocket::{gelu_mul, silu_mul, rms_norm, rms_norm_noscale, rope_apply}` are host
+  rayon kernels (single pass where flex runs several serial scalar passes); the NPU
+  loaders turn them on (`util/glue.rs`, shared by emb2/gemma4/qwen3), `ROCKET_GLUE=0`
+  restores the composite ops, `ROCKET_GLUE=1` forces the kernels in CPU modes.
+- `--npu` = pack-and-drop: projections offload in the model's dtype — f32/f16 pack
+  resident fp16 BOs (0.82 GiB for qwen3) and bf16 packs the same way via an exact
+  bf16->f16 conversion (log §17); the embedding table keeps the model dtype (f16 for
+  an f32 body), 298 MiB CPU-resident for qwen3 f32. `--npu-attn npu` (default) also
+  offloads attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention
+  (within ~1 s on wall, ~40% more CPU). `--npu` accepts `--dtype f32|f16|bf16` and
+  excludes `--quant q8`.
 - With canonical tiling (default) resident weights serve any `M >= 4`; only the
   `M % 4` alignment pad remains. `ROCKET_CTX_CANONICAL=0` restores the legacy
   `M >= 256` pad (A/B only). One pack serves all lengths.
@@ -465,15 +469,16 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   matmuls per layer, one input conversion per group. The loader packs each weight straight
   from the store and drops the host copy (`pack-and-drop`).
 - librocketnpu's float matmul ladder (header): fp16 resident (`rocket_weights_pack` +
-  `rocket_matmul_fp16_prepacked`), used for f32/f16 model weights; bf16 (full-speed
-  2-byte geometry — same as fp16/int16 — fp32 accumulate and NO scaling, but
-  streaming-only: no resident-weight variant, so the extension keeps bf16 weights
-  host-native and feeds `rocket_matmul_bf16_stream` an f32 conversion per call,
-  `_mt` on a refusal); and tf32 (the only 4-byte-input path, explicitly half-rate).
-  bf16 has no speed advantage over fp16 on the NPU (the device ties); the library
-  docs call it token-identical, and the board A/B confirms the numerics (cosine
-  0.99985/0.99990 vs f32) — but the stream path is 26-30% slower end-to-end than
-  the resident fp16 path because it re-packs the weight per call (log §16).
+  `rocket_matmul_fp16_prepacked`) — what the extension uses for f32/f16 model weights
+  **and for bf16** (packed via the exact bf16->f16 conversion); bf16 (full-speed
+  2-byte geometry, fp32 accumulate and NO scaling, but streaming-only: no
+  resident-weight variant, so `ROCKET_BF16_STREAM=1` keeps weights host-native and
+  feeds `rocket_matmul_bf16_stream` an f32 conversion per call, `_mt` on a refusal);
+  and tf32 (the only 4-byte-input path, explicitly half-rate). bf16 has no speed
+  advantage over fp16 on the NPU (the device ties; the library docs call it
+  token-identical), and its stream re-packs the weight per call — 26-30 % slower
+  end-to-end than the resident path (log §16), which is why bf16 weights pack
+  resident fp16 by default (log §17).
 - Projection fields are `#[cfg_attr(npu, module(skip))]` so the store never materializes
   CPU copies in the NPU build. For that build's CPU modes (`--quant q8`, no `--npu`),
   `load_cpu_projections` loads the same tensors explicitly (with the PyTorch `[out,in]` ->
@@ -545,13 +550,14 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   body (f32 softmax/PLE/logits) with bf16 weights. Native bf16 costs CPU speed on
   flex (the bf16 GEMM converts operands to f32 per call): qwen3 82-token bf16
   142 tok/s vs 211 f32, 3.6k 222.7 vs 268.2 (2.9x at 82 tokens, 1.2x at 3.6k); f16 is
-  the slowest 16-bit mode (60.8/131.9 tok/s). On the board the NPU bf16 path is
-  26.6% slower than the resident fp16 path (qwen3 46.6 vs 58.8 tok/s) and 30% for
-  emb2 (134.9 vs 174.8), with device time tied — `--dtype f32` stays the fast board
-  config. Numerics verified: qwen3 bf16 cosine 0.99983 vs f32 (82 tok) and 0.999845
-  on the board; emb2 text/image ~0.9999 vs HF f32 and 0.999905 on the board; gemma4
-  bf16 9/9 tokens identical to HF (f32 body). `--dtype f16` is still rejected for
-  emb2 (f16 numerics: 0.98 text / 0.70 image).
+  the slowest 16-bit mode (60.8/131.9 tok/s). On the board, bf16 weights pack the
+  resident fp16 path by default, so the NPU bf16 gap is now 6.2 % for qwen3 (54.4 vs
+  57.8 tok/s) and emb2 bf16 is *faster* than its f32 arm (163.4 vs 156.7) at ~60 % of
+  the memory; the opt-in `ROCKET_BF16_STREAM=1` path (the library's bf16 stream) is
+  26-30 % slower (log §16/§17). Numerics verified: qwen3 bf16 cosine 0.99983 vs f32
+  (82 tok) and 0.999845 on the board; emb2 text/image ~0.9999 vs HF f32 and 0.999939
+  on the board; gemma4 bf16 9/9 tokens identical to HF (f32 body). `--dtype f16` is
+  still rejected for emb2 (f16 numerics: 0.98 text / 0.70 image).
 - Tokenizer must run with `add_special_tokens=true` (appends EOS 151643), matching
   `llama-embedding` token counts.
 - 16-bit weights are slower than f32 at model level on this CPU (f16 2-4x, bf16 1.2-2.9x,

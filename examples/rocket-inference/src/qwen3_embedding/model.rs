@@ -41,6 +41,29 @@ pub fn stage_stats_reset() {
     T_NORM_US.store(0, Ordering::Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Fused CPU glue (`--npu` builds with the NPU glue on): single-pass host kernels
+// replacing flex's serial scalar chains. `ROCKET_GLUE=0/1` is the A/B switch.
+// ---------------------------------------------------------------------------
+
+/// `RmsNorm::forward` through the fused kernel when the NPU glue is on.
+fn fused_rms_norm<const D: usize>(norm: &RmsNorm, x: Tensor<D>) -> Tensor<D> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if crate::util::glue::glue() {
+        return burn_rocket::rms_norm(x, norm.gamma.val(), norm.epsilon);
+    }
+    norm.forward(x)
+}
+
+/// `silu(gate) * up` through the fused kernel when the NPU glue is on.
+fn fused_silu_mul<const D: usize>(gate: Tensor<D>, up: Tensor<D>) -> Tensor<D> {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if crate::util::glue::glue() {
+        return burn_rocket::silu_mul(gate, up);
+    }
+    silu(gate) * up
+}
+
 /// Model hyper-parameters, deserialized from the HF `config.json`.
 #[allow(dead_code)] // full config.json schema; not every field is consumed
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -189,7 +212,7 @@ impl Qwen3Embedding {
         for layer in &self.layers {
             x = layer.forward(x, rope, attn_chunk, key_block, fused, self.quantized);
         }
-        let x = self.norm.forward(x);
+        let x = fused_rms_norm(&self.norm, x);
         // Last-token pooling.
         x.slice(s![.., s - 1..s, ..]).reshape([b, d])
     }
@@ -228,7 +251,7 @@ impl Qwen3Layer {
     ) -> Tensor<3> {
         let t = Instant::now();
         let residual = x.clone();
-        let h = self.input_layernorm.forward(x);
+        let h = fused_rms_norm(&self.input_layernorm, x);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -240,7 +263,7 @@ impl Qwen3Layer {
 
         let t = Instant::now();
         let residual = h.clone();
-        let h = self.post_attention_layernorm.forward(h);
+        let h = fused_rms_norm(&self.post_attention_layernorm, h);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -340,8 +363,17 @@ impl Qwen3Attention {
             .reshape([b, s, kv, d]);
         let v = self.v_proj.forward(x, quantized).reshape([b, s, kv, d]);
 
-        let q = rope.apply(self.q_norm.forward(q), 0);
-        let k = rope.apply(self.k_norm.forward(k), 0);
+        let q = fused_rms_norm(&self.q_norm, q);
+        let k = fused_rms_norm(&self.k_norm, k);
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if crate::util::glue::glue() {
+            // Fused one-pass RoPE; the tables are the [S, D/2] slices it takes.
+            let q = burn_rocket::rope_apply(q, rope.cos_rows(0, s), rope.sin_rows(0, s));
+            let k = burn_rocket::rope_apply(k, rope.cos_rows(0, s), rope.sin_rows(0, s));
+            return (q, k, v);
+        }
+        let q = rope.apply(q, 0);
+        let k = rope.apply(k, 0);
 
         (q, k, v)
     }
@@ -535,10 +567,10 @@ impl Qwen3Mlp {
             let gu = burn_rocket::matmul(x, id);
             let gate = gu.clone().slice(s![.., .., 0..n]);
             let up = gu.slice(s![.., .., n..2 * n]);
-            return self.down_proj.forward(silu(gate) * up, quantized);
+            return self.down_proj.forward(fused_silu_mul(gate, up), quantized);
         }
         let gate = self.gate_proj.forward(x.clone(), quantized);
         let up = self.up_proj.forward(x, quantized);
-        self.down_proj.forward(silu(gate) * up, quantized)
+        self.down_proj.forward(fused_silu_mul(gate, up), quantized)
     }
 }

@@ -185,7 +185,11 @@ fn load_npu_text(
         if opts.int8 {
             "int8 g32".to_string()
         } else if native_bf16_count == count {
-            "native bf16".to_string()
+            if burn_rocket::bf16_stream_mode() {
+                "native bf16 via the bf16 stream".to_string()
+            } else {
+                "native bf16 packed resident fp16".to_string()
+            }
         } else {
             format!("resident fp16 ({native_bf16_count}/{count} bf16)")
         },
