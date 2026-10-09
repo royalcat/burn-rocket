@@ -55,7 +55,7 @@ name), `--max-tokens`, `--max-new-tokens`, `--temperature`, plus the detected
 family's loading flags:
 
 - qwen3: `--dtype`, `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--chunk`, `--key-block`, `--attn`
-- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--npu-int8-group`, `--attn-chunk`, `--video-fps`, `--video-max-frames`
+- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--npu-int8-group`, `--attn-chunk`, `--video-fps`, `--video-max-frames`, `--defer-towers`
 - intent: `--npu`, `--npu-threads`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`
 - Gemma 4: `--f16`, `--quant`, `--npu`, `--npu-threads`, `--attn-chunk`
 
@@ -132,6 +132,21 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   rms_norm_noscale, rope_apply}`): single rayon passes instead of flex's serial
   scalar chains; q8 CPU glue on-vs-off cosine 1.0 (max|d| 1.4e-7), `--npu` glue
   on/off equivalent vs HF; `ROCKET_GLUE=0/1` is the A/B switch.
+- **Idle-memory round** (2026-10-09, log-gemma §14): the emb2 server's towers load
+  lazily and the process returns its heap. `--defer-towers` (serve + gemma CLI)
+  moves the vision/audio towers into `Emb2Model.towers: Option<Towers>` behind
+  `#[module(skip)]`; a towers-only store pass loads them on the first media request
+  with the same dtype/Q8 policy (eager loads use the same pass; a text-only load
+  applies 413 tensors in ~1 s, was 896 in ~4 s). `util::mem::{trim_heap,
+  trim_after_request}` release the allocator's free pages at serve startup and after
+  every request (`ROCKET_TRIM=0` disables the latter). Dev host q8+f32 steady
+  1694 -> 754 MiB deferred (1306 eager) and flat under long requests. Board
+  `openviking-embed-1` (`b4634c9` + `--defer-towers`): idle 2183 -> 605 MiB anon
+  (`docker stats` 3.205 -> 1.552 GiB); a 3767-token request steps to ~1.18 GiB
+  (glibc arena high-water) and the next request's trim returns it to ~0.78 GiB.
+  Text and media outputs are bit-identical deferred vs eager;
+  `MALLOC_MMAP_THRESHOLD_=131072` was tried and rejected (no memory gain, +60 %
+  wall, log-gemma §14).
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
@@ -156,8 +171,9 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
   emb2 (above). The live OpenViking embedding backend (`openviking-embed-1`) runs
-  EmbeddingGemma 2 on the `c951944` image, which predates the performance round
-  (canonical tiling, chunked attention, int8, glue).
+  EmbeddingGemma 2 on the `b4634c9` image (`--dtype f32 --quant q8 --npu
+  --npu-attn npu --attn-chunk 1024 --defer-towers`; idle-memory round, log-gemma
+  §14).
 
 ## Repo layout
 
@@ -359,13 +375,17 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - **Live service**: OpenViking's embedding backend. Since 2026-10-08 it is
   EmbeddingGemma 2: container `openviking-embed-1` (image
-  `git.kmsign.org/royalcat/rocket-inference:c951944`) runs `serve --backend flex
-  --dtype f32 --quant q8 --npu --npu-attn npu --port 8383 --max-tokens 8192
-  --model-dir /models/embeddinggemma-2`, CPUs 4-7, NPU. Any board run shares the
-  NPU and cores 4-7 with it. Historically (2026-10-05) the backend was qwen3 on
-  `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7, `mem_limit`
-  8g, weights at `/root/models/qwen3-embedding-0.6b`; that image predates the
-  repo inversion. `examples/rocket-inference/docker/build.sh` pushes
+  `git.kmsign.org/royalcat/rocket-inference:b4634c9`, the idle-memory round) runs
+  `serve --backend flex --dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk
+  1024 --defer-towers --port 8383 --max-tokens 8192 --model-dir
+  /models/embeddinggemma-2`, CPUs 4-7, NPU, `mem_limit` 8g. Idle RssAnon is
+  605 MiB at boot / ~780 MiB after long traffic (2183 MiB before the round); the
+  stack file is `/home/komodo/.komodo/stacks/openviking/compose.yaml` (on the
+  board; deploy with `docker compose up -d embed` from its directory). Any board
+  run shares the NPU and cores 4-7 with it. Historically (2026-10-05) the backend
+  was qwen3 on `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7,
+  `mem_limit` 8g, weights at `/root/models/qwen3-embedding-0.6b`; that image
+  predates the repo inversion. `examples/rocket-inference/docker/build.sh` pushes
   `git.kmsign.org/royalcat/rocket-inference:<sha>`.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
@@ -625,10 +645,12 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   gemma4 prefill) still build `[n][n]` masks and OOM at ~30k; the same query-chunking
   idea applies (per-chunk `[C, q1]` causal masks, prefix keys), plus a 30k measurement
   of the emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
-- Board service: the emb2 backend runs the pre-round `c951944` image. Redeploy on
-  this build (canonical tiling + chunked attention + glue; keep fp16 `--npu` as the
-  speed config — the int8 g32 path is 2.4x slower, readback-bound) and re-measure
-  the served latencies.
+- Board service: `openviking-embed-1` runs `b4634c9` (idle-memory round, log-gemma
+  §14; keep fp16 `--npu` as the speed config — the int8 g32 path is 2.4x slower,
+  readback-bound). Remaining: re-measure the served latencies on an idle board
+  (the 2026-10-09 numbers were taken while the board was busy), and decide whether
+  the NPU BO shmem (~1.3 GiB) or the long-request glibc high-water (~+0.6 GiB,
+  released by the next request) warrant further work.
 - QAT mobile board re-run (log-gemma §13): the f16 text-only profile is now 3.7 GiB
   anon plus ~1.2 GiB reclaimable table pages (`--defer-towers`), so a guarded run
   should fit a busy board; then the `ROCKET_NPU_DECODE=1` decode-speed pre-gate

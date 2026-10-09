@@ -636,17 +636,87 @@ Open: the board re-run (guarded scope) and the NPU-decode pre-gate —
 CPU copies kept, so the decode speed can be measured before switching to
 `keep_cpu=false` (pack-and-drop, decode stays on the NPU).
 
-## 14. Deferred
+## 14. Idle-memory round: deferred towers + heap trims (2026-10-09)
+
+Goal: the served emb2 backend (`openviking-embed-1`, text-only in production)
+held ~1.7 GiB anon on the dev host and **2183 MiB on the board** while idle,
+and kept growing with every long request. Three findings shaped the round:
+
+1. **The tokenizer is a hidden 467 MiB peak.** `gemma tokenize` alone peaks at
+   466.9 MiB on this checkpoint (262144 vocab / 514906 merges), and glibc kept
+   ~270 MiB of that parse after the model load (A/B: setting
+   `MALLOC_MMAP_THRESHOLD_=131072` alone dropped the served steady from 1694
+   to 1423 MiB).
+2. **Idle creeps per request.** Each request left 25-55 MiB resident (the
+   allocator retains the request's high-water mark; the NPU full-attention
+   layers read back a 4.2k-token score matrix of ~280 MB per layer). On the
+   board the *same* config read anywhere from 0.75 to 2.3 GiB (§18).
+3. **The towers are ~550 MiB of text-only dead weight.** The Q8 vision+audio
+   towers load eagerly for `/embed`, which production never calls.
+
+Changes (commit `b4634c9`):
+
+- `--defer-towers` (gemma CLI + `serve`, emb2; mirrors the Gemma 4 flag): the
+  towers live behind `Emb2Model.towers: Option<Towers>` (`#[module(skip)]`)
+  and load in a towers-only store pass — eagerly by default, or on the first
+  media request. A text-only load now applies **413 tensors (was 896) in ~1 s**
+  instead of ~4 s.
+- Heap release: `util::mem::{trim_heap, trim_after_request}` — `malloc_trim(0)`
+  after serve startup (releases the tokenizer parse's retired heap) and after
+  every request (`ROCKET_TRIM=0` disables).
+
+Dev host (flex, q8+f32, `data/one_long.txt` = 2594 tokens; RssAnon):
+
+| config | after load | steady served | 3x 6.6k-token requests |
+|---|---|---|---|
+| before (q8, eager towers) | 1216 | 1694 | +25-55 MiB per request, never released |
+| new, eager towers | 1217 | 1306 | flat |
+| new, `--defer-towers` | 663 | **754** | 771-831 (flat) |
+
+Media works unchanged in deferred mode: the first `/embed` (image or audio)
+loads the towers in 7.3-7.5 s (+550 MiB, one-time, Q8-resident). Eager and
+deferred towers are numerically identical — text (q8+f32) matches the
+previous build **bit-for-bit** (max|d| = 0), image/audio cosines eager-vs-deferred
+are **1.000000000** (max|d| = 0), and the served `/embed` responses are
+bit-identical between the two modes.
+
+Board (`openviking-embed-1`, text-only; image `4a8657b` -> `b4634c9` with
+`--defer-towers` added; the board was busy — `satellite-deposit` at ~7 GiB and
+>100 % CPU — so latencies are lower bounds, memory is exact):
+
+| RssAnon | before (`4a8657b`, 33 h uptime) | after (`b4634c9`) |
+|---|---|---|
+| idle | 2183 (steady over the 33 h, §18) | **605** (at boot) |
+| 6-token request | 2183.1 (log) | 606 (0.50-0.55 s) |
+| 980-token request | — | 708 (6.0 s, 163 tok/s) |
+| 3767-token request | — | 1179-1186 (24-25 s, 150-159 tok/s) |
+| next request (6 tok) | — | 781 |
+| `docker stats` idle | 3.205 GiB | 1.552 GiB |
+| NPU BO shmem | 1081 MiB | 1330 MiB (post-traffic) |
+
+The +470 MiB long-request step is the glibc arena high-water of the 3.7k-token
+forward (the PLE tensor `[1, n, 24, 512]` f32 alone is 185 MB); the *next*
+request's trim releases it, so the steady state under traffic is ~0.8 GiB vs
+2.2 GiB before. Forcing `MALLOC_MMAP_THRESHOLD_=131072` was tried on the board
+as a fix and reverted: memory barely moved (1147 vs 1179 MiB at 3767 tokens)
+while every request got ~60 % slower (6.0 -> 9.9 s at 980 tokens, 23.7 -> 40.7 s
+at 3767), so the default allocator behavior stays. Text numerics are unchanged
+(the dev-host bit-identical checks above; the towers and trims do not touch the
+text path). The deployed service never calls `/embed`: if it ever does, the
+towers load lazily (+~550 MiB, Q8) and stay resident.
+
+## 15. Deferred
 
 - QAT mobile board re-run (a guarded scope; the f16 text-only profile is now
   3.7 GiB anon plus ~1.2 GiB reclaimable table pages) and the
   `ROCKET_NPU_DECODE=1` decode-speed pre-gate (§13).
 - 30k-token text with chunked attention (the old OOM point); needs the board.
 - Production `openviking-embed-1` redeploy: **done** — `b09c082` on 2026-10-08
-  (canonical tiling, chunking, fused glue) and `4a8657b` on 2026-10-09 (burn 0.22
-  + native bf16). The deployed config stays `--dtype f32 --quant q8 --npu
-  --npu-attn npu --attn-chunk 1024`: the native-bf16 default loses ~20–25 % to
-  q8 on the board (log §18).
+  (canonical tiling, chunking, fused glue), `4a8657b` on 2026-10-09 (burn 0.22
+  + native bf16) and `b4634c9` on 2026-10-09 (deferred towers + heap trims, §14;
+  idle 2183 -> 605 MiB anon). The deployed config stays `--dtype f32 --quant q8
+  --npu --npu-attn npu --attn-chunk 1024` plus `--defer-towers`: the native-bf16
+  default loses ~20–25 % to q8 on the board (log §18).
 - Exposing `--npu-int8` / `--npu-int8-group` on `serve` (the server loads fp16
   text weights today).
 - int8 for the vision/audio towers (small share of the work; text-only today).

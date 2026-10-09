@@ -112,10 +112,11 @@ model directory name), `--max-tokens` (prompt/context cap), `--max-new-tokens`
 (default generation cap), `--temperature`, plus the loading flags of the
 detected family (e.g. `--dtype`/`--quant`/`--npu`/`--npu-attn`/`--chunk`/
 `--key-block`/`--attn` for qwen3; `--quant`/`--npu`/`--npu-attn`/`--attn-chunk`/
-`--video-fps`/`--video-max-frames` for EmbeddingGemma 2; `--npu`/`--npu-threads`/
+`--video-fps`/`--video-max-frames`/`--defer-towers` for EmbeddingGemma 2;
+`--npu`/`--npu-threads`/
 `--delta-chunk`/`--embed-f16`/`--pure-npu`/`--npu-decode` for the intent model;
-`--f16`/`--quant`/`--npu`/`--attn-chunk` for Gemma 4). A flag that does not
-apply to the detected model is rejected.
+`--f16`/`--quant`/`--npu`/`--attn-chunk`/`--defer-towers` for Gemma 4). A flag
+that does not apply to the detected model is rejected.
 
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final
@@ -309,7 +310,7 @@ need f32/bf16 range), `--text`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
 `--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--quant none|q8`,
 `--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`,
-`--npu-int8-group` (default 32), plus `--dump-*`
+`--npu-int8-group` (default 32), `--defer-towers`, plus `--dump-*`
 debug hooks. On the NPU build, `ROCKET_CTX_CANONICAL=0` restores the legacy
 pad-to-256 tiling and `ROCKET_GLUE=0/1` toggles the fused host kernels
 (`--npu` enables them; `=1` forces them in CPU modes).
@@ -336,7 +337,12 @@ Summary against the HF f32 reference (transformers 5.19; full table in the log):
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
 
 Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
-1068 MiB; all share a ~4.2 GiB load peak. The text backbone on the NPU packs 218
+1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
+Q8 vision/audio towers out of the process (they load on the first media request,
+~7.5 s, Q8), and `serve` returns its heap at startup and after every request
+(`ROCKET_TRIM=0` disables the latter), so a text-only q8 process idles at
+~754 MiB anon on the dev host (1694 before) and the board's deployed service at
+605 MiB (2183 before; log §14). The text backbone on the NPU packs 218
 projections into 0.25 GiB of resident fp16 weights with windowed attention: on
 the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
 user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
@@ -347,8 +353,8 @@ weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) v
 0.999939 vs f32. Against the deployed `--quant q8` arm, though, bf16 loses
 ~20–25 % on the quiet board (log §18: 843 tok 4.5–5.0 s vs 3.6–4.0 s; 4203 tok
 29.3–30.8 s vs 24.5–26.5 s), so the production service keeps
-`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024`. The vision and
-audio towers, norms, RoPE and the embedding table stay
+`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`.
+The vision and audio towers, norms, RoPE and the embedding table stay
 on the CPU.
 
 Performance round (2026-10-08, log §12; board timings in §12.5):

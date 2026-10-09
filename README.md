@@ -34,12 +34,16 @@ registers exactly the endpoints that model supports (embedding models get
 `/v1/embeddings`/`/embed`, chat models get both the OpenAI chat and the Ollama
 APIs).
 
-The Qwen3 embedding server is the configuration running in production on a Rock 5B+
-(OpenViking's embedding backend, `--npu --npu-attn cpu --max-tokens 8192`): a
-3,633-token input runs in ~87 s (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds
-than the CPU-only flex path (the default NPU attention is slightly faster: ~45 tok/s,
--51% CPU). The intent model answers the 166-token v7 planner prompt in 11.7 s with
-`--npu` (89.9 s CPU-only). Flags, endpoints and deployment:
+OpenViking's embedding backend in production on a Rock 5B+ is EmbeddingGemma 2
+(`rocket-inference serve --dtype f32 --quant q8 --npu --npu-attn npu
+--defer-towers`): the text-only service idles at 605 MiB anon (2183 MiB before the
+idle-memory round; the vision/audio towers load only if a media request ever
+arrives). Its 3,633-token predecessor configuration (Qwen3-Embedding-0.6B on the
+NPU, `--npu --npu-attn cpu --max-tokens 8192`) ran a 3,633-token input in ~87 s
+(~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds than the CPU-only flex path
+(the default NPU attention is slightly faster: ~45 tok/s, -51% CPU). The intent
+model answers the 166-token v7 planner prompt in 11.7 s with `--npu` (89.9 s
+CPU-only). Flags, endpoints and deployment:
 [examples/rocket-inference/README.md](examples/rocket-inference/README.md).
 
 ## What it provides
@@ -150,7 +154,8 @@ using ~51% fewer CPU-seconds than the CPU-only flex path (the CPU path remains ~
 slower than the production `ik_llama.cpp` Q8_0 server); the intent model is
 token-identical to the HF reference and runs a 166-token v7 planner prompt in 11.7 s
 with `--npu` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 reference
-on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident)
+on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident,
+605 MiB anon idle in the deployed text-only `--defer-towers` configuration)
 and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
 fp16 weights plus windowed attention, for 1.61x wall and -33 % user CPU vs the CPU
 baseline (2587-token text). Gemma 4 E2B-it greedily reproduces the HF reference
