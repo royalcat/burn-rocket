@@ -87,16 +87,18 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )
         }
         Family::Emb2 => {
+            let quant_q8 = args.quant.unwrap_or(false);
             let (model, _cfg) = emb2_load::load_model(
                 &model_dir,
                 dtype,
-                args.quant.unwrap_or(false),
+                quant_q8,
                 args.npu.unwrap_or(false).then_some(emb2_load::NpuOpts {
                     threads: args.npu_threads.unwrap_or(5),
                     attn: args.npu_attn.unwrap_or(true),
                     int8: false,
                     i8_group: 32,
                 }),
+                args.defer_towers.unwrap_or(false),
                 &device,
             )?;
             let tokenizer = tokenizer()?;
@@ -107,6 +109,8 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     tokenizer,
                     device,
                     dtype,
+                    model_dir: model_dir.clone(),
+                    quant_q8,
                     max_tokens,
                     attn_chunk: args.attn_chunk.unwrap_or(1024),
                     image_soft_tokens,
@@ -400,6 +404,7 @@ impl Args {
                 "attn-chunk",
                 "video-fps",
                 "video-max-frames",
+                "defer-towers",
             ],
             Family::Intent => &[
                 "model-dir",

@@ -215,6 +215,11 @@ pub struct Emb2Engine {
     pub tokenizer: Tokenizer,
     pub device: Device,
     pub dtype: DType,
+    /// For deferred tower loads (`--defer-towers`).
+    pub model_dir: PathBuf,
+    /// Whether the model's projections are Q8-resident: deferred towers load
+    /// with the same quantization.
+    pub quant_q8: bool,
     pub max_tokens: usize,
     pub attn_chunk: usize,
     pub image_soft_tokens: usize,
@@ -387,6 +392,17 @@ impl Emb2Engine {
 
     fn embed_media(&mut self, req: EmbedMediaRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
+        if req.image.is_some() || req.video.is_some() || req.audio.is_some() {
+            // Deferred towers (`--defer-towers`) load on the first media request.
+            crate::gemma::embeddinggemma::load::load_towers(
+                &mut self.model,
+                &self.model_dir,
+                self.dtype,
+                self.quant_q8,
+                &self.device,
+            )
+            .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
+        }
         let (vector, tokens) =
             self.embed_one(req.text, req.image, req.video, req.audio, &prefix, req.dim)?;
         Ok(EmbedResult {

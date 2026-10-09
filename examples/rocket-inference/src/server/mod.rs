@@ -76,6 +76,10 @@ impl AppState {
                 queue_s,
                 compute_s: t0.elapsed().as_secs_f64(),
             };
+            // Long requests leave their transient buffers in the allocator's
+            // arenas; hand them back before the next request (`ROCKET_TRIM=0`
+            // disables it).
+            crate::util::trim_after_request();
             Ok((out, timing))
         })
         .await
@@ -99,6 +103,10 @@ fn init_logging() {
 /// Serve one loaded model on `addr` until the process is stopped.
 pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     init_logging();
+    // Release what loading and tokenizing left in the allocator's arenas before
+    // the first request (the loaders trim their own transients; the tokenizer
+    // parse and the engine construction happen after those trims).
+    crate::util::trim_heap();
     let capabilities = settings.capabilities;
     let model_name = settings.model_name.clone();
     let state = AppState {

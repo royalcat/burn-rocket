@@ -14,7 +14,7 @@ use burn_store::{
 };
 
 use crate::gemma::config::Emb2Config;
-use crate::gemma::embeddinggemma::model::Emb2Model;
+use crate::gemma::embeddinggemma::model::{Emb2Model, Towers};
 use crate::util::rss_mib;
 
 /// NPU offload options (`--npu` and its sub-flags).
@@ -43,6 +43,7 @@ pub fn load_model(
     dtype: DType,
     quant_q8: bool,
     npu: Option<NpuOpts>,
+    defer_towers: bool,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
@@ -58,23 +59,16 @@ pub fn load_model(
         );
     }
     crate::gemma::layers::set_model_dtype(dtype);
-    let vision_cfg = cfg
-        .vision_config
+    // Both configs are still required: text-only checkpoints are not supported
+    // (the towers only load later with `--defer-towers`).
+    cfg.vision_config
         .as_ref()
         .context("checkpoint has no vision_config (text-only checkpoints are not supported yet)")?;
-    let audio_cfg = cfg
-        .audio_config
+    cfg.audio_config
         .as_ref()
         .context("checkpoint has no audio_config (text-only checkpoints are not supported yet)")?;
     let t0 = Instant::now();
-    let audio_bounds = read_audio_clip_bounds(model_dir, audio_cfg)?;
-    let mut model = Emb2Model::new(
-        &cfg.text_config,
-        vision_cfg,
-        audio_cfg,
-        &audio_bounds,
-        device,
-    );
+    let mut model = Emb2Model::new(&cfg.text_config, device);
     let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
         .allow_partial(true)
         .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
@@ -103,13 +97,83 @@ pub fn load_model(
         if quant_q8 && !opts.int8 {
             model = quantize_low_ram(model)?;
         }
+        if !defer_towers {
+            load_towers(&mut model, model_dir, dtype, quant_q8 && !opts.int8, device)?;
+        }
         return load_npu_text(model, cfg, opts, device);
     }
     let _ = npu;
     if quant_q8 {
         model = quantize_low_ram(model)?;
     }
+    if !defer_towers {
+        load_towers(&mut model, model_dir, dtype, quant_q8, device)?;
+    }
+    if defer_towers {
+        println!("towers: deferred (load on the first media request)");
+    }
     Ok((model, cfg))
+}
+
+/// Load the vision/audio towers into `model` (a no-op once they are present).
+///
+/// Text-only loads never call this; `--defer-towers` serving calls it on the
+/// first media request. The towers of a `--quant q8` model are mapped to
+/// Q8-resident weights here, matching the eager configuration (`#[module(skip)]`
+/// keeps them out of the text model's quantization pass).
+pub fn load_towers(
+    model: &mut Emb2Model,
+    model_dir: &Path,
+    dtype: DType,
+    quant_q8: bool,
+    device: &Device,
+) -> Result<()> {
+    if model.has_towers() {
+        return Ok(());
+    }
+    let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
+    let vision_cfg = cfg
+        .vision_config
+        .as_ref()
+        .context("checkpoint has no vision_config")?;
+    let audio_cfg = cfg
+        .audio_config
+        .as_ref()
+        .context("checkpoint has no audio_config")?;
+    let audio_bounds = read_audio_clip_bounds(model_dir, audio_cfg)?;
+    let t0 = Instant::now();
+    let mut towers = Towers::new(
+        vision_cfg,
+        audio_cfg,
+        &audio_bounds,
+        cfg.text_config.hidden_size,
+        device,
+    );
+    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
+        .allow_partial(true)
+        .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
+    let result = towers
+        .load_from(&mut store)
+        .with_context(|| format!("load towers from {}", model_dir.display()))?;
+    // The pass sees the whole checkpoint; only the towers' own parameters are in
+    // the tree, so a missing one is an error and the rest report as unused.
+    crate::util::store::check_missing(&result, |_| false)?;
+    drop(store);
+    if quant_q8 {
+        use crate::util::quant::LowRam;
+        let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
+        towers = towers.map(&mut mapper);
+        crate::util::trim_heap();
+    }
+    model.set_towers(towers);
+    println!(
+        "towers: loaded ({:?}{}) in {:.2}s (resident {:.0} MiB anon)",
+        dtype,
+        if quant_q8 { ", q8-resident" } else { "" },
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok(())
 }
 
 /// Pack the text backbone's projections into resident NPU buffers (HF `[N, K]`
@@ -172,10 +236,7 @@ fn load_npu_text(
         model.text_mut().set_npu_attn(true);
     }
     crate::gemma::layers::set_npu_glue(true);
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    crate::util::trim_heap();
     println!(
         "NPU: offloaded {count} text projections ({:.2} GiB, {} threads) in {:.2}s \
          ({}, attention on the {}; resident {:.0} MiB anon)",
@@ -204,26 +265,31 @@ fn load_npu_text(
 /// are dequantized per call, so only the current layer's f32 weights are
 /// materialized. The embedding table, norms, scalars and position tables stay
 /// f32.
+///
+/// The text backbone only: the towers are a `#[module(skip)]` field, so their
+/// pass quantizes them itself ([`load_towers`]).
 fn quantize_low_ram(model: Emb2Model) -> Result<Emb2Model> {
-    use crate::util::quant::{LowRam, param_group};
+    use crate::util::quant::LowRam;
 
     let t0 = Instant::now();
-    let proj_group = param_group(
-        r"(q_proj|k_proj|v_proj|o_proj|post|relative_k_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection|embedding_projection|input_proj|input_proj_linear|ffw_layer_1|ffw_layer_2|linear_start|linear_end|output_proj)\.(linear\.)?weight$",
-    )?;
-    let mut mapper = LowRam::new(vec![proj_group], Vec::new(), None);
+    let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
     let model = model.map(&mut mapper);
     crate::gemma::layers::set_quantized(true);
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    unsafe {
-        libc::malloc_trim(0);
-    }
+    crate::util::trim_heap();
     println!(
-        "Q8-resident projections in {:.2}s (resident {:.0} MiB anon)",
+        "Q8-resident text projections in {:.2}s (resident {:.0} MiB anon)",
         t0.elapsed().as_secs_f64(),
         rss_mib()
     );
     Ok(model)
+}
+
+/// The projection module paths `--quant q8` keeps Q8-resident (text backbone and
+/// both towers — the quantize passes and the deferred towers load share it).
+fn projection_group() -> Result<burn::module::ParamGroup> {
+    crate::util::quant::param_group(
+        r"(q_proj|k_proj|v_proj|o_proj|post|relative_k_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection|embedding_projection|input_proj|input_proj_linear|ffw_layer_1|ffw_layer_2|linear_start|linear_end|output_proj)\.(linear\.)?weight$",
+    )
 }
 
 /// Read the audio tower's `Gemma4ClippableLinear` clip bounds (`input_min` etc.

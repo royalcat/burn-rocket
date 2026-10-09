@@ -11,4 +11,4 @@ pub mod rope;
 pub mod store;
 
 pub use device::device;
-pub use mem::rss_mib;
+pub use mem::{rss_mib, trim_after_request, trim_heap};

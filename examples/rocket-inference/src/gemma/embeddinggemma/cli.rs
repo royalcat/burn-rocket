@@ -10,8 +10,8 @@ use burn::tensor::{DType, Int};
 use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
-use crate::gemma::embeddinggemma::load::{NpuOpts, load_model};
-use crate::gemma::embeddinggemma::model::{stage_stats, stage_stats_reset};
+use crate::gemma::embeddinggemma::load::{NpuOpts, load_model, load_towers};
+use crate::gemma::embeddinggemma::model::{Emb2Model, stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
 use crate::util::device;
 use crate::util::store::native_dtype;
@@ -63,6 +63,9 @@ struct Args {
     npu_attn: bool,
     npu_int8: bool,
     npu_int8_group: usize,
+    /// `--defer-towers`: skip the vision/audio towers at load; a media run
+    /// loads them before input assembly.
+    defer_towers: bool,
 }
 
 impl Args {
@@ -101,6 +104,7 @@ impl Args {
             npu_attn: true,
             npu_int8: false,
             npu_int8_group: 32,
+            defer_towers: false,
         };
         if let Some(v) = f.take("--model-dir")? {
             args.model_dir = PathBuf::from(v);
@@ -188,6 +192,7 @@ impl Args {
         }
         args.npu = f.take_bool("--npu");
         args.npu_int8 = f.take_bool("--npu-int8");
+        args.defer_towers = f.take_bool("--defer-towers");
         if args.npu_int8 && !args.npu {
             bail!("--npu-int8 requires --npu");
         }
@@ -306,11 +311,35 @@ fn build_inputs(
     ))
 }
 
+/// `--defer-towers`: a run that includes media must load the towers before
+/// input assembly; text-only runs never touch them.
+fn maybe_load_towers(
+    args: &Args,
+    model: &mut Emb2Model,
+    dtype: DType,
+    device: &Device,
+) -> Result<()> {
+    let has_media = args.image.is_some() || args.video.is_some() || args.audio.is_some();
+    if args.defer_towers && has_media {
+        // The same quantization policy as an eager load: `--quant q8` applies
+        // unless `--npu-int8` replaces it (`q8` is ignored there).
+        load_towers(
+            model,
+            &args.model_dir,
+            dtype,
+            args.quant_q8 && !args.npu_int8,
+            device,
+        )?;
+    }
+    Ok(())
+}
+
 fn run_embed(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
-    let (model, cfg) = load_model(
+    let dtype = args.dtype();
+    let (mut model, cfg) = load_model(
         &args.model_dir,
-        args.dtype(),
+        dtype,
         args.quant_q8,
         args.npu.then_some(NpuOpts {
             threads: args.npu_threads,
@@ -318,10 +347,12 @@ fn run_embed(args: &Args) -> Result<()> {
             int8: args.npu_int8,
             i8_group: args.npu_int8_group,
         }),
+        args.defer_towers,
         &device,
     )?;
+    maybe_load_towers(args, &mut model, dtype, &device)?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;
-    let rope = model.text().rope_tables(n, args.dtype(), &device);
+    let rope = model.text().rope_tables(n, dtype, &device);
 
     stage_stats_reset();
     let t0 = Instant::now();
@@ -364,9 +395,10 @@ fn run_embed(args: &Args) -> Result<()> {
 
 fn run_bench(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
-    let (model, _cfg) = load_model(
+    let dtype = args.dtype();
+    let (mut model, _cfg) = load_model(
         &args.model_dir,
-        args.dtype(),
+        dtype,
         args.quant_q8,
         args.npu.then_some(NpuOpts {
             threads: args.npu_threads,
@@ -374,10 +406,12 @@ fn run_bench(args: &Args) -> Result<()> {
             int8: args.npu_int8,
             i8_group: args.npu_int8_group,
         }),
+        args.defer_towers,
         &device,
     )?;
+    maybe_load_towers(args, &mut model, dtype, &device)?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;
-    let rope = model.text().rope_tables(n, args.dtype(), &device);
+    let rope = model.text().rope_tables(n, dtype, &device);
 
     for rep in 0..args.reps.max(1) {
         stage_stats_reset();
