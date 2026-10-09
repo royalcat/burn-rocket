@@ -2,7 +2,7 @@
 
 Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](../..)
 library: one binary, four model families, `flex` CPU backend by default with
-optional RK3588 NPU offload (`--npu`).
+RK3588 NPU offload (`--npu`, the default for `serve` on the NPU build).
 
 | family | model | CLI commands | served endpoints |
 |---|---|---|---|
@@ -56,8 +56,17 @@ cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 The aarch64 binaries and models on the board live under `/root/rocket-inference/`
 (binary) and `/root/models/`; run from the deploy dir (the qwen bench uses the
 relative `data/bench_text.txt`). The NPU build is self-contained
-(`librocketnpu` is statically linked) and needs `/dev/accel/accel0` at run time
-for `--npu`.
+(`librocketnpu` is statically linked) and needs `/dev/accel/accel0` at run time for
+`--npu`, which `serve` turns on by default on that build (see [Serving](#serving)).
+
+The container image builds both architectures from the same Dockerfile, chosen by the
+build platform; on x86-64 the same command produces the x86-64-v3 (AVX2) flex CPU
+image:
+
+```sh
+# on the board (or any aarch64 host), with vendor/rocketnpu/librocketnpu.a staged
+docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
+```
 
 ## Serving
 
@@ -117,6 +126,11 @@ detected family (e.g. `--dtype`/`--quant`/`--npu`/`--npu-attn`/`--chunk`/
 `--delta-chunk`/`--embed-f16`/`--pure-npu`/`--npu-decode` for the intent model;
 `--f16`/`--quant`/`--npu`/`--attn-chunk`/`--defer-towers` for Gemma 4). A flag
 that does not apply to the detected model is rejected.
+
+`serve` defaults to NPU offload on builds that have it (aarch64 + `--features npu`);
+`--no-npu` forces the flex CPU path, and `--quant q8` (the CPU low-RAM mode) keeps
+the CPU path unless `--npu` is explicit. The standalone `qwen3`/`gemma`/`intent`
+commands keep `--npu` opt-in.
 
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final

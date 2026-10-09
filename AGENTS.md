@@ -61,6 +61,11 @@ family's loading flags:
 
 A flag that does not apply to the detected model is rejected.
 
+`serve` defaults to NPU offload on builds that have it (aarch64 + `--features npu`);
+`--no-npu` forces the flex CPU path, and `--quant q8` (the CPU low-RAM mode) keeps the
+CPU path unless `--npu` is explicit. The standalone `qwen3`/`gemma`/`intent` commands
+keep `--npu` opt-in.
+
 Cleanup + formatting (2026-10-08): commit `2301d3b` removed the dead code across
 the Gemma modules, cfg-gated the NPU-only helpers, annotated the checkpoint-config
 structs, moved the safetensors load-report checks into `util/store.rs`, and made
@@ -167,6 +172,18 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
   Fixed-strategy kernels are 3.8 GF/s. The flex+NPU configuration remains the fastest; the
   GPU lever is closed until CubeCL/panvk improve.
+- **CI images** (2026-10-10): `.github/workflows/build-images.yml` builds
+  rocket-inference for every push to `main`/`v*` tags (PRs build+smoke, no push) on
+  native runners with a plain `docker build` and publishes to GHCR
+  (`ghcr.io/royalcat/rocket-inference`): the aarch64 (NPU) image takes
+  `<sha>`/`latest`, amd64 takes `<sha>-amd64`/`latest-amd64`. `examples/rocket-inference/Dockerfile`
+  branches on Docker's `TARGETARCH`: arm64 = `--features npu` + the staged archive,
+  amd64 = `RUSTFLAGS=-C target-cpu=x86-64-v3`, flex only (the amd64 image needs an
+  AVX2-capable CPU). `serve` now defaults to NPU offload on NPU builds (`--no-npu`
+  opts out; `--quant q8` keeps the CPU path unless `--npu` is explicit), so the image
+  CMD is arch-uniform; the standalone `qwen3`/`gemma`/`intent` commands keep `--npu`
+  opt-in. The arm64 CI job installs `drm/rocket_accel.h` from Linux v6.18 (Ubuntu
+  24.04's kernel uapi headers predate the mainline rocket driver).
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -201,7 +218,8 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
 | `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
-| `examples/rocket-inference/Dockerfile`, `docker/build.sh` | container image (aarch64, built on the board, pushed to the Forgejo registry) |
+| `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
+| `.github/workflows/build-images.yml` | CI: plain `docker build` on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build and smoke-test without pushing |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy); `build.rs` auto-builds a per-target copy into `$OUT_DIR` when it is absent |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
@@ -329,15 +347,21 @@ compiles the extension on any host (no linking); `cargo build --release -p burn-
 --target aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the
 FFI probe. `--no-default-features` gives the FFI-only crate (no Burn, no archive).
 
-Container image: `examples/rocket-inference/docker/build.sh [git-ref]` stages the tree,
-builds the aarch64 image on the board and pushes
-`git.kmsign.org/royalcat/rocket-inference:<sha>`. It needs
-`vendor/rocketnpu/librocketnpu.a` (run `scripts/build-rocketnpu.sh`; `VENDOR_SRC`
-overrides) and registry credentials on the control host; run it from anywhere in the
-repo. The image CMD is the unified server:
-`serve --backend flex --dtype f32 --npu --npu-attn cpu --port 8383 --max-tokens 8192
---model-dir /models/qwen3-embedding-0.6b --model-name qwen3-embedding` (the image
-needs a rebuild to pick up the post-merge CMD).
+Container image: one Dockerfile serves both architectures, chosen by the build
+platform — `docker build -f examples/rocket-inference/Dockerfile .` (context = repo
+root) on an aarch64 host with `vendor/rocketnpu/librocketnpu.a` staged
+(`scripts/build-rocketnpu.sh`) builds the NPU image, on x86-64 it builds the
+x86-64-v3 (AVX2) flex CPU image. `examples/rocket-inference/docker/build.sh
+[git-ref]` stages the tree, builds the aarch64 image on the board and pushes
+`git.kmsign.org/royalcat/rocket-inference:<sha>` (needs the archive — `VENDOR_SRC`
+overrides — and registry credentials on the control host; run it from anywhere in
+the repo). `.github/workflows/build-images.yml` builds both on every push to `main`
+and `v*` tags on native runners (plain `docker build`, no cross/QEMU) and pushes
+`ghcr.io/royalcat/rocket-inference`: aarch64 = `<sha>` + `latest` (primary), amd64 =
+`<sha>-amd64` + `latest-amd64`; PRs build and smoke-test without pushing. The image
+CMD is the unified server, identical on both architectures (the NPU flags are inert
+on amd64): `serve --backend flex --dtype f32 --npu-attn cpu --port 8383 --max-tokens
+8192 --model-dir /models/qwen3-embedding-0.6b --model-name qwen3-embedding`.
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
@@ -474,7 +498,8 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   an f32 body), 298 MiB CPU-resident for qwen3 f32. `--npu-attn npu` (default) also
   offloads attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention
   (within ~1 s on wall, ~40% more CPU). `--npu` accepts `--dtype f32|f16|bf16` and
-  excludes `--quant q8`.
+  excludes `--quant q8`. `serve` defaults `--npu` on for this build (`--no-npu`
+  opts out; `--quant q8` also keeps the CPU path unless `--npu` is explicit).
 - With canonical tiling (default) resident weights serve any `M >= 4`; only the
   `M % 4` alignment pad remains. `ROCKET_CTX_CANONICAL=0` restores the legacy
   `M >= 256` pad (A/B only). One pack serves all lengths.
@@ -677,6 +702,10 @@ cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-
 # formatting + lint gates (both clean)
 cargo fmt --all -- --check
 cargo clippy -p rocket-inference --no-default-features
+# container image for this architecture (context = repo root; the aarch64 branch
+# needs vendor/rocketnpu/librocketnpu.a staged first)
+docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
+docker run --rm rocket-inference:local --help
 # single-core speed gate (blocked path is the single-core record); run from
 # examples/rocket-inference
 taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256

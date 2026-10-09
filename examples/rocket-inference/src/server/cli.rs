@@ -49,6 +49,16 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let max_new_tokens = args.max_new_tokens.unwrap_or(default_max_new);
     let temperature = args.temperature.unwrap_or(0.0);
 
+    // NPU offload is `serve`'s default on builds that have it (aarch64 + the
+    // `npu` feature); `--no-npu` forces the flex CPU path, and `--quant q8`
+    // (the CPU low-RAM mode) keeps the CPU path unless `--npu` is explicit.
+    let npu = resolve_npu(
+        cfg!(all(feature = "npu", target_arch = "aarch64")),
+        args.npu,
+        args.no_npu.unwrap_or(false),
+        args.quant.unwrap_or(false),
+    );
+
     // The model dtype: the checkpoint's native float dtype unless --dtype says
     // otherwise (families without a dtype flag handle their native dtype in their
     // own loader).
@@ -61,7 +71,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 &model_dir,
                 dtype,
                 args.quant.unwrap_or(false),
-                args.npu.unwrap_or(false),
+                npu,
                 args.npu_threads.unwrap_or(5),
                 args.npu_attn.unwrap_or(true),
                 &device,
@@ -92,7 +102,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 &model_dir,
                 dtype,
                 quant_q8,
-                args.npu.unwrap_or(false).then_some(emb2_load::NpuOpts {
+                npu.then_some(emb2_load::NpuOpts {
                     threads: args.npu_threads.unwrap_or(5),
                     attn: args.npu_attn.unwrap_or(true),
                     int8: false,
@@ -128,7 +138,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
         Family::Intent => {
             let opts = IntentLoadOptions {
-                npu: args.npu.unwrap_or(false),
+                npu,
                 npu_threads: args.npu_threads.unwrap_or(5),
                 embed_f16: args.embed_f16.unwrap_or(false),
                 pure_npu: args.pure_npu.unwrap_or(false),
@@ -179,7 +189,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 args.defer_towers.unwrap_or(false),
             )?;
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            if args.npu.unwrap_or(false) {
+            if npu {
                 gen_loader::pack_text_for_prefill(
                     &mut model,
                     args.npu_threads.unwrap_or(5),
@@ -188,7 +198,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 )?;
             }
             #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-            if args.npu.unwrap_or(false) {
+            if npu {
                 bail!("--npu requires an aarch64 build with --features npu");
             }
             let lm_head = gen_loader::build_lm_head(model.text(), dtype.tensor_dtype(), &device);
@@ -255,6 +265,7 @@ struct Args {
     dtype: Option<DType>,
     quant: Option<bool>,
     npu: Option<bool>,
+    no_npu: Option<bool>,
     npu_threads: Option<usize>,
     npu_attn: Option<bool>,
     chunk: Option<usize>,
@@ -314,6 +325,7 @@ impl Args {
             args.quant = Some(v == "q8");
         }
         args.npu = f.take_flag("--npu");
+        args.no_npu = f.take_flag("--no-npu");
         if let Some(v) = f.take_parsed("--npu-threads")? {
             args.npu_threads = Some(v);
         }
@@ -381,6 +393,7 @@ impl Args {
                 "dtype",
                 "quant",
                 "npu",
+                "no-npu",
                 "npu-threads",
                 "npu-attn",
                 "chunk",
@@ -399,6 +412,7 @@ impl Args {
                 "dtype",
                 "quant",
                 "npu",
+                "no-npu",
                 "npu-threads",
                 "npu-attn",
                 "attn-chunk",
@@ -416,6 +430,7 @@ impl Args {
                 "max-new-tokens",
                 "temperature",
                 "npu",
+                "no-npu",
                 "npu-threads",
                 "delta-chunk",
                 "embed-f16",
@@ -433,13 +448,14 @@ impl Args {
                 "temperature",
                 "quant",
                 "npu",
+                "no-npu",
                 "npu-threads",
                 "f16",
                 "attn-chunk",
                 "defer-towers",
             ],
         };
-        let set: [(&str, bool); 25] = [
+        let set: [(&str, bool); 26] = [
             ("model-dir", self.model_dir.is_some()),
             ("family", self.family.is_some()),
             ("backend", self.backend.is_some()),
@@ -451,6 +467,7 @@ impl Args {
             ("dtype", self.dtype.is_some()),
             ("quant", self.quant.is_some()),
             ("npu", self.npu.is_some()),
+            ("no-npu", self.no_npu.is_some()),
             ("npu-threads", self.npu_threads.is_some()),
             ("npu-attn", self.npu_attn.is_some()),
             ("chunk", self.chunk.is_some()),
@@ -475,5 +492,43 @@ impl Args {
             bail!("--f16 does not apply to the {} model", family.name());
         }
         Ok(())
+    }
+}
+
+/// `serve`'s NPU decision. Offload is on by default on builds that have it
+/// (aarch64 + the `npu` feature); `--no-npu` forces the flex CPU path, and
+/// `--quant q8` — the CPU low-RAM mode — keeps the CPU path unless `--npu` is
+/// explicit (the qwen3 NPU loader packs its own weights and rejects q8).
+fn resolve_npu(available: bool, npu_flag: Option<bool>, no_npu: bool, quant_q8: bool) -> bool {
+    npu_flag.unwrap_or(available && !quant_q8) && !no_npu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_npu;
+
+    #[test]
+    fn npu_defaults_on_only_when_available() {
+        assert!(resolve_npu(true, None, false, false));
+        assert!(!resolve_npu(false, None, false, false));
+    }
+
+    #[test]
+    fn quant_q8_keeps_the_cpu_path_unless_npu_is_explicit() {
+        assert!(!resolve_npu(true, None, false, true));
+        assert!(resolve_npu(true, Some(true), false, true));
+    }
+
+    #[test]
+    fn no_npu_forces_the_cpu_path() {
+        assert!(!resolve_npu(true, None, true, false));
+        assert!(!resolve_npu(true, Some(true), true, false));
+        assert!(!resolve_npu(false, Some(true), true, false));
+    }
+
+    #[test]
+    fn explicit_npu_reaches_the_loader() {
+        assert!(resolve_npu(true, Some(true), false, false));
+        assert!(resolve_npu(false, Some(true), false, false));
     }
 }

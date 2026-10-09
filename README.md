@@ -46,6 +46,12 @@ model answers the 166-token v7 planner prompt in 11.7 s with `--npu` (89.9 s
 CPU-only). Flags, endpoints and deployment:
 [examples/rocket-inference/README.md](examples/rocket-inference/README.md).
 
+Container images for both architectures are built and published to GHCR on every
+push to `main`: `ghcr.io/royalcat/rocket-inference:<sha>` / `:latest` is the aarch64
+RK3588 image (NPU offload is `serve`'s default there; `--no-npu` forces the flex CPU
+path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
+(`.github/workflows/build-images.yml`).
+
 ## What it provides
 
 - **Burn backend extension** (`#[backend_extension(Flex)]`, default `npu` feature): ordinary

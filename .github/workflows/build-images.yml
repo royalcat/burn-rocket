@@ -1,0 +1,108 @@
+name: build images
+
+# One commit -> two container images of rocket-inference:
+#   aarch64 (primary) — the full build with RK3588 NPU offload (`serve` uses the
+#                       NPU by default on this build; `--no-npu` forces flex).
+#   amd64             — x86-64-v3 flex CPU build (no NPU support).
+# Each runs a plain `docker build` on a native runner of the matching
+# architecture: no cross-compilation, emulation or buildx. Images go to GHCR;
+# the aarch64 image takes the primary tags (<sha>, latest), the amd64 image the
+# -amd64 suffixed ones.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rocket-inference
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  amd64:
+    name: amd64 image (x86-64-v3, no NPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -f examples/rocket-inference/Dockerfile -t "$IMAGE:local" .
+      - name: Smoke test (the binary starts and finds its runtime libraries)
+        run: docker run --rm "$IMAGE:local" --help
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eux
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          tags="$IMAGE:${SHA:0:7}-amd64"
+          if [ "$REF_TYPE" = "tag" ]; then
+            tags="$tags $IMAGE:${REF_NAME}-amd64"
+          elif [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            tags="$tags $IMAGE:latest-amd64"
+          fi
+          for tag in $tags; do
+            docker tag "$IMAGE:local" "$tag"
+            docker push "$tag"
+          done
+
+  arm64:
+    name: arm64 image (NPU)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the librocketnpu build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake pkg-config libdrm-dev file
+      # Ubuntu 24.04's kernel uapi headers predate the mainline rocket accel
+      # driver, and rocket-userspace needs drm/rocket_accel.h (Linux v6.18).
+      - name: Install the mainline rocket uAPI header
+        run: |
+          sudo mkdir -p /usr/include/drm
+          curl -fsSL \
+            https://raw.githubusercontent.com/torvalds/linux/v6.18/include/uapi/drm/rocket_accel.h \
+            | sudo tee /usr/include/drm/rocket_accel.h >/dev/null
+      - name: Build librocketnpu.a
+        run: scripts/build-rocketnpu.sh --target host
+      - name: Build
+        run: docker build -f examples/rocket-inference/Dockerfile -t "$IMAGE:local" .
+      - name: Smoke test (the binary starts and finds its runtime libraries)
+        run: docker run --rm "$IMAGE:local" --help
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eux
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          tags="$IMAGE:${SHA:0:7}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            tags="$tags $IMAGE:${REF_NAME}"
+          elif [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            tags="$tags $IMAGE:latest"
+          fi
+          for tag in $tags; do
+            docker tag "$IMAGE:local" "$tag"
+            docker push "$tag"
+          done
