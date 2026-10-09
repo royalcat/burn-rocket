@@ -202,6 +202,7 @@ pub struct Qwen3Engine {
     pub cfg: Qwen3Config,
     pub tokenizer: Tokenizer,
     pub device: Device,
+    pub dtype: DType,
     pub chunk: usize,
     pub key_block: usize,
     pub attn_fused: bool,
@@ -330,7 +331,7 @@ impl Qwen3Engine {
             n,
             self.cfg.head_dim,
             self.cfg.rope_theta,
-            DType::F32,
+            self.dtype,
             &self.device,
         );
         let out = self

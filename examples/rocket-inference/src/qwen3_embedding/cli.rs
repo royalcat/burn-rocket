@@ -14,6 +14,7 @@ use crate::qwen3_embedding::load::load_model;
 use crate::qwen3_embedding::model::{stage_stats, stage_stats_reset};
 use crate::util::device;
 use crate::util::rope::RopeCache;
+use crate::util::store::native_dtype;
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut it = it;
@@ -34,7 +35,8 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
 
 struct Args {
     model_dir: PathBuf,
-    dtype: DType,
+    /// `None` = the checkpoint's native dtype.
+    dtype: Option<DType>,
     backend: String,
     chunk: usize,
     reps: usize,
@@ -59,7 +61,7 @@ impl Args {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let mut args = Args {
             model_dir: PathBuf::from(format!("{home}/models/qwen3-embedding-0.6b")),
-            dtype: DType::F32,
+            dtype: None,
             backend: if cfg!(feature = "cpu") { "cpu" } else { "flex" }.to_string(),
             chunk: 256,
             reps: 3,
@@ -85,12 +87,12 @@ impl Args {
             args.backend = v;
         }
         if let Some(v) = f.take("--dtype")? {
-            args.dtype = match v.as_str() {
+            args.dtype = Some(match v.as_str() {
                 "f32" => DType::F32,
                 "f16" => DType::F16,
                 "bf16" => DType::BF16,
                 other => bail!("unsupported dtype '{other}'"),
-            };
+            });
         }
         if let Some(v) = f.take_parsed("--chunk")? {
             args.chunk = v;
@@ -140,6 +142,13 @@ impl Args {
         Ok(args)
     }
 
+    /// The resolved model dtype: the checkpoint's native float dtype unless
+    /// `--dtype` overrides it.
+    fn dtype(&self) -> DType {
+        self.dtype
+            .unwrap_or_else(|| native_dtype(&self.model_dir.join("model.safetensors")))
+    }
+
     fn input_text(&self) -> Result<String> {
         if let Some(t) = &self.text {
             return Ok(t.clone());
@@ -170,7 +179,7 @@ fn run_bench(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
     let (model, cfg) = load_model(
         &args.model_dir,
-        args.dtype,
+        args.dtype(),
         args.quant_q8,
         args.npu,
         args.npu_threads,
@@ -184,7 +193,7 @@ fn run_bench(args: &Args) -> Result<()> {
     }
     let ids_i64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
     let input = Tensor::<2, Int>::from_data(TensorData::new(ids_i64, [1, n]), &device);
-    let rope = RopeCache::new(n, cfg.head_dim, cfg.rope_theta, args.dtype, &device);
+    let rope = RopeCache::new(n, cfg.head_dim, cfg.rope_theta, args.dtype(), &device);
 
     stage_stats_reset();
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -217,7 +226,7 @@ fn run_bench(args: &Args) -> Result<()> {
         "tokens={n} attn={attn} chunk={} key_block={} dtype={:?} best={best:.3}s => {:.1} tok/s",
         args.chunk,
         args.key_block,
-        args.dtype,
+        args.dtype(),
         n as f64 / best
     );
     {
@@ -243,14 +252,14 @@ fn run_gemm(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
     let (m, n, k) = (args.m, args.n, args.k);
     let gflops = 2.0 * m as f64 * n as f64 * k as f64;
-    let a =
-        Tensor::<2>::random([m, k], burn::tensor::Distribution::Default, &device).cast(args.dtype);
+    let a = Tensor::<2>::random([m, k], burn::tensor::Distribution::Default, &device)
+        .cast(args.dtype());
     let b = if args.transb {
         Tensor::<2>::random([n, k], burn::tensor::Distribution::Default, &device)
     } else {
         Tensor::<2>::random([k, n], burn::tensor::Distribution::Default, &device)
     }
-    .cast(args.dtype);
+    .cast(args.dtype());
     let b = if args.quant_q8 {
         use burn::tensor::quantization::{QuantScheme, QuantValue, ScaleDtype};
         let scheme = QuantScheme::default()
@@ -289,7 +298,7 @@ fn run_gemm(args: &Args) -> Result<()> {
     println!(
         "m={m} n={n} k={k} transb={} dtype={:?} best={best:.3}s => {:.1} GFLOPS",
         args.transb,
-        args.dtype,
+        args.dtype(),
         gflops / best / 1e9
     );
     Ok(())
@@ -312,7 +321,7 @@ fn run_embed(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
     let (model, cfg) = load_model(
         &args.model_dir,
-        args.dtype,
+        args.dtype(),
         args.quant_q8,
         args.npu,
         args.npu_threads,
@@ -323,7 +332,7 @@ fn run_embed(args: &Args) -> Result<()> {
     let n = ids.len();
     let ids_i64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
     let input = Tensor::<2, Int>::from_data(TensorData::new(ids_i64, [1, n]), &device);
-    let rope = RopeCache::new(n, cfg.head_dim, cfg.rope_theta, args.dtype, &device);
+    let rope = RopeCache::new(n, cfg.head_dim, cfg.rope_theta, args.dtype(), &device);
 
     let t0 = Instant::now();
     let out = model.forward(input, &rope, args.chunk, args.key_block, args.attn_fused);

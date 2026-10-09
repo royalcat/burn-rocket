@@ -177,12 +177,14 @@ impl Proj {
 }
 
 /// Linear forward that also supports Q8-resident weights: the weight is dequantized
-/// to f32 on the fly and used through the normal float linear path. Only the current
-/// layer's weights are materialized, so the resident model stays ~0.6 GB smaller.
+/// on the fly and cast to the activation dtype (the body may be f32 or a native
+/// 16-bit dtype). Only the current layer's weights are materialized, so the
+/// resident model stays ~0.6 GB smaller.
 pub fn linear_forward(lin: &Linear, x: Tensor<3>, quantized: bool) -> Tensor<3> {
     if !quantized {
         return lin.forward(x);
     }
-    let weight = lin.weight.val().dequantize(); // [in, out] f32
-    burn::tensor::module::linear(x, weight, lin.bias.as_ref().map(|b| b.val()))
+    let weight = lin.weight.val().dequantize().cast(x.dtype()); // [in, out]
+    let bias = lin.bias.as_ref().map(|b| b.val().cast(x.dtype()));
+    burn::tensor::module::linear(x, weight, bias)
 }

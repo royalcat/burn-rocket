@@ -50,12 +50,14 @@ pub fn load_model(
     if npu.is_some() {
         bail!("--npu requires an aarch64 build with --features npu");
     }
-    if dtype != DType::F32 {
+    if dtype == DType::F16 {
         bail!(
-            "--dtype f16 is not numerically supported (RMSNorm/softmax/PLE precision): \
-             cosine drops to 0.98 (text) / 0.70 (image) vs the f32 reference; use f32"
+            "--dtype f16 is not numerically supported for EmbeddingGemma 2 \
+             (RMSNorm/softmax/PLE precision): cosine drops to 0.98 (text) / 0.70 (image) \
+             vs the f32 reference; use f32 or the native bf16"
         );
     }
+    crate::gemma::layers::set_model_dtype(dtype);
     let vision_cfg = cfg
         .vision_config
         .as_ref()
@@ -90,15 +92,12 @@ pub fn load_model(
     drop(store);
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(opts) = npu {
-        if dtype != DType::F32 {
-            bail!("--npu needs --dtype f32 (NPU activations are f32 on the CPU side)");
-        }
-        // int8 packs straight from f32 (one quantization step, no dequant round
-        // trip); the q8 low-RAM mapper only feeds the fp16 pack.
+        // int8 packs straight from the model weights (one quantization step, no
+        // dequant round trip); the q8 low-RAM mapper only feeds the fp16 pack.
         if quant_q8 && opts.int8 {
             eprintln!(
                 "note: --quant q8 is ignored with --npu-int8 \
-                 (the int8 resident path quantizes straight from f32)"
+                 (the int8 resident path quantizes the model weights directly)"
             );
         }
         if quant_q8 && !opts.int8 {
@@ -128,6 +127,7 @@ fn load_npu_text(
     let t0 = Instant::now();
     let mut count = 0usize;
     let mut bytes = 0usize;
+    let mut native_bf16_count = 0usize;
     model.text_mut().for_each_projection_mut(|lin| {
         let w = lin.weight.val();
         let w = if crate::gemma::layers::is_quantized() {
@@ -136,32 +136,37 @@ fn load_npu_text(
             w
         };
         let [k, n] = w.shape().dims::<2>();
-        let values: Vec<f32> = w
-            .cast(DType::F32)
-            .into_data()
-            .try_to_vec()
-            .expect("f32 projection weights");
         // Burn `Linear` is `[in, out]`; the NPU packs HF `[out, in]` = `[N, K]`.
-        let mut t = vec![0f32; n * k];
-        for i in 0..k {
-            let src = &values[i * n..(i + 1) * n];
-            for j in 0..n {
-                t[j * k + i] = src[j];
+        // The weight keeps its native dtype (f32 packs a resident fp16 weight,
+        // bf16 stays native and uses the bf16 stream).
+        let tensor = match w.dtype() {
+            DType::F32 => {
+                let values: Vec<f32> = w.into_data().try_to_vec().expect("f32 projection weights");
+                let t = crate::gemma::layers::transpose_nk(&values, k, n);
+                Tensor::<2>::from_data(TensorData::new(t, [n, k]), (&*device, DType::F32))
             }
-        }
-        let tensor = Tensor::<2>::from_data(TensorData::new(t, [n, k]), device);
+            DType::BF16 => {
+                let values: Vec<burn::tensor::bf16> =
+                    w.into_data().try_to_vec().expect("bf16 projection weights");
+                let t = crate::gemma::layers::transpose_nk(&values, k, n);
+                Tensor::<2>::from_data(TensorData::new(t, [n, k]), (&*device, DType::BF16))
+            }
+            other => panic!("emb2 NPU pack: unsupported weight dtype {other:?} (f32 or bf16)"),
+        };
+        let native_bf16 = tensor.dtype() == DType::BF16;
         let id = if opts.int8 {
             burn_rocket::pack_i8(tensor, opts.i8_group)
         } else {
             burn_rocket::pack(tensor)
         };
         crate::gemma::layers::register_npu_weight(&lin.weight, id);
-        // Shrink the (now redundant) f32 copy in place: `Param::map` keeps the
+        // Shrink the (now redundant) copy in place: `Param::map` keeps the
         // parameter id, so the registry lookup in `lin` still hits.
         let dev = device.clone();
         lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
         count += 1;
         bytes += n * k * if opts.int8 { 1 } else { 2 };
+        native_bf16_count += usize::from(native_bf16 && !opts.int8);
     });
     if opts.attn {
         model.text_mut().set_npu_attn(true);
@@ -172,12 +177,18 @@ fn load_npu_text(
         libc::malloc_trim(0);
     }
     println!(
-        "NPU: packed {count} text projections into resident {} weights ({:.2} GiB, {} threads) \
-         in {:.2}s; attention on the {} (resident {:.0} MiB anon)",
-        if opts.int8 { "int8 g32" } else { "fp16" },
+        "NPU: offloaded {count} text projections ({:.2} GiB, {} threads) in {:.2}s \
+         ({}, attention on the {}; resident {:.0} MiB anon)",
         bytes as f64 / (1u64 << 30) as f64,
         opts.threads,
         t0.elapsed().as_secs_f64(),
+        if opts.int8 {
+            "int8 g32".to_string()
+        } else if native_bf16_count == count {
+            "native bf16".to_string()
+        } else {
+            format!("resident fp16 ({native_bf16_count}/{count} bf16)")
+        },
         if opts.attn { "NPU" } else { "CPU" },
         rss_mib()
     );
@@ -196,7 +207,7 @@ fn quantize_low_ram(model: Emb2Model) -> Result<Emb2Model> {
     let proj_group = param_group(
         r"(q_proj|k_proj|v_proj|o_proj|post|relative_k_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection|embedding_projection|input_proj|input_proj_linear|ffw_layer_1|ffw_layer_2|linear_start|linear_end|output_proj)\.(linear\.)?weight$",
     )?;
-    let mut mapper = LowRam::new(vec![proj_group], Vec::new());
+    let mut mapper = LowRam::new(vec![proj_group], Vec::new(), None);
     let model = model.map(&mut mapper);
     crate::gemma::layers::set_quantized(true);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]

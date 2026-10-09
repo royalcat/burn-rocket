@@ -15,6 +15,7 @@ use crate::qwen3_embedding::load as qwen3_load;
 use crate::qwen35_intent::loader as intent_loader;
 use crate::qwen35_intent::loader::IntentLoadOptions;
 use crate::util::device;
+use crate::util::store::native_dtype;
 
 use super::Settings;
 use super::engine::{
@@ -48,11 +49,17 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let max_new_tokens = args.max_new_tokens.unwrap_or(default_max_new);
     let temperature = args.temperature.unwrap_or(0.0);
 
+    // The model dtype: the checkpoint's native float dtype unless --dtype says
+    // otherwise (families without a dtype flag handle their native dtype in their
+    // own loader).
+    let dtype = args
+        .dtype
+        .unwrap_or_else(|| native_dtype(&model_dir.join("model.safetensors")));
     let (engine, capabilities) = match family {
         Family::Qwen3Embed => {
             let (model, cfg) = qwen3_load::load_model(
                 &model_dir,
-                args.dtype.unwrap_or(DType::F32),
+                dtype,
                 args.quant.unwrap_or(false),
                 args.npu.unwrap_or(false),
                 args.npu_threads.unwrap_or(5),
@@ -66,6 +73,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     cfg,
                     tokenizer,
                     device,
+                    dtype,
                     chunk: args.chunk.unwrap_or(256),
                     key_block: args.key_block.unwrap_or(256),
                     attn_fused: args.attn.unwrap_or(true),
@@ -81,7 +89,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         Family::Emb2 => {
             let (model, _cfg) = emb2_load::load_model(
                 &model_dir,
-                args.dtype.unwrap_or(DType::F32),
+                dtype,
                 args.quant.unwrap_or(false),
                 args.npu.unwrap_or(false).then_some(emb2_load::NpuOpts {
                     threads: args.npu_threads.unwrap_or(5),
@@ -98,7 +106,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     model,
                     tokenizer,
                     device,
-                    dtype: DType::F32,
+                    dtype,
                     max_tokens,
                     attn_chunk: args.attn_chunk.unwrap_or(1024),
                     image_soft_tokens,
@@ -144,12 +152,20 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )
         }
         Family::Gemma4 => {
+            // Flags win; otherwise load the checkpoint's native dtype.
             let dtype = if args.quant.unwrap_or(false) {
                 LoadDtype::Q8
+            } else if let Some(dt) = args.dtype {
+                match dt {
+                    DType::F32 => LoadDtype::F32,
+                    DType::F16 => LoadDtype::F16,
+                    DType::BF16 => LoadDtype::Bf16,
+                    other => bail!("unsupported dtype {other:?} for Gemma 4"),
+                }
             } else if args.gen_f16.unwrap_or(false) {
                 LoadDtype::F16
             } else {
-                LoadDtype::F32
+                LoadDtype::from_native(&model_dir)
             };
             #[allow(unused_mut)]
             let (mut model, cfg) = gen_loader::load_gen_model(&model_dir, dtype, &device)?;
@@ -166,7 +182,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             if args.npu.unwrap_or(false) {
                 bail!("--npu requires an aarch64 build with --features npu");
             }
-            let lm_head = gen_loader::build_lm_head(model.text(), dtype != LoadDtype::F32, &device);
+            let lm_head = gen_loader::build_lm_head(model.text(), dtype.tensor_dtype(), &device);
             let tokenizer = tokenizer()?;
             let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&model_dir);
             (
@@ -279,7 +295,8 @@ impl Args {
             args.dtype = Some(match v.as_str() {
                 "f32" => DType::F32,
                 "f16" => DType::F16,
-                other => bail!("unsupported dtype '{other}' (expected f32|f16)"),
+                "bf16" => DType::BF16,
+                other => bail!("unsupported dtype '{other}' (expected f32|f16|bf16)"),
             });
         }
         if let Some(v) = f.take_choice("--quant", &["none", "q8"])? {

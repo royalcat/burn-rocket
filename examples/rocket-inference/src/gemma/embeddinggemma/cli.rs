@@ -14,6 +14,7 @@ use crate::gemma::embeddinggemma::load::{NpuOpts, load_model};
 use crate::gemma::embeddinggemma::model::{stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
 use crate::util::device;
+use crate::util::store::native_dtype;
 
 /// `(input ids, optional media soft tokens, sequence length)`.
 type PreparedInput = (Tensor<2, Int>, Option<(Vec<usize>, Tensor<2>)>, usize);
@@ -30,7 +31,8 @@ pub fn run(cmd: &str, it: impl Iterator<Item = String>) -> Result<()> {
 
 struct Args {
     model_dir: PathBuf,
-    dtype: DType,
+    /// `None` = the checkpoint's native dtype.
+    dtype: Option<DType>,
     backend: String,
     text: Option<String>,
     text_file: Option<PathBuf>,
@@ -68,7 +70,7 @@ impl Args {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let mut args = Args {
             model_dir: PathBuf::from(format!("{home}/models/embeddinggemma-2")),
-            dtype: DType::F32,
+            dtype: None,
             backend: if cfg!(feature = "cpu") { "cpu" } else { "flex" }.to_string(),
             text: None,
             text_file: None,
@@ -107,11 +109,12 @@ impl Args {
             args.backend = v;
         }
         if let Some(v) = f.take("--dtype")? {
-            args.dtype = match v.as_str() {
+            args.dtype = Some(match v.as_str() {
                 "f32" => DType::F32,
                 "f16" => DType::F16,
-                other => bail!("unsupported dtype '{other}' (expected f32|f16)"),
-            };
+                "bf16" => DType::BF16,
+                other => bail!("unsupported dtype '{other}' (expected f32|f16|bf16)"),
+            });
         }
         if let Some(v) = f.take("--text")? {
             args.text = Some(v);
@@ -207,6 +210,13 @@ impl Args {
         Ok(args)
     }
 
+    /// The resolved model dtype: the checkpoint's native float dtype unless
+    /// `--dtype` overrides it.
+    fn dtype(&self) -> DType {
+        self.dtype
+            .unwrap_or_else(|| native_dtype(&self.model_dir.join("model.safetensors")))
+    }
+
     fn input_text(&self) -> Result<String> {
         if let Some(t) = &self.text {
             return Ok(t.clone());
@@ -300,7 +310,7 @@ fn run_embed(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
     let (model, cfg) = load_model(
         &args.model_dir,
-        args.dtype,
+        args.dtype(),
         args.quant_q8,
         args.npu.then_some(NpuOpts {
             threads: args.npu_threads,
@@ -311,7 +321,7 @@ fn run_embed(args: &Args) -> Result<()> {
         &device,
     )?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;
-    let rope = model.text().rope_tables(n, args.dtype, &device);
+    let rope = model.text().rope_tables(n, args.dtype(), &device);
 
     stage_stats_reset();
     let t0 = Instant::now();
@@ -356,7 +366,7 @@ fn run_bench(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
     let (model, _cfg) = load_model(
         &args.model_dir,
-        args.dtype,
+        args.dtype(),
         args.quant_q8,
         args.npu.then_some(NpuOpts {
             threads: args.npu_threads,
@@ -367,7 +377,7 @@ fn run_bench(args: &Args) -> Result<()> {
         &device,
     )?;
     let (input, soft, n) = build_inputs(args, &model, &device)?;
-    let rope = model.text().rope_tables(n, args.dtype, &device);
+    let rope = model.text().rope_tables(n, args.dtype(), &device);
 
     for rep in 0..args.reps.max(1) {
         stage_stats_reset();

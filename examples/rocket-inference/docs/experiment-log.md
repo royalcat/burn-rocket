@@ -771,3 +771,60 @@ the extension (feature-graph check); both remain available for secondary targets
 Checks: `cargo check` matrix (burn-rocket default / `--no-default-features` / `flex`;
 example flex / default cpu / aarch64 npu / gpu-wgsl probe), `cargo test -p burn-rocket`
 (11 unit tests + doctests) and the parity suite above.
+
+## 16. Native bf16 round: model-native weights + the NPU bf16 path (2026-10-09)
+
+Motivation: drop the pre.4 bf16 workarounds (f16 tables, f32 upcasts, the
+`--npu needs --dtype f32` guards) and default to the checkpoint's native dtype;
+offload bf16 models with the library's bf16 matmul where it exists.
+
+**Defaults**: `--dtype` (qwen3/emb2; gemma4 has its own `--dtype`/`--f16`/`--quant`)
+now defaults to the checkpoint's native float dtype — bf16 for all three.
+`--dtype f32` keeps the f32 parity path bit-comparable. The intent checkpoint is
+f32-native (its file is a mixed export: f32 language model + bf16 vision tower, the
+latter unused by the text server), so that family is unchanged.
+
+**Extension** (`burn-rocket`): `pack`/`pack2`/`pack3` accept f32/f16 (resident
+fp16 as before) and bf16 (kept host-native — the library has no resident bf16);
+`matmul` on a bf16 weight converts it to f32 into a per-call scratch and drives
+`rocket_matmul_bf16_stream` (`_mt` on a refusal); `pack_i8` quantizes from any of
+the three; matmul/attention/glue outputs follow the activation dtype and the fused
+glue kernels take f32/f16/bf16. Two footguns found and fixed along the way:
+`Tensor::from_data(data, device)` with a bare device resets the dtype to the device
+default (f32) — every weight-loading site now passes `(&device, dtype)` (the first
+board runs silently packed f32->fp16 through this); and the qwen3 NPU loader's
+`read_projection`/`load_cpu_projections` had the same latent dtype reset.
+
+**q8 + bf16**: `--quant q8` now works with any model dtype; the per-call dequant
+follows the model dtype, and the embedding table is only forced to f16 for an f32
+body (16-bit bodies keep their native table).
+
+**Dev-host parity** (flex): qwen3 bf16 cosine 0.99983 vs f32 (82 tok); emb2 bf16
+text 0.99995 / image 0.99989 vs HF f32 — f16 was 0.98/0.70, so bf16's full exponent
+range fixes what f16 broke; gemma4 bf16 9/9 tokens identical to HF on the short
+prompt (f32 body). CPU cost: qwen3 82-token bf16 142 tok/s vs 211 f32; emb2 1.3x
+slower; gemma4 decode 0.54 vs 3.55 tok/s (6.6x — its f32 body casts per call).
+
+**Board A/B** (busy board, cores 4-7, NPU shared with the live emb2 service; the
+numbers are contention-loaded but the two arms ran back-to-back):
+
+| model | config | wall | tok/s | resident | cosine vs f32 |
+|---|---|---|---|---|---|
+| qwen3 3633 tok | bf16 (default) | 78.0 s | 46.6 | 1138 MiB anon | 0.999845 |
+| qwen3 3633 tok | `--dtype f32` | 61.8 s | 58.8 | 298 MiB anon | - |
+| emb2 2587 tok | bf16 (default) | 19.2 s | 134.9 | 1423 MiB anon | 0.999905 |
+| emb2 2587 tok | `--dtype f32` | 14.8 s | 174.8 | 2321 MiB anon | - |
+
+Numerics are at the f32 level (cosine 0.99985/0.99990, well inside the gates). The
+bf16 arm is 26 % (qwen3) / 30 % (emb2) slower end-to-end: the bf16 stream has no
+resident weights, so it re-packs A/B every call (counted in the NPU time: qwen3
+108.5 vs 86.5 s over two runs) and we convert the weight bf16->f32 per call; the
+bf16 body also adds CPU glue cost on flex (qwen3 flex+overhead 42 vs 23 s). Memory
+splits by family: qwen3 bf16 holds its native weights host-side (+840 MiB anon vs
+the pack-and-drop f32 arm) while emb2 bf16 is ~900 MiB smaller than its f32 arm.
+`--dtype f32` stays the fast board config; bf16 is the default for
+model-native-weight policy and the numerics story.
+
+Missing from this round: a `--npu` gemma4 bf16 A/B (the board had ~2.4 GB free —
+the model needs ~10 GB) and an intent re-check (that model is no longer deployed on
+the board).

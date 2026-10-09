@@ -63,22 +63,25 @@ than the CPU-only flex path (the default NPU attention is slightly faster: ~45 t
   );
   ```
 
-  `pack`/`pack2`/`pack3` consume f32 CPU weights and keep fp16 resident copies in NPU
-  memory for the process lifetime (`WeightId` handles). Fused packs concatenate several
-  weights that share one input along N, so one matmul produces all their outputs (the
-  example packs q|k|v and gate|up that way). Matmuls are chunked above
-  `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the per-call
-  input buffer; rows are independent, so chunking is bit-identical.
+  `pack`/`pack2`/`pack3` consume f32/f16 weights and keep fp16 resident copies in NPU
+  memory for the process lifetime (`WeightId` handles), or native bf16 weights (kept
+  host-side: the library has no resident bf16, so each matmul streams the weight
+  through `rocket_matmul_bf16_stream` with an f32 conversion per call). Fused packs
+  concatenate several weights that share one input along N, so one matmul produces all
+  their outputs (the example packs q|k|v and gate|up that way). Matmuls are chunked
+  above `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the
+  per-call input buffer; rows are independent, so chunking is bit-identical.
 
-- **Low-level FFI API** (`RocketCtx`, `RocketWeight`, `RocketStream`, `RocketFaCtx`,
-  `f32_to_f16`, `pad_rows`, driver/counter helpers) for callers that do not want Burn
-  tensor routing. See `examples/probe.rs` for a runnable smoke test.
+- **Low-level FFI API** (`RocketCtx`, `RocketWeight`, `RocketStream`, `RocketBf16Stream`,
+  `RocketFaCtx`, `f32_to_f16`, `pad_rows`, driver/counter helpers) for callers that do
+  not want Burn tensor routing. See `examples/probe.rs` for a runnable smoke test.
 
 The ops are **inference-only**: the extension macro generates no autodiff and calling
 them with an autodiff context panics inside Burn. `librocketnpu` contexts are not
 thread-safe; the extension routes every call through one global engine behind a mutex
-(`burn_rocket::stats()` reports accumulated convert/NPU time). Resident weights are
-packed for the `M >= 256` tiling, smaller requests are padded.
+(`burn_rocket::stats()` reports accumulated convert/NPU time). Resident weights use
+the canonical tiling (`M >= 4`; `ROCKET_CTX_CANONICAL=0` restores the legacy
+`M >= 256` padding).
 
 ## Features
 

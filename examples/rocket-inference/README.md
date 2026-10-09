@@ -157,9 +157,9 @@ $B qwen3 embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out 
 ```
 
 Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
-`--dtype f32|f16|bf16` (f32 is the parity mode; bf16/f16 are memory modes, slower on
-flex), `--quant none|q8` (q8 = Q8-resident
-low-RAM mode), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
+`--dtype f32|f16|bf16` (default: the checkpoint's native dtype, bf16; `--dtype f32`
+is the parity/speed mode on CPU), `--quant none|q8` (q8 = Q8-resident
+low-RAM mode; its dequant follows the model dtype), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
 attention only), `--tokens`, `--text`, `--text-file`, `--out`; `gemm` adds
 `--m/--n/--k/--transb`. Serving uses the flags of the [Serving](#serving)
 section.
@@ -209,9 +209,12 @@ Deployed and measured against the production server, both on cores 4-7 with
 
 ### NPU offload
 
-All 196 projections are packed into resident fp16 NPU buffers (0.82 GiB; q|k|v
-and gate|up are each one segmented weight) and the CPU keeps only an f16
-embedding table (**298 MiB resident**).
+The default `--dtype` is the checkpoint's native bf16: the projections stay
+host-native (the library has no resident bf16) and each matmul streams through
+`rocket_matmul_bf16_stream` with an f32 conversion per call; `--dtype f32` packs
+all 196 projections into resident fp16 NPU buffers (0.82 GiB; q|k|v and gate|up
+are each one segmented weight) and keeps only an f16 embedding table on the CPU
+(**298 MiB resident**).
 
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
@@ -221,8 +224,10 @@ embedding table (**298 MiB resident**).
 
 Numerics: cosine 0.999365 vs the production Q8_0 reference; the NPU attention
 run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
-`rocket` module on the board (contained; reboot reverts). `--npu` requires
-`--dtype f32` and excludes `--quant q8`.
+`rocket` module on the board (contained; reboot reverts). Native-bf16 `--npu`
+(2026-10-09 board A/B, log §16) is numerically at the f32 level (cosine 0.999845)
+but 26 % slower (46.6 vs 58.8 tok/s) — `--dtype f32` is the fast NPU config;
+`--npu` excludes `--quant q8`.
 
 ## Qwen3.5-0.8B intent (`intent`)
 
@@ -297,7 +302,8 @@ $B gemma tokenize --model-dir $M --text "hello"
 ```
 
 Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
-`--dtype f32` (f16 is rejected — RMSNorm/softmax/PLE need f32), `--text`,
+`--dtype f32|bf16` (default: native bf16; f16 is rejected — RMSNorm/softmax/PLE
+need f32/bf16 range), `--text`,
 `--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
 `--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--quant none|q8`,
@@ -324,6 +330,7 @@ Summary against the HF f32 reference (transformers 5.19; full table in the log):
 | text (9 tok, 2594 tok; dims 768/256) | 1.00000000 |
 | image (PNG/JPEG), video (4 frames), audio (5 s/30 s) | 1.00000000 |
 | text + image / text + audio | 1.00000000 |
+| text/image, native bf16 (default) | 0.99995 / 0.99989 (dev host); 0.999905 vs f32 on the board |
 | any modality, `--quant q8` | 0.9996-0.9999 |
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
 
@@ -332,7 +339,11 @@ Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 projections into 0.25 GiB of resident fp16 weights with windowed attention: on
 the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
 user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
-33% less CPU. The vision/audio towers, norms, RoPE and the embedding table stay
+33% less CPU. Native bf16 (the default) with `--npu` keeps the weights host-native
+and streams them per call: 19.2 s (134.9 tok/s, 1423 MiB anon) vs 14.8 s
+(174.8 tok/s, 2321 MiB) for `--dtype f32` on the 2026-10-09 board A/B (log §16) —
+at the f32 numerics level (0.999905) but 30 % slower, so `--dtype f32` is the fast
+board config. The vision/audio towers, norms, RoPE and the embedding table stay
 on the CPU.
 
 Performance round (2026-10-08, log §12; board timings in §12.5):
@@ -384,7 +395,8 @@ Precision modes (`gen` and serving), measured on the dev host (32 threads,
 
 | mode | flags | resident | decode | notes |
 |---|---|---|---|---|
-| f32 (default) | - | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
+| f32 | `--dtype f32` | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
+| bf16 (default) | - | 9889 MiB | 0.54 tok/s | native bf16 weights with the f32 body; 9/9 tokens identical to HF on the short prompt; **decode is 6.6x slower than f32** (flex's per-call bf16->f32 GEMM conversion) |
 | f16 | `--f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
 | Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call |
 

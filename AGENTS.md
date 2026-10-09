@@ -465,11 +465,15 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   matmuls per layer, one input conversion per group. The loader packs each weight straight
   from the store and drops the host copy (`pack-and-drop`).
 - librocketnpu's float matmul ladder (header): fp16 resident (`rocket_weights_pack` +
-  `rocket_matmul_fp16_prepacked`, what the extension uses; needs the per-row amax
-  scaling), bf16 (full-speed 2-byte geometry — same as fp16/int16 — fp32 accumulate and
-  NO scaling, but streaming-only: no resident-weight variant, so prefill-shaped), and
-  tf32 (the only 4-byte-input path, explicitly half-rate). bf16 on the NPU would run at
-  fp16 speed; the flex CPU bf16 penalty below does not apply there.
+  `rocket_matmul_fp16_prepacked`), used for f32/f16 model weights; bf16 (full-speed
+  2-byte geometry — same as fp16/int16 — fp32 accumulate and NO scaling, but
+  streaming-only: no resident-weight variant, so the extension keeps bf16 weights
+  host-native and feeds `rocket_matmul_bf16_stream` an f32 conversion per call,
+  `_mt` on a refusal); and tf32 (the only 4-byte-input path, explicitly half-rate).
+  bf16 has no speed advantage over fp16 on the NPU (the device ties); the library
+  docs call it token-identical, and the board A/B confirms the numerics (cosine
+  0.99985/0.99990 vs f32) — but the stream path is 26-30% slower end-to-end than
+  the resident fp16 path because it re-packs the weight per call (log §16).
 - Projection fields are `#[cfg_attr(npu, module(skip))]` so the store never materializes
   CPU copies in the NPU build. For that build's CPU modes (`--quant q8`, no `--npu`),
   `load_cpu_projections` loads the same tensors explicitly (with the PyTorch `[out,in]` ->
@@ -529,17 +533,25 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - `--quant q8` = low-RAM mode: projection weights stay Q8_0-quantized and are
   dequantized once per layer per forward (`linear_forward` in `src/util/proj.rs`, the
   shared `LowRam` mapper in `src/util/quant.rs`, `Qwen3Embedding::quantized` in
-  `src/qwen3_embedding/model.rs`); the embedding table is f16; `libc::malloc_trim` after
-  quantization releases the freed f32 pages (glibc otherwise retains ~1.3 GB in arenas).
+  `src/qwen3_embedding/model.rs`); the dequant follows the model dtype, and the
+  embedding table is f16 for an f32 body (native dtype for 16-bit bodies);
+  `libc::malloc_trim` after quantization releases the freed pages (glibc otherwise
+  retains ~1.3 GB in arenas).
   Resident ~0.78 GB anon vs ~2.4 GB for f32, cost ~2 s per forward. Load peak is still
   ~2.3 GB (the file is materialized as f32 before quantization).
-- `--dtype bf16` works on burn 0.22.0 (verified: 310 tensors load, an 82-token embed
-  runs, cosine 0.99983 vs f32). Its cost is length-dependent (dev host, 32 threads,
-  fused attention, bench with one warmup): 89.2 tok/s at 82 tokens and 222.7 at 3.6k vs
-  259.1/268.2 for f32 — 2.9x at 82 tokens but only 1.2x at 3.6k. The penalty is flex's
-  per-call bf16->f32 operand conversion before the f32 GEMM (bf16 has no native flex
-  GEMM); f32 stays the parity/default mode and f16 is the slowest 16-bit mode
-  (60.8/131.9 tok/s).
+- `--dtype` (and the family equivalents) defaults to the checkpoint's native float
+  dtype — bf16 for every current checkpoint; `--dtype f32` selects the f32 parity
+  path. The model body runs in the resolved dtype (qwen3/emb2); gemma4 keeps its f32
+  body (f32 softmax/PLE/logits) with bf16 weights. Native bf16 costs CPU speed on
+  flex (the bf16 GEMM converts operands to f32 per call): qwen3 82-token bf16
+  142 tok/s vs 211 f32, 3.6k 222.7 vs 268.2 (2.9x at 82 tokens, 1.2x at 3.6k); f16 is
+  the slowest 16-bit mode (60.8/131.9 tok/s). On the board the NPU bf16 path is
+  26.6% slower than the resident fp16 path (qwen3 46.6 vs 58.8 tok/s) and 30% for
+  emb2 (134.9 vs 174.8), with device time tied — `--dtype f32` stays the fast board
+  config. Numerics verified: qwen3 bf16 cosine 0.99983 vs f32 (82 tok) and 0.999845
+  on the board; emb2 text/image ~0.9999 vs HF f32 and 0.999905 on the board; gemma4
+  bf16 9/9 tokens identical to HF (f32 body). `--dtype f16` is still rejected for
+  emb2 (f16 numerics: 0.98 text / 0.70 image).
 - Tokenizer must run with `add_special_tokens=true` (appends EOS 151643), matching
   `llama-embedding` token counts.
 - 16-bit weights are slower than f32 at model level on this CPU (f16 2-4x, bf16 1.2-2.9x,

@@ -384,6 +384,85 @@ impl Drop for RocketStream {
     }
 }
 
+/// Persistent streaming context for bf16 matmuls (`rocket_matmul_bf16_stream`):
+/// worker fds and per-`(M,K,N)` scratch BOs stay resident, while A and B are
+/// re-packed every call. The interface takes f32 operands (the NPU truncates to
+/// bf16 during the scatter) and writes an f32 `[M, N]` output.
+///
+/// Not `Send`/`Sync`; the extension only touches it while holding the global
+/// engine mutex.
+pub struct RocketBf16Stream {
+    s: *mut ffi::RocketBf16StreamOpaque,
+}
+
+impl RocketBf16Stream {
+    /// Create a stream with `nthreads` workers.
+    pub fn new(nthreads: usize) -> Result<Self, Error> {
+        let s = unsafe { ffi::rocket_bf16_stream_create(nthreads as i32) };
+        if s.is_null() {
+            return Err(Error {
+                op: "rocket_bf16_stream_create",
+                rc: ffi::ROCKET_E_DEVICE,
+            });
+        }
+        Ok(RocketBf16Stream { s })
+    }
+
+    /// `C[M, N] = A[M, K] * B[N, K]^T`, re-packing A and B every call. Returns
+    /// the library status: `ROCKET_OK`, or a negative value telling the caller
+    /// to fall back to [`matmul_bf16_mt`](Self::matmul_mt).
+    pub fn matmul(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) -> i32 {
+        assert_eq!(a.len(), m * k, "A must be [M, K]");
+        assert_eq!(b.len(), n * k, "B must be [N, K]");
+        assert_eq!(c.len(), m * n, "C must be [M, N]");
+        unsafe {
+            ffi::rocket_matmul_bf16_stream(
+                self.s,
+                m as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+            )
+        }
+    }
+
+    /// The per-call multicore fallback (opens its own worker fds; allocates and
+    /// frees all BOs per call).
+    pub fn matmul_mt(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+        nthreads: usize,
+    ) -> Result<(), Error> {
+        assert_eq!(a.len(), m * k, "A must be [M, K]");
+        assert_eq!(b.len(), n * k, "B must be [N, K]");
+        assert_eq!(c.len(), m * n, "C must be [M, N]");
+        let rc = unsafe {
+            ffi::rocket_matmul_bf16_mt(
+                m as i32,
+                k as i32,
+                n as i32,
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+                nthreads as i32,
+            )
+        };
+        check("rocket_matmul_bf16_mt", rc)
+    }
+}
+
+impl Drop for RocketBf16Stream {
+    fn drop(&mut self) {
+        unsafe { ffi::rocket_bf16_stream_free(self.s) }
+    }
+}
+
 /// Persistent context for masked grouped-query attention on the NPU
 /// (`rocket_flash_attn_fp16_ctx`): worker fds and per-head scratch stay resident
 /// across calls. Not `Send`/`Sync`.

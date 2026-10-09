@@ -34,11 +34,36 @@ pub fn f16_weights() -> bool {
     F16_WEIGHTS.load(Ordering::Relaxed)
 }
 
+/// Process-wide bf16-weight flag (Gemma 4 `Bf16` load): projections are native
+/// bf16 while the model body computes in f32, so `lin` casts per call.
+static BF16_WEIGHTS: AtomicBool = AtomicBool::new(false);
+
+pub fn set_bf16_weights(on: bool) {
+    BF16_WEIGHTS.store(on, Ordering::Relaxed);
+}
+
+pub fn bf16_weights() -> bool {
+    BF16_WEIGHTS.load(Ordering::Relaxed)
+}
+
+/// The model's activation dtype, set by the loaders. Q8-resident weights are
+/// stored as `QFloat`, so `weight_dtype` cannot read the activation dtype from
+/// the param; it falls back to this (default f32).
+static MODEL_DTYPE: std::sync::OnceLock<DType> = std::sync::OnceLock::new();
+
+pub fn set_model_dtype(dtype: DType) {
+    let _ = MODEL_DTYPE.set(dtype);
+}
+
+pub fn model_dtype() -> DType {
+    *MODEL_DTYPE.get().unwrap_or(&DType::F32)
+}
+
 /// The activation dtype matching a (possibly Q8-resident) weight: activations
-/// stay f32 in low-RAM mode because `lin` dequantizes weights to f32.
+/// run in the model dtype in low-RAM mode (`lin` dequantizes weights into it).
 pub(crate) fn weight_dtype<const D: usize>(w: &Param<Tensor<D>>) -> DType {
     if is_quantized() {
-        DType::F32
+        model_dtype()
     } else {
         w.val().dtype()
     }
@@ -73,13 +98,21 @@ fn linear_body<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
         }
     }
     if is_quantized() {
-        let weight = l.weight.val().dequantize();
-        return burn::tensor::module::linear(x, weight, l.bias.as_ref().map(|b| b.val()));
+        // Q8-resident weights: dequantize per call into the activation dtype.
+        let weight = l.weight.val().dequantize().cast(x.dtype());
+        let bias = l.bias.as_ref().map(|b| b.val().cast(x.dtype()));
+        return burn::tensor::module::linear(x, weight, bias);
     }
     if f16_weights() {
         // f16-resident weights: compute in f16, return in the activation dtype.
         let dt = x.dtype();
         let out = burn::tensor::module::linear(x.cast(DType::F16), l.weight.val(), None);
+        return out.cast(dt);
+    }
+    if bf16_weights() {
+        // Native bf16 weights with an f32 body: cast per call, like f16 mode.
+        let dt = x.dtype();
+        let out = burn::tensor::module::linear(x.cast(DType::BF16), l.weight.val(), None);
         return out.cast(dt);
     }
     l.forward(x)
@@ -257,27 +290,47 @@ pub fn prefill_mode() -> bool {
     PREFILL_MODE.load(Ordering::Relaxed)
 }
 
-/// Pack one `Linear` into resident NPU memory and register it. With
-/// `keep_cpu` the f32 copy stays (prefill-only mode), otherwise it is shrunk to
-/// a `[1, 1]` placeholder (the id is preserved so `lin` still finds the weight).
+/// Transpose a `[k, n]` buffer to the `[n, k]` layout the NPU packs take
+/// (Burn `Linear` is `[in, out]`; the packs are HF `[out, in]` = `[N, K]`).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -> (usize, usize) {
-    let w = lin.weight.val();
-    let [k, n] = w.shape().dims::<2>();
-    let values: Vec<f32> = w
-        .cast(DType::F32)
-        .into_data()
-        .try_to_vec()
-        .expect("f32 projection weights");
-    // Burn `Linear` is `[in, out]`; the NPU packs HF `[out, in]` = `[N, K]`.
-    let mut t = vec![0f32; n * k];
+pub(crate) fn transpose_nk<T: Copy + Default>(values: &[T], k: usize, n: usize) -> Vec<T> {
+    let mut t = vec![T::default(); n * k];
     for i in 0..k {
         let src = &values[i * n..(i + 1) * n];
         for j in 0..n {
             t[j * k + i] = src[j];
         }
     }
-    let tensor = Tensor::<2>::from_data(TensorData::new(t, [n, k]), device);
+    t
+}
+
+/// Pack one `Linear` into NPU memory in its native dtype and register it: f32
+/// packs a resident fp16 weight, bf16 stays native (the bf16 stream re-packs it
+/// per call). With `keep_cpu` the f32 copy stays (prefill-only mode), otherwise
+/// it is shrunk to a `[1, 1]` placeholder (the id is preserved so `lin` still
+/// finds the weight).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -> (usize, usize) {
+    let w = lin.weight.val();
+    let [k, n] = w.shape().dims::<2>();
+    let tensor = match w.dtype() {
+        DType::F32 => {
+            let values: Vec<f32> = w.into_data().try_to_vec().expect("f32 projection weights");
+            Tensor::<2>::from_data(
+                TensorData::new(transpose_nk(&values, k, n), [n, k]),
+                (device, DType::F32),
+            )
+        }
+        DType::BF16 => {
+            let values: Vec<burn::tensor::bf16> =
+                w.into_data().try_to_vec().expect("bf16 projection weights");
+            Tensor::<2>::from_data(
+                TensorData::new(transpose_nk(&values, k, n), [n, k]),
+                (device, DType::BF16),
+            )
+        }
+        other => panic!("pack_linear_into_npu: unsupported weight dtype {other:?} (f32 or bf16)"),
+    };
     let id = burn_rocket::pack(tensor);
     register_npu_weight(&lin.weight, id);
     if !keep_cpu {

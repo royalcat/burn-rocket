@@ -37,6 +37,11 @@ pub struct RocketStreamOpaque {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct RocketBf16StreamOpaque {
+    _private: [u8; 0],
+}
+
 pub const ROCKET_OK: c_int = 0;
 pub const ROCKET_E_SHAPE: c_int = -1;
 pub const ROCKET_E_TILING: c_int = -2;
@@ -105,6 +110,33 @@ unsafe extern "C" {
         a: *const F16,
         b: *const F16,
         c: *mut F16,
+    ) -> c_int;
+
+    // Streaming bf16 path: f32 A/B operands, truncated to bf16 during the NPU
+    // scatter; fp32 output (host double K-accum). No resident-weight variant
+    // exists, so the weight is re-packed per call. `_mt` is the per-call
+    // multicore fallback the stream tells the caller to use on a refusal.
+    pub fn rocket_bf16_stream_create(nthreads: c_int) -> *mut RocketBf16StreamOpaque;
+    pub fn rocket_bf16_stream_free(s: *mut RocketBf16StreamOpaque);
+    #[allow(clippy::too_many_arguments)]
+    pub fn rocket_matmul_bf16_stream(
+        s: *mut RocketBf16StreamOpaque,
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    pub fn rocket_matmul_bf16_mt(
+        m: c_int,
+        k: c_int,
+        n: c_int,
+        a: *const f32,
+        b: *const f32,
+        c: *mut f32,
+        nthreads: c_int,
     ) -> c_int;
 
     // Masked grouped-query attention (LLM prefill): NPU QK/PV, additive mask,

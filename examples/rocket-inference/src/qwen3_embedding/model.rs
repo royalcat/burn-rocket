@@ -69,9 +69,15 @@ pub struct Qwen3Embedding {
     embed_tokens: Embedding,
     layers: Vec<Qwen3Layer>,
     norm: RmsNorm,
-    /// True when projection weights are stored Q8-quantized and dequantized per
-    /// forward (low-RAM mode, `--quant q8`).
+    /// True when projection weights are stored Q8-quantized (low-RAM mode,
+    /// `--quant q8`) or packed off the CPU entirely (NPU mode); those forwards
+    /// then dequantize per call rather than using a resident copy.
     quantized: bool,
+    /// The body dtype quantized/offloaded modes gather into (a 16-bit table is
+    /// cast to this after the embedding lookup). Meaningless when `quantized`
+    /// is false, where the body follows the loaded tensor dtype.
+    #[module(skip)]
+    body_dtype: DType,
 }
 
 impl Qwen3Embedding {
@@ -88,17 +94,25 @@ impl Qwen3Embedding {
             layers,
             norm,
             quantized: false,
+            body_dtype: DType::F32,
         }
     }
 
-    /// Mark projection weights as Q8-resident; their forward path then dequantizes
-    /// each weight on the fly instead of keeping an f32 copy.
+    /// Mark projection weights as Q8-resident or NPU-resident; their forward path
+    /// then dequantizes each weight on the fly instead of keeping an f32 copy.
     pub fn set_quantized(&mut self, quantized: bool) {
         self.quantized = quantized;
     }
 
-    /// Keep only an f16 copy of the token-embedding table (NPU mode; the gathered rows
-    /// are cast back to f32 per forward). Releases the freed f32 pages to the OS.
+    /// The dtype the model body computes in when `quantized` is set (the table is
+    /// cast to it after the embedding lookup).
+    pub fn set_body_dtype(&mut self, dtype: DType) {
+        self.body_dtype = dtype;
+    }
+
+    /// Keep only an f16 copy of the token-embedding table (f32 NPU mode; the
+    /// gathered rows are cast back per forward). Native bf16 models keep their
+    /// table dtype. Releases the freed pages to the OS.
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn embed_table_to_f16(&mut self) {
         self.embed_tokens.weight = self
@@ -165,12 +179,12 @@ impl Qwen3Embedding {
     ) -> Tensor<2> {
         let [b, s] = input_ids.dims();
         let d = self.hidden_size();
-        // The embedding table may be kept in f16 in low-RAM mode while the model body
-        // stays f32; the cast is exact (the source safetensors are bf16) and costs one
-        // [B, S, D] pass.
+        // The embedding table may be kept in a 16-bit dtype while the model body
+        // computes in another; the cast is exact (the source safetensors are bf16)
+        // and costs one [B, S, D] pass.
         let mut x = self.embed_tokens.forward(input_ids);
         if self.quantized {
-            x = x.cast(DType::F32);
+            x = x.cast(self.body_dtype);
         }
         for layer in &self.layers {
             x = layer.forward(x, rope, attn_chunk, key_block, fused, self.quantized);

@@ -23,23 +23,33 @@ pub fn param_group(regex: &str) -> Result<ParamGroup> {
 }
 
 /// Map every float param matching one of `quantize` to [`q8_scheme`] and every
-/// param matching one of `to_f16` to f16; everything else is left untouched.
+/// param matching one of `keep` to `keep_dtype` (left untouched when `None`);
+/// everything else is left untouched.
 ///
 /// Params are cast to f32 before quantization (a no-op in the modes that allow
 /// `--quant q8`, and the safe behavior for checkpoints loaded in another dtype).
 pub struct LowRam {
     scheme: QuantScheme,
     quantize: Vec<ParamGroup>,
-    to_f16: Vec<ParamGroup>,
+    keep: Vec<ParamGroup>,
+    /// Cast "keep" params to this dtype, when set. The f32 body's f16 table
+    /// keeps the low-RAM mode's memory saving; 16-bit bodies keep their native
+    /// table dtype.
+    keep_dtype: Option<DType>,
     path: Vec<String>,
 }
 
 impl LowRam {
-    pub fn new(quantize: Vec<ParamGroup>, to_f16: Vec<ParamGroup>) -> Self {
+    pub fn new(
+        quantize: Vec<ParamGroup>,
+        keep: Vec<ParamGroup>,
+        keep_dtype: Option<DType>,
+    ) -> Self {
         Self {
             scheme: q8_scheme(),
             quantize,
-            to_f16,
+            keep,
+            keep_dtype,
             path: Vec::new(),
         }
     }
@@ -67,12 +77,11 @@ impl ModuleMapper for LowRam {
                 let qparams = compute_q_params(&self.scheme, range);
                 tensor.quantize(&self.scheme, qparams)
             })
-        } else if self
-            .to_f16
-            .iter()
-            .any(|g| g.matches(&param.id, Some(&path)))
-        {
-            param.map(|tensor| tensor.cast(DType::F16))
+        } else if self.keep.iter().any(|g| g.matches(&param.id, Some(&path))) {
+            match self.keep_dtype {
+                Some(dtype) => param.map(|tensor| tensor.cast(dtype)),
+                None => param,
+            }
         } else {
             param
         }

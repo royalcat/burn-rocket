@@ -14,6 +14,8 @@
 //! The LM head is tied to `embed_tokens` (the checkpoint has no `lm_head`
 //! tensor); the loader materializes the transposed table once for logits.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use burn::prelude::*;
 use burn::tensor::DType;
@@ -67,27 +69,69 @@ pub fn pack_text_for_prefill(
 /// Per-tensor dtype selection, applied during loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadDtype {
-    /// f32 projections (parity).
+    /// f32 projections and body (parity).
     F32,
-    /// f16 projections: half the memory, f16 GEMM.
+    /// f16 projections: half the memory, f16 GEMM; the body stays f32.
     F16,
     /// f16 during load, then Q8_0-resident (memory-only: decode dequantizes).
     Q8,
+    /// The checkpoint's native bf16 throughout: projections, tables and body.
+    Bf16,
+}
+
+impl LoadDtype {
+    /// The dtype linear projections (and the tied LM head) load in.
+    pub fn tensor_dtype(self) -> DType {
+        match self {
+            LoadDtype::F32 => DType::F32,
+            LoadDtype::F16 | LoadDtype::Q8 => DType::F16,
+            LoadDtype::Bf16 => DType::BF16,
+        }
+    }
+
+    /// Map the checkpoint's native float dtype to a `LoadDtype` (bf16 for the
+    /// current checkpoints; f32/f16 checkpoints stay in their own dtype).
+    pub fn from_native(model_dir: &Path) -> Self {
+        match crate::util::store::native_dtype(&model_dir.join("model.safetensors")) {
+            DType::F16 => LoadDtype::F16,
+            DType::F32 => LoadDtype::F32,
+            _ => LoadDtype::Bf16,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct LoadDtypeAdapter {
-    f16: bool,
-    /// Keep token tables in f32 (QAT parity: the reference dequantizes to f32,
-    /// so an f16 table would round the per-layer embeddings).
-    f32_tables: bool,
+    /// Linear projections.
+    linear: DType,
+    /// Token tables (`embed_tokens*`).
+    table: DType,
+    /// Every other float tensor in the module tree (norms, scalars, ...).
+    rest: DType,
 }
 
 impl LoadDtypeAdapter {
     pub fn new(_device: &Device, dtype: LoadDtype) -> Self {
-        Self {
-            f16: matches!(dtype, LoadDtype::F16 | LoadDtype::Q8),
-            f32_tables: false,
+        match dtype {
+            LoadDtype::F32 => Self {
+                linear: DType::F32,
+                // f16 tables halve the dominant table while staying exact for
+                // bf16 sources; the gathered rows are cast back per forward.
+                table: DType::F16,
+                rest: DType::F32,
+            },
+            LoadDtype::F16 | LoadDtype::Q8 => Self {
+                linear: DType::F16,
+                table: DType::F16,
+                rest: DType::F32,
+            },
+            LoadDtype::Bf16 => Self {
+                linear: DType::BF16,
+                table: DType::BF16,
+                // The generation model computes in f32 (f32 softmax/PLE/logits);
+                // norms and scalars must match the body.
+                rest: DType::F32,
+            },
         }
     }
 }
@@ -95,7 +139,9 @@ impl LoadDtypeAdapter {
 impl LoadDtypeAdapter {
     /// Keep the token tables in f32 (QAT checkpoints dequantize to f32).
     pub fn with_f32_tables(mut self, on: bool) -> Self {
-        self.f32_tables = on;
+        if on {
+            self.table = DType::F32;
+        }
         self
     }
 }
@@ -108,27 +154,19 @@ impl ModuleAdapter for LoadDtypeAdapter {
             || name.ends_with("embed_tokens_per_layer.weight");
         let is_linear = ctx.module_type() == Some("Struct:Linear");
 
-        if is_table && self.f32_tables {
-            bridge::map_data(tensor, name, DType::F32, shape, |data| {
-                data.convert_dtype(DType::F32)
-            })
-        } else if is_table {
-            // f16 storage; the gathered rows are cast back to f32.
-            bridge::map_data(tensor, name, DType::F16, shape, |data| {
-                data.convert_dtype(DType::F16)
-            })
-        } else if is_linear && self.f16 {
+        let target = if is_table {
+            self.table
+        } else if is_linear {
             // f16 during load (halves the f32 footprint); the Q8 pass runs after
             // the model is fully loaded, because the store applies tensors in the
             // backend's packed layout, which cannot be produced from the adapter.
-            bridge::map_data(tensor, name, DType::F16, shape, |data| {
-                data.convert_dtype(DType::F16)
-            })
+            self.linear
         } else {
-            bridge::map_data(tensor, name, DType::F32, shape, |data| {
-                data.convert_dtype(DType::F32)
-            })
-        }
+            self.rest
+        };
+        bridge::map_data(tensor, name, target, shape, move |data| {
+            data.convert_dtype(target)
+        })
     }
 
     fn clone_box(&self) -> Box<dyn ModuleAdapter> {
@@ -144,7 +182,7 @@ pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
     let proj_group = param_group(
         r"(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection)\.weight$",
     )?;
-    let mut mapper = LowRam::new(vec![proj_group], Vec::new());
+    let mut mapper = LowRam::new(vec![proj_group], Vec::new(), None);
     let model = model.map(&mut mapper);
     crate::gemma::layers::set_quantized(true);
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -353,6 +391,7 @@ pub fn load_gen_model(
             LoadDtype::F32 => " (f32 projections, f16 tables)",
             LoadDtype::F16 => " (f16 projections, f16 tables)",
             LoadDtype::Q8 => " (f16 load -> Q8 projections, f16 tables)",
+            LoadDtype::Bf16 => " (native bf16)",
         },
         t0.elapsed().as_secs_f64(),
         rss_mib()
@@ -368,20 +407,19 @@ pub fn load_gen_model(
             crate::gemma::layers::set_f16_weights(true);
             model
         }
+        LoadDtype::Bf16 => {
+            crate::gemma::layers::set_bf16_weights(true);
+            model
+        }
         LoadDtype::F32 => model,
     };
+    crate::gemma::layers::set_model_dtype(dtype.tensor_dtype());
     Ok((model, cfg))
 }
 
-/// Transposed, tied LM head `[hidden, vocab]` for the logits path. f32 by
-/// default (parity); f16 in q8 mode, where logits are computed in f16 like the
-/// bf16 reference.
-pub fn build_lm_head(text: &GenTextModel, low_precision: bool, device: &Device) -> Tensor<2> {
-    let dtype = if low_precision {
-        DType::F16
-    } else {
-        DType::F32
-    };
+/// Transposed, tied LM head `[hidden, vocab]` for the logits path, in the
+/// projections' dtype (f32 parity; f16 in q8/f16 mode; native bf16).
+pub fn build_lm_head(text: &GenTextModel, dtype: DType, device: &Device) -> Tensor<2> {
     text.embed_table()
         .val()
         .cast(dtype)
@@ -454,6 +492,7 @@ impl ModuleAdapter for QatAdapter {
         let target = match self.dtype {
             LoadDtype::F32 => DType::F32,
             LoadDtype::F16 | LoadDtype::Q8 => DType::F16,
+            LoadDtype::Bf16 => DType::BF16,
         };
         let scales = scales.clone();
         let shape = Shape::new([rows, k]);

@@ -25,11 +25,12 @@ use std::time::Instant;
 use burn::backend::tensor::FloatTensor;
 use burn::backend::{Backend, Dispatch, Flex, TensorMetadata, backend_extension};
 use burn::tensor::{DType, Tensor, TensorData};
-use half::f16;
+use half::{bf16, f16};
 
 use crate::masks::{build_causal_mask, build_causal_window_mask, build_window_mask};
 use crate::{
-    Error, OpFailure, RocketCtx, RocketFaCtx, RocketI8Ctx, RocketI8Weight, RocketWeight, pad_rows,
+    Error, OpFailure, RocketBf16Stream, RocketCtx, RocketFaCtx, RocketI8Ctx, RocketI8Weight,
+    RocketWeight, pad_rows,
 };
 
 /// The Flex backend's float primitive, the concrete type the ops execute on.
@@ -227,6 +228,15 @@ struct Resident {
     n: usize,
 }
 
+/// A native bf16 weight held on the host. The library's bf16 matmul has no
+/// resident-weight variant and takes f32 operands, so the weight stays in its
+/// model-native bf16 bytes and is converted into an f32 scratch per call.
+struct Bf16Resident {
+    data: Vec<bf16>, // [N, K] row-major
+    k: usize,
+    n: usize,
+}
+
 /// A resident group-wise int8 weight plus the host-side weight scales the
 /// per-call API needs (`[N, K/group]`).
 struct I8Resident {
@@ -268,6 +278,10 @@ struct Engine {
     ctx: RocketCtx,
     fa: Option<FaState>,
     weights: HashMap<u64, Resident>,
+    /// Native bf16 weights (host-side; the bf16 stream re-packs per call).
+    bf16_weights: HashMap<u64, Bf16Resident>,
+    /// Streaming bf16 context, created lazily at the first bf16 matmul.
+    bf16: Option<RocketBf16Stream>,
     /// Resident int8 weights (the context is created lazily at the first int8
     /// pack; it owns its own worker fds).
     i8_ctx: Option<RocketI8Ctx>,
@@ -310,6 +324,8 @@ pub fn init(threads: usize) -> Result<(), Error> {
         ctx,
         fa: None,
         weights: HashMap::new(),
+        bf16_weights: HashMap::new(),
+        bf16: None,
         i8_ctx: None,
         i8_weights: HashMap::new(),
         next_id: 1,
@@ -327,21 +343,11 @@ impl RocketOps for Flex {
     }
 
     fn rocket_pack2(a: FloatTensor<Self>, b: FloatTensor<Self>) -> u64 {
-        pack_many(
-            vec![to_host(a, "fused weight 0"), to_host(b, "fused weight 1")],
-            "fused weight",
-        )
+        pack_many(vec![a, b], "fused weight")
     }
 
     fn rocket_pack3(a: FloatTensor<Self>, b: FloatTensor<Self>, c: FloatTensor<Self>) -> u64 {
-        pack_many(
-            vec![
-                to_host(a, "fused weight 0"),
-                to_host(b, "fused weight 1"),
-                to_host(c, "fused weight 2"),
-            ],
-            "fused weight",
-        )
+        pack_many(vec![a, b, c], "fused weight")
     }
 
     fn rocket_pack_i8(t: FloatTensor<Self>, group: usize) -> u64 {
@@ -468,62 +474,135 @@ impl RocketOps for Flex {
     }
 }
 
-/// `t` is a `[N, K]` f32 tensor; returns `(k, n, row-major [N, K] fp16)`.
+/// `t` is a `[N, K]` f32 or f16 tensor; returns `(k, n, row-major [N, K] fp16)`.
 fn to_host(t: FlexTensor, what: &str) -> (usize, usize, Vec<f16>) {
-    assert_eq!(
-        t.dtype(),
-        DType::F32,
-        "{what}: the NPU path needs f32 weights"
-    );
+    let dtype = t.dtype();
     let [n, k] = t.shape().dims::<2>();
-    let values: Vec<f32> = t
+    match dtype {
+        DType::F32 => {
+            let values: Vec<f32> = t
+                .into_data()
+                .try_to_vec()
+                .unwrap_or_else(|e| panic!("{what}: expected f32 data ({e})"));
+            (k, n, f32_to_f16_par(&values))
+        }
+        DType::F16 => {
+            let values: Vec<f16> = t
+                .into_data()
+                .try_to_vec()
+                .unwrap_or_else(|e| panic!("{what}: expected f16 data ({e})"));
+            (k, n, values)
+        }
+        other => panic!("{what}: unsupported weight dtype {other:?} (f32/f16/bf16)"),
+    }
+}
+
+/// `t` is a `[N, K]` bf16 tensor; returns `(k, n, row-major [N, K] bf16)`.
+fn to_host_bf16(t: FlexTensor, what: &str) -> (usize, usize, Vec<bf16>) {
+    assert_eq!(t.dtype(), DType::BF16, "{what}: expected bf16 weights");
+    let [n, k] = t.shape().dims::<2>();
+    let values: Vec<bf16> = t
         .into_data()
         .try_to_vec()
-        .unwrap_or_else(|e| panic!("{what}: expected f32 data ({e})"));
-    (k, n, f32_to_f16_par(&values))
+        .unwrap_or_else(|e| panic!("{what}: expected bf16 data ({e})"));
+    (k, n, values)
 }
 
 fn pack_one(t: FlexTensor, what: &str) -> u64 {
-    let (k, n, b) = to_host(t, what);
-    with_engine(|e| {
-        let weight = e
-            .ctx
-            .pack_weight(PACK_M, k, n, &b)
-            .unwrap_or_else(|err| op_failure("rocket_weights_pack", err.rc, PACK_M, k, n));
-        let id = e.next_id;
-        e.next_id += 1;
-        e.weights.insert(id, Resident { weight, k, n });
-        id
-    })
+    match t.dtype() {
+        DType::F32 | DType::F16 => {
+            let (k, n, b) = to_host(t, what);
+            with_engine(|e| {
+                let weight = e
+                    .ctx
+                    .pack_weight(PACK_M, k, n, &b)
+                    .unwrap_or_else(|err| op_failure("rocket_weights_pack", err.rc, PACK_M, k, n));
+                let id = e.next_id;
+                e.next_id += 1;
+                e.weights.insert(id, Resident { weight, k, n });
+                id
+            })
+        }
+        DType::BF16 => {
+            let (k, n, data) = to_host_bf16(t, what);
+            with_engine(|e| {
+                let id = e.next_id;
+                e.next_id += 1;
+                e.bf16_weights.insert(id, Bf16Resident { data, k, n });
+                id
+            })
+        }
+        other => panic!("{what}: unsupported weight dtype {other:?} (f32/f16/bf16)"),
+    }
 }
 
-/// Fused groups: every part is `[N_i, K]` with a shared `K`; the resident weight
-/// is the concatenation along N, so one matmul produces all outputs.
-fn pack_many(parts: Vec<(usize, usize, Vec<f16>)>, what: &str) -> u64 {
-    let k = parts[0].0;
+/// Fused groups: every part is `[N_i, K]` with a shared `K`; the weight is the
+/// concatenation along N, so one matmul produces all outputs. f32 parts pack a
+/// segmented resident fp16 weight (no concat materialized); bf16 parts stay
+/// native and are concatenated host-side (the bf16 API takes one B buffer).
+fn pack_many(parts: Vec<FlexTensor>, what: &str) -> u64 {
+    let dtype = parts[0].dtype();
     assert!(
-        parts.iter().all(|(kk, _, _)| *kk == k),
-        "{what}: all parts must share K"
+        parts.iter().all(|p| p.dtype() == dtype),
+        "{what}: all parts must share a dtype"
     );
-    let bufs: Vec<&[f16]> = parts.iter().map(|(_, _, b)| b.as_slice()).collect();
-    let n: usize = parts.iter().map(|(_, n, _)| *n).sum();
-    with_engine(|e| {
-        let weight = e
-            .ctx
-            .pack_weight_seg(PACK_M, k, &bufs)
-            .unwrap_or_else(|err| op_failure("rocket_weights_pack_seg", err.rc, PACK_M, k, n));
-        let id = e.next_id;
-        e.next_id += 1;
-        e.weights.insert(id, Resident { weight, k, n });
-        id
-    })
+    match dtype {
+        DType::F32 | DType::F16 => {
+            let hosts: Vec<(usize, usize, Vec<f16>)> =
+                parts.into_iter().map(|p| to_host(p, what)).collect();
+            let k = hosts[0].0;
+            assert!(
+                hosts.iter().all(|(kk, _, _)| *kk == k),
+                "{what}: all parts must share K"
+            );
+            let bufs: Vec<&[f16]> = hosts.iter().map(|(_, _, b)| b.as_slice()).collect();
+            let n: usize = hosts.iter().map(|(_, n, _)| *n).sum();
+            with_engine(|e| {
+                let weight = e
+                    .ctx
+                    .pack_weight_seg(PACK_M, k, &bufs)
+                    .unwrap_or_else(|err| {
+                        op_failure("rocket_weights_pack_seg", err.rc, PACK_M, k, n)
+                    });
+                let id = e.next_id;
+                e.next_id += 1;
+                e.weights.insert(id, Resident { weight, k, n });
+                id
+            })
+        }
+        DType::BF16 => {
+            let hosts: Vec<(usize, usize, Vec<bf16>)> =
+                parts.into_iter().map(|p| to_host_bf16(p, what)).collect();
+            let k = hosts[0].0;
+            assert!(
+                hosts.iter().all(|(kk, _, _)| *kk == k),
+                "{what}: all parts must share K"
+            );
+            let n: usize = hosts.iter().map(|(_, n, _)| *n).sum();
+            let mut data: Vec<bf16> = Vec::with_capacity(n * k);
+            for (_, _, b) in hosts {
+                data.extend_from_slice(&b);
+            }
+            with_engine(|e| {
+                let id = e.next_id;
+                e.next_id += 1;
+                e.bf16_weights.insert(id, Bf16Resident { data, k, n });
+                id
+            })
+        }
+        other => panic!("{what}: unsupported weight dtype {other:?} (f32/f16/bf16)"),
+    }
 }
 
-/// Pack one `[N, K]` f32 weight as a resident group-wise int8 weight: the codes
-/// are quantized host-side (symmetric `max/127` per K-group) and scattered into
-/// NPU BOs once; the weight scales stay host-side for the per-call dequant.
+/// Pack one `[N, K]` f32/bf16 weight as a resident group-wise int8 weight: the
+/// codes are quantized host-side (symmetric `max/127` per K-group) and scattered
+/// into NPU BOs once; the weight scales stay host-side for the per-call dequant.
 fn pack_i8_one(t: FlexTensor, group: usize) -> u64 {
-    assert_eq!(t.dtype(), DType::F32, "the NPU path needs f32 weights");
+    let dtype = t.dtype();
+    assert!(
+        matches!(dtype, DType::F32 | DType::F16 | DType::BF16),
+        "the int8 path needs f32, f16 or bf16 weights (got {dtype:?})"
+    );
     let [n, k] = t.shape().dims::<2>();
     assert!(
         group > 0 && group.is_multiple_of(32) && k.is_multiple_of(group),
@@ -531,10 +610,27 @@ fn pack_i8_one(t: FlexTensor, group: usize) -> u64 {
     );
     assert_eq!(k % 32, 0, "the int8 path needs K % 32 == 0 (K={k})");
     assert_eq!(n % 32, 0, "the int8 path needs N % 32 == 0 (N={n})");
-    let values: Vec<f32> = t
-        .into_data()
-        .try_to_vec()
-        .expect("the NPU path needs f32 weights");
+    let values: Vec<f32> = match dtype {
+        DType::F32 => t
+            .into_data()
+            .try_to_vec()
+            .expect("the NPU path needs f32 weights"),
+        DType::F16 => {
+            let v: Vec<f16> = t
+                .into_data()
+                .try_to_vec()
+                .expect("the NPU path needs f16 weights");
+            v.into_iter().map(f16::to_f32).collect()
+        }
+        DType::BF16 => {
+            let v: Vec<bf16> = t
+                .into_data()
+                .try_to_vec()
+                .expect("the NPU path needs bf16 weights");
+            v.into_iter().map(bf16::to_f32).collect()
+        }
+        _ => unreachable!(),
+    };
     let (q, b_scale) = quantize_i8_weight(&values, n, k, group);
     with_engine(|e| {
         let threads = e.threads;
@@ -593,23 +689,38 @@ fn quantize_i8_rows(values: &[f32], m: usize, k: usize, group: usize) -> (Vec<i8
     (q, scales)
 }
 
-/// `t` must be f32; returns its shape and values.
+/// `t` must be f32 or bf16; returns its shape and f32 values.
 fn to_host_f32(t: FlexTensor, what: &str) -> (Vec<usize>, Vec<f32>) {
-    assert_eq!(t.dtype(), DType::F32, "{what} must be f32");
     let dims: Vec<usize> = t.shape().into();
-    let values: Vec<f32> = t
-        .into_data()
-        .try_to_vec()
-        .unwrap_or_else(|e| panic!("{what}: expected f32 data ({e})"));
+    let values = read_floats_f32(t, what);
     (dims, values)
 }
 
+/// Build a float tensor from f32 values in the requested output dtype.
+fn floats_tensor(values: Vec<f32>, dims: Vec<usize>, dtype: DType) -> FlexTensor {
+    match dtype {
+        DType::F32 => FlexTensor::from_data(TensorData::new(values, dims)),
+        DType::F16 => {
+            let v: Vec<f16> = values.into_iter().map(f16::from_f32).collect();
+            FlexTensor::from_data(TensorData::new(v, dims))
+        }
+        DType::BF16 => {
+            let v: Vec<bf16> = values.into_iter().map(bf16::from_f32).collect();
+            FlexTensor::from_data(TensorData::new(v, dims))
+        }
+        other => panic!("unsupported glue dtype {other:?} (f32/f16/bf16)"),
+    }
+}
+
 /// Fused `gelu_approximate(a) * b`: one rayon pass instead of the composite's
-/// ~9 single-threaded flex ops (with a `tanh` and a `powf` per element).
+/// ~9 single-threaded flex ops (with a `tanh` and a `powf` per element). Runs in
+/// f32 internally and writes back the input dtype (f32 or bf16).
 fn gelu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
     use rayon::prelude::*;
     const CHUNK: usize = 8192;
 
+    let out_dtype = a.dtype();
+    assert_eq!(b.dtype(), out_dtype, "gelu_mul inputs must share a dtype");
     let (dims, av) = to_host_f32(a, "gelu_mul input a");
     let (bdims, bv) = to_host_f32(b, "gelu_mul input b");
     assert_eq!(dims, bdims, "gelu_mul inputs must share a shape");
@@ -618,7 +729,7 @@ fn gelu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
         .zip(av.par_chunks(CHUNK))
         .zip(bv.par_chunks(CHUNK))
         .for_each(|((o, g), u)| crate::host::gelu_mul(g, u, o));
-    FlexTensor::from_data(TensorData::new(out, dims))
+    floats_tensor(out, dims, out_dtype)
 }
 
 /// Fused weighted RMSNorm over the last dim: one pass per row instead of the
@@ -626,6 +737,7 @@ fn gelu_mul_impl(a: FlexTensor, b: FlexTensor) -> FlexTensor {
 fn rms_norm_impl(x: FlexTensor, w: FlexTensor, eps: f64) -> FlexTensor {
     use rayon::prelude::*;
 
+    let out_dtype = x.dtype();
     let (dims, xv) = to_host_f32(x, "rms_norm input");
     let d = *dims.last().expect("rms_norm needs at least one dim");
     let (_, wv) = to_host_f32(w, "rms_norm weight");
@@ -634,13 +746,14 @@ fn rms_norm_impl(x: FlexTensor, w: FlexTensor, eps: f64) -> FlexTensor {
     out.par_chunks_mut(d)
         .zip(xv.par_chunks(d))
         .for_each(|(o, row)| crate::host::rms_norm_row(row, &wv, eps as f32, o));
-    FlexTensor::from_data(TensorData::new(out, dims))
+    floats_tensor(out, dims, out_dtype)
 }
 
 /// Fused scale-free RMSNorm over the last dim (`x * (mean(x^2) + eps)^-0.5`).
 fn rms_norm_noscale_impl(x: FlexTensor, eps: f64) -> FlexTensor {
     use rayon::prelude::*;
 
+    let out_dtype = x.dtype();
     let (dims, xv) = to_host_f32(x, "rms_norm_noscale input");
     let d = *dims
         .last()
@@ -649,13 +762,14 @@ fn rms_norm_noscale_impl(x: FlexTensor, eps: f64) -> FlexTensor {
     out.par_chunks_mut(d)
         .zip(xv.par_chunks(d))
         .for_each(|(o, row)| crate::host::rms_norm_row(row, &[], eps as f32, o));
-    FlexTensor::from_data(TensorData::new(out, dims))
+    floats_tensor(out, dims, out_dtype)
 }
 
 /// Fused rotate-half RoPE: one pass instead of slice/mul/sub/add/cat chains.
 fn rope_impl(x: FlexTensor, cos: FlexTensor, sin: FlexTensor) -> FlexTensor {
     use rayon::prelude::*;
 
+    let out_dtype = x.dtype();
     let (dims, xv) = to_host_f32(x, "rope input");
     assert_eq!(dims.len(), 4, "rope: x must be [B, S, H, D]");
     let (s, h, d) = (dims[1], dims[2], dims[3]);
@@ -676,13 +790,14 @@ fn rope_impl(x: FlexTensor, cos: FlexTensor, sin: FlexTensor) -> FlexTensor {
             o,
         );
     });
-    FlexTensor::from_data(TensorData::new(out, dims))
+    floats_tensor(out, dims, out_dtype)
 }
 
 /// How a registry id is executed; resolved before the host-side conversion so
 /// the (parallel) conversion runs outside the engine lock.
 enum WeightKind {
     F16,
+    Bf16,
     I8 { group: usize },
 }
 
@@ -691,6 +806,9 @@ fn weight_kind(id: u64, k: usize) -> WeightKind {
         if let Some(r) = e.weights.get(&id) {
             assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
             WeightKind::F16
+        } else if let Some(r) = e.bf16_weights.get(&id) {
+            assert_eq!(k, r.k, "activation K mismatch for NPU bf16 weight id {id}");
+            WeightKind::Bf16
         } else if let Some(r) = e.i8_weights.get(&id) {
             assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
             WeightKind::I8 { group: r.group }
@@ -700,34 +818,64 @@ fn weight_kind(id: u64, k: usize) -> WeightKind {
     })
 }
 
+/// Read a float tensor (f32, f16 or bf16) as f32 values.
+fn read_floats_f32(t: FlexTensor, what: &str) -> Vec<f32> {
+    match t.dtype() {
+        DType::F32 => t
+            .into_data()
+            .try_to_vec()
+            .unwrap_or_else(|e| panic!("{what}: expected f32 data ({e})")),
+        DType::F16 => {
+            let v: Vec<f16> = t
+                .into_data()
+                .try_to_vec()
+                .unwrap_or_else(|e| panic!("{what}: expected f16 data ({e})"));
+            v.into_iter().map(f16::to_f32).collect()
+        }
+        DType::BF16 => {
+            let v: Vec<bf16> = t
+                .into_data()
+                .try_to_vec()
+                .unwrap_or_else(|e| panic!("{what}: expected bf16 data ({e})"));
+            v.into_iter().map(bf16::to_f32).collect()
+        }
+        other => panic!("{what}: unsupported float dtype {other:?} (f32/f16/bf16)"),
+    }
+}
+
 fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
     let dims: Vec<usize> = x.shape().into();
     assert!(dims.len() >= 2, "NPU matmul needs at least [M, K]");
     let k = dims[dims.len() - 1];
     let m: usize = dims[..dims.len() - 1].iter().product();
-    assert_eq!(x.dtype(), DType::F32, "the NPU path needs f32 activations");
-    let values: Vec<f32> = x
-        .into_data()
-        .try_to_vec()
-        .expect("the NPU path needs f32 activations");
+    let out_dtype = x.dtype();
+    let values = read_floats_f32(x, "matmul activations");
 
     match weight_kind(id, k) {
         WeightKind::F16 => {
             let t_conv = Instant::now();
             let a16 = f32_to_f16_par(&values);
             T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
-            matmul_f16(dims, m, k, id, &a16)
+            matmul_f16(dims, m, k, id, &a16, out_dtype)
         }
+        WeightKind::Bf16 => matmul_bf16(dims, m, k, id, &values, out_dtype),
         WeightKind::I8 { group } => {
             let t_conv = Instant::now();
             let (q, a_scale) = quantize_i8_rows(&values, m, k, group);
             T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
-            matmul_i8(dims, m, k, id, group, &q, &a_scale)
+            matmul_i8(dims, m, k, id, group, &q, &a_scale, out_dtype)
         }
     }
 }
 
-fn matmul_f16(dims: Vec<usize>, m: usize, k: usize, id: u64, a16: &[f16]) -> FlexTensor {
+fn matmul_f16(
+    dims: Vec<usize>,
+    m: usize,
+    k: usize,
+    id: u64,
+    a16: &[f16],
+    out_dtype: DType,
+) -> FlexTensor {
     with_engine(|e| {
         let r = e
             .weights
@@ -780,13 +928,14 @@ fn matmul_f16(dims: Vec<usize>, m: usize, k: usize, id: u64, a16: &[f16]) -> Fle
 
         let mut out_dims = dims;
         *out_dims.last_mut().unwrap() = n;
-        FlexTensor::from_data(TensorData::new(c32, out_dims))
+        floats_tensor(c32, out_dims, out_dtype)
     })
 }
 
 /// Group-wise int8 matmul with a resident weight. The output buffer is sized to
 /// the `M % 4` pad (`ceil4(m)`) so chunks write straight into it; the pad rows
 /// are truncated before the tensor is built.
+#[allow(clippy::too_many_arguments)]
 fn matmul_i8(
     dims: Vec<usize>,
     m: usize,
@@ -795,6 +944,7 @@ fn matmul_i8(
     group: usize,
     q: &[i8],
     a_scale: &[f32],
+    out_dtype: DType,
 ) -> FlexTensor {
     debug_assert_eq!(q.len(), m.div_ceil(4) * 4 * k);
     let n_groups = k / group;
@@ -833,7 +983,93 @@ fn matmul_i8(
 
         let mut out_dims = dims;
         *out_dims.last_mut().unwrap() = n;
-        FlexTensor::from_data(TensorData::new(c32, out_dims))
+        floats_tensor(c32, out_dims, out_dtype)
+    })
+}
+
+/// Pad `rows` f32 rows of width `k` to `padded_rows` by repeating the last row
+/// (rows are independent; the pad is ignored on readback).
+fn pad_rows_f32(src: &[f32], rows: usize, k: usize, padded_rows: usize) -> Vec<f32> {
+    debug_assert!(padded_rows >= rows);
+    let mut out = Vec::with_capacity(padded_rows * k);
+    out.extend_from_slice(src);
+    if padded_rows > rows {
+        let last = &src[(rows - 1) * k..rows * k];
+        for _ in rows..padded_rows {
+            out.extend_from_slice(last);
+        }
+    }
+    out
+}
+
+/// Native-bf16 matmul: the library's bf16 path takes f32 operands (truncated to
+/// bf16 on the NPU scatter) and has no resident-weight variant, so the weight is
+/// converted into an f32 buffer once per call and the stream re-packs it into
+/// its per-shape scratch BOs. Rows are chunked and padded to `M % 4` like the
+/// fp16 path; the stream's `_mt` sibling takes shapes it declines.
+fn matmul_bf16(
+    dims: Vec<usize>,
+    m: usize,
+    k: usize,
+    id: u64,
+    a32: &[f32],
+    out_dtype: DType,
+) -> FlexTensor {
+    with_engine(|e| {
+        let r = e
+            .bf16_weights
+            .get(&id)
+            .unwrap_or_else(|| panic!("NPU bf16 weight id {id} is not packed"));
+        let n = r.n;
+        let threads = e.threads;
+
+        // One f32 conversion of the weight per call (the bf16 API needs f32 B).
+        let t_conv = Instant::now();
+        let b32: Vec<f32> = r.data.iter().map(|v| bf16::to_f32(*v)).collect();
+        T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+        if e.bf16.is_none() {
+            e.bf16 =
+                Some(RocketBf16Stream::new(threads).unwrap_or_else(|err| {
+                    op_failure("rocket_bf16_stream_create", err.rc, 0, k, n)
+                }));
+        }
+        let stream = e.bf16.as_ref().expect("created above");
+
+        let chunk_m = matmul_chunk_m();
+        let mut c32: Vec<f32> = Vec::with_capacity(m * n);
+        let mut off = 0;
+        while off < m {
+            let rows = if chunk_m == 0 {
+                m - off
+            } else {
+                (m - off).min(chunk_m)
+            };
+            let padded_m = (rows.div_ceil(4) * 4).max(4);
+            let src = &a32[off * k..(off + rows) * k];
+
+            let t_conv = Instant::now();
+            let padded = (padded_m != rows).then(|| pad_rows_f32(src, rows, k, padded_m));
+            let a: &[f32] = padded.as_deref().unwrap_or(src);
+            let mut c = vec![0f32; padded_m * n];
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+            let t_npu = Instant::now();
+            let rc = stream.matmul(padded_m, k, n, a, &b32, &mut c);
+            if rc != crate::ffi::ROCKET_OK {
+                RocketBf16Stream::matmul_mt(padded_m, k, n, a, &b32, &mut c, threads)
+                    .unwrap_or_else(|err| op_failure("rocket_matmul_bf16_mt", err.rc, rows, k, n));
+            }
+            T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+            NPU_CALLS.fetch_add(1, Ordering::Relaxed);
+
+            c32.extend_from_slice(&c[..rows * n]);
+            off += rows;
+        }
+
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = n;
+        floats_tensor(c32, out_dims, out_dtype)
     })
 }
 
@@ -866,6 +1102,7 @@ fn attention_impl(
     mode: MaskMode,
 ) -> FlexTensor {
     let q_dims: Vec<usize> = q.shape().into();
+    let out_dtype = q.dtype();
     assert_eq!(q_dims.len(), 3, "NPU attention input must be [1, S, H*D]");
     let (b, n) = (q_dims[0], q_dims[1]);
     assert_eq!(b, 1, "the NPU attention path supports batch size 1");
@@ -893,18 +1130,9 @@ fn attention_impl(
         );
     }
 
-    let qf: Vec<f32> = q
-        .into_data()
-        .try_to_vec()
-        .expect("the NPU path needs f32 activations");
-    let kf: Vec<f32> = k
-        .into_data()
-        .try_to_vec()
-        .expect("the NPU path needs f32 activations");
-    let vf: Vec<f32> = v
-        .into_data()
-        .try_to_vec()
-        .expect("the NPU path needs f32 activations");
+    let qf = read_floats_f32(q, "attention q");
+    let kf = read_floats_f32(k, "attention k");
+    let vf = read_floats_f32(v, "attention v");
 
     let out = with_engine(|e| {
         let recreate = match &e.fa {
@@ -1024,7 +1252,7 @@ fn attention_impl(
         o
     });
 
-    FlexTensor::from_data(TensorData::new(out, q_dims))
+    floats_tensor(out, q_dims, out_dtype)
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,4 +1535,33 @@ fn unpack_heads(src: &[f16], n: usize, heads: usize, d: usize) -> Vec<f32> {
         }
     });
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bf16_values_read_and_write_round_trip() {
+        let values = vec![1.5f32, -2.25, 0.0, 3.0];
+        let t = floats_tensor(values.clone(), vec![2, 2], DType::BF16);
+        assert_eq!(t.dtype(), DType::BF16);
+        let (dims, back) = to_host_f32(t, "test");
+        assert_eq!(dims, vec![2, 2]);
+        assert_eq!(back, values); // bf16 represents these exactly
+
+        let t32 = floats_tensor(values.clone(), vec![2, 2], DType::F32);
+        let (_, back32) = to_host_f32(t32, "test");
+        assert_eq!(back32, values);
+    }
+
+    #[test]
+    fn f32_row_pad_repeats_the_last_row() {
+        let src = vec![1., 2., 3., 4., 5., 6.];
+        assert_eq!(
+            pad_rows_f32(&src, 2, 3, 4),
+            vec![1., 2., 3., 4., 5., 6., 4., 5., 6., 4., 5., 6.]
+        );
+        assert_eq!(pad_rows_f32(&src, 2, 3, 2), src);
+    }
 }

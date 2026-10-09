@@ -45,6 +45,8 @@ struct Args {
     top_p: f32,
     enable_thinking: bool,
     gen_f16: bool,
+    /// `None` = the checkpoint's native dtype.
+    dtype: Option<LoadDtype>,
 }
 
 impl Args {
@@ -73,6 +75,7 @@ impl Args {
             top_p: 0.95,
             enable_thinking: false,
             gen_f16: false,
+            dtype: None,
         };
         if let Some(v) = f.take("--gen-model-dir")? {
             args.gen_model_dir = PathBuf::from(v);
@@ -135,6 +138,14 @@ impl Args {
         }
         args.enable_thinking = f.take_bool("--enable-thinking");
         args.gen_f16 = f.take_bool("--f16");
+        if let Some(v) = f.take("--dtype")? {
+            args.dtype = Some(match v.as_str() {
+                "f32" => LoadDtype::F32,
+                "f16" => LoadDtype::F16,
+                "bf16" => LoadDtype::Bf16,
+                other => bail!("unsupported dtype '{other}' (expected f32|f16|bf16)"),
+            });
+        }
         f.finish(&format!("gemma {cmd}"))?;
         Ok(args)
     }
@@ -159,12 +170,15 @@ struct MessageJson {
 
 fn run_gen(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
+    // Flags win; otherwise load the checkpoint's native dtype.
     let dtype = if args.quant_q8 {
         LoadDtype::Q8
+    } else if let Some(v) = args.dtype {
+        v
     } else if args.gen_f16 {
         LoadDtype::F16
     } else {
-        LoadDtype::F32
+        LoadDtype::from_native(&args.gen_model_dir)
     };
     #[allow(unused_mut)]
     let (mut model, cfg) = loader::load_gen_model(&args.gen_model_dir, dtype, &device)?;
@@ -176,7 +190,7 @@ fn run_gen(args: &Args) -> Result<()> {
     if args.npu {
         bail!("--npu requires an aarch64 build with --features npu");
     }
-    let lm_head = loader::build_lm_head(model.text(), dtype != LoadDtype::F32, &device);
+    let lm_head = loader::build_lm_head(model.text(), dtype.tensor_dtype(), &device);
     let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
 

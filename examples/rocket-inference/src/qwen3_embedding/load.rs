@@ -44,13 +44,19 @@ pub fn load_model(
     drop(store);
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if npu {
-        if dtype != DType::F32 {
-            bail!("--npu needs --dtype f32 (NPU activations are f32 on the CPU side)");
-        }
         if quant_q8 {
-            bail!("--npu packs its own fp16 weights; --quant q8 is not applicable");
+            bail!("--npu packs its own weights; --quant q8 is not applicable");
         }
-        return load_npu_projections(model, cfg, model_dir, npu_threads, npu_attn, device, t0);
+        return load_npu_projections(
+            model,
+            cfg,
+            model_dir,
+            dtype,
+            npu_threads,
+            npu_attn,
+            device,
+            t0,
+        );
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if npu {
@@ -61,32 +67,31 @@ pub fn load_model(
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     load_cpu_projections(&mut model, &cfg, model_dir, dtype, quant_q8, device)?;
     if quant_q8 {
-        if dtype != DType::F32 {
-            bail!(
-                "--quant q8 needs --dtype f32 (Q8-resident weights are dequantized to f32 on the fly)"
-            );
-        }
         use crate::util::quant::{LowRam, param_group};
         let t0 = Instant::now();
         // Low-RAM mode. Projection weights stay Q8_0-quantized (symmetric int8,
         // 32-value blocks, f16 block scales = llama.cpp's Q8_0); the forward dequantizes
-        // each weight on the fly, so only the current layer's f32 weights are
-        // materialized (~62 MB) instead of all 1.75 GB. The token-embedding table is
-        // kept in f16 (exact for bf16-sourced values in range) and gathered rows are
-        // cast back to f32 per forward; bf16 is supported but ~2x slower on flex.
+        // each weight on the fly, so only the current layer's weights are materialized
+        // (~62 MB) instead of all of them. The token-embedding table stays in the
+        // model's native dtype (16-bit for bf16/f16 models); with an f32 body it is
+        // kept in f16 (exact for bf16-sourced values in range, and half the bytes)
+        // and gathered rows are cast back per forward.
         let proj_group = param_group(r"\.(q|k|v|o|gate|up|down)_proj\.weight$")?;
         let embed_group = param_group(r"embed_tokens\.weight$")?;
-        let mut mapper = LowRam::new(vec![proj_group], vec![embed_group]);
+        let table_dtype = (dtype == DType::F32).then_some(DType::F16);
+        let mut mapper = LowRam::new(vec![proj_group], vec![embed_group], table_dtype);
         model = model.map(&mut mapper);
         model.set_quantized(true);
-        // Return freed f32 weight pages to the OS: glibc keeps them in its arenas,
+        model.set_body_dtype(dtype);
+        // Return freed pages to the OS: glibc keeps them in its arenas,
         // which would hide the memory saving (measured: ~1.3 GB retained).
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unsafe {
             libc::malloc_trim(0);
         }
         println!(
-            "Q8-resident projections + f16 embedding table in {:.2}s (resident {:.0} MiB anon)",
+            "Q8-resident projections + {:?} embedding table in {:.2}s (resident {:.0} MiB anon)",
+            table_dtype.unwrap_or(dtype),
             t0.elapsed().as_secs_f64(),
             rss_mib()
         );
@@ -94,19 +99,20 @@ pub fn load_model(
     Ok((model, cfg))
 }
 
-/// Read one projection weight from the store as f32 `[n, k]` data.
+/// Read one projection weight from the store as `[n, k]` data in `dtype`.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn read_projection(
     store: &mut SafetensorsStore,
     layer: usize,
     kind: crate::util::proj::ProjKind,
+    dtype: DType,
 ) -> Result<(usize, usize, TensorData)> {
     use burn_store::ModuleStore;
     let key = format!("layers.{layer}.{}", kind.key());
     let tensor = store
         .get_tensor(&key)?
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
-    let data = burn_store::bridge::to_data(tensor)?.convert_dtype(DType::F32);
+    let data = burn_store::bridge::to_data(tensor)?.convert_dtype(dtype);
     let [n, k] = data.shape().dims::<2>();
     Ok((k, n, data))
 }
@@ -137,10 +143,11 @@ fn load_cpu_projections(
         .per_block([32], ScaleDtype::F16);
     for layer in 0..cfg.num_hidden_layers {
         for kind in ProjKind::ALL {
-            let (_, _, data) = read_projection(&mut store, layer, kind)?;
+            let (_, _, data) = read_projection(&mut store, layer, kind, dtype)?;
             // The store holds PyTorch `[out, in]`; Burn's `Linear` wants `[in, out]`.
-            let t = Tensor::<2>::from_data(data, device).swap_dims(0, 1);
+            let t = Tensor::<2>::from_data(data, (&*device, dtype)).swap_dims(0, 1);
             let t = if quant_q8 {
+                let t = t.cast(DType::F32);
                 let range = compute_range(&scheme, &t, &Calibration::MinMax);
                 let qparams = compute_q_params(&scheme, range);
                 t.quantize(&scheme, qparams)
@@ -162,14 +169,17 @@ fn load_cpu_projections(
     Ok(())
 }
 
-/// Pack every projection weight straight into resident NPU buffers (fp16, HF
-/// `[out, in]` = `[N, K]` layout, no transpose) and keep only an f16 embedding
-/// table on the CPU. Pack-and-drop: the CPU never holds projection weights.
+/// Pack every projection weight straight into NPU buffers (reusing the model's
+/// native dtype — f32 packs a resident fp16 weight, bf16 stays native and uses
+/// the bf16 stream; HF `[out, in]` = `[N, K]` layout, no transpose). Pack-and-drop:
+/// the CPU never holds projection weights. The token-embedding table keeps the
+/// model dtype (f32 builds cast it to f16 to save the bytes).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn load_npu_projections(
     mut model: Qwen3Embedding,
     cfg: Qwen3Config,
     model_dir: &Path,
+    dtype: DType,
     npu_threads: usize,
     npu_attn: bool,
     device: &Device,
@@ -195,14 +205,14 @@ fn load_npu_projections(
     }
 
     for layer in 0..cfg.num_hidden_layers {
-        // o and down keep individual resident weights.
+        // o and down keep individual weights.
         for kind in [ProjKind::O, ProjKind::Down] {
-            let (k, n, data) = read_projection(&mut store, layer, kind)?;
+            let (k, n, data) = read_projection(&mut store, layer, kind, dtype)?;
             bytes += k * n * 2;
-            let id = burn_rocket::pack(Tensor::<2>::from_data(data, device));
+            let id = burn_rocket::pack(Tensor::<2>::from_data(data, (&*device, dtype)));
             *model.projection_mut(layer, kind) = Proj::Npu(id);
         }
-        // q|k|v and gate|up are packed as one resident weight each (one matmul,
+        // q|k|v and gate|up are packed as one weight each (one matmul,
         // one A-pack per group).
         let groups: [(FusedGroup, &[ProjKind]); 2] = [
             (FusedGroup::Qkv, &[ProjKind::Q, ProjKind::K, ProjKind::V]),
@@ -212,13 +222,13 @@ fn load_npu_projections(
             let mut parts = Vec::new();
             let mut k = 0usize;
             for &kind in kinds {
-                let (kk, n, data) = read_projection(&mut store, layer, kind)?;
+                let (kk, n, data) = read_projection(&mut store, layer, kind, dtype)?;
                 if k == 0 {
                     k = kk;
                 }
                 assert_eq!(k, kk, "fused group members must share K");
                 bytes += kk * n * 2;
-                parts.push(Tensor::<2>::from_data(data, device));
+                parts.push(Tensor::<2>::from_data(data, (&*device, dtype)));
             }
             model.set_fused_handle(layer, group, pack_group(parts));
         }
@@ -227,11 +237,21 @@ fn load_npu_projections(
         model.set_npu_attn(true);
         println!("NPU: attention offload enabled (n_head=16, n_kv=8, head_dim=128)");
     }
-    model.embed_table_to_f16();
+    if dtype == DType::F32 {
+        model.embed_table_to_f16();
+    } else {
+        model.set_quantized(true);
+        model.set_body_dtype(dtype);
+    }
     println!(
-        "NPU: packed {} projections into resident fp16 weights ({:.2} GiB, {} threads) in {:.2}s; \
+        "NPU: offloaded {} {} projections ({:.2} GiB, {} threads) in {:.2}s; \
          model ready in {:.2}s (resident {:.0} MiB anon)",
         cfg.num_hidden_layers * ProjKind::ALL.len(),
+        if dtype == DType::F32 {
+            "resident fp16"
+        } else {
+            "native bf16"
+        },
         bytes as f64 / (1u64 << 30) as f64,
         npu_threads,
         t_npu.elapsed().as_secs_f64(),
