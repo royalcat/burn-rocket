@@ -1,9 +1,13 @@
 //! Generic, family-agnostic helpers shared by every model in this crate.
 
+pub mod checkpoint;
 pub mod device;
+pub mod gguf;
+pub mod gguf_tokenizer;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub mod glue;
 pub mod http;
+pub mod hub;
 pub mod mem;
 pub mod proj;
 pub mod quant;

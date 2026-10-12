@@ -27,6 +27,7 @@ use burn_store::{
 use crate::gemma::config::Emb2Config;
 use crate::gemma::gemma4::model::{GenRoot, GenTextModel, Towers};
 use crate::gemma::layers::ClipBounds;
+use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 
 /// Pack the generation model's text projections into resident fp16 NPU weights
 /// for the prefill pass. `keep_cpu` retains the f32 copies (decode runs on the
@@ -95,12 +96,21 @@ impl LoadDtype {
     }
 
     /// Map the checkpoint's native float dtype to a `LoadDtype` (bf16 for the
-    /// current checkpoints; f32/f16 checkpoints stay in their own dtype).
+    /// current safetensors checkpoints; GGUF defaults to f16 projections/tables).
     pub fn from_native(model_dir: &Path) -> Self {
-        match crate::util::store::native_dtype(&model_dir.join("model.safetensors")) {
-            DType::F16 => LoadDtype::F16,
-            DType::F32 => LoadDtype::F32,
-            _ => LoadDtype::Bf16,
+        match crate::util::checkpoint::find_in_dir(model_dir) {
+            Ok(p)
+                if p.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gguf")) =>
+            {
+                LoadDtype::F16
+            }
+            Ok(p) => match crate::util::store::native_dtype(&p) {
+                DType::F16 => LoadDtype::F16,
+                DType::F32 => LoadDtype::F32,
+                _ => LoadDtype::Bf16,
+            },
+            Err(_) => LoadDtype::Bf16,
         }
     }
 }
@@ -253,6 +263,14 @@ pub fn load_gen_model(
     device: &Device,
     defer_towers: bool,
 ) -> Result<(GenRoot, Emb2Config)> {
+    // GGUF checkpoints: text via the checkpoint trait; QAT and the towers are
+    // safetensors, except the towers also load from a `mmproj-*.gguf` when present.
+    {
+        let mut ckpt = crate::util::checkpoint::open_in_dir(model_dir)?;
+        if ckpt.format() == "gguf" {
+            return load_gen_model_gguf(&mut ckpt, model_dir, dtype, device, defer_towers);
+        }
+    }
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
     let t0 = std::time::Instant::now();
     let mut model = GenRoot::new(&cfg.text_config, device);
@@ -393,9 +411,188 @@ pub fn load_gen_model(
     Ok((model, cfg))
 }
 
+/// Load the Gemma 4 text backbone from a GGUF checkpoint with the same dtype
+/// adapter as the safetensors path. Text-only (towers/QAT are safetensors).
+fn load_gen_model_gguf(
+    ckpt: &mut AnyCheckpoint,
+    model_dir: &std::path::Path,
+    dtype: LoadDtype,
+    device: &Device,
+    defer_towers: bool,
+) -> Result<(GenRoot, Emb2Config)> {
+    let cfg = Emb2Config::from_value(ckpt.config_json()?)?;
+    let t0 = std::time::Instant::now();
+    let mut model = GenRoot::new(&cfg.text_config, device);
+    let adapter = PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, dtype));
+    let result = ckpt.load_into_with(&mut model, Box::new(adapter))?;
+    // KV-shared layers never compute K/V, so their weights may be absent (the
+    // GGUF ships them anyway, in which case they load as unused).
+    let first_shared = cfg
+        .text_config
+        .num_hidden_layers
+        .saturating_sub(cfg.text_config.num_kv_shared_layers);
+    crate::util::store::check_load_report(&result, |name| is_shared_kv_param(name, first_shared))?;
+    println!(
+        "loaded {} tensors from gguf in {:.2}s (resident {:.0} MiB anon)",
+        result.applied.len(),
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    let mut model = match dtype {
+        LoadDtype::Q8 => quantize_gen(model)?,
+        LoadDtype::F16 => {
+            crate::gemma::layers::set_f16_weights(true);
+            model
+        }
+        LoadDtype::Bf16 => {
+            crate::gemma::layers::set_bf16_weights(true);
+            model
+        }
+        LoadDtype::F32 => model,
+    };
+    crate::gemma::layers::set_model_dtype(dtype.tensor_dtype());
+    if !defer_towers && let Some(mmproj) = find_mmproj(model_dir) {
+        load_towers_mmproj(&mut model, model_dir, &mmproj, device)?;
+    }
+    Ok((model, cfg))
+}
+
+/// Find a `mmproj-*.gguf` (or plain `mmproj.gguf`) in `model_dir`.
+fn find_mmproj(model_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cands: Vec<_> = std::fs::read_dir(model_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("mmproj"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    cands.sort();
+    cands.into_iter().next()
+}
+
+/// Load the vision/audio towers from a Gemma 4 `mmproj-*.gguf`. The towers always
+/// run in f32 (matching the safetensors path); QAT does not apply to GGUF.
+fn load_towers_mmproj(
+    model: &mut GenRoot,
+    model_dir: &std::path::Path,
+    mmproj: &std::path::Path,
+    device: &Device,
+) -> Result<()> {
+    let cfg =
+        Emb2Config::from_value(crate::util::checkpoint::open_in_dir(model_dir)?.config_json()?)?;
+    let vision_cfg = cfg
+        .vision_config
+        .as_ref()
+        .context("checkpoint has no vision_config")?;
+    let audio_cfg = cfg
+        .audio_config
+        .as_ref()
+        .context("checkpoint has no audio_config")?;
+    let mut ckpt = crate::util::checkpoint::AnyCheckpoint::Gguf(
+        crate::util::checkpoint::GgufCheckpoint::open_mmproj_gemma4(mmproj)?,
+    );
+    let vision_bounds = if vision_cfg.use_clipped_linears {
+        read_bounds_mmproj(&mut ckpt, "v", vision_cfg.num_hidden_layers, &VISION_PAIRS)?
+    } else {
+        Default::default()
+    };
+    let audio_bounds = if audio_cfg.use_clipped_linears {
+        read_bounds_mmproj(&mut ckpt, "a", audio_cfg.num_hidden_layers, &AUDIO_PAIRS)?
+    } else {
+        Default::default()
+    };
+    let t0 = std::time::Instant::now();
+    let mut root = TowerRoot {
+        model: Towers::new(
+            vision_cfg,
+            audio_cfg,
+            &vision_bounds,
+            &audio_bounds,
+            cfg.text_config.hidden_size,
+            device,
+        ),
+    };
+    let adapter = PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, LoadDtype::F32));
+    let result = ckpt.load_into_with(&mut root, Box::new(adapter))?;
+    crate::util::store::check_missing(&result, |_| false)?;
+    model.set_towers(root.model);
+    println!(
+        "towers: loaded from mmproj (f32) in {:.2}s (resident {:.0} MiB anon)",
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok(())
+}
+
+/// (mmproj clip prefix, tower module name) for the Gemma 4 vision tower.
+const VISION_PAIRS: [(&str, &str); 7] = [
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_out", "self_attn.o_proj"),
+    ("ffn_gate", "mlp.gate_proj"),
+    ("ffn_up", "mlp.up_proj"),
+    ("ffn_down", "mlp.down_proj"),
+];
+
+/// (mmproj clip prefix, tower module name) for the Gemma 4 audio tower.
+const AUDIO_PAIRS: [(&str, &str); 10] = [
+    ("attn_q", "self_attn.q_proj"),
+    ("attn_k", "self_attn.k_proj"),
+    ("attn_v", "self_attn.v_proj"),
+    ("attn_out", "self_attn.post"),
+    ("ffn_up", "feed_forward1.ffw_layer_1"),
+    ("ffn_down", "feed_forward1.ffw_layer_2"),
+    ("ffn_up_1", "feed_forward2.ffw_layer_1"),
+    ("ffn_down_1", "feed_forward2.ffw_layer_2"),
+    ("conv_pw1", "lconv1d.linear_start"),
+    ("conv_pw2", "lconv1d.linear_end"),
+];
+
+/// Clip bounds from the mmproj clip scalars, keyed `layers.{i}.{name}`.
+fn read_bounds_mmproj(
+    ckpt: &mut AnyCheckpoint,
+    letter: &str,
+    layers: usize,
+    pairs: &[(&str, &str)],
+) -> Result<std::collections::HashMap<String, ClipBounds>> {
+    let mut bounds = std::collections::HashMap::new();
+    for layer in 0..layers {
+        for (clip, name) in pairs {
+            let base = format!("{letter}.blk.{layer}.{clip}");
+            let mut read = |suffix: &str| -> Result<f32> {
+                let data = ckpt
+                    .get_raw(&format!("{base}.{suffix}"), DType::F32)?
+                    .ok_or_else(|| anyhow::anyhow!("missing clip scalar {base}.{suffix}"))?;
+                let v: Vec<f32> = data.try_to_vec()?;
+                v.first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("empty clip scalar {base}.{suffix}"))
+            };
+            bounds.insert(
+                format!("layers.{layer}.{name}"),
+                ClipBounds {
+                    input_min: read("input_min")?,
+                    input_max: read("input_max")?,
+                    output_min: read("output_min")?,
+                    output_max: read("output_max")?,
+                },
+            );
+        }
+    }
+    Ok(bounds)
+}
+
 /// QAT scale records by module path.
 pub type QatScales = std::collections::HashMap<String, crate::gemma::qat::ModuleScales>;
-
 /// Attach the per-dtype adapters shared by the main and towers-only load passes.
 fn with_load_adapters(
     store: SafetensorsStore,
@@ -429,6 +626,9 @@ pub fn load_towers(
 ) -> Result<()> {
     if model.has_towers() {
         return Ok(());
+    }
+    if let Some(mmproj) = find_mmproj(model_dir) {
+        return load_towers_mmproj(model, model_dir, &mmproj, device);
     }
     let cfg_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;

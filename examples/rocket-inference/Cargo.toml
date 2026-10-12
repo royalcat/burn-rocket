@@ -45,6 +45,10 @@ burn-store = { version = "=0.22.0", default-features = false, features = [
     "memmap",
 ] }
 tokenizers = "0.21"
+# GGUF checkpoint parsing (mmap path for zero-copy tensor access).
+gguf-rs = { version = "0.1", features = ["mmap"] }
+# Hugging Face Hub download client (blocking wrappers over its async core).
+hf-hub = { version = "1", features = ["blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 libc = "0.2"

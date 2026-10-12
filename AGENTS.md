@@ -207,7 +207,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
 | `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
-| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), safetensors load-report checks (`store`) |
+| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), and `hf-hub` model resolution (`hub`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
 | `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs` |
@@ -306,6 +306,51 @@ text, busy board): q8 CPU 34.5 s / 94 s user CPU -> q8+npu 21.4 s / 63 s
 (1.61x faster, 33 % less CPU); numerics vs HF f32 0.9996-0.9999 (text/image/
 audio), 0.9992 (video). Not yet done: f32 `--npu` on the board, NPU offload for
 the vision/audio towers, 8k-context NPU attention memory.
+
+## GGUF checkpoints + `-hf` (2026-10-12)
+
+`rocket-inference` loads **GGUF** checkpoints as well as safetensors, through a shared
+`Checkpoint` trait (`src/util/checkpoint.rs`): `SafetensorsCheckpoint`,
+`GgufCheckpoint` and the erased `AnyCheckpoint`. Tensors are exposed in the
+HF/PyTorch convention, so the same `PyTorchToBurnAdapter`-based chains apply to both
+formats; `pack_tensors()` + `AnyCheckpoint::load_into_with(adapter)` let a family
+supply its own adapter (gemma4's per-tensor `LoadDtypeAdapter`).
+
+- **Reader** (`src/util/gguf.rs`): `gguf-rs` parses metadata/tensor descriptors and we
+  mmap the file for zero-copy bytes; Q8_0/F16/BF16/F32/F64/I32 dequantize to f32.
+  NB `gguf-rs`'s `Tensor::size` is wrong for unquantized types above kind 9 (it
+  divides by a 256 block size) — `byte_len` computes the length instead. GGUF and HF
+  share the element memory order, so only shape labels reverse (no permutation).
+- **Config**: a sibling `config.json`, else the base repo's (fetched via hf-hub;
+  dense Gemma configs carry per-layer overrides GGUF metadata lacks), else
+  synthesized from GGUF metadata.
+- **Tokenizer** (`src/util/gguf_tokenizer.rs`): built from GGUF metadata — byte-level
+  BPE (Qwen) and SPM/unigram with `Metaspace` (Gemma). Byte-identical to the
+  reference `tokenizer.json` on all four families.
+- **Key maps** in `checkpoint.rs`: per-family GGUF→HF tables (Qwen3/Qwen3.5,
+  EmbeddingGemma 2, Gemma 4) plus the `clip` mmproj map for the towers.
+- **Semantic conversions** (GGUF's convention differs from HF's):
+  - qwen3.5 `ssm_a` = `-exp(A_log)` → `A_log = ln(-ssm_a)`;
+  - qwen3.5 transformer RMSNorm weights carry a `+1` unit offset (the SSM norm does not);
+  - audio `per_dim_scale` = `softplus(per_dim_scale)`;
+  - the vision patch embed flattens channels-last (a real `(out,c,h,w)→(out,h,w,c)` permute);
+  - depthwise conv `[k,C] → [C,1,k]`.
+- **mmproj towers**: `mmproj-*.gguf` (a `clip` file) loads the vision/audio towers with
+  their per-linear clip bounds; EmbeddingGemma 2 and Gemma 4. Gemma 4 text stays
+  safetensors/QAT-capable.
+- **`-hf`**: llama.cpp-style `-hf <owner>/<name>:<quant>` (quant required) resolves and
+  downloads the main file plus a matching `mmproj-<quant>.gguf`/`mmproj.gguf`
+  (`--mmproj`/`--revision` override) via `hf-hub` 1.0, then injects `--model-dir`
+  (still supported for local dirs). The file guess strips a trailing `-GGUF` from the
+  repo name (`X-GGUF` → `X-Q8_0.gguf`).
+
+Verified (GGUF vs the safetensors path, dev host): qwen3 Q8 cosine 0.9993;
+EmbeddingGemma 2 Q8 text 0.9990 / image 0.9996 / audio 0.9995 / video 0.9998 (mmproj);
+Gemma 4 Q8 text token-identical, image/audio coherent (mmproj); Qwen3.5 Q8 coherent
+chat. `-hf` tested end to end (text and mmproj image).
+
+Known gap: Gemma 4 mmproj audio soft-token count differs by 1 (142 vs 141) although the
+output is coherent — TODO.
 
 ## Rebuild + deploy to the board
 

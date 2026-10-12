@@ -117,8 +117,8 @@ impl Args {
     }
 }
 
-/// Build the intent model + tokenizer for `gen`.
-fn load_intent(args: &Args) -> Result<(IntentModel, Tokenizer)> {
+/// Build the intent model + tokenizer + stop ids for `gen`.
+fn load_intent(args: &Args) -> Result<(IntentModel, Tokenizer, Vec<u32>)> {
     let device = device(&args.backend)?;
     let opts = IntentLoadOptions {
         npu: args.npu,
@@ -135,7 +135,7 @@ fn load_intent(args: &Args) -> Result<(IntentModel, Tokenizer)> {
         args.npu_decode,
     )?;
     println!("intent model resident {:.0} MiB anon", rss_mib());
-    Ok((loaded.model, loaded.tokenizer))
+    Ok((loaded.model, loaded.tokenizer, loaded.stop_ids))
 }
 
 /// ChatML wrapper identical to the model's Ollama template.
@@ -144,7 +144,7 @@ fn chat_wrap(text: &str) -> String {
 }
 
 fn run_gen(args: &Args) -> Result<()> {
-    let (mut model, tokenizer) = load_intent(args)?;
+    let (mut model, tokenizer, stops) = load_intent(args)?;
     let text = args.input_text()?;
     let prompt = if args.raw { text } else { chat_wrap(&text) };
     let enc = tokenizer
@@ -158,7 +158,6 @@ fn run_gen(args: &Args) -> Result<()> {
             args.max_tokens
         );
     }
-    let stops = loader::stop_ids(&args.model_dir, &tokenizer, &model.cfg);
     if let Some(path) = &args.dump_hidden {
         let hidden = model.forward_hidden(&ids);
         let layers: Vec<Vec<f32>> = hidden

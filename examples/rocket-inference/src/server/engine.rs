@@ -65,15 +65,40 @@ impl Family {
     }
 }
 
-/// Detect the model family from a checkpoint's `config.json` (`model_type`).
+/// Detect the model family from a checkpoint's `config.json` (`model_type`), or
+/// from a GGUF file's `general.architecture`.
 pub fn detect_family(model_dir: &Path) -> Result<Family> {
     let path = model_dir.join("config.json");
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    detect_from_value(&json)
-        .with_context(|| format!("detect the model family in {}", model_dir.display()))
+    if path.exists() {
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        return detect_from_value(&json)
+            .with_context(|| format!("detect the model family in {}", model_dir.display()));
+    }
+    // No config.json: assume a GGUF directory and read the architecture.
+    let ck = crate::util::checkpoint::open_in_dir(model_dir)?;
+    detect_from_arch(ck.arch()).with_context(|| {
+        format!(
+            "detect the model family in {} (GGUF architecture)",
+            model_dir.display()
+        )
+    })
+}
+
+fn detect_from_arch(arch: Option<&str>) -> Result<Family> {
+    match arch {
+        Some("qwen3") => Ok(Family::Qwen3Embed),
+        Some("gemma-embedding2") => Ok(Family::Emb2),
+        Some("qwen35") => Ok(Family::Intent),
+        Some("gemma4") => Ok(Family::Gemma4),
+        Some(other) => bail!(
+            "unsupported GGUF architecture '{other}' \
+             (pass --family qwen3|embeddinggemma|intent|gemma4)"
+        ),
+        None => bail!("checkpoint is neither config.json nor GGUF"),
+    }
 }
 
 fn detect_from_value(json: &serde_json::Value) -> Result<Family> {

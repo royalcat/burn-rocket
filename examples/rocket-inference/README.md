@@ -29,15 +29,36 @@ measurements and verification results.
 |---|---|
 | `src/main.rs`, `src/cli.rs` | dispatch (`serve` + the four families), shared flag parser, usage |
 | `src/server/` | the one server: model detection, capability routing, OpenAI + multimodal + Ollama endpoints |
-| `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache` |
+| `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache`, the shared checkpoint trait + GGUF access + tokenizer, `hf-hub` resolution |
 | `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loaders (f32/Q8/NPU), CLI |
-| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, safetensors loader + NPU pack-and-drop, CLI |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, loader (safetensors/GGUF) + NPU pack-and-drop, CLI |
 | `src/gemma/` | shared Gemma 4 building blocks: config schemas, low-RAM/NPU linear helpers (`layers`), QAT (`qat`), media decoding, USM audio frontend, vision/audio towers, input assembly |
 | `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders, CLI |
 | `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, CLI |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
 | `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
+
+## GGUF models (`-hf`)
+
+Every family also loads **GGUF** checkpoints, locally or straight from the Hub:
+
+```sh
+# llama.cpp-style <owner>/<name>:<quant> (quant required). Downloads the main GGUF
+# plus a matching mmproj-<quant>.gguf for the multimodal families, then runs.
+./rocket-inference qwen3 embed -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 --quant q8 --text "Hello"
+./rocket-inference gemma embed -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --quant q8 --image data/cat.jpeg
+./rocket-inference gemma gen   -hf unsloth/gemma-4-E2B-it-GGUF:Q8_0 --text "Hi"
+./rocket-inference intent gen  -hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0 --text "Hello!"
+
+# a local directory with a *.gguf (and optionally mmproj-*.gguf) works the same
+./rocket-inference serve --model-dir /path/to/gguf-dir --port 8383
+```
+
+`--mmproj <quant|file>` overrides the mmproj choice, `--revision` pins a revision, and
+`HF_HOME`/`HF_HUB_CACHE`/`HF_TOKEN` configure the cache and auth. The tokenizer and
+config come from the GGUF itself (config falls back to the base repo's `config.json`
+for the dense Gemma checkpoints). Main quant target: Q8_0; F16/BF16/F32 also load.
 
 ## Build
 

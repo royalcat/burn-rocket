@@ -13,8 +13,8 @@ use crate::cli::FlagArgs;
 use crate::gemma::embeddinggemma::load::{NpuOpts, load_model, load_towers};
 use crate::gemma::embeddinggemma::model::{Emb2Model, stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
+use crate::util::checkpoint::Checkpoint;
 use crate::util::device;
-use crate::util::store::native_dtype;
 
 /// `(input ids, optional media soft tokens, sequence length)`.
 type PreparedInput = (Tensor<2, Int>, Option<(Vec<usize>, Tensor<2>)>, usize);
@@ -219,7 +219,7 @@ impl Args {
     /// `--dtype` overrides it.
     fn dtype(&self) -> DType {
         self.dtype
-            .unwrap_or_else(|| native_dtype(&self.model_dir.join("model.safetensors")))
+            .unwrap_or_else(|| crate::util::checkpoint::default_dtype_in_dir(&self.model_dir))
     }
 
     fn input_text(&self) -> Result<String> {
@@ -234,8 +234,9 @@ impl Args {
     }
 
     fn tokenizer(&self) -> Result<Tokenizer> {
-        Tokenizer::from_file(self.model_dir.join("tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))
+        crate::util::checkpoint::open_in_dir(&self.model_dir)?
+            .tokenizer()
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e:#}"))
     }
 
     /// Resolve the task prompt prefix from `config_sentence_transformers.json`

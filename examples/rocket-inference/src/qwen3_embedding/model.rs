@@ -81,9 +81,10 @@ pub struct Qwen3Config {
 }
 
 impl Qwen3Config {
-    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&text)?)
+    /// Parse the config from an in-memory HF-style JSON value (the `config.json`
+    /// contents, or the shape the GGUF backend synthesizes).
+    pub fn from_value(value: serde_json::Value) -> anyhow::Result<Self> {
+        Ok(serde_json::from_value(value)?)
     }
 }
 

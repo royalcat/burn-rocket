@@ -25,6 +25,8 @@ fn main() -> Result<()> {
         eprintln!("{}", cli::USAGE);
         std::process::exit(2);
     };
+    let rest = util::hub::resolve_args(it)?;
+    let it = rest.into_iter();
     match family.as_str() {
         "serve" => server::cli::run(it),
         "qwen3" => qwen3_embedding::cli::run(it),

@@ -7,14 +7,12 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
-use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
 use crate::qwen3_embedding::load::load_model;
 use crate::qwen3_embedding::model::{stage_stats, stage_stats_reset};
 use crate::util::device;
 use crate::util::rope::RopeCache;
-use crate::util::store::native_dtype;
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut it = it;
@@ -146,7 +144,7 @@ impl Args {
     /// `--dtype` overrides it.
     fn dtype(&self) -> DType {
         self.dtype
-            .unwrap_or_else(|| native_dtype(&self.model_dir.join("model.safetensors")))
+            .unwrap_or_else(|| crate::util::checkpoint::default_dtype_in_dir(&self.model_dir))
     }
 
     fn input_text(&self) -> Result<String> {
@@ -162,8 +160,8 @@ impl Args {
 }
 
 fn tokenize(args: &Args) -> Result<Vec<u32>> {
-    let tokenizer = Tokenizer::from_file(args.model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    use crate::util::checkpoint::Checkpoint;
+    let tokenizer = crate::util::checkpoint::open_in_dir(&args.model_dir)?.tokenizer()?;
     let text = args.input_text()?;
     let enc = tokenizer
         .encode(text.as_str(), true)
@@ -177,8 +175,9 @@ fn tokenize(args: &Args) -> Result<Vec<u32>> {
 
 fn run_bench(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
+    let mut ckpt = crate::util::checkpoint::open_in_dir(&args.model_dir)?;
     let (model, cfg) = load_model(
-        &args.model_dir,
+        &mut ckpt,
         args.dtype(),
         args.quant_q8,
         args.npu,
@@ -319,8 +318,9 @@ fn run_tokenize(args: &Args) -> Result<()> {
 
 fn run_embed(args: &Args) -> Result<()> {
     let device = device(&args.backend)?;
+    let mut ckpt = crate::util::checkpoint::open_in_dir(&args.model_dir)?;
     let (model, cfg) = load_model(
-        &args.model_dir,
+        &mut ckpt,
         args.dtype(),
         args.quant_q8,
         args.npu,

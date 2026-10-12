@@ -14,8 +14,8 @@ use crate::gemma::inputs;
 use crate::qwen3_embedding::load as qwen3_load;
 use crate::qwen35_intent::loader as intent_loader;
 use crate::qwen35_intent::loader::IntentLoadOptions;
+use crate::util::checkpoint::Checkpoint;
 use crate::util::device;
-use crate::util::store::native_dtype;
 
 use super::Settings;
 use super::engine::{
@@ -33,9 +33,9 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
 
     let device = device(&args.backend())?;
     let tokenizer = || -> Result<Tokenizer> {
-        let path = model_dir.join("tokenizer.json");
-        Tokenizer::from_file(&path)
-            .map_err(|e| anyhow::anyhow!("tokenizer {}: {e}", path.display()))
+        crate::util::checkpoint::open_in_dir(&model_dir)?
+            .tokenizer()
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e:#}"))
     };
 
     // Per-family defaults for the server-side knobs.
@@ -64,11 +64,12 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     // own loader).
     let dtype = args
         .dtype
-        .unwrap_or_else(|| native_dtype(&model_dir.join("model.safetensors")));
+        .unwrap_or_else(|| crate::util::checkpoint::default_dtype_in_dir(&model_dir));
     let (engine, capabilities) = match family {
         Family::Qwen3Embed => {
+            let mut ckpt = crate::util::checkpoint::open_in_dir(&model_dir)?;
             let (model, cfg) = qwen3_load::load_model(
-                &model_dir,
+                &mut ckpt,
                 dtype,
                 args.quant.unwrap_or(false),
                 npu,
@@ -76,7 +77,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 args.npu_attn.unwrap_or(true),
                 &device,
             )?;
-            let tokenizer = tokenizer()?;
+            let tokenizer = ckpt.tokenizer()?;
             (
                 Engine::Qwen3(Box::new(Qwen3Engine {
                     model,

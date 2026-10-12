@@ -57,6 +57,12 @@ impl Emb2Config {
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
     }
+
+    /// Parse from an in-memory HF-style JSON value (also the shape the GGUF
+    /// backend synthesizes).
+    pub fn from_value(value: serde_json::Value) -> anyhow::Result<Self> {
+        serde_json::from_value(value).context("parse EmbeddingGemma config")
+    }
 }
 
 /// Per-layer attention override, keyed by layer index (zero-padded strings in

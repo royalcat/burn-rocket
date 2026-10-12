@@ -1,7 +1,8 @@
 //! Qwen3-Embedding model loading: f32/f16 weights, Q8 low-RAM (`--quant q8`)
-//! and pack-and-drop NPU loading (`--npu`).
+//! and pack-and-drop NPU loading (`--npu`). The weight source is a
+//! [`AnyCheckpoint`] (safetensors or GGUF); tensors arrive in the HF/PyTorch
+//! convention, so both formats share this code.
 
-use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -9,15 +10,13 @@ use burn::prelude::*;
 use burn::tensor::DType;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 use burn::tensor::TensorData;
-use burn_store::{
-    FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
-};
 
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
+use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
 pub fn load_model(
-    model_dir: &Path,
+    ckpt: &mut AnyCheckpoint,
     dtype: DType,
     quant_q8: bool,
     npu: bool,
@@ -25,57 +24,39 @@ pub fn load_model(
     npu_attn: bool,
     device: &Device,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
-    let cfg = Qwen3Config::from_file(&model_dir.join("config.json"))?;
+    let cfg = Qwen3Config::from_value(ckpt.config_json()?)?;
     let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
     let mut model = Qwen3Embedding::new(&cfg, device);
     let t0 = Instant::now();
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
-        .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
-    let result = model
-        .load_from(&mut store)
-        .with_context(|| format!("load {}", model_dir.display()))?;
+    let result = ckpt
+        .load_into(&mut model, dtype)
+        .with_context(|| format!("load {} checkpoint", ckpt.format()))?;
     crate::util::store::check_load_report(&result, |_| false)?;
     println!(
-        "loaded {} tensors as {:?} in {:.2}s",
+        "loaded {} tensors as {:?} from {} in {:.2}s",
         result.applied.len(),
         dtype,
+        ckpt.format(),
         t0.elapsed().as_secs_f64()
     );
-    drop(store);
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if npu {
         if quant_q8 {
             bail!("--npu packs its own weights; --quant q8 is not applicable");
         }
-        return load_npu_projections(
-            model,
-            cfg,
-            model_dir,
-            dtype,
-            npu_threads,
-            npu_attn,
-            device,
-            t0,
-        );
+        return load_npu_projections(ckpt, model, cfg, dtype, npu_threads, npu_attn, device, t0);
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if npu {
         bail!("--npu requires an aarch64 build with --features npu");
     }
     // NPU builds skip the projection fields in the module tree (the NPU loader
-    // packs them straight from the store); load them here for the CPU paths.
+    // packs them straight from the checkpoint); load them here for the CPU paths.
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    load_cpu_projections(&mut model, &cfg, model_dir, dtype, quant_q8, device)?;
+    load_cpu_projections(&mut model, ckpt, &cfg, dtype, quant_q8, device)?;
     if quant_q8 {
         use crate::util::quant::{LowRam, param_group};
         let t0 = Instant::now();
-        // Low-RAM mode. Projection weights stay Q8_0-quantized (symmetric int8,
-        // 32-value blocks, f16 block scales = llama.cpp's Q8_0); the forward dequantizes
-        // each weight on the fly, so only the current layer's weights are materialized
-        // (~62 MB) instead of all of them. The token-embedding table stays in the
-        // model's native dtype (16-bit for bf16/f16 models); with an f32 body it is
-        // kept in f16 (exact for bf16-sourced values in range, and half the bytes)
-        // and gathered rows are cast back per forward.
         let proj_group = param_group(r"\.(q|k|v|o|gate|up|down)_proj\.weight$")?;
         let embed_group = param_group(r"embed_tokens\.weight$")?;
         let table_dtype = (dtype == DType::F32).then_some(DType::F16);
@@ -83,8 +64,6 @@ pub fn load_model(
         model = model.map(&mut mapper);
         model.set_quantized(true);
         model.set_body_dtype(dtype);
-        // Return freed pages to the OS: glibc keeps them in its arenas,
-        // which would hide the memory saving (measured: ~1.3 GB retained).
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unsafe {
             libc::malloc_trim(0);
@@ -99,33 +78,29 @@ pub fn load_model(
     Ok((model, cfg))
 }
 
-/// Read one projection weight from the store as `[n, k]` data in `dtype`.
+/// Read one projection weight as `[n, k]` HF-convention data in `dtype`.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn read_projection(
-    store: &mut SafetensorsStore,
+    ckpt: &mut AnyCheckpoint,
     layer: usize,
     kind: crate::util::proj::ProjKind,
     dtype: DType,
 ) -> Result<(usize, usize, TensorData)> {
-    use burn_store::ModuleStore;
     let key = format!("layers.{layer}.{}", kind.key());
-    let tensor = store
-        .get_tensor(&key)?
+    let data = ckpt
+        .get(&key, dtype)?
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))?;
-    let data = burn_store::bridge::to_data(tensor)?.convert_dtype(dtype);
     let [n, k] = data.shape().dims::<2>();
     Ok((k, n, data))
 }
 
 /// In NPU builds the projection fields are `#[module(skip)]` (the NPU loader packs
-/// them straight from the store), so CPU-mode runs must load them explicitly.
-/// With `quant_q8` the weights are quantized on the fly, matching the low-RAM mode
-/// of the non-NPU build.
+/// them straight from the checkpoint), so CPU-mode runs must load them explicitly.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn load_cpu_projections(
     model: &mut Qwen3Embedding,
+    ckpt: &mut AnyCheckpoint,
     cfg: &Qwen3Config,
-    model_dir: &Path,
     dtype: DType,
     quant_q8: bool,
     device: &Device,
@@ -137,14 +112,13 @@ fn load_cpu_projections(
     };
 
     let t0 = Instant::now();
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
     let scheme = QuantScheme::default()
         .with_value(QuantValue::Q8S)
         .per_block([32], ScaleDtype::F16);
     for layer in 0..cfg.num_hidden_layers {
         for kind in ProjKind::ALL {
-            let (_, _, data) = read_projection(&mut store, layer, kind, dtype)?;
-            // The store holds PyTorch `[out, in]`; Burn's `Linear` wants `[in, out]`.
+            let (_, _, data) = read_projection(ckpt, layer, kind, dtype)?;
+            // The checkpoint holds HF `[out, in]`; Burn's `Linear` wants `[in, out]`.
             let t = Tensor::<2>::from_data(data, (&*device, dtype)).swap_dims(0, 1);
             let t = if quant_q8 {
                 let t = t.cast(DType::F32);
@@ -169,16 +143,16 @@ fn load_cpu_projections(
     Ok(())
 }
 
-/// Pack every projection weight straight into NPU buffers (reusing the model's
-/// native dtype — f32 packs a resident fp16 weight, bf16 stays native and uses
-/// the bf16 stream; HF `[out, in]` = `[N, K]` layout, no transpose). Pack-and-drop:
-/// the CPU never holds projection weights. The token-embedding table keeps the
-/// model dtype (f32 builds cast it to f16 to save the bytes).
+/// Pack every projection weight straight into NPU buffers (HF `[out, in]` =
+/// `[N, K]` layout, no transpose). Pack-and-drop: the CPU never holds projection
+/// weights. The token-embedding table keeps the model dtype (f32 builds cast it
+/// to f16 to save the bytes).
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
 fn load_npu_projections(
+    ckpt: &mut AnyCheckpoint,
     mut model: Qwen3Embedding,
     cfg: Qwen3Config,
-    model_dir: &Path,
     dtype: DType,
     npu_threads: usize,
     npu_attn: bool,
@@ -191,7 +165,6 @@ fn load_npu_projections(
         .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
     crate::util::glue::set_glue(true);
 
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
     let t_npu = Instant::now();
     let mut bytes = 0usize;
 
@@ -206,15 +179,12 @@ fn load_npu_projections(
     }
 
     for layer in 0..cfg.num_hidden_layers {
-        // o and down keep individual weights.
         for kind in [ProjKind::O, ProjKind::Down] {
-            let (k, n, data) = read_projection(&mut store, layer, kind, dtype)?;
+            let (k, n, data) = read_projection(ckpt, layer, kind, dtype)?;
             bytes += k * n * 2;
             let id = burn_rocket::pack(Tensor::<2>::from_data(data, (&*device, dtype)));
             *model.projection_mut(layer, kind) = Proj::Npu(id);
         }
-        // q|k|v and gate|up are packed as one weight each (one matmul,
-        // one A-pack per group).
         let groups: [(FusedGroup, &[ProjKind]); 2] = [
             (FusedGroup::Qkv, &[ProjKind::Q, ProjKind::K, ProjKind::V]),
             (FusedGroup::GateUp, &[ProjKind::Gate, ProjKind::Up]),
@@ -223,7 +193,7 @@ fn load_npu_projections(
             let mut parts = Vec::new();
             let mut k = 0usize;
             for &kind in kinds {
-                let (kk, n, data) = read_projection(&mut store, layer, kind, dtype)?;
+                let (kk, n, data) = read_projection(ckpt, layer, kind, dtype)?;
                 if k == 0 {
                     k = kk;
                 }

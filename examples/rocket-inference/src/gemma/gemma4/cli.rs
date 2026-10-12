@@ -4,13 +4,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use tokenizers::Tokenizer;
 
 use crate::cli::FlagArgs;
 use crate::gemma::gemma4::chat::{self, gen_eos};
 use crate::gemma::gemma4::loader::{self, LoadDtype};
 use crate::gemma::gemma4::model::{gen_stage_stats, gen_stage_stats_reset};
 use crate::gemma::inputs;
+use crate::util::checkpoint::Checkpoint;
 use crate::util::device;
 
 pub fn run(cmd: &str, it: impl Iterator<Item = String>) -> Result<()> {
@@ -196,8 +196,7 @@ fn run_gen(args: &Args) -> Result<()> {
         bail!("--npu requires an aarch64 build with --features npu");
     }
     let lm_head = loader::build_lm_head(model.text(), dtype.tensor_dtype(), &device);
-    let tokenizer = Tokenizer::from_file(args.gen_model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let tokenizer = crate::util::checkpoint::open_in_dir(&args.gen_model_dir)?.tokenizer()?;
 
     let messages: Vec<chat::Message> = match &args.messages {
         Some(json) => serde_json::from_str::<Vec<MessageJson>>(json)

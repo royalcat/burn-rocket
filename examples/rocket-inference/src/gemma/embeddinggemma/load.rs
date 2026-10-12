@@ -9,12 +9,10 @@ use burn::prelude::*;
 use burn::tensor::DType;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 use burn::tensor::TensorData;
-use burn_store::{
-    FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
-};
 
 use crate::gemma::config::Emb2Config;
 use crate::gemma::embeddinggemma::model::{Emb2Model, Towers};
+use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
 /// NPU offload options (`--npu` and its sub-flags).
@@ -46,7 +44,8 @@ pub fn load_model(
     defer_towers: bool,
     device: &Device,
 ) -> Result<(Emb2Model, Emb2Config)> {
-    let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
+    let mut ckpt = crate::util::checkpoint::open_in_dir(model_dir)?;
+    let cfg = Emb2Config::from_value(ckpt.config_json()?)?;
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if npu.is_some() {
         bail!("--npu requires an aarch64 build with --features npu");
@@ -54,36 +53,29 @@ pub fn load_model(
     if dtype == DType::F16 {
         bail!(
             "--dtype f16 is not numerically supported for EmbeddingGemma 2 \
-             (RMSNorm/softmax/PLE precision): cosine drops to 0.98 (text) / 0.70 (image) \
+             can produce NaN and (RMSNorm/softmax/PLE precision): cosine drops to 0.98 (text) / 0.70 (image) \
              vs the f32 reference; use f32 or the native bf16"
         );
     }
     crate::gemma::layers::set_model_dtype(dtype);
-    // Both configs are still required: text-only checkpoints are not supported
-    // (the towers only load later with `--defer-towers`).
-    cfg.vision_config
-        .as_ref()
-        .context("checkpoint has no vision_config (text-only checkpoints are not supported yet)")?;
-    cfg.audio_config
-        .as_ref()
-        .context("checkpoint has no audio_config (text-only checkpoints are not supported yet)")?;
     let t0 = Instant::now();
     let mut model = Emb2Model::new(&cfg.text_config, device);
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
-        .allow_partial(true)
-        .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
-    let result = model
-        .load_from(&mut store)
-        .with_context(|| format!("load {}", model_dir.display()))?;
+    let result = ckpt.load_into(&mut model, dtype).with_context(|| {
+        format!(
+            "load {} text backbone from {}",
+            ckpt.format(),
+            model_dir.display()
+        )
+    })?;
     crate::util::store::check_load_report(&result, |_| false)?;
     println!(
-        "loaded {} tensors as {:?} in {:.2}s (resident {:.0} MiB anon)",
+        "loaded {} text tensors as {:?} from {} in {:.2}s (resident {:.0} MiB anon)",
         result.applied.len(),
         dtype,
+        ckpt.format(),
         t0.elapsed().as_secs_f64(),
         rss_mib()
     );
-    drop(store);
     if defer_towers {
         println!("towers: deferred (load on the first media request)");
     }
@@ -100,7 +92,7 @@ pub fn load_model(
         if quant_q8 && !opts.int8 {
             model = quantize_low_ram(model)?;
         }
-        if !defer_towers {
+        if !defer_towers && towers_available(model_dir) {
             load_towers(&mut model, model_dir, dtype, quant_q8 && !opts.int8, device)?;
         }
         return load_npu_text(model, cfg, opts, device);
@@ -109,10 +101,16 @@ pub fn load_model(
     if quant_q8 {
         model = quantize_low_ram(model)?;
     }
-    if !defer_towers {
+    if !defer_towers && towers_available(model_dir) {
         load_towers(&mut model, model_dir, dtype, quant_q8, device)?;
     }
     Ok((model, cfg))
+}
+
+/// Whether a towers checkpoint is present: a safetensors `model.safetensors` or a
+/// GGUF `mmproj-*.gguf`.
+fn towers_available(model_dir: &Path) -> bool {
+    model_dir.join("model.safetensors").exists() || find_mmproj(model_dir).is_some()
 }
 
 /// Load the vision/audio towers into `model` (a no-op once they are present).
@@ -131,7 +129,18 @@ pub fn load_towers(
     if model.has_towers() {
         return Ok(());
     }
-    let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
+    if let Some(mmproj) = find_mmproj(model_dir) {
+        return load_towers_mmproj(model, model_dir, &mmproj, dtype, quant_q8, device);
+    }
+    let path = model_dir.join("model.safetensors");
+    if !path.exists() {
+        bail!(
+            "no vision/audio towers checkpoint in {} (GGUF multimodal towers are not wired yet)",
+            model_dir.display()
+        );
+    }
+    let mut ckpt = crate::util::checkpoint::open(&path)?;
+    let cfg = Emb2Config::from_value(ckpt.config_json()?)?;
     let vision_cfg = cfg
         .vision_config
         .as_ref()
@@ -140,7 +149,7 @@ pub fn load_towers(
         .audio_config
         .as_ref()
         .context("checkpoint has no audio_config")?;
-    let audio_bounds = read_audio_clip_bounds(model_dir, audio_cfg)?;
+    let audio_bounds = read_audio_clip_bounds(&mut ckpt, audio_cfg)?;
     let t0 = Instant::now();
     let mut towers = Towers::new(
         vision_cfg,
@@ -149,16 +158,12 @@ pub fn load_towers(
         cfg.text_config.hidden_size,
         device,
     );
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"))
-        .allow_partial(true)
-        .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
-    let result = towers
-        .load_from(&mut store)
+    let result = ckpt
+        .load_into(&mut towers, dtype)
         .with_context(|| format!("load towers from {}", model_dir.display()))?;
     // The pass sees the whole checkpoint; only the towers' own parameters are in
     // the tree, so a missing one is an error and the rest report as unused.
     crate::util::store::check_missing(&result, |_| false)?;
-    drop(store);
     if quant_q8 {
         use crate::util::quant::LowRam;
         let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
@@ -174,6 +179,114 @@ pub fn load_towers(
         rss_mib()
     );
     Ok(())
+}
+
+/// Find a `mmproj-*.gguf` (or plain `mmproj.gguf`) in `model_dir`.
+fn find_mmproj(model_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut cands: Vec<_> = std::fs::read_dir(model_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+                && p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("mmproj"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    cands.sort();
+    cands.into_iter().next()
+}
+
+/// Load the vision/audio towers from a `clip` `mmproj-*.gguf` (GGUF checkpoints).
+fn load_towers_mmproj(
+    model: &mut Emb2Model,
+    model_dir: &Path,
+    mmproj_path: &Path,
+    dtype: DType,
+    quant_q8: bool,
+    device: &Device,
+) -> Result<()> {
+    let cfg =
+        Emb2Config::from_value(crate::util::checkpoint::open_in_dir(model_dir)?.config_json()?)?;
+    let vision_cfg = cfg
+        .vision_config
+        .as_ref()
+        .context("config has no vision_config")?;
+    let audio_cfg = cfg
+        .audio_config
+        .as_ref()
+        .context("config has no audio_config")?;
+    let mut ckpt = crate::util::checkpoint::GgufCheckpoint::open_mmproj(mmproj_path)?;
+    let audio_bounds = read_audio_clip_bounds_mmproj(&mut ckpt, audio_cfg)?;
+    let t0 = Instant::now();
+    let mut towers = Towers::new(
+        vision_cfg,
+        audio_cfg,
+        &audio_bounds,
+        cfg.text_config.hidden_size,
+        device,
+    );
+    let result = ckpt.load_into(&mut towers, dtype)?;
+    crate::util::store::check_missing(&result, |_| false)?;
+    if quant_q8 {
+        use crate::util::quant::LowRam;
+        let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
+        towers = towers.map(&mut mapper);
+        crate::util::trim_heap();
+    }
+    model.set_towers(towers);
+    println!(
+        "towers: loaded from mmproj ({:?}{}) in {:.2}s (resident {:.0} MiB anon)",
+        dtype,
+        if quant_q8 { ", q8-resident" } else { "" },
+        t0.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    Ok(())
+}
+
+/// Audio `Gemma4ClippableLinear` bounds from the mmproj clip scalars.
+fn read_audio_clip_bounds_mmproj(
+    ckpt: &mut crate::util::checkpoint::GgufCheckpoint,
+    cfg: &crate::gemma::config::AudioConfig,
+) -> Result<std::collections::HashMap<String, crate::gemma::layers::ClipBounds>> {
+    // (mmproj module prefix, tower module name).
+    const PAIRS: [(&str, &str); 10] = [
+        ("attn_q", "self_attn.q_proj"),
+        ("attn_k", "self_attn.k_proj"),
+        ("attn_v", "self_attn.v_proj"),
+        ("attn_out", "self_attn.post"),
+        ("ffn_up", "feed_forward1.ffw_layer_1"),
+        ("ffn_down", "feed_forward1.ffw_layer_2"),
+        ("ffn_up_1", "feed_forward2.ffw_layer_1"),
+        ("ffn_down_1", "feed_forward2.ffw_layer_2"),
+        ("conv_pw1", "lconv1d.linear_start"),
+        ("conv_pw2", "lconv1d.linear_end"),
+    ];
+    let mut bounds = std::collections::HashMap::new();
+    for layer in 0..cfg.num_hidden_layers {
+        for (clip, name) in PAIRS {
+            let base = format!("a.blk.{layer}.{clip}");
+            let mut read = |suffix: &str| -> Result<f32> {
+                let data = ckpt
+                    .get_raw(&format!("{base}.{suffix}"), DType::F32)?
+                    .ok_or_else(|| anyhow::anyhow!("missing clip scalar {base}.{suffix}"))?;
+                let v: Vec<f32> = data.try_to_vec()?;
+                v.first()
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("empty clip scalar {base}.{suffix}"))
+            };
+            let clipb = crate::gemma::layers::ClipBounds {
+                input_min: read("input_min")?,
+                input_max: read("input_max")?,
+                output_min: read("output_min")?,
+                output_max: read("output_max")?,
+            };
+            bounds.insert(format!("layers.{layer}.{name}"), clipb);
+        }
+    }
+    Ok(bounds)
 }
 
 /// Pack the text backbone's projections into resident NPU buffers (HF `[N, K]`
@@ -296,16 +409,13 @@ fn projection_group() -> Result<burn::module::ParamGroup> {
 /// scalars) straight from the checkpoint, keyed by module path relative to
 /// `audio_tower` (e.g. `layers.0.feed_forward1.ffw_layer_1`).
 fn read_audio_clip_bounds(
-    model_dir: &Path,
+    ckpt: &mut AnyCheckpoint,
     cfg: &crate::gemma::config::AudioConfig,
 ) -> Result<std::collections::HashMap<String, crate::gemma::layers::ClipBounds>> {
-    use burn_store::ModuleStore;
-    let mut store = SafetensorsStore::from_file(model_dir.join("model.safetensors"));
     let mut read = |key: &str| -> Result<f32> {
-        let tensor = store
-            .get_tensor(key)?
+        let data = ckpt
+            .get(key, DType::F32)?
             .ok_or_else(|| anyhow::anyhow!("missing clip scalar {key}"))?;
-        let data = burn_store::bridge::to_data(tensor)?.convert_dtype(DType::F32);
         let v: Vec<f32> = data.try_to_vec()?;
         v.first()
             .copied()

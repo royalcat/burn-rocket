@@ -15,6 +15,7 @@
 
 use std::time::Instant;
 
+use anyhow::Context;
 use burn::prelude::*;
 use burn::tensor::activation::{sigmoid, silu, softmax, softplus};
 use burn::tensor::module::attention;
@@ -79,9 +80,12 @@ pub struct IntentConfigFile {
 }
 
 impl IntentTextConfig {
-    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
-        let file: IntentConfigFile = serde_json::from_str(&text)?;
+    /// Parse the text config from an HF-style JSON value: the full checkpoint
+    /// config with a nested `text_config` (the same shape the GGUF backend
+    /// fetches/synthesizes).
+    pub fn from_value(value: serde_json::Value) -> anyhow::Result<Self> {
+        let file: IntentConfigFile =
+            serde_json::from_value(value).context("parse intent text_config")?;
         Ok(file.text_config)
     }
 
