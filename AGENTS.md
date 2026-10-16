@@ -172,11 +172,15 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
   Fixed-strategy kernels are 3.8 GF/s. The flex+NPU configuration remains the fastest; the
   GPU lever is closed until CubeCL/panvk improve.
-- **CI images** (2026-10-10): `.github/workflows/build-images.yml` builds
-  rocket-inference for every push to `main`/`v*` tags (PRs build+smoke, no push) on
-  native runners with a plain `docker build` and publishes to GHCR
+- **CI images** (2026-10-10, buildx rewrite 2026-10-17): `.github/workflows/build-images.yml`
+  builds rocket-inference for every push to `main`/`v*` tags (PRs build without
+  pushing — no smoke run, no local image, login skipped) on native runners with
+  `docker/build-push-action` + `docker/metadata-action` and a per-architecture
+  `type=gha` buildx cache (`scope=amd64`/`arm64`), and publishes to GHCR
   (`ghcr.io/royalcat/rocket-inference`): the aarch64 (NPU) image takes
-  `<sha>`/`latest`, amd64 takes `<sha>-amd64`/`latest-amd64`. `examples/rocket-inference/Dockerfile`
+  `<sha>`/`latest`, amd64 takes `<sha>-amd64`/`latest-amd64` (tag names unchanged:
+  `type=sha,format=short,prefix=` plus the `-amd64` `flavor` suffix; a `v*` tag push
+  adds `<v-tag>`/`<v-tag>-amd64`). `examples/rocket-inference/Dockerfile`
   branches on Docker's `TARGETARCH`: arm64 = `--features npu` + the staged archive,
   amd64 = `RUSTFLAGS=-C target-cpu=x86-64-v3`, flex only (the amd64 image needs an
   AVX2-capable CPU). `serve` now defaults to NPU offload on NPU builds (`--no-npu`
@@ -219,7 +223,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
 | `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`) and the GGUF tokenizer parity check (`tokenizer_parity.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
-| `.github/workflows/build-images.yml` | CI: plain `docker build` on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build and smoke-test without pushing |
+| `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy); `build.rs` auto-builds a per-target copy into `$OUT_DIR` when it is absent |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
@@ -411,12 +415,14 @@ x86-64-v3 (AVX2) flex CPU image. `examples/rocket-inference/docker/build.sh
 `git.kmsign.org/royalcat/rocket-inference:<sha>` (needs the archive — `VENDOR_SRC`
 overrides — and registry credentials on the control host; run it from anywhere in
 the repo). `.github/workflows/build-images.yml` builds both on every push to `main`
-and `v*` tags on native runners (plain `docker build`, no cross/QEMU) and pushes
-`ghcr.io/royalcat/rocket-inference`: aarch64 = `<sha>` + `latest` (primary), amd64 =
-`<sha>-amd64` + `latest-amd64`; PRs build and smoke-test without pushing. The image
-CMD is the unified server, identical on both architectures (the NPU flags are inert
-on amd64): `serve --backend flex --dtype f32 --npu-attn cpu --port 8383 --max-tokens
-8192 --model-dir /models/qwen3-embedding-0.6b --model-name qwen3-embedding`.
+and `v*` tags on native runners (buildx via `docker/build-push-action`, no
+cross/QEMU; the arm64 job builds `librocketnpu.a` on the runner first) and pushes
+`ghcr.io/royalcat/rocket-inference` with `docker/metadata-action` tags: aarch64 =
+`<sha>` + `latest` (primary), amd64 = `<sha>-amd64` + `latest-amd64`; PRs build
+without pushing. The image CMD is the unified server, identical on both architectures
+(the NPU flags are inert on amd64): `serve --backend flex --dtype f32 --npu-attn cpu
+--port 8383 --max-tokens 8192 --model-dir /models/qwen3-embedding-0.6b
+--model-name qwen3-embedding`.
 
 The `bench` summary prints `stages: attention/mlp/norms` and, with `--npu`, an
 `npu breakdown: calls/convert/npu/flex+overhead` line — check these before profiling.
@@ -767,6 +773,10 @@ cargo clippy -p rocket-inference --no-default-features
 # needs vendor/rocketnpu/librocketnpu.a staged first)
 docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
 docker run --rm rocket-inference:local --help
+# lint the CI workflow; actionlint catches expression bugs (e.g. the buildx
+# round's `id.meta.outputs.*`, which must be `steps.meta.*`), but not runtime
+# env like an undefined `env.REGISTRY`
+docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:latest -color
 # single-core speed gate (blocked path is the single-core record); run from
 # examples/rocket-inference
 taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
