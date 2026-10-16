@@ -188,9 +188,9 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
   emb2 (above). The live OpenViking embedding backend (`openviking-embed-1`) runs
-  EmbeddingGemma 2 on the `b4634c9` image (`--dtype f32 --quant q8 --npu
-  --npu-attn npu --attn-chunk 1024 --defer-towers`; idle-memory round, log-gemma
-  §14).
+  EmbeddingGemma 2 from `unsloth/embeddinggemma-2-GGUF:Q8_0` on the `a986d54` image
+  (GGUF round; observed 2026-10-16) — that image predates the 2026-10-17 `gemma4`
+  tokenizer fix and needs a rebuild + redeploy (see "Board deployment").
 
 ## Repo layout
 
@@ -217,7 +217,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
-| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
+| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`) and the GGUF tokenizer parity check (`tokenizer_parity.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: plain `docker build` on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build and smoke-test without pushing |
 | `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy); `build.rs` auto-builds a per-target copy into `$OUT_DIR` when it is absent |
@@ -325,8 +325,15 @@ supply its own adapter (gemma4's per-tensor `LoadDtypeAdapter`).
   dense Gemma configs carry per-layer overrides GGUF metadata lacks), else
   synthesized from GGUF metadata.
 - **Tokenizer** (`src/util/gguf_tokenizer.rs`): built from GGUF metadata — byte-level
-  BPE (Qwen) and SPM/unigram with `Metaspace` (Gemma). Byte-identical to the
-  reference `tokenizer.json` on all four families.
+  BPE (Qwen), merge-based BPE for `gemma4` (`tokens` + `merges` over space-to-`▁` text
+  with `byte_fallback`/`fuse_unk`), and score-based SPM/unigram for real SPM (`llama`).
+  `gemma4` `scores` are placeholder constants, so feeding them to Unigram picks the
+  fewest pieces and mis-segments compounds (`Dokumenten` became `Do|kum|enten`; fixed
+  2026-10-17); byte-fallback `<0xXX>` tokens stay out of the added-special set (the
+  reference `added_tokens` excludes them). A/B: `tools/tokenizer_parity.py` —
+  token-identical to the reference `tokenizer.json` and `llama-tokenize`; a related
+  checkpoint's file (same vocab/merges, different BOS/EOS policy — emb2 adds both, the
+  gemma-4-*-it chat models neither) reports as `OK~` (segments match).
 - **Key maps** in `checkpoint.rs`: per-family GGUF→HF tables (Qwen3/Qwen3.5,
   EmbeddingGemma 2, Gemma 4) plus the `clip` mmproj map for the towers.
 - **Semantic conversions** (GGUF's convention differs from HF's):
@@ -345,7 +352,10 @@ supply its own adapter (gemma4's per-tensor `LoadDtypeAdapter`).
   repo name (`X-GGUF` → `X-Q8_0.gguf`).
 
 Verified (GGUF vs the safetensors path, dev host): qwen3 Q8 cosine 0.9993;
-EmbeddingGemma 2 Q8 text 0.9990 / image 0.9996 / audio 0.9995 / video 0.9998 (mmproj);
+EmbeddingGemma 2 Q8 text 0.9990-0.9998 (short 0.9990 .. German paragraphs 0.9998,
+re-measured 2026-10-16 after the tokenizer fix; against the F16 llama.cpp reference
+every text now sits at 0.9995-0.9998, where the pre-fix GGUF path had drifted to
+0.984-0.996 on German text), image 0.9996 / audio 0.9995 / video 0.9998 (mmproj);
 Gemma 4 Q8 text token-identical, image/audio coherent (mmproj); Qwen3.5 Q8 coherent
 chat. `-hf` tested end to end (text and mmproj image).
 
@@ -443,18 +453,22 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   the old directory is left in place. Run from the deploy dir (the bench uses the
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - **Live service**: OpenViking's embedding backend. Since 2026-10-08 it is
-  EmbeddingGemma 2: container `openviking-embed-1` (image
-  `git.kmsign.org/royalcat/rocket-inference:b4634c9`, the idle-memory round) runs
-  `serve --backend flex --dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk
-  1024 --defer-towers --port 8383 --max-tokens 8192 --model-dir
-  /models/embeddinggemma-2`, CPUs 4-7, NPU, `mem_limit` 8g. Idle RssAnon is
-  605 MiB at boot / ~780 MiB after long traffic (2183 MiB before the round); the
-  stack file is `/home/komodo/.komodo/stacks/openviking/compose.yaml` (on the
-  board; deploy with `docker compose up -d embed` from its directory). Any board
-  run shares the NPU and cores 4-7 with it. Historically (2026-10-05) the backend
-  was qwen3 on `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7,
-  `mem_limit` 8g, weights at `/root/models/qwen3-embedding-0.6b`; that image
-  predates the repo inversion. `examples/rocket-inference/docker/build.sh` pushes
+  EmbeddingGemma 2; observed 2026-10-16 it runs the GGUF round — container
+  `openviking-embed-1` on `ghcr.io/royalcat/rocket-inference:latest` (`a986d54` at
+  the time) with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024
+  --port 8383 --max-tokens 8192 -hf unsloth/embeddinggemma-2-GGUF:Q8_0`, CPUs 4-7,
+  NPU, `mem_limit` 8g. That image predates the 2026-10-17 `gemma4` tokenizer fix:
+  rebuild it, redeploy, and re-embed the documents indexed in the GGUF-era window
+  (its vectors and queries were self-consistent but up to ~0.016 cosine off the
+  reference on German text). The previous idle-memory image was `b4634c9`
+  (`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`,
+  idle RssAnon 605 MiB at boot / ~780 MiB after long traffic). The stack file is
+  `/home/komodo/.komodo/stacks/openviking/compose.yaml` (on the board; deploy with
+  `docker compose up -d embed` from its directory). Any board run shares the NPU
+  and cores 4-7 with it. Historically (2026-10-05) the backend was qwen3 on
+  `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7, `mem_limit` 8g,
+  weights at `/root/models/qwen3-embedding-0.6b`; that image predates the repo
+  inversion. `examples/rocket-inference/docker/build.sh` pushes
   `git.kmsign.org/royalcat/rocket-inference:<sha>`.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
@@ -715,12 +729,14 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   gemma4 prefill) still build `[n][n]` masks and OOM at ~30k; the same query-chunking
   idea applies (per-chunk `[C, q1]` causal masks, prefix keys), plus a 30k measurement
   of the emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
-- Board service: `openviking-embed-1` runs `b4634c9` (idle-memory round, log-gemma
-  §14; keep fp16 `--npu` as the speed config — the int8 g32 path is 2.4x slower,
-  readback-bound). Remaining: re-measure the served latencies on an idle board
-  (the 2026-10-09 numbers were taken while the board was busy), and decide whether
-  the NPU BO shmem (~1.3 GiB) or the long-request glibc high-water (~+0.6 GiB,
-  released by the next request) warrant further work.
+- Board service: rebuild `openviking-embed-1` from a post-2026-10-17 commit and
+  redeploy (the running `a986d54` GGUF image has the score-based Unigram `gemma4`
+  tokenizer), then re-embed the GGUF-era index window. Keep fp16 `--npu` as the
+  speed config (the int8 g32 path is 2.4x slower, readback-bound). Remaining:
+  re-measure the served latencies on an idle board (the 2026-10-09 numbers were
+  taken while the board was busy), and decide whether the NPU BO shmem (~1.3 GiB)
+  or the long-request glibc high-water (~+0.6 GiB, released by the next request)
+  warrant further work.
 - QAT mobile board re-run (log-gemma §13): the f16 text-only profile is now 3.7 GiB
   anon plus ~1.2 GiB reclaimable table pages (`--defer-towers`), so a guarded run
   should fit a busy board; then the `ROCKET_NPU_DECODE=1` decode-speed pre-gate
@@ -758,6 +774,12 @@ taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tok
 cargo run --release -- qwen3 bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
 # embedding + cosine against a reference JSON
 cargo run --release -- qwen3 embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
+# GGUF tokenizer parity: our `<family> tokenize` == the reference tokenizer.json ==
+# llama-tokenize (built-in German regression words; --text/--text-file extend it);
+# needs a python with `tokenizers` (the emb2 venv on this host)
+/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/tokenizer_parity.py \
+    --gguf /tmp/opencode/emb-compare/embeddinggemma-2-Q8_0.gguf \
+    --ref /mnt/hub/models/embeddinggemma-2/tokenizer.json
 # server smoke test (one command for every model; family auto-detected)
 cargo run --release -- serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 &
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"hi"}'
