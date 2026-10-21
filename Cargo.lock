@@ -1112,8 +1112,8 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "half",
- "libc",
  "rayon",
+ "rocket-npu",
 ]
 
 [[package]]
@@ -6413,6 +6413,14 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rocket-npu"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "libc",
 ]
 
 [[package]]

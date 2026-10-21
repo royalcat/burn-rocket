@@ -129,13 +129,13 @@ fn panic_to_api(payload: Box<dyn Any + Send>) -> ApiError {
             "{} failed (rc={rc}, m={} k={} n={})",
             failure.error.op, failure.m, failure.k, failure.n
         );
-        if rc == burn_rocket::ffi::ROCKET_E_NOMEM {
+        if rc == -3 {
             return ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("NPU out of memory: {detail}; retry the request"),
             );
         }
-        if rc == burn_rocket::ffi::ROCKET_E_SHAPE || rc == burn_rocket::ffi::ROCKET_E_TILING {
+        if rc == -1 || rc == -2 {
             return ApiError::internal(format!("NPU error: {detail}"));
         }
         eprintln!("fatal NPU failure: {detail}; exiting for a clean restart");

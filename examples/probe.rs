@@ -1,8 +1,7 @@
 //! Probe: open the NPU, pack a resident fp16 weight, run one matmul, verify
 //! against a CPU reference and print timing/counters.
 //!
-//! Build (dev host, cross) — the pinned archive is auto-built by build.rs when
-//! absent (or run `scripts/build-rocketnpu.sh` to pre-build it):
+//! Build (dev host, cross); the pure-Rust driver needs no archive or C toolchain:
 //!   cargo build --release -p burn-rocket --example probe --features npu \
 //!       --target aarch64-unknown-linux-gnu
 //! then scp `$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/examples/probe` to the board.
@@ -22,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let k: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(1024);
     let n: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(3072);
 
-    let ctx = RocketCtx::new(5)?;
+    let mut ctx = RocketCtx::new(5)?;
 
     // Deterministic pseudo-random inputs in [-0.5, 0.5).
     let mut state = 0x1234_5678_9abc_def0u64;

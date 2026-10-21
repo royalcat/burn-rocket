@@ -2,7 +2,7 @@
 //!
 //! Burn tensors reach these operations through the macro-generated `Dispatch`
 //! routing; the `Flex` implementation below runs the resident-weight matmul and
-//! masked grouped-query attention on the RK3588 NPU through `librocketnpu`.
+//! masked grouped-query attention on the RK3588 NPU through the pure-Rust `rocket-npu` driver.
 //!
 //! Use the high-level helpers ([`pack`], [`pack2`], [`pack3`], [`matmul`],
 //! [`attention`]) so model code only sees ordinary `Tensor`s:
@@ -158,7 +158,7 @@ static NPU_CALLS: AtomicU64 = AtomicU64::new(0);
 pub struct Stats {
     /// f32<->f16 conversion and layout work on the CPU side.
     pub convert_s: f64,
-    /// Time inside `librocketnpu` calls.
+    /// Time inside driver calls.
     pub npu_s: f64,
     /// Number of NPU calls (matmuls + attention).
     pub calls: u64,
@@ -182,7 +182,7 @@ pub fn stats_reset() {
 
 // ---------------------------------------------------------------------------
 // Global engine: one NPU context, the resident weights and the attention
-// scratch/fa context. `librocketnpu` contexts are not thread-safe, so every op
+// scratch/fa context. The driver contexts are not thread-safe, so every op
 // goes through this mutex.
 // ---------------------------------------------------------------------------
 
@@ -291,7 +291,7 @@ struct Engine {
     next_id: u64,
 }
 
-// SAFETY: `librocketnpu` contexts are not thread-safe and are deliberately not
+// SAFETY: the legacy C contexts were not thread-safe and were deliberately not
 // `Send`; the engine is only ever touched while holding `ENGINE`'s mutex, which
 // serializes every access. This mirrors the previous per-model `unsafe impl
 // Send + Sync` justification.
@@ -1051,7 +1051,7 @@ fn matmul_i8(
 
             let t_npu = Instant::now();
             e.i8_ctx
-                .as_ref()
+                .as_mut()
                 .expect("the int8 context exists once an int8 weight is packed")
                 .matmul_gw(padded_m, k, n, a, sa, &r.b_scale, cf, &r.weight)
                 .unwrap_or_else(|err| {
@@ -1116,7 +1116,7 @@ fn matmul_bf16(
                     op_failure("rocket_bf16_stream_create", err.rc, 0, k, n)
                 }));
         }
-        let stream = e.bf16.as_ref().expect("created above");
+        let stream = e.bf16.as_mut().expect("created above");
 
         let chunk_m = matmul_chunk_m();
         let mut c32: Vec<f32> = Vec::with_capacity(m * n);
@@ -1138,7 +1138,7 @@ fn matmul_bf16(
 
             let t_npu = Instant::now();
             let rc = stream.matmul(padded_m, k, n, a, &b32, &mut c);
-            if rc != crate::ffi::ROCKET_OK {
+            if rc != 0 {
                 RocketBf16Stream::matmul_mt(padded_m, k, n, a, &b32, &mut c, threads)
                     .unwrap_or_else(|err| op_failure("rocket_matmul_bf16_mt", err.rc, rows, k, n));
             }

@@ -2,28 +2,28 @@
 name = "burn-rocket"
 version = "0.1.0"
 edition = "2024"
-description = "RK3588 NPU offload (mainline `rocket` driver) via librocketnpu"
+description = "RK3588 NPU offload (mainline `rocket` driver) via the pure-Rust rocket-npu driver"
 license = "GPL-3.0-or-later"
 
 [workspace]
-members = ["examples/rocket-inference"]
+members = ["crates/rocket-npu", "examples/rocket-inference"]
 
 [features]
-# NPU offload is the first-class target: `librocketnpu` builds on the host through
-# build.rs (cross for aarch64, native for link checks), so the default build is the
-# real one. Secondary targets: `--no-default-features` = FFI-only (no Burn, no
-# archive), `--no-default-features --features flex` = Burn dependency without the
-# extension/archive (feature-graph check).
+# NPU offload is the first-class target: the pure-Rust `rocket-npu` driver
+# compiles on any host, so the default build is the real one. Secondary targets:
+# `--no-default-features` = helpers only (no Burn, no driver),
+# `--no-default-features --features flex` = Burn dependency without the extension
+# (feature-graph check).
 default = ["npu"]
 # Burn's `#[backend_extension(Flex)]` catalog cfg is evaluated in this crate, so
 # the feature selecting the `Flex` backend must be named exactly `flex`.
 flex = ["dep:burn", "dep:rayon"]
-# The NPU extension ops (`crate::ext`); links librocketnpu (see build.rs).
-npu = ["flex"]
+# The NPU extension ops (`crate::ext`) on the pure-Rust `rocket-npu` driver.
+npu = ["flex", "dep:rocket-npu"]
 
 [dependencies]
-libc = "0.2"
 half = "2"
+rocket-npu = { path = "crates/rocket-npu", optional = true }
 rayon = { version = "1", optional = true }
 burn = { version = "=0.22.0", default-features = false, features = [
     "std",
@@ -31,8 +31,7 @@ burn = { version = "=0.22.0", default-features = false, features = [
     "extension",
 ], optional = true }
 
-# Low-level FFI probe (`RocketCtx`/`RocketWeight`); links librocketnpu, so it
-# needs the `npu` feature (aarch64).
+# Low-level driver probe (device open, one-shot matmul vs CPU); needs `npu`.
 [[example]]
 name = "probe"
 required-features = ["npu"]

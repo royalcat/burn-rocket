@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt + clippy + tests (x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (driver + library)
+        run: cargo clippy -p rocket-npu -p burn-rocket --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test -p rocket-npu -p burn-rocket
+      - name: Flex CPU example
+        run: cargo check -p rocket-inference --no-default-features

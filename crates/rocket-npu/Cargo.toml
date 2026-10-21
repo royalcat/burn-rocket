@@ -1,0 +1,15 @@
+[package]
+name = "rocket-npu"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust userspace driver for the mainline RK3588 `rocket` NPU"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+half = "2"
+libc = "0.2"
+
+[features]
+# Reserved for host-loop acceleration experiments; the NPU paths use std threads.
+rayon = []
+

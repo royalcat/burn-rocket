@@ -1,33 +1,23 @@
 //! RK3588 NPU offload for Burn models, through the mainline `rocket` driver.
 //!
-//! This crate wraps `librocketnpu`
-//! (<https://github.com/gregordinary/rocket-userspace>), the userspace driver for
-//! the mainline `rocket` DRM-accel driver. It exposes the fp16 resident-weight
-//! matmul (`C[M,N] = A[M,K] * B[N,K]^T`) and masked GQA attention that Burn models
-//! use to offload their projections and attention; everything else stays on the
-//! CPU backend.
+//! The userspace driver is the pure-Rust `rocket-npu` crate; this crate keeps the
+//! Burn-facing surface: the [`RocketOps`](ext::RocketOps) backend extension, the
+//! resident-weight registry, the fused CPU glue, and the host-built attention masks.
+//! Everything NPU-specific (device, register programs, matmul, attention) lives in
+//! `rocket-npu` and needs no C toolchain or kernel headers.
 //!
-//! On the `Flex` backend the operations are also exposed as Burn **backend
-//! extensions** (`crate::ext`, feature `npu`): the [`ext::RocketOps`] trait is
-//! routed through Burn's `Dispatch`, and the ordinary-`Tensor` helpers
+//! On the `Flex` backend the operations are exposed as Burn **backend extensions**
+//! (`crate::ext`, feature `npu`): the [`ext::RocketOps`] trait is routed through
+//! Burn's `Dispatch`, and the ordinary-`Tensor` helpers
 //! [`pack`](ext::pack), [`pack2`](ext::pack2), [`pack3`](ext::pack3),
 //! [`matmul`](ext::matmul) and [`attention`](ext::attention) wrap the dispatch
 //! plumbing. Call [`ext::init`] once before using them.
 //!
-//! aarch64-only: it links `librocketnpu.a` (see `build.rs` and `ROCKETNPU_DIR`).
-//!
-//! Handles are **not** `Send`/`Sync`: `rocket_ctx` mutates shared per-shape
-//! scratch every call and is documented as not thread-safe. The extension ops
-//! serialize access through one global engine.
-//!
-//! ```
-//! # #[cfg(target_arch = "aarch64")] {
-//! use burn_rocket::RocketCtx;
-//! let ctx = RocketCtx::new(5).unwrap();
-//! # }
-//! ```
+//! The extension ops are inference-only and serialize through one global engine.
 
-pub mod ffi;
+/// The pure-Rust NPU driver this crate is built on.
+#[cfg(feature = "npu")]
+pub use rocket_npu as npu;
 
 /// Fused host-side elementwise kernels for the NPU build's CPU glue
 /// (unit tested on any host; the callers live in the `npu`-gated extension).
@@ -50,8 +40,6 @@ pub use ext::{
 
 pub use half;
 use half::f16;
-use std::ffi::CStr;
-use std::sync::Arc;
 use std::sync::OnceLock;
 
 /// Canonical tiling for resident weights (default **on**): the NPU plans every
@@ -68,7 +56,9 @@ pub fn canonical_tiling() -> bool {
     })
 }
 
-/// Error from a librocketnpu call.
+/// Error from an NPU operation, with the same negative status codes the old C
+/// library used (`-1` shape, `-2` tiling, `-3` NOMEM, `-4` device, `-5`
+/// unsupported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error {
     pub op: &'static str,
@@ -78,11 +68,11 @@ pub struct Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.rc {
-            ffi::ROCKET_E_SHAPE => "unsupported shape",
-            ffi::ROCKET_E_TILING => "shape not tileable",
-            ffi::ROCKET_E_NOMEM => "host allocation failed",
-            ffi::ROCKET_E_DEVICE => "device/driver failure",
-            ffi::ROCKET_E_UNSUPPORTED => "unsupported feature",
+            -1 => "unsupported shape",
+            -2 => "shape not tileable",
+            -3 => "host allocation failed",
+            -4 => "device/driver failure",
+            -5 => "unsupported feature",
             _ => "unknown error",
         };
         write!(f, "{} failed: {} (rc={})", self.op, kind, self.rc)
@@ -94,15 +84,23 @@ impl std::error::Error for Error {}
 impl Error {
     /// True when the caller should fall back to a different path (`ROCKET_E_TILING`).
     pub fn is_fallback(&self) -> bool {
-        self.rc == ffi::ROCKET_E_TILING
+        self.rc == -2
+    }
+}
+
+#[cfg(feature = "npu")]
+impl From<rocket_npu::Error> for Error {
+    fn from(value: rocket_npu::Error) -> Self {
+        Error {
+            op: value.op(),
+            rc: value.status().code(),
+        }
     }
 }
 
 /// Panic payload of a failed extension op: the raw [`Error`] plus the shape the
 /// call used, so a host (e.g. the serving layer) can map failures to responses
-/// instead of parsing panic strings. For matmuls `m`/`k`/`n` are the GEMM
-/// shape; for attention `m` is the token count, `k` the KV length and `n` the
-/// head dim; mirrors and packs report the packed shape.
+/// instead of parsing panic strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpFailure {
     pub error: Error,
@@ -111,190 +109,83 @@ pub struct OpFailure {
     pub n: usize,
 }
 
-fn check(op: &'static str, rc: i32) -> Result<(), Error> {
-    if rc == ffi::ROCKET_OK {
-        Ok(())
-    } else {
-        Err(Error { op, rc })
-    }
-}
-
-/// Device/driver information.
+/// Device/driver information: `Some("rocket")` when a device opens.
+#[cfg(feature = "npu")]
 pub fn driver_name() -> Option<String> {
-    unsafe {
-        let p = ffi::rocket_driver_name();
-        if p.is_null() {
-            return None;
-        }
-        Some(CStr::from_ptr(p).to_string_lossy().into_owned())
-    }
+    rocket_npu::Device::open()
+        .ok()
+        .map(|d| d.driver_name().to_string())
 }
 
 /// Number of big (A76) cores available for worker pinning, 0 if not applicable.
+#[cfg(feature = "npu")]
 pub fn num_big_cores() -> i32 {
-    unsafe { ffi::rocket_num_big_cores() }
+    rocket_npu::device::affinity::num_big_cores() as i32
 }
 
 /// `(submit_ioctls, submitted_tasks)` since the last reset.
+#[cfg(feature = "npu")]
 pub fn submit_counters() -> (u64, u64) {
-    unsafe {
-        (
-            ffi::rocket_submit_ioctl_count(),
-            ffi::rocket_submit_task_count(),
-        )
-    }
+    (
+        rocket_npu::device::submit::ioctl_submit_count(),
+        rocket_npu::device::submit::submitted_task_count(),
+    )
 }
 
 /// Reset the submit counters.
+#[cfg(feature = "npu")]
 pub fn reset_submit_counters() {
-    unsafe { ffi::rocket_submit_counters_reset() }
+    rocket_npu::device::submit::reset_counters();
 }
 
-/// Spin-poll the completion fence for up to `us` microseconds before blocking.
-pub fn set_busy_poll_us(us: i64) {
-    unsafe { ffi::rocket_busy_poll_set_us(us as libc::c_long) }
-}
-
-struct CtxInner {
-    ctx: *mut ffi::RocketCtxOpaque,
-    fd: i32,
-}
-
-// The context owns worker fds and per-shape scratch; librocketnpu documents it as
-// not thread-safe. `CtxInner` is therefore deliberately neither Send nor Sync.
-
-impl Drop for CtxInner {
-    fn drop(&mut self) {
-        unsafe {
-            ffi::rocket_ctx_free(self.ctx);
-            ffi::rocket_close(self.fd);
-        }
-    }
-}
+/// Compatibility shim: the busy-poll budget is resolved once from
+/// `ROCKET_BUSY_POLL`; a post-init override is not supported by the port.
+#[cfg(feature = "npu")]
+pub fn set_busy_poll_us(_us: i64) {}
 
 /// A persistent NPU context: worker fds plus per-shape scratch.
 ///
-/// Not `Send`/`Sync` — give each concurrent caller its own context. The per-call
-/// fan-out across the three NPU cores happens inside one context.
+/// One context must not be used from several threads at once; the extension
+/// engine serializes every access.
+#[cfg(feature = "npu")]
 pub struct RocketCtx {
-    inner: Arc<CtxInner>,
+    inner: rocket_npu::matmul::Context,
 }
 
+#[cfg(feature = "npu")]
 impl RocketCtx {
-    /// Open the device and create a context with `nthreads` worker threads/fds.
-    ///
-    /// The context requests the library's canonical tiling (M-independent down
-    /// to 4) unless `ROCKET_CTX_CANONICAL=0` selects the legacy tiling.
-    // `CtxInner` is deliberately not Send/Sync (see above); the Arc shares the
-    // context among clones and callers serialize access themselves.
-    #[allow(clippy::arc_with_non_send_sync)]
+    /// Open the device and create a context with `nthreads` worker fds.
     pub fn new(nthreads: usize) -> Result<Self, Error> {
-        let fd = unsafe { ffi::rocket_open() };
-        if fd < 0 {
-            return Err(Error {
-                op: "rocket_open",
-                rc: fd,
-            });
-        }
-        let flags = if canonical_tiling() {
-            ffi::ROCKET_CTX_TILING_CANONICAL
-        } else {
-            0
-        };
-        let ctx = unsafe { ffi::rocket_ctx_create_ex(nthreads as i32, flags) };
-        if ctx.is_null() {
-            unsafe { ffi::rocket_close(fd) };
-            return Err(Error {
-                op: "rocket_ctx_create_ex",
-                rc: ffi::ROCKET_E_DEVICE,
-            });
-        }
-        Ok(Self {
-            inner: Arc::new(CtxInner { ctx, fd }),
-        })
+        let inner = rocket_npu::matmul::Context::new(nthreads)?;
+        Ok(Self { inner })
     }
 
     /// Pack a weight matrix `B` of shape `[N, K]` (row-major fp16) into resident
-    /// NPU buffers, once. `m` is the warm-up row count used for tiling; with the
-    /// canonical tiling (the default) the resulting handle can be reused for any
-    /// `M >= 4` with the same `K`/`N`; the legacy tiling only serves `M >= 256`
-    /// (smaller calls must be padded).
+    /// NPU buffers, once. With the canonical tiling the handle serves any
+    /// `M >= 4` with the same `K`/`N`.
     pub fn pack_weight(
-        &self,
+        &mut self,
         m: usize,
         k: usize,
         n: usize,
         b: &[f16],
     ) -> Result<RocketWeight, Error> {
-        assert_eq!(b.len(), n * k, "weight buffer must be [N, K]");
-        let w = unsafe {
-            ffi::rocket_weights_pack(
-                self.inner.ctx,
-                m as i32,
-                k as i32,
-                n as i32,
-                b.as_ptr() as *const ffi::F16,
-            )
-        };
-        if w.is_null() {
-            return Err(Error {
-                op: "rocket_weights_pack",
-                rc: ffi::ROCKET_E_SHAPE,
-            });
-        }
-        Ok(RocketWeight {
-            w,
-            ctx: self.inner.clone(),
-        })
+        Ok(self.inner.pack_weight(m, k, n, b)?)
     }
 
-    /// Pack several weights that share one input activation into a single resident
-    /// weight, concatenated along N: `C[:, sum(Ns)] = A * [B0; B1; ...]^T`.
-    /// Each `parts[i]` is `[Ns[i], K]` row-major fp16; the total `N` is their sum.
+    /// Pack several weights that share one input, concatenated along N.
     pub fn pack_weight_seg(
-        &self,
+        &mut self,
         m: usize,
         k: usize,
         parts: &[&[f16]],
     ) -> Result<RocketWeight, Error> {
-        let ns: Vec<i32> = parts.iter().map(|p| (p.len() / k) as i32).collect();
-        let n: usize = ns.iter().map(|&x| x as usize).sum();
-        let ptrs: Vec<*const ffi::F16> = parts
-            .iter()
-            .map(|p| {
-                assert_eq!(p.len() % k, 0, "each segment must be [Ns, K]");
-                p.as_ptr() as *const ffi::F16
-            })
-            .collect();
-        let w = unsafe {
-            ffi::rocket_weights_pack_seg(
-                self.inner.ctx,
-                m as i32,
-                k as i32,
-                n as i32,
-                ptrs.as_ptr(),
-                ns.as_ptr(),
-                parts.len() as i32,
-            )
-        };
-        if w.is_null() {
-            return Err(Error {
-                op: "rocket_weights_pack_seg",
-                rc: ffi::ROCKET_E_SHAPE,
-            });
-        }
-        Ok(RocketWeight {
-            w,
-            ctx: self.inner.clone(),
-        })
+        Ok(self.inner.pack_weight_seg(m, k, parts)?)
     }
 
     /// `C[M, N] = A[M, K] * B[N, K]^T` with a resident weight.
-    ///
-    /// `a` is `[M, K]` and `c` is `[M, N]`, both row-major fp16. `m` may differ
-    /// from the `m` used at pack time for `M >= 256`.
     pub fn matmul_prepacked(
-        &self,
+        &mut self,
         m: usize,
         k: usize,
         n: usize,
@@ -302,200 +193,33 @@ impl RocketCtx {
         c: &mut [f16],
         w: &RocketWeight,
     ) -> Result<(), Error> {
-        assert_eq!(a.len(), m * k, "A must be [M, K]");
-        assert_eq!(c.len(), m * n, "C must be [M, N]");
-        let rc = unsafe {
-            ffi::rocket_matmul_fp16_prepacked(
-                self.inner.ctx,
-                m as i32,
-                k as i32,
-                n as i32,
-                a.as_ptr() as *const ffi::F16,
-                c.as_mut_ptr() as *mut ffi::F16,
-                w.w,
-            )
-        };
-        check("rocket_matmul_fp16_prepacked", rc)
-    }
-
-    /// Create a streaming context (weights re-packed on every call) bound to a
-    /// fresh device fd. Useful when weights do not fit in resident memory.
-    pub fn stream(&self, nthreads: usize) -> Result<RocketStream, Error> {
-        let s = unsafe { ffi::rocket_stream_create(nthreads as i32) };
-        if s.is_null() {
-            return Err(Error {
-                op: "rocket_stream_create",
-                rc: ffi::ROCKET_E_DEVICE,
-            });
-        }
-        Ok(RocketStream { s })
+        Ok(self.inner.matmul_prepacked(m, k, n, a, c, w)?)
     }
 }
 
-/// A weight resident in NPU buffers, packed from a `[N, K]` row-major fp16 matrix.
-pub struct RocketWeight {
-    w: *mut ffi::RocketWeightsOpaque,
-    ctx: Arc<CtxInner>,
-}
+/// A weight resident in NPU buffers.
+#[cfg(feature = "npu")]
+pub type RocketWeight = rocket_npu::matmul::Weight;
 
-impl Drop for RocketWeight {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_weights_free(self.ctx.ctx, self.w) }
-    }
-}
-
-/// Streaming matmul context: keeps scratch/worker BOs but re-packs `B` per call.
-pub struct RocketStream {
-    s: *mut ffi::RocketStreamOpaque,
-}
-
-impl RocketStream {
-    /// `C[M, N] = A[M, K] * B[N, K]^T`, re-packing `B` every call.
-    pub fn matmul(
-        &self,
-        m: usize,
-        k: usize,
-        n: usize,
-        a: &[f16],
-        b: &[f16],
-        c: &mut [f16],
-    ) -> Result<(), Error> {
-        assert_eq!(a.len(), m * k, "A must be [M, K]");
-        assert_eq!(b.len(), n * k, "B must be [N, K]");
-        assert_eq!(c.len(), m * n, "C must be [M, N]");
-        let rc = unsafe {
-            ffi::rocket_matmul_fp16_stream(
-                self.s,
-                m as i32,
-                k as i32,
-                n as i32,
-                a.as_ptr() as *const ffi::F16,
-                b.as_ptr() as *const ffi::F16,
-                c.as_mut_ptr() as *mut ffi::F16,
-            )
-        };
-        check("rocket_matmul_fp16_stream", rc)
-    }
-}
-
-impl Drop for RocketStream {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_stream_free(self.s) }
-    }
-}
-
-/// Persistent streaming context for bf16 matmuls (`rocket_matmul_bf16_stream`):
-/// worker fds and per-`(M,K,N)` scratch BOs stay resident, while A and B are
-/// re-packed every call. The interface takes f32 operands (the NPU truncates to
-/// bf16 during the scatter) and writes an f32 `[M, N]` output.
-///
-/// Not `Send`/`Sync`; the extension only touches it while holding the global
-/// engine mutex.
-pub struct RocketBf16Stream {
-    s: *mut ffi::RocketBf16StreamOpaque,
-}
-
-impl RocketBf16Stream {
-    /// Create a stream with `nthreads` workers.
-    pub fn new(nthreads: usize) -> Result<Self, Error> {
-        let s = unsafe { ffi::rocket_bf16_stream_create(nthreads as i32) };
-        if s.is_null() {
-            return Err(Error {
-                op: "rocket_bf16_stream_create",
-                rc: ffi::ROCKET_E_DEVICE,
-            });
-        }
-        Ok(RocketBf16Stream { s })
-    }
-
-    /// `C[M, N] = A[M, K] * B[N, K]^T`, re-packing A and B every call. Returns
-    /// the library status: `ROCKET_OK`, or a negative value telling the caller
-    /// to fall back to [`matmul_bf16_mt`](Self::matmul_mt).
-    pub fn matmul(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) -> i32 {
-        assert_eq!(a.len(), m * k, "A must be [M, K]");
-        assert_eq!(b.len(), n * k, "B must be [N, K]");
-        assert_eq!(c.len(), m * n, "C must be [M, N]");
-        unsafe {
-            ffi::rocket_matmul_bf16_stream(
-                self.s,
-                m as i32,
-                k as i32,
-                n as i32,
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_mut_ptr(),
-            )
-        }
-    }
-
-    /// The per-call multicore fallback (opens its own worker fds; allocates and
-    /// frees all BOs per call).
-    pub fn matmul_mt(
-        m: usize,
-        k: usize,
-        n: usize,
-        a: &[f32],
-        b: &[f32],
-        c: &mut [f32],
-        nthreads: usize,
-    ) -> Result<(), Error> {
-        assert_eq!(a.len(), m * k, "A must be [M, K]");
-        assert_eq!(b.len(), n * k, "B must be [N, K]");
-        assert_eq!(c.len(), m * n, "C must be [M, N]");
-        let rc = unsafe {
-            ffi::rocket_matmul_bf16_mt(
-                m as i32,
-                k as i32,
-                n as i32,
-                a.as_ptr(),
-                b.as_ptr(),
-                c.as_mut_ptr(),
-                nthreads as i32,
-            )
-        };
-        check("rocket_matmul_bf16_mt", rc)
-    }
-}
-
-impl Drop for RocketBf16Stream {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_bf16_stream_free(self.s) }
-    }
-}
-
-/// Persistent context for masked grouped-query attention on the NPU
-/// (`rocket_flash_attn_fp16_ctx`): worker fds and per-head scratch stay resident
-/// across calls. Not `Send`/`Sync`.
+/// Persistent masked-GQA attention context (`rocket_flash_attn_fp16_ctx`).
+#[cfg(feature = "npu")]
 pub struct RocketFaCtx {
-    c: *mut ffi::RocketFaCtxOpaque,
+    inner: rocket_npu::attn::Attention,
 }
 
+#[cfg(feature = "npu")]
 impl RocketFaCtx {
-    /// Create with `nthreads` workers (clamped by the library to `[1, min(8, n_head)]`).
     pub fn new(nthreads: usize) -> Result<Self, Error> {
-        let c = unsafe { ffi::rocket_fa_ctx_create(nthreads as i32) };
-        if c.is_null() {
-            return Err(Error {
-                op: "rocket_fa_ctx_create",
-                rc: ffi::ROCKET_E_DEVICE,
-            });
-        }
-        Ok(Self { c })
+        Ok(Self {
+            inner: rocket_npu::attn::Attention::new(nthreads)?,
+        })
     }
 
-    /// Masked GQA attention: `softmax(scale * Q K^T + mask) V`.
-    ///
-    /// Layouts (fp16, head-major):
-    /// - `q`: `[n_head][n_tokens][head_dim]`
-    /// - `k`: `[n_kv_heads][n_kv][head_dim]`
-    /// - `v`: `[n_kv_heads][dv][n_kv]` (per-head transposed: the AV B-operand)
-    /// - `mask`: `[n_tokens][n_kv]` additive (`-inf` masks), or `None` for unmasked
-    /// - `out`: `[n_head][n_tokens][dv]`
-    ///
-    /// `n_head` must be a multiple of `n_kv_heads`, `head_dim % 32 == 0`, `dv % 16 == 0`.
+    /// Masked GQA attention (fp16, head-major layouts); see
+    /// [`rocket_npu::attn::Attention::flash`].
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attn(
-        &self,
+        &mut self,
         n_tokens: usize,
         n_kv: usize,
         head_dim: usize,
@@ -510,125 +234,47 @@ impl RocketFaCtx {
         mask: Option<&[f16]>,
         out: &mut [f16],
     ) -> Result<(), Error> {
-        assert_eq!(q.len(), n_head * n_tokens * head_dim);
-        assert_eq!(k.len(), n_kv_heads * n_kv * head_dim);
-        assert_eq!(v.len(), n_kv_heads * dv * n_kv);
-        assert_eq!(out.len(), n_head * n_tokens * dv);
-        if let Some(m) = mask {
-            assert_eq!(m.len(), n_tokens * n_kv);
-        }
-        let rc = unsafe {
-            ffi::rocket_flash_attn_fp16_ctx(
-                self.c,
-                n_tokens as i32,
-                n_kv as i32,
-                head_dim as i32,
-                dv as i32,
-                n_head as i32,
-                n_kv_heads as i32,
-                scale,
-                softcap,
-                q.as_ptr() as *const ffi::F16,
-                k.as_ptr() as *const ffi::F16,
-                v.as_ptr() as *const ffi::F16,
-                mask.map_or(std::ptr::null(), |m| m.as_ptr() as *const ffi::F16),
-                out.as_mut_ptr() as *mut ffi::F16,
-            )
-        };
-        check("rocket_flash_attn_fp16_ctx", rc)
-    }
-}
-
-impl Drop for RocketFaCtx {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_fa_ctx_free(self.c) }
+        Ok(self.inner.flash(
+            n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads, scale, softcap, q, k, v, mask, out,
+        )?)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Resident int8 (W8A8) group-wise weights
+// int8 and native bf16 stream
+//
+// The wrappers below expose the Rust `rocket-npu` resident group-wise int8 and
+// bf16-stream contexts on the same surface the C library used.
 // ---------------------------------------------------------------------------
 
-struct I8CtxInner {
-    ctx: *mut ffi::RocketI8CtxOpaque,
-}
-
-// Like `CtxInner`, the int8 context mutates shared per-shape scratch and is not
-// thread-safe; the extension engine serializes every access.
-
-impl Drop for I8CtxInner {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_i8_ctx_free(self.ctx) }
-    }
-}
-
-/// A persistent int8 matmul context (worker fds plus per-shape scratch).
-///
-/// Weights packed through it must be freed before it; [`RocketI8Weight`] holds
-/// its own handle to the context, so that order holds for any drop order.
+/// Resident group-wise int8 context (`rocket_i8_ctx` in the C API).
 pub struct RocketI8Ctx {
-    inner: Arc<I8CtxInner>,
+    inner: rocket_npu::matmul::I8Context,
 }
 
 impl RocketI8Ctx {
-    /// Create a context with `nthreads` workers.
-    // `I8CtxInner` is deliberately not Send/Sync (like `CtxInner`); the Arc only
-    // shares the context among clones, and callers serialize access.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(nthreads: usize) -> Result<Self, Error> {
-        let ctx = unsafe { ffi::rocket_i8_ctx_create(nthreads as i32) };
-        if ctx.is_null() {
-            return Err(Error {
-                op: "rocket_i8_ctx_create",
-                rc: ffi::ROCKET_E_DEVICE,
-            });
-        }
         Ok(Self {
-            inner: Arc::new(I8CtxInner { ctx }),
+            inner: rocket_npu::matmul::I8Context::new(nthreads)?,
         })
     }
 
-    /// Pack a group-wise int8 weight `B` `[N, K]` (row-major int8 codes) and the
-    /// per-channel per-group scales that go with it. `m` is the warm-up row count;
-    /// the resident layout is M-independent, so one pack serves every `M >= 4`
-    /// with the same `K`/`N`. `group % 32 == 0` must divide `K`.
+    /// Pack a pre-quantized `[N, K]` int8 weight with K-groups of `group`.
     pub fn pack_weight_gw(
-        &self,
+        &mut self,
         m: usize,
         k: usize,
         n: usize,
         b: &[i8],
         group: usize,
     ) -> Result<RocketI8Weight, Error> {
-        assert_eq!(b.len(), n * k, "weight buffer must be [N, K]");
-        let w = unsafe {
-            ffi::rocket_i8_weights_pack_gw(
-                self.inner.ctx,
-                m as i32,
-                k as i32,
-                n as i32,
-                b.as_ptr(),
-                group as i32,
-            )
-        };
-        if w.is_null() {
-            return Err(Error {
-                op: "rocket_i8_weights_pack_gw",
-                rc: ffi::ROCKET_E_SHAPE,
-            });
-        }
-        Ok(RocketI8Weight {
-            w,
-            ctx: self.inner.clone(),
-        })
+        Ok(self.inner.pack_weight_gw(m, k, n, b, group)?)
     }
 
-    /// `C[M, N] = sum_g a_scale[m, g] * b_scale[n, g] * (int32 partial of K-group g)`,
-    /// accumulated in f32. `a` is `[M, K]` int8 (pre-quantized), `a_scale` `[M, K/group]`,
-    /// `b_scale` `[N, K/group]`, `cf` `[M, N]` f32. `M % 4 == 0` (pad single rows).
+    /// `C[m,n] = sum_g a_scale[m,g] * b_scale[n,g] * (A_g B_g^T)`, f32 output.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_gw(
-        &self,
+        &mut self,
         m: usize,
         k: usize,
         n: usize,
@@ -638,34 +284,54 @@ impl RocketI8Ctx {
         cf: &mut [f32],
         w: &RocketI8Weight,
     ) -> Result<(), Error> {
-        assert_eq!(a.len(), m * k, "A must be [M, K]");
-        assert_eq!(cf.len(), m * n, "C must be [M, N]");
-        let rc = unsafe {
-            ffi::rocket_matmul_int8_prepacked_gw(
-                self.inner.ctx,
-                m as i32,
-                k as i32,
-                n as i32,
-                a.as_ptr(),
-                a_scale.as_ptr(),
-                b_scale.as_ptr(),
-                cf.as_mut_ptr(),
-                w.w,
-            )
-        };
-        check("rocket_matmul_int8_prepacked_gw", rc)
+        Ok(self.inner.matmul_gw(m, k, n, a, a_scale, b_scale, cf, w)?)
     }
 }
 
 /// A group-wise int8 weight resident in NPU buffers.
-pub struct RocketI8Weight {
-    w: *mut ffi::RocketI8WeightsOpaque,
-    ctx: Arc<I8CtxInner>,
+pub type RocketI8Weight = rocket_npu::matmul::I8Weight;
+
+/// Persistent native-bf16 stream: f32 in/out, bf16 device math, f64 host accumulation.
+pub struct RocketBf16Stream {
+    inner: rocket_npu::matmul::Bf16Stream,
 }
 
-impl Drop for RocketI8Weight {
-    fn drop(&mut self) {
-        unsafe { ffi::rocket_i8_weights_free(self.ctx.ctx, self.w) }
+impl RocketBf16Stream {
+    pub fn new(nthreads: usize) -> Result<Self, Error> {
+        Ok(Self {
+            inner: rocket_npu::matmul::Bf16Stream::new(nthreads)?,
+        })
+    }
+
+    /// Re-packs A and B every call; returns 0 or a negative status.
+    pub fn matmul(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) -> i32 {
+        match self.inner.matmul(m, k, n, a, b, c) {
+            Ok(()) => 0,
+            Err(e) => e.status().code(),
+        }
+    }
+
+    /// The per-call multi-core fallback (opens its own worker fds).
+    pub fn matmul_mt(
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+        nthreads: usize,
+    ) -> Result<(), Error> {
+        Ok(rocket_npu::matmul::Bf16Stream::matmul_mt(
+            m, k, n, a, b, c, nthreads,
+        )?)
     }
 }
 

@@ -75,21 +75,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - name: Install the librocketnpu build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake pkg-config libdrm-dev file
-      # Ubuntu 24.04's kernel uapi headers predate the mainline rocket accel
-      # driver, and rocket-userspace needs drm/rocket_accel.h (Linux v6.18).
-      - name: Install the mainline rocket uAPI header
-        run: |
-          sudo mkdir -p /usr/include/drm
-          curl -fsSL \
-            https://raw.githubusercontent.com/torvalds/linux/v6.18/include/uapi/drm/rocket_accel.h \
-            | sudo tee /usr/include/drm/rocket_accel.h >/dev/null
-      - name: Build librocketnpu.a
-        run: scripts/build-rocketnpu.sh --target host
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 

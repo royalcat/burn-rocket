@@ -9,7 +9,7 @@ default = ["cpu"]
 # host-architecture LLVM bundle (fails to link for aarch64). The `flex` backend is
 # always available.
 cpu = ["burn/cpu", "burn/autotune", "burn/fusion"]
-# RK3588 NPU offload via librocketnpu (aarch64 only; see the root burn-rocket crate).
+# RK3588 NPU offload via the pure-Rust rocket-npu driver (aarch64; see the root crate).
 npu = ["dep:burn-rocket", "burn-rocket/npu"]
 # GPU (CubeCL/wgpu) backend; the Rock 5B+ reaches it through Mesa panvk.
 # `gpu-spirv` uses CubeCL's SPIR-V compiler (burn's `vulkan` feature), `gpu-wgsl`

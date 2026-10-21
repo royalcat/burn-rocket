@@ -7,17 +7,14 @@
 # embedding server.
 #
 # One Dockerfile, two architectures; the build platform picks the branch:
-#   arm64/aarch64 — the `npu` feature links the aarch64-only static librocketnpu
-#                   and `serve` offloads to the RK3588 NPU through the mainline
-#                   `rocket` driver (needs /dev/accel/accel0 at run time).
-#                   Requires vendor/rocketnpu/librocketnpu.a in the build
-#                   context (scripts/build-rocketnpu.sh stages it).
+#   arm64/aarch64 — the pure-Rust `npu` feature offloads to the RK3588 NPU
+#                   through the mainline `rocket` driver (needs
+#                   /dev/accel/accel0 at run time). No C toolchain or archive.
 #   amd64/x86_64  — flex CPU build for x86-64-v3 (AVX2), no NPU support.
 #
 # The build context is the repo root:
 #   docker build -f examples/rocket-inference/Dockerfile .
-# examples/rocket-inference/docker/build.sh assembles the same context (with the
-# archive) for the board. The default command is identical on both
+# examples/rocket-inference/docker/build.sh assembles the same context for the board. The default command is identical on both
 # architectures: `serve` picks the NPU on aarch64 builds that have it (pass
 # `--no-npu` for the flex CPU path) and stays on flex elsewhere.
 
@@ -37,12 +34,9 @@ RUN set -eux; \
     arch="${TARGETARCH:-$(uname -m)}"; \
     case "$arch" in \
         arm64|aarch64) \
-            test -s vendor/rocketnpu/librocketnpu.a \
-                || { echo "missing vendor/rocketnpu/librocketnpu.a in the build context (aarch64 builds link the NPU archive; run scripts/build-rocketnpu.sh)" >&2; exit 1; }; \
             cargo build --release --locked \
                 -p rocket-inference \
                 --no-default-features --features npu \
-                --target aarch64-unknown-linux-gnu \
                 --jobs "${CARGO_BUILD_JOBS}" \
             ;; \
         amd64|x86_64) \

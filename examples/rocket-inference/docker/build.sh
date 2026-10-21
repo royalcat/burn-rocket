@@ -2,10 +2,9 @@
 # Build the aarch64 container image for rocket-inference and push it to the
 # Forgejo registry (git.kmsign.org/royalcat/rocket-inference).
 #
-# The image is aarch64-only (the `npu` feature links the aarch64-only static
-# librocketnpu), so it is built natively on the rock-5b-plus board, which has
-# the NPU. The control host performs the push because it holds the registry
-# credentials.
+# The image is aarch64-only (the NPU driver is aarch64), so it is built natively
+# on the rock-5b-plus board, which has the NPU. The control host performs the
+# push because it holds the registry credentials.
 #
 # Usage:
 #   examples/rocket-inference/docker/build.sh                 # HEAD of this checkout
@@ -15,8 +14,6 @@
 # Env overrides:
 #   BOARD=root@rock-5b-plus.lan      ssh target for the build host
 #   REMOTE_DIR=/root/rocket-inference-image  staging dir on the board
-#   VENDOR_SRC=<path-to-librocketnpu.a>  vendor library; unset = the checkout's
-#                                        vendor/rocketnpu (scripts/build-rocketnpu.sh)
 #   CARGO_BUILD_JOBS=4               cargo parallelism inside the image build
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,20 +36,6 @@ git -C "$REPO" archive "$COMMIT" | tar -C "$STAGE" -xf -
 # plain `docker build .` works. Old refs (root Dockerfile) pass through.
 [ -f "$STAGE/Dockerfile" ] || cp "$REPO/examples/rocket-inference/Dockerfile" "$STAGE/Dockerfile"
 [ -f "$STAGE/.dockerignore" ] || cp "$REPO/.dockerignore" "$STAGE/.dockerignore"
-
-# vendor/rocketnpu/librocketnpu.a is gitignored; take it from VENDOR_SRC or the
-# worktree (scripts/build-rocketnpu.sh).
-mkdir -p "$STAGE/vendor/rocketnpu"
-LIB="$STAGE/vendor/rocketnpu/librocketnpu.a"
-if [ -n "${VENDOR_SRC:-}" ]; then
-    cp "$VENDOR_SRC" "$LIB"
-elif [ -s "$REPO/vendor/rocketnpu/librocketnpu.a" ]; then
-    cp "$REPO/vendor/rocketnpu/librocketnpu.a" "$LIB"
-else
-    echo "error: no librocketnpu.a: run scripts/build-rocketnpu.sh or set VENDOR_SRC" >&2
-    exit 1
-fi
-test -s "$LIB" || { echo "error: empty vendor library" >&2; exit 1; }
 
 echo "==> shipping context -> ${BOARD}:${REMOTE_DIR}"
 ssh "$BOARD" "rm -rf '$REMOTE_DIR' && mkdir -p '$REMOTE_DIR'"

@@ -1,14 +1,17 @@
 # burn-rocket
 
 RK3588 NPU offload for [Burn](https://burn.dev) models, through the mainline `rocket`
-driver: a safe Rust wrapper around [`librocketnpu`](https://github.com/gregordinary/rocket-userspace)
-and a set of Burn **backend-extension** ops that run a model's projection matmuls and
-masked grouped-query attention on the RK3588 NPU while everything else stays on the CPU
+driver: a pure-Rust userspace driver (`rocket-npu`, in `crates/rocket-npu`) and a set
+of Burn **backend-extension** ops that run a model's projection matmuls and masked
+grouped-query attention on the RK3588 NPU while everything else stays on the CPU
 backend.
 
-The library is `aarch64`-only for anything that touches the NPU: it links the static
-`librocketnpu.a`, which talks to `/dev/accel/accel0` through the in-kernel `rocket`
-driver.
+The library is `aarch64`-only for anything that touches the NPU: the driver talks to
+`/dev/accel/accel0` through the in-kernel `rocket` driver. There is no C toolchain,
+CMake, kernel-header, or vendor-archive step: the register programs, tiling planner,
+buffer objects, matmul and attention are all Rust in `crates/rocket-npu` (an
+interface-compatible port of `librocketnpu`, byte-identical register programs and
+planner output).
 
 ## AI Disclosure
 
@@ -75,19 +78,20 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
 
   `pack`/`pack2`/`pack3` consume f32/f16 weights and keep fp16 resident copies in NPU
   memory for the process lifetime (`WeightId` handles), and bf16 weights pack the same
-  way via an exact bf16->f16 conversion (the library's bf16 stream — no resident
-  variant, re-packs per call — is opt-in behind `ROCKET_BF16_STREAM=1`). Fused packs
+  way via an exact bf16->f16 conversion. Fused packs
   concatenate several weights that share one input along N, so one matmul produces all
   their outputs (the example packs q|k|v and gate|up that way). Matmuls are chunked
   above `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the
   per-call input buffer; rows are independent, so chunking is bit-identical.
 
-- **Low-level FFI API** (`RocketCtx`, `RocketWeight`, `RocketStream`, `RocketBf16Stream`,
-  `RocketFaCtx`, `f32_to_f16`, `pad_rows`, driver/counter helpers) for callers that do
-  not want Burn tensor routing. See `examples/probe.rs` for a runnable smoke test.
+- **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
+  `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention`, `f16` helpers,
+  driver/counter helpers) for callers that do not want Burn tensor routing. The
+  `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old surface. See
+  `examples/probe.rs` for a runnable smoke test.
 
 The ops are **inference-only**: the extension macro generates no autodiff and calling
-them with an autodiff context panics inside Burn. `librocketnpu` contexts are not
+them with an autodiff context panics inside Burn. The driver contexts are not
 thread-safe; the extension routes every call through one global engine behind a mutex
 (`burn_rocket::stats()` reports accumulated convert/NPU time). Resident weights use
 the canonical tiling (`M >= 4`; `ROCKET_CTX_CANONICAL=0` restores the legacy
@@ -99,46 +103,50 @@ the canonical tiling (`M >= 4`; `ROCKET_CTX_CANONICAL=0` restores the legacy
 |---|---|
 | `default` | `npu` — NPU offload is the first-class target |
 | `flex` | compiles against Burn's `Flex` backend (required by the extension catalog; the feature name must stay exactly `flex`) |
-| `npu` | the `RocketOps` extension ops; links `librocketnpu.a` (implies `flex`) |
+| `npu` | the `RocketOps` extension ops on the pure-Rust driver (implies `flex`) |
 
-`--no-default-features` gives the FFI-only crate (no Burn, no archive);
-`--no-default-features --features flex` the Burn dependency without the extension or
-archive (feature-graph check).
+`--no-default-features` gives the no-Burn crate (helpers and masks only);
+`--no-default-features --features flex` the Burn dependency without the extension
+(feature-graph check).
 
 ## Building
 
-`librocketnpu.a` is supplied automatically: `build.rs` uses `ROCKETNPU_DIR` when set,
-else a matching `vendor/rocketnpu/` archive, else builds one into `$OUT_DIR/rocketnpu`
-with `scripts/build-rocketnpu.sh` (pinned
-[`gregordinary/rocket-userspace`](https://github.com/gregordinary/rocket-userspace)
-commit, aarch64 cross by default). The first build clones and compiles the C library
-(clone/cmake cache under `$OUT_DIR/rocket-userspace`, removed by `cargo clean`); later
-builds reuse it. `ROCKETNPU_AUTO=0` disables the auto-build (warn only) and
-`ROCKETNPU_SRC=<checkout>` builds offline from an existing checkout.
-
-Run the script directly to install the archive into `vendor/rocketnpu/` (gitignored) —
-for the docker image, a fixed deployment artifact, or a different pin:
-
-```sh
-# aarch64 archive for the board (cross; the default)
-scripts/build-rocketnpu.sh
-# host archive, for link checks on this machine
-scripts/build-rocketnpu.sh --target host
-```
-
-The script records the built commit and architecture in `vendor/rocketnpu/{COMMIT,ARCH}`
-and skips the build when the directory already matches. `--commit <sha>` moves the pin;
-`--cache <dir>` and `--profile <name>` (default `release`) control the cache location
-(`<target-dir>/<profile>/build/burn-rocket` for manual runs).
+There is no external driver archive to build. `rocket-npu` is a workspace member and
+compiles on any host (device access is runtime-only):
 
 ```sh
 # compile check (npu is the default; works on any target, no linking)
 cargo check -p burn-rocket
 
-# aarch64 build of the probe example (links vendor/rocketnpu/librocketnpu.a)
+# aarch64 build of the probe example
 cargo build --release -p burn-rocket --example probe \
   --target aarch64-unknown-linux-gnu
 ```
+
+The example app builds with `--no-default-features --features npu` (aarch64) or
+`--no-default-features` (flex CPU on any target).
+
+Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
+group-wise int8, the native bf16 stream and masked GQA attention are ported and
+validated on the board. Planner and regcmd output are byte-equal to the C library;
+fp16/bf16 cosine >= 0.99999, int8 matches its dequantized reference. Qwen3
+3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16 microbenchmarks
+are at or above the C library's speed.
+
+### Missing surface
+
+`rocket-npu` is a focused matmul/attention driver, not a full replacement of every
+`librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented matmul,
+resident group-wise int8, the native bf16 stream, masked GQA attention, and the
+device/BO/submit primitives.
+
+Not exposed yet: dense/per-channel int8, one-shot int8 group-wise, int4/int16/tf32,
+one-shot bf16 and resident bf16, `mha_self`, the `*_ref` host references, the
+`_planes`/transposed variants, RK3576 entries, batched/chained submit, multi-job
+submit, the public `rocket_stream_*`/`rocket_mm_batch_*` aliases, the long-context
+tiled attention path, on-NPU softmax, and every non-matmul op family (conv, pool,
+activation, norm, FFN, softmax, reduce, resize, encoders, graph). See the
+`rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and
@@ -169,4 +177,4 @@ token-for-token, and its QAT mobile checkpoints load bit-exactly.
 
 ## License
 
-GPL-3.0-or-later, matching `librocketnpu`.
+GPL-3.0-or-later, matching the upstream `librocketnpu` design this port follows.

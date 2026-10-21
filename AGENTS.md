@@ -1,8 +1,9 @@
 # AGENTS.md — burn-rocket
 
-`burn-rocket` is the main crate: RK3588 NPU offload for Burn models — an FFI wrapper
-over `librocketnpu` plus the `RocketOps` Burn backend extension (projections and
-attention on the mainline `rocket` driver). The inference app is
+`burn-rocket` is the main crate: RK3588 NPU offload for Burn models — the pure-Rust
+`rocket-npu` driver (`crates/rocket-npu`) plus the `RocketOps` Burn backend extension
+(projections and attention on the mainline `rocket` driver). No C toolchain, CMake,
+kernel headers, or vendor archive are involved. The inference app is
 `examples/rocket-inference/` (one binary, four model families: `qwen3`
 Qwen3-Embedding-0.6B, `intent` Qwen3.5-0.8B, `gemma` EmbeddingGemma 2 and Gemma 4
 E2B-it). Read `README.md` (library) and `examples/rocket-inference/README.md` (app)
@@ -78,9 +79,13 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 
 - **Library**: `burn-rocket` exposes the NPU as a Burn backend extension
   (`#[backend_extension(Flex)]`, `src/ext.rs`); ordinary `Tensor`s in/out via
-  `burn_rocket::{init, pack, pack2, pack3, matmul, attention, stats}`. Failure payloads
-  are typed (`OpFailure`), one global engine serializes the not-thread-safe FFI contexts.
-  Compile-checks on x86 with `--features npu`; linking needs aarch64.
+  `burn_rocket::{init, pack, pack2, pack3, matmul, attention, stats}`. The NPU side is
+  `crates/rocket-npu` (device/uAPI, regcmd, planner, cube layout, resident matmul,
+  flash attention): planner and fp16 regcmd output are byte-identical to the C library
+  on 132/132 planner shapes and every emitted program checked, and board numerics are
+  cosine >= 0.99999. Failure payloads are typed (`OpFailure`), one global engine
+  serializes the not-thread-safe contexts. Compile-checks on x86 with `--features npu`;
+  device access needs aarch64.
 - **Example CPU path** (`flex` backend, Q8 low-RAM): numerically faithful (cosine
   0.9991-0.9995 vs the production Q8_0 reference) and ~5× lower RAM (776 MiB vs ~4 GB),
   but 2.3× slower than the production `ik_llama.cpp` int8 server on the board
@@ -186,8 +191,18 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   AVX2-capable CPU). `serve` now defaults to NPU offload on NPU builds (`--no-npu`
   opts out; `--quant q8` keeps the CPU path unless `--npu` is explicit), so the image
   CMD is arch-uniform; the standalone `qwen3`/`gemma`/`intent` commands keep `--npu`
-  opt-in. The arm64 CI job installs `drm/rocket_accel.h` from Linux v6.18 (Ubuntu
-  24.04's kernel uapi headers predate the mainline rocket driver).
+- **Port status**: fp16 one-shot/streaming/resident/segmented matmul, group-wise int8,
+  the native bf16 stream and masked GQA attention are ported. Planner and regcmd output
+  are byte-equal to the C library; fp16/bf16 cosine >= 0.99999 and int8 matches its
+  dequantized reference. Board microbenchmarks: int8 512x3072x1024 62-70 ms vs C
+  59-66, bf16 stream 24-27 ms vs C 22-26. Attention uses a per-worker head split (no chained
+  per-head batch yet): 2587-token 8-head attention is 367 ms vs the C library's 295 ms.
+  End-to-end: qwen3 3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
+  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): dense/per-channel
+  int8, one-shot int8 group-wise, int4/int16/tf32, one-shot/resident bf16 (stream only),
+  `mha_self`, `*_ref` host references, `_planes`/transposed variants, RK3576 entries,
+  batched/chained submit, multi-job submit, public `rocket_stream_*`/`rocket_mm_batch_*`
+  aliases, tiled long-context attention, on-NPU softmax, and all non-matmul op families.
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -200,14 +215,14 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 
 | path | contents |
 |---|---|
-| `src/lib.rs` | FFI wrappers (`RocketCtx`/`RocketWeight`/`RocketStream`/`RocketFaCtx`, `pack_weight_seg`, `flash_attn`), driver/counter helpers, `Error`/`OpFailure` |
-| `src/ffi.rs` | raw `extern "C"` declarations for `librocketnpu` |
+| `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + fp16 emitter), `matmul/` (plan, layout, bos, run, context), `attn/`, `hw`, `knobs`, `error`; `src/bin/` has the parity dump and board self-tests |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `build.rs` | links `librocketnpu.a` for `npu` builds; resolves `ROCKETNPU_DIR` → matching `vendor/rocketnpu` → `$OUT_DIR/rocketnpu` → auto-build via the script (`ROCKETNPU_AUTO=0` disables, failures warn and are stamped) |
-| `scripts/build-rocketnpu.sh` | builds `librocketnpu.a` from a pinned `rocket-userspace` commit on the host (aarch64 cross by default, `--target host` for link checks); cache: `$OUT_DIR/rocket-userspace` from build.rs, else `<target-dir>/<profile>/build/burn-rocket` |
-| `examples/probe.rs` | low-level FFI probe (open device, pack, matmul, verify vs CPU) |
+| `tools/c-oracle/` | host-side C oracle (planner + fp16 regcmd dump) and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest`, `bf16_selftest` |
+| `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
 | `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
@@ -224,7 +239,6 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`) and the GGUF tokenizer parity check (`tokenizer_parity.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
-| `vendor/rocketnpu/` | **gitignored**: `librocketnpu.a`, `librocketgraph.a`, headers, `COMMIT`/`ARCH` provenance — built on the host by `scripts/build-rocketnpu.sh` (pinned upstream commit; no board copy); `build.rs` auto-builds a per-target copy into `$OUT_DIR` when it is absent |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
 ## Gemma family (`examples/rocket-inference/src/gemma/`)
@@ -369,10 +383,7 @@ output is coherent — TODO.
 ## Rebuild + deploy to the board
 
 ```sh
-# optional: pre-build the aarch64 archive into vendor/rocketnpu (build.rs
-# auto-builds a per-target copy into $OUT_DIR when it is absent)
-scripts/build-rocketnpu.sh
-# NPU build of the example (links vendor/rocketnpu/librocketnpu.a, or ROCKETNPU_DIR=<dir>)
+# NPU build of the example (pure Rust; no archive/C toolchain)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu
 ssh root@rock-5b-plus.lan 'mkdir -p /root/rocket-inference'
@@ -397,26 +408,25 @@ taskset -c 4-7 /root/rocket-inference/rocket-inference gemma bench \
     --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
 ```
 
-The binary is self-contained (`librocketnpu` is statically linked); the model lives at
+The binary is self-contained (the driver is statically linked Rust); the model lives at
 `/root/models/qwen3-embedding-0.6b/` on the board. On the board run from
 `/root/rocket-inference` (the bench uses the relative `data/bench_text.txt`).
 
 Library-only builds: `cargo check -p burn-rocket` (the `npu` feature is the default)
 compiles the extension on any host (no linking); `cargo build --release -p burn-rocket
 --target aarch64-unknown-linux-gnu` builds the library, and `--example probe` adds the
-FFI probe. `--no-default-features` gives the FFI-only crate (no Burn, no archive).
+driver probe. `--no-default-features` gives the no-Burn crate (helpers and masks only).
 
 Container image: one Dockerfile serves both architectures, chosen by the build
 platform — `docker build -f examples/rocket-inference/Dockerfile .` (context = repo
-root) on an aarch64 host with `vendor/rocketnpu/librocketnpu.a` staged
-(`scripts/build-rocketnpu.sh`) builds the NPU image, on x86-64 it builds the
+root) on an aarch64 host builds the NPU image, on x86-64 it builds the
 x86-64-v3 (AVX2) flex CPU image. `examples/rocket-inference/docker/build.sh
 [git-ref]` stages the tree, builds the aarch64 image on the board and pushes
 `git.kmsign.org/royalcat/rocket-inference:<sha>` (needs the archive — `VENDOR_SRC`
 overrides — and registry credentials on the control host; run it from anywhere in
 the repo). `.github/workflows/build-images.yml` builds both on every push to `main`
 and `v*` tags on native runners (buildx via `docker/build-push-action`, no
-cross/QEMU; the arm64 job builds `librocketnpu.a` on the runner first) and pushes
+cross/QEMU) and pushes
 `ghcr.io/royalcat/rocket-inference` with `docker/metadata-action` tags: aarch64 =
 `<sha>` + `latest` (primary), amd64 = `<sha>-amd64` + `latest-amd64`; PRs build
 without pushing. The image CMD is the unified server, identical on both architectures
@@ -433,9 +443,6 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 - `$CARGO_TARGET_DIR` is a shared cache (`/home/royalcat/.cache/rust/target`); never
   assume a project-local `target/`.
-- `librocketnpu` source/build cache: `$OUT_DIR/rocket-userspace/` when the script
-  runs from `build.rs`, else `<target-dir>/<profile>/build/burn-rocket/` (`src/`
-  clone + `build-<target>-<sha>/` cmake trees); removed by `cargo clean`.
 - Model: `~/models/qwen3-embedding-0.6b/` (HF bf16 safetensors + tokenizer.json).
 - Production reference: `~/projects/ik_llama.cpp/build/bin/llama-embedding` +
   `~/models/qwen3-embedding-0.6b-q8_0.gguf` (patched skip-lm-head build).
@@ -506,32 +513,16 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ## NPU offload (`--npu`, aarch64)
 
-- `burn-rocket` (repo root) = FFI to `librocketnpu` (rocket-userspace) plus the `RocketOps`
-  Burn backend extension. `npu` is the crate's **default** feature (first-class target: the
-  archive builds through `build.rs`); `--no-default-features` gives the FFI-only crate and
-  `--no-default-features --features flex` the Burn dependency without the extension or
-  archive (feature-graph check). `npu` implies
-  `flex` (required because Burn's `#[backend_extension(Flex)]` reads `feature = "flex"` in
-  the consuming crate) and links `vendor/rocketnpu/librocketnpu.a` (built by
-  `scripts/build-rocketnpu.sh`; override with `ROCKETNPU_DIR`). Build the example with
-  `--no-default-features --features npu`; aarch64 only: the dep is target-gated in
-  `examples/rocket-inference/Cargo.toml`.
-- `build.rs` supplies the archive without a manual step: `ROCKETNPU_DIR` (explicit;
-  never auto-built) → matching `vendor/rocketnpu` (an absent `ARCH` counts as aarch64)
-  → `$OUT_DIR/rocketnpu` → auto-build `scripts/build-rocketnpu.sh --out
-  $OUT_DIR/rocketnpu` (`ROCKETNPU_AUTO=0` disables; `ROCKETNPU_SRC=<checkout>` is the
-  offline path; cross vs native is picked from the target arch). A failed auto-build
-  only warns, and a stamp in `$OUT_DIR` (keyed by the script's size+mtime) blocks
-  retries until the script changes or `cargo clean -p burn-rocket`.
-- The cross archive must be built against the aarch64 uapi headers: with the host's
-  `/usr/include` first, `asm/posix_types.h` takes its non-x86 branch, `__kernel_size_t`
-  becomes 32-bit and `struct drm_version` 56 bytes, so the wrong `DRM_IOCTL_VERSION`
-  makes `rocket_open` fail with ENODEV on the board (found 2026-10-07 by the board A/B
-  of the fresh archive). `scripts/build-rocketnpu.sh` shims libdrm for the cross build
-  and keeps the host include dirs out; each build runs a `_Static_assert` ABI guard.
+- `burn-rocket` (repo root) = the pure-Rust `rocket-npu` driver plus the `RocketOps`
+  Burn backend extension. `npu` is the crate's **default** feature; `--no-default-features`
+  gives the no-Burn crate and `--no-default-features --features flex` the Burn dependency
+  without the extension (feature-graph check). `npu` implies `flex` (required because
+  Burn's `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and
+  `dep:rocket-npu`. Build the example with `--no-default-features --features npu`;
+  aarch64 only: the dep is target-gated in `examples/rocket-inference/Cargo.toml`.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
-  one global engine behind a mutex (the FFI contexts are not thread-safe), so NPU calls
+  one global engine behind a mutex (the driver contexts are not thread-safe), so NPU calls
   serialize. `attention_window(q, k, v, h, kv, d, scale, softcap, window)` (added
   2026-10-07 for EmbeddingGemma 2) applies a bidirectional band mask
   (`|q - kv| <= window`; `window < 0` = no mask); `attention_window_block(..., window,
@@ -579,9 +570,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   `src/util/http.rs`, containment in each family's server, log §12).
 - Board: the 600 MHz patched module (`insmod /root/npu-poc/rocket-patched-600/rocket-npu600.ko
   rocket_npu_clk_hz=600000000` after `rmmod rocket`; contained, reboot reverts) is ~3x the
-  stock 200 MHz boot clock. `librocketnpu` is the host cross-built archive from
-  `scripts/build-rocketnpu.sh` (GPL-3.0-or-later); the board's
-  `/root/npu-poc/rocket-userspace` tree is an older revision and is no longer the source.
+  stock 200 MHz boot clock. The driver is the pure-Rust `crates/rocket-npu`
+  (GPL-3.0-or-later); the board's `/root/npu-poc/rocket-userspace` tree is only
+  historical reference.
 - Measured (3,633 tok, 4 threads, cores 4-7): CPU-only 100.1 s / 622 CPU-s;
   `--npu --npu-attn cpu` 86.9 s / 409 CPU-s; `--npu` (NPU attention, default) 80.8 s /
   302 CPU-s — re-verified after the extension-ops refactor (log §11; the pre-refactor
@@ -592,7 +583,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   (`pack_weight_seg`, concatenated along N): 196 tensors -> 112 resident weights, 4
   matmuls per layer, one input conversion per group. The loader packs each weight straight
   from the store and drops the host copy (`pack-and-drop`).
-- librocketnpu's float matmul ladder (header): fp16 resident (`rocket_weights_pack` +
+- The C library's float matmul ladder (for reference): fp16 resident (`rocket_weights_pack` +
   `rocket_matmul_fp16_prepacked`) — what the extension uses for f32/f16 model weights
   **and for bf16** (packed via the exact bf16->f16 conversion); bf16 (full-speed
   2-byte geometry, fp32 accumulate and NO scaling, but streaming-only: no
@@ -710,7 +701,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   - The impl exists only for `Flex`: an op call with a `cpu`/CubeCL tensor panics on the
     dispatch side ("wrong backend"), and an autodiff context panics too (no backward is
     generated) — the ops are inference-only.
-  - The one global engine serializes calls (the FFI contexts are not thread-safe), so NPU
+  - The one global engine serializes calls (the driver contexts are not thread-safe), so NPU
     ops from several threads queue up rather than race.
 - Cross-compile: `.cargo/config.toml` sets `aarch64-linux-gnu-gcc` for
   `aarch64-unknown-linux-gnu`; artifacts land in
@@ -761,7 +752,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 B=$CARGO_TARGET_DIR/release/rocket-inference
 # library compile checks (npu is the default; no linking on the host)
 cargo check -p burn-rocket
-# FFI-only and flex-only (no extension/archive) variants
+# no-Burn and flex-only variants
 cargo check -p burn-rocket --no-default-features
 cargo check -p burn-rocket --no-default-features --features flex
 # example npu compile check (the dep is aarch64-gated, so use the target)
@@ -769,8 +760,7 @@ cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-
 # formatting + lint gates (both clean)
 cargo fmt --all -- --check
 cargo clippy -p rocket-inference --no-default-features
-# container image for this architecture (context = repo root; the aarch64 branch
-# needs vendor/rocketnpu/librocketnpu.a staged first)
+# container image for this architecture (context = repo root)
 docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
 docker run --rm rocket-inference:local --help
 # lint the CI workflow; actionlint catches expression bugs (e.g. the buildx

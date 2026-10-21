@@ -67,7 +67,7 @@ for the dense Gemma checkpoints). Main quant target: Q8_0; F16/BF16/F32 also loa
 cargo build --release -p rocket-inference --no-default-features
 # default build (adds the CubeCL/LLVM `cpu` backend)
 cargo build --release -p rocket-inference
-# aarch64 cross-build (board); `--features npu` links librocketnpu
+# aarch64 cross-build (board); `--features npu` enables the pure-Rust driver
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
@@ -77,7 +77,7 @@ cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 The aarch64 binaries and models on the board live under `/root/rocket-inference/`
 (binary) and `/root/models/`; run from the deploy dir (the qwen bench uses the
 relative `data/bench_text.txt`). The NPU build is self-contained
-(`librocketnpu` is statically linked) and needs `/dev/accel/accel0` at run time for
+(the pure-Rust driver is statically linked) and needs `/dev/accel/accel0` at run time for
 `--npu`, which `serve` turns on by default on that build (see [Serving](#serving)).
 
 The container image builds both architectures from the same Dockerfile, chosen by the
@@ -85,7 +85,7 @@ build platform; on x86-64 the same command produces the x86-64-v3 (AVX2) flex CP
 image:
 
 ```sh
-# on the board (or any aarch64 host), with vendor/rocketnpu/librocketnpu.a staged
+# on the board (or any aarch64 host)
 docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
 ```
 
@@ -504,9 +504,8 @@ board). Not yet done: streaming, video input.
 `--no-default-features` drops the CubeCL/LLVM `cpu` backend, whose prebuilt LLVM
 bundle is host-architecture and cannot link for aarch64; `flex` (NEON on
 aarch64) is always available. The linker is configured in `.cargo/config.toml`.
-`--features npu` links `librocketnpu.a`: `build.rs` uses `ROCKETNPU_DIR` when
-set, else a matching `vendor/rocketnpu/`, else builds one into `$OUT_DIR` with
-`scripts/build-rocketnpu.sh`.
+`--features npu` enables the pure-Rust `rocket-npu` driver; there is no vendor
+archive, C toolchain or kernel-header step.
 
 ## Notes
 
