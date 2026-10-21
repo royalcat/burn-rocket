@@ -484,12 +484,13 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - **Live service**: OpenViking's embedding backend. Since 2026-10-08 it is
   EmbeddingGemma 2; since 2026-10-21 it runs the pure-Rust driver image
-  `ghcr.io/royalcat/rocket-inference:rust-npu-18be74a` (branch `rust-rocket`
-  commit `18be74a`; the branch is unmerged, so CI `:latest` is still the C driver)
+  `ghcr.io/royalcat/rocket-inference:rust-npu-18be74a` (commit `18be74a`; the
+  `rust-rocket` branch was merged to `main` as `f06f0ea` on 2026-10-22, so CI
+  `:latest` now builds the pure-Rust driver from `main`)
   with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024 --port 8383
   --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`,
   CPUs 4-7, NPU, `mem_limit` 8g. The 2026-10-21 scratch-memory round
-  (log-gemma §15) is **not** deployed yet: rebuild/redeploy that branch tip and
+  (log-gemma §15) is **not** deployed yet: rebuild/redeploy from `main` and
   re-measure on an idle board. The previous C/GGUF image `a986d54` predates the
   2026-10-17 `gemma4` tokenizer fix; the documents indexed in the GGUF-era window
   may need re-embedding (their vectors and queries were self-consistent but up to
