@@ -32,26 +32,41 @@ const MAX_WORKERS: usize = 8;
 struct Scratch {
     plan: Plan,
     bos: Bos,
+    stamp: u64,
+}
+
+/// Per-worker attention scratch accounting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScratchMem {
+    /// Padded query/key shape the worker's buffers are sized for.
+    pub shape: (usize, usize),
+    pub bo_bytes: usize,
+    pub host_bytes: usize,
+}
+
+/// All scratch held by one attention context.
+#[derive(Debug, Clone, Default)]
+pub struct MemStats {
+    pub bo_bytes: usize,
+    pub host_bytes: usize,
+    pub workers: Vec<ScratchMem>,
 }
 
 impl Scratch {
     fn new(dev: &Device, m: usize, k: usize, n: usize) -> Result<Self> {
         let plan = Plan::new(m, k, n)?;
         let bos = Bos::new(dev, &plan, Config::from_env())?;
-        Ok(Scratch { plan, bos })
-    }
-
-    fn get(&mut self, dev: &Device, m: usize, k: usize, n: usize) -> Result<()> {
-        if self.plan.m != m || self.plan.k != k || self.plan.n != n {
-            *self = Scratch::new(dev, m, k, n)?;
-        }
-        Ok(())
+        Ok(Scratch {
+            plan,
+            bos,
+            stamp: 0,
+        })
     }
 
     fn matmul(&mut self, a: &[f16], b: &[f16], c: &mut [f16]) -> Result<()> {
         self.bos.pack_input(&self.plan, a)?;
         self.bos.pack_weights(&self.plan, b)?;
-        let wt = self.bos.wt_all.mem_ref();
+        let wt = self.bos.wt().mem_ref();
         if self.bos.has_pong {
             match compute_kacc(&self.plan, &mut self.bos, wt, c) {
                 Ok(()) => return Ok(()),
@@ -63,10 +78,82 @@ impl Scratch {
     }
 }
 
+/// A two-entry scratch cache. A forward alternates between a sliding-layer chunk
+/// and a full-layer chunk; keeping both avoids reallocating the large `[Tp, Kn]`
+/// BOs on every layer, while the bound stops a short request from retaining an
+/// arbitrarily old shape forever.
+struct ScratchCache {
+    entries: Vec<Scratch>,
+    clock: u64,
+    /// Clock at the last [`ScratchCache::trim`]; entries at or below it belong
+    /// to an earlier request.
+    last_trim: u64,
+}
+
+impl ScratchCache {
+    fn new(dev: &Device, m: usize, k: usize, n: usize) -> Result<Self> {
+        Ok(ScratchCache {
+            entries: vec![Scratch::new(dev, m, k, n)?],
+            clock: 1,
+            last_trim: 0,
+        })
+    }
+
+    fn get(&mut self, dev: &Device, m: usize, k: usize, n: usize) -> Result<()> {
+        self.clock += 1;
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|s| s.plan.m == m && s.plan.k == k && s.plan.n == n)
+        {
+            self.entries[i].stamp = self.clock;
+            // `current_mut` is the last entry, so a hit has to move to the back.
+            if i + 1 != self.entries.len() {
+                let hit = self.entries.remove(i);
+                self.entries.push(hit);
+            }
+            return Ok(());
+        }
+        if self.entries.len() >= 2 {
+            let oldest = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.stamp)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            // Drop before allocating: the new BOs can be as large as the old.
+            self.entries.remove(oldest);
+        }
+        let mut scratch = Scratch::new(dev, m, k, n)?;
+        scratch.stamp = self.clock;
+        self.entries.push(scratch);
+        Ok(())
+    }
+
+    fn current_mut(&mut self) -> &mut Scratch {
+        self.entries
+            .last_mut()
+            .expect("attention scratch cache is never empty")
+    }
+
+    fn bo_bytes(&self) -> usize {
+        self.entries.iter().map(|s| s.bos.bytes()).sum()
+    }
+
+    /// Drop entries from earlier requests, keeping every shape touched by the
+    /// just-finished one (the first and last chunk can differ in length).
+    fn trim(&mut self) {
+        let mark = self.clock;
+        self.entries.retain(|s| s.stamp > self.last_trim);
+        self.last_trim = mark;
+    }
+}
+
 struct Worker {
     dev: Device,
-    qk: Scratch,
-    av: Scratch,
+    qk: ScratchCache,
+    av: ScratchCache,
     qh: Vec<f16>,
     kh: Vec<f16>,
     vh: Vec<f16>,
@@ -81,10 +168,25 @@ struct Worker {
 }
 
 impl Worker {
+    fn mem(&self) -> ScratchMem {
+        let host = self.qh.capacity()
+            + self.kh.capacity()
+            + self.vh.capacity()
+            + self.p.capacity()
+            + self.scores.capacity()
+            + self.ctx.capacity()
+            + self.out.capacity();
+        ScratchMem {
+            bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes(),
+            host_bytes: host * 2,
+            shape: (self.tp, self.kn),
+        }
+    }
+
     fn new(dev: Device) -> Result<Self> {
         // Small placeholder shapes; replaced on the first real call.
-        let qk = Scratch::new(&dev, 4, 32, 16)?;
-        let av = Scratch::new(&dev, 4, 32, 16)?;
+        let qk = ScratchCache::new(&dev, 4, 32, 16)?;
+        let av = ScratchCache::new(&dev, 4, 32, 16)?;
         Ok(Worker {
             dev,
             qk,
@@ -117,9 +219,23 @@ impl Worker {
         self.scores.resize(self.tp * self.kn, f16::ZERO);
         self.p.resize(self.tp * self.kn, f16::ZERO);
         self.ctx.resize(self.tp * dv, f16::ZERO);
+        self.shrink_host();
         self.qk.get(&self.dev, self.tp, dk, self.kn)?;
         self.av.get(&self.dev, self.tp, self.kn, dv)?;
         Ok(())
+    }
+
+    /// Release the long-request host matrices once the working shape is much
+    /// smaller; small changes keep the capacity.
+    fn shrink_host(&mut self) {
+        if self.scores.capacity() > self.tp * self.kn * 4 {
+            self.qh.shrink_to_fit();
+            self.kh.shrink_to_fit();
+            self.vh.shrink_to_fit();
+            self.scores.shrink_to_fit();
+            self.p.shrink_to_fit();
+            self.ctx.shrink_to_fit();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -163,7 +279,9 @@ impl Worker {
                 self.vh[dst..dst + kv].copy_from_slice(&v[src..src + kv]);
             }
 
-            self.qk.matmul(&self.qh, &self.kh, &mut self.scores)?;
+            self.qk
+                .current_mut()
+                .matmul(&self.qh, &self.kh, &mut self.scores)?;
             softmax(
                 &self.scores,
                 &mut self.p,
@@ -175,7 +293,9 @@ impl Worker {
                 scale,
                 softcap,
             );
-            self.av.matmul(&self.p, &self.vh, &mut self.ctx)?;
+            self.av
+                .current_mut()
+                .matmul(&self.p, &self.vh, &mut self.ctx)?;
 
             for row in 0..t {
                 let dst = (oi * t + row) * dv;
@@ -202,6 +322,28 @@ impl Attention {
             workers.push(Worker::new(Device::open()?)?);
         }
         Ok(Attention { workers })
+    }
+
+    /// Live scratch held by the worker contexts.
+    pub fn mem_stats(&self) -> MemStats {
+        let mut stats = MemStats::default();
+        for w in &self.workers {
+            let m = w.mem();
+            stats.bo_bytes += m.bo_bytes;
+            stats.host_bytes += m.host_bytes;
+            stats.workers.push(m);
+        }
+        stats
+    }
+
+    /// Drop shape classes from an earlier, much larger request and release the
+    /// host matrices they held. The just-used class stays resident.
+    pub fn trim_scratch(&mut self) {
+        for w in &mut self.workers {
+            w.qk.trim();
+            w.av.trim();
+            w.shrink_host();
+        }
     }
 
     /// `out = softmax(scale * Q K^T + mask) V`, per head, GQA-aware.

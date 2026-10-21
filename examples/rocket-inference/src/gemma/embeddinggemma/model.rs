@@ -187,24 +187,31 @@ impl TextAttention {
             let qf = q.reshape([b, s, h * d]);
             let kf = k.reshape([b, s, kv * d]);
             let vf = v.reshape([b, s, kv * d]);
-            if spec.sliding && s > chunk {
-                // Chunked band attention: a query chunk only attends to the keys
-                // within `sliding_window` of it, so the score matrix, the host
-                // softmax and the mask stay O(s * (chunk + 2*window)) instead of
-                // O(s^2) (which OOMs the board around 30k).
-                let w = sliding_window;
+            if s > chunk {
+                // Chunked attention: a query chunk only attends to the keys it can
+                // see, so the score matrix, host softmax and mask stay
+                // O(chunk * (chunk + 2*window)) instead of O(s^2), which OOMs the
+                // board around 30k. Sliding layers use their band; full layers see
+                // every key (no mask) but still process the queries in chunks.
                 let chunk = chunk.max(1);
                 let mut outs: Vec<Tensor<3>> = Vec::new();
                 let mut q0 = 0;
                 while q0 < s {
                     let q1 = (q0 + chunk).min(s);
-                    let k0 = q0.saturating_sub(w);
-                    let k1 = (q1 + w).min(s);
+                    let (k0, k1, window) = if spec.sliding {
+                        (
+                            q0.saturating_sub(sliding_window),
+                            (q1 + sliding_window).min(s),
+                            sliding_window as i64,
+                        )
+                    } else {
+                        (0, s, -1)
+                    };
                     let qc = qf.clone().slice(s![.., q0..q1, ..]);
                     let kc = kf.clone().slice(s![.., k0..k1, ..]);
                     let vc = vf.clone().slice(s![.., k0..k1, ..]);
                     outs.push(burn_rocket::attention_window_block(
-                        qc, kc, vc, h, kv, d, 1.0, None, w as i64, q0 as i64, k0 as i64,
+                        qc, kc, vc, h, kv, d, 1.0, None, window, q0 as i64, k0 as i64,
                     ));
                     q0 = q1;
                 }

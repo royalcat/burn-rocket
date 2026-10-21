@@ -29,8 +29,8 @@ use half::{bf16, f16};
 
 use crate::masks::{build_causal_mask, build_causal_window_mask, build_window_mask};
 use crate::{
-    Error, OpFailure, RocketBf16Stream, RocketCtx, RocketFaCtx, RocketI8Ctx, RocketI8Weight,
-    RocketWeight, pad_rows,
+    AttnMem, Error, MemStats, OpFailure, RocketBf16Stream, RocketCtx, RocketFaCtx, RocketI8Ctx,
+    RocketI8Weight, RocketWeight, SlotMem, pad_rows,
 };
 
 /// The Flex backend's float primitive, the concrete type the ops execute on.
@@ -180,6 +180,68 @@ pub fn stats_reset() {
     NPU_CALLS.store(0, Ordering::Relaxed);
 }
 
+/// Live scratch held by the global engine, or `None` before [`init`].
+///
+/// The per-shape matmul cache and attention scratch are the two length-scoped
+/// allocations; this readout is what `ROCKET_MEM_LOG=1` prints per request.
+pub fn mem_stats() -> Option<MemStats> {
+    let mut guard = engine();
+    let e = guard.as_mut()?;
+    let mut stats = MemStats {
+        weights_bytes: e.weights.values().map(|r| r.weight.bytes()).sum(),
+        ..MemStats::default()
+    };
+    let mm = e.ctx.mem_stats();
+    stats.matmul_bo_bytes = mm.bo_bytes;
+    stats.matmul_host_bytes = mm.host_bytes;
+    stats.slots = mm
+        .slots
+        .into_iter()
+        .map(|s| SlotMem {
+            m: s.m,
+            k: s.k,
+            n: s.n,
+            bo_bytes: s.bo_bytes,
+            host_bytes: s.host_bytes,
+        })
+        .collect();
+    if !e.fa.is_empty() {
+        stats.attention_bo_bytes = e.fa.iter().map(|f| f.fa.mem_stats().bo_bytes).sum();
+        stats.attention_host_bytes = e.fa.iter().map(|f| f.fa.mem_stats().host_bytes).sum();
+        stats.attn_workers =
+            e.fa.iter()
+                .flat_map(|f| f.fa.mem_stats().workers)
+                .map(|w| AttnMem {
+                    tp: w.shape.0,
+                    kn: w.shape.1,
+                    bo_bytes: w.bo_bytes,
+                    host_bytes: w.host_bytes,
+                })
+                .collect();
+    }
+    Some(stats)
+}
+
+/// Drop matmul scratch sets from earlier requests, keeping the just-used set.
+/// Called after a served request when `ROCKET_TRIM` is on.
+pub fn trim_scratch() {
+    let mut guard = engine();
+    if let Some(e) = guard.as_mut() {
+        e.ctx.trim_scratch();
+        for fa in &mut e.fa {
+            fa.fa.trim_scratch();
+        }
+    }
+}
+
+/// Drop every cached matmul scratch set (startup / low-memory reset).
+pub fn clear_scratch() {
+    let mut guard = engine();
+    if let Some(e) = guard.as_mut() {
+        e.ctx.clear_scratch();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Global engine: one NPU context, the resident weights and the attention
 // scratch/fa context. The driver contexts are not thread-safe, so every op
@@ -275,10 +337,41 @@ struct FaState {
     out: Vec<f16>,     // [n_head][n][head_dim]
 }
 
+/// A model can alternate two attention geometries (EmbeddingGemma 2's sliding
+/// and full layers differ in head_dim and KV heads). Keeping one context per
+/// geometry avoids reopening the worker fds and discarding the scratch every
+/// layer.
+const MAX_FA_GEOMETRIES: usize = 4;
+
+impl FaState {
+    fn new(fa: RocketFaCtx, n_head: usize, n_kv: usize, head_dim: usize) -> Self {
+        FaState {
+            fa,
+            n_head,
+            n_kv,
+            head_dim,
+            n: 0,
+            n_k: 0,
+            mask: Vec::new(),
+            win: usize::MAX,
+            win_mask: Vec::new(),
+            cw: usize::MAX,
+            cw_mask: Vec::new(),
+            wb: None,
+            wb_mask: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+}
+
 struct Engine {
     threads: usize,
     ctx: RocketCtx,
-    fa: Option<FaState>,
+    /// One attention context per geometry (see [`MAX_FA_GEOMETRIES`]).
+    fa: Vec<FaState>,
     weights: HashMap<u64, Resident>,
     /// Native bf16 weights (host-side; the bf16 stream re-packs per call).
     bf16_weights: HashMap<u64, Bf16Resident>,
@@ -324,7 +417,7 @@ pub fn init(threads: usize) -> Result<(), Error> {
     *guard = Some(Engine {
         threads,
         ctx,
-        fa: None,
+        fa: Vec::new(),
         weights: HashMap::new(),
         bf16_weights: HashMap::new(),
         bf16: None,
@@ -468,7 +561,7 @@ impl RocketOps for Flex {
         kv_start: i64,
     ) -> FloatTensor<Self> {
         let mode = if window < 0 {
-            MaskMode::None
+            MaskMode::NoneBlock
         } else {
             MaskMode::WindowBlock {
                 window: window as usize,
@@ -1160,6 +1253,8 @@ fn matmul_bf16(
 enum MaskMode {
     /// Full bidirectional attention (no mask).
     None,
+    /// Full bidirectional attention over a query chunk; `n_k != n` is allowed.
+    NoneBlock,
     /// Causal: `j <= t`.
     Causal,
     /// Symmetric band: `|t - j| <= window`.
@@ -1205,7 +1300,7 @@ fn attention_impl(
         vec![1, n_k, n_kv * head_dim],
         "NPU attention: v must be [1, S, KV*D]"
     );
-    if !matches!(mode, MaskMode::WindowBlock { .. }) {
+    if !matches!(mode, MaskMode::WindowBlock { .. } | MaskMode::NoneBlock) {
         assert_eq!(
             n_k, n,
             "the full-sequence mask modes need equal query/key lengths"
@@ -1217,38 +1312,30 @@ fn attention_impl(
     let vf = read_floats_f32(v, "attention v");
 
     let out = with_engine(|e| {
-        let recreate = match &e.fa {
-            Some(s) => s.n_head != n_head || s.n_kv != n_kv || s.head_dim != head_dim,
-            None => true,
+        let threads = e.threads;
+        let idx = match e
+            .fa
+            .iter()
+            .position(|s| s.n_head == n_head && s.n_kv == n_kv && s.head_dim == head_dim)
+        {
+            Some(i) => i,
+            None => {
+                let fa = RocketFaCtx::new(threads).unwrap_or_else(|err| {
+                    op_failure("rocket_fa_ctx_create", err.rc, n, n_k, head_dim)
+                });
+                if e.fa.len() >= MAX_FA_GEOMETRIES {
+                    e.fa.remove(0);
+                }
+                e.fa.push(FaState::new(fa, n_head, n_kv, head_dim));
+                e.fa.len() - 1
+            }
         };
-        if recreate {
-            let fa = RocketFaCtx::new(e.threads)
-                .unwrap_or_else(|err| op_failure("rocket_fa_ctx_create", err.rc, n, n_k, head_dim));
-            e.fa = Some(FaState {
-                fa,
-                n_head,
-                n_kv,
-                head_dim,
-                n: 0,
-                n_k: 0,
-                mask: Vec::new(),
-                win: usize::MAX,
-                win_mask: Vec::new(),
-                cw: usize::MAX,
-                cw_mask: Vec::new(),
-                wb: None,
-                wb_mask: Vec::new(),
-                q: Vec::new(),
-                k: Vec::new(),
-                v: Vec::new(),
-                out: Vec::new(),
-            });
-        }
-        let st = e.fa.as_mut().unwrap();
+        let st = &mut e.fa[idx];
         if st.n != n || st.n_k != n_k {
             st.n = n;
             st.n_k = n_k;
-            st.mask = build_causal_mask(n);
+            // Built lazily: EmbeddingGemma 2's full layers use no mask at all.
+            st.mask.clear();
             st.win = usize::MAX;
             st.win_mask.clear();
             st.cw = usize::MAX;
@@ -1262,6 +1349,9 @@ fn attention_impl(
         }
 
         let t_conv = Instant::now();
+        if matches!(mode, MaskMode::Causal) && st.mask.is_empty() {
+            st.mask = build_causal_mask(n);
+        }
         if let MaskMode::Window(w) = mode
             && st.win != w
         {
@@ -1303,7 +1393,7 @@ fn attention_impl(
 
         let t_npu = Instant::now();
         let mask = match mode {
-            MaskMode::None => None,
+            MaskMode::None | MaskMode::NoneBlock => None,
             MaskMode::Causal => Some(&mask[..]),
             MaskMode::Window(_) => Some(&win_mask[..]),
             MaskMode::CausalWindow(_) => Some(&cw_mask[..]),

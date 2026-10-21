@@ -78,8 +78,10 @@ impl AppState {
             };
             // Long requests leave their transient buffers in the allocator's
             // arenas; hand them back before the next request (`ROCKET_TRIM=0`
-            // disables it).
+            // disables it). The driver trim keeps the just-used shape set and
+            // drops per-shape scratch from earlier requests.
             crate::util::trim_after_request();
+            crate::util::log_npu_mem();
             Ok((out, timing))
         })
         .await
@@ -107,6 +109,10 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     // the first request (the loaders trim their own transients; the tokenizer
     // parse and the engine construction happen after those trims).
     crate::util::trim_heap();
+    // Mark the load-time matmul scratch as older than the first request: the
+    // per-request trim then keeps only the request's own shape set.
+    crate::util::trim_npu_scratch();
+    crate::util::log_npu_mem();
     let capabilities = settings.capabilities;
     let model_name = settings.model_name.clone();
     let state = AppState {

@@ -37,6 +37,56 @@ pub use ext::{
     bf16_stream_mode, gelu_mul, init, matmul, pack, pack_i8, pack2, pack3, rms_norm,
     rms_norm_noscale, rope_apply, silu_mul, stats, stats_reset,
 };
+#[cfg(feature = "npu")]
+pub use ext::{clear_scratch, mem_stats, trim_scratch};
+
+/// One entry of the matmul per-shape scratch cache.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlotMem {
+    /// Capacity class height (the slot's `M`); calls with a smaller live `M` reuse it.
+    pub m: usize,
+    pub k: usize,
+    pub n: usize,
+    pub bo_bytes: usize,
+    pub host_bytes: usize,
+}
+
+/// One attention worker's retained scratch.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttnMem {
+    /// Padded `(query, key)` shape the scratch is sized for.
+    pub tp: usize,
+    pub kn: usize,
+    pub bo_bytes: usize,
+    pub host_bytes: usize,
+}
+
+/// Live NPU scratch accounting for the global engine.
+///
+/// `mem_stats` is `None` on builds without the `npu` feature (and before
+/// `init`), so callers can log it unconditionally from shared server code.
+#[derive(Debug, Clone, Default)]
+pub struct MemStats {
+    /// Resident weight BOs (the packed projections).
+    pub weights_bytes: usize,
+    pub matmul_bo_bytes: usize,
+    pub matmul_host_bytes: usize,
+    pub attention_bo_bytes: usize,
+    pub attention_host_bytes: usize,
+    pub slots: Vec<SlotMem>,
+    pub attn_workers: Vec<AttnMem>,
+}
+
+#[cfg(not(feature = "npu"))]
+pub fn mem_stats() -> Option<MemStats> {
+    None
+}
+
+#[cfg(not(feature = "npu"))]
+pub fn trim_scratch() {}
+
+#[cfg(not(feature = "npu"))]
+pub fn clear_scratch() {}
 
 pub use half;
 use half::f16;
@@ -195,6 +245,21 @@ impl RocketCtx {
     ) -> Result<(), Error> {
         Ok(self.inner.matmul_prepacked(m, k, n, a, c, w)?)
     }
+
+    /// Keep only the matmul shape set touched since the previous call.
+    pub fn trim_scratch(&mut self) {
+        self.inner.trim_scratch();
+    }
+
+    /// Drop every cached matmul shape set.
+    pub fn clear_scratch(&mut self) {
+        self.inner.clear_scratch();
+    }
+
+    /// Live per-shape scratch held by this context.
+    pub fn mem_stats(&self) -> rocket_npu::matmul::MemStats {
+        self.inner.mem_stats()
+    }
 }
 
 /// A weight resident in NPU buffers.
@@ -238,6 +303,16 @@ impl RocketFaCtx {
             n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads, scale, softcap, q, k, v, mask, out,
         )?)
     }
+
+    /// Live per-worker attention scratch.
+    pub fn mem_stats(&self) -> rocket_npu::attn::MemStats {
+        self.inner.mem_stats()
+    }
+
+    /// Drop scratch classes from an earlier, much larger request.
+    pub fn trim_scratch(&mut self) {
+        self.inner.trim_scratch();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +323,12 @@ impl RocketFaCtx {
 // ---------------------------------------------------------------------------
 
 /// Resident group-wise int8 context (`rocket_i8_ctx` in the C API).
+#[cfg(feature = "npu")]
 pub struct RocketI8Ctx {
     inner: rocket_npu::matmul::I8Context,
 }
 
+#[cfg(feature = "npu")]
 impl RocketI8Ctx {
     pub fn new(nthreads: usize) -> Result<Self, Error> {
         Ok(Self {
@@ -289,13 +366,16 @@ impl RocketI8Ctx {
 }
 
 /// A group-wise int8 weight resident in NPU buffers.
+#[cfg(feature = "npu")]
 pub type RocketI8Weight = rocket_npu::matmul::I8Weight;
 
 /// Persistent native-bf16 stream: f32 in/out, bf16 device math, f64 host accumulation.
+#[cfg(feature = "npu")]
 pub struct RocketBf16Stream {
     inner: rocket_npu::matmul::Bf16Stream,
 }
 
+#[cfg(feature = "npu")]
 impl RocketBf16Stream {
     pub fn new(nthreads: usize) -> Result<Self, Error> {
         Ok(Self {

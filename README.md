@@ -71,6 +71,7 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   );
 
   // bidirectional band attention (encoders): |q - kv| <= window, window < 0 = no mask
+  // (a no-mask block may have n_k != n_q, which is how full layers are chunked)
   let out = burn_rocket::attention_window(
       q, k, v, 4, 2, 256, 1.0, None, 512,
   );
@@ -83,6 +84,16 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   their outputs (the example packs q|k|v and gate|up that way). Matmuls are chunked
   above `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the
   per-call input buffer; rows are independent, so chunking is bit-identical.
+
+  The per-shape scratch cache is bounded: `M` is keyed by capacity classes (≤25 %
+  padding, live rows planned per call so padded rows are never computed), the
+  streaming-weight and CPU-accumulation BOs are allocated lazily, and
+  `ROCKET_SCRATCH_MB` (default 1024, `0` = unlimited) caps the cache with
+  free-before-allocate LRU. A served request keeps its own shape set; the next
+  request's trim drops earlier sets (`burn_rocket::trim_scratch`, run by the
+  example after each request; `ROCKET_TRIM=0` disables it). `ROCKET_M_BUCKET=0`
+  restores exact-`M` slots, and `ROCKET_MEM_LOG=1` prints the live split
+  (weights / matmul BO+host / attention BO+host).
 
 - **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
   `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention`, `f16` helpers,
@@ -171,9 +182,9 @@ with `--npu` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 
 on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident,
 605 MiB anon idle in the deployed text-only `--defer-towers` configuration)
 and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
-fp16 weights plus windowed attention, for 1.61x wall and -33 % user CPU vs the CPU
-baseline (2587-token text). Gemma 4 E2B-it greedily reproduces the HF reference
-token-for-token, and its QAT mobile checkpoints load bit-exactly.
+fp16 weights plus chunked sliding **and full** attention, for 1.61x wall and -33 %
+user CPU vs the CPU baseline (2587-token text). Gemma 4 E2B-it greedily reproduces
+the HF reference token-for-token, and its QAT mobile checkpoints load bit-exactly.
 
 ## License
 

@@ -105,7 +105,7 @@ pub fn one_shot(
     let mut bos = Bos::new(dev, &plan, config)?;
     bos.pack_input(&plan, a)?;
     bos.pack_weights(&plan, b)?;
-    let wt = bos.wt_all.mem_ref();
+    let wt = bos.wt().mem_ref();
     let mut out = vec![f16::ZERO; m * n];
     if config.kacc {
         match compute_kacc(&plan, &mut bos, wt, &mut out) {
@@ -151,6 +151,7 @@ fn submit(
 
 /// CPU fp32 accumulation over every K-tile (the byte-exact reference path).
 pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Result<()> {
+    bos.ensure_out()?;
     let mut prof = Prof::new();
     let mut acc = vec![0.0f32; plan.m * plan.n];
     let total = plan.jobs();
@@ -168,7 +169,7 @@ pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Res
                 }
                 prof.mark(b'g');
                 let out_off = nb * plan.out_slot;
-                let output_dma = (bos.out_all.dma_address() + (out_off * 2) as u64) as u32;
+                let output_dma = (bos.out().dma_address() + (out_off * 2) as u64) as u32;
                 let input =
                     bos.in_all.dma_address() + ((mi * plan.nkt + ki) * plan.in_slot * 2) as u64;
                 let weights = wt.dma + ((ni * plan.nkt + ki) * plan.wt_slot * 2) as u64;
@@ -196,18 +197,18 @@ pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Res
                 if nb == BATCH || done == total {
                     bos.regcmd.fini()?;
                     prof.mark(b's');
-                    bos.out_all.prep(0)?;
-                    bos.out_all.fini()?;
+                    bos.out_mut().prep(0)?;
+                    bos.out_mut().fini()?;
                     prof.mark(b's');
                     let in_handles = [bos.in_all.handle(), wt.handle, bos.regcmd.handle()];
-                    let out_handles = [bos.out_all.handle()];
+                    let out_handles = [bos.out().handle()];
                     let dev = bos.dev.clone();
                     submit(&dev, bos, &tasks, &in_handles, &out_handles)?;
                     prof.mark(b'u');
-                    bos.out_all.prep(wait_ns())?;
+                    bos.out_mut().prep(wait_ns())?;
                     prof.mark(b'w');
 
-                    let bytes = bos.out_all.as_slice();
+                    let bytes = bos.out().as_slice();
                     let words = unsafe {
                         std::slice::from_raw_parts(bytes.as_ptr().cast::<f16>(), bytes.len() / 2)
                     };
@@ -223,7 +224,7 @@ pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Res
                             plan.n_tile(ni),
                         );
                     }
-                    bos.out_all.fini()?;
+                    bos.out_mut().fini()?;
                     prof.mark(b'r');
                     nb = 0;
                     tasks.clear();

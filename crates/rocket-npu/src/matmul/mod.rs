@@ -11,7 +11,7 @@ pub mod run;
 
 pub use bf16::Bf16Stream;
 pub use bos::{Bos, Config};
-pub use context::{Context, Weight};
+pub use context::{Context, MemStats, SlotMem, Weight};
 pub use int8::{I8Context, I8Weight};
 pub use plan::{Plan, plan_geom};
 pub use run::{compute_cpu, compute_kacc, one_shot};

@@ -45,6 +45,85 @@ pub fn trim_after_requests() -> bool {
 /// (see [`trim_after_requests`]).
 pub fn trim_after_request() {
     if trim_after_requests() {
+        // Keep the just-used matmul shape set, drop per-shape scratch from
+        // earlier requests before handing the transient heap back.
+        trim_npu_scratch();
         trim_heap();
     }
+}
+
+/// Drop per-shape matmul scratch from earlier requests, keeping the just-used
+/// set. A no-op without the `npu` feature.
+pub fn trim_npu_scratch() {
+    #[cfg(feature = "npu")]
+    burn_rocket::trim_scratch();
+}
+
+/// Whether `ROCKET_MEM_LOG=1` enables the per-request NPU scratch line.
+#[cfg_attr(not(feature = "npu"), allow(dead_code))]
+pub fn mem_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ROCKET_MEM_LOG").is_ok_and(|v| v != "0"))
+}
+
+/// Print the driver's live BO/host scratch split (no-op without the `npu`
+/// feature or before `burn_rocket::init`).
+pub fn log_npu_mem() {
+    #[cfg(feature = "npu")]
+    {
+        if mem_log_enabled() {
+            log_npu_mem_impl();
+        }
+    }
+}
+
+#[cfg(feature = "npu")]
+fn log_npu_mem_impl() {
+    let Some(stats) = burn_rocket::mem_stats() else {
+        return;
+    };
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    let mut slots: Vec<_> = stats.slots.iter().collect();
+    slots.sort_by_key(|s| std::cmp::Reverse(s.bo_bytes + s.host_bytes));
+    let top_slots = slots
+        .iter()
+        .take(5)
+        .map(|s| {
+            format!(
+                "{}x{}x{}:{:.1}/{:.1}",
+                s.m,
+                s.k,
+                s.n,
+                mib(s.bo_bytes),
+                mib(s.host_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let attn = stats
+        .attn_workers
+        .iter()
+        .map(|w| {
+            format!(
+                "{}x{}:{:.1}/{:.1}",
+                w.tp,
+                w.kn,
+                mib(w.bo_bytes),
+                mib(w.host_bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    tracing::info!(
+        target: "npu_mem",
+        weights_mib = mib(stats.weights_bytes),
+        matmul_bo_mib = mib(stats.matmul_bo_bytes),
+        matmul_host_mib = mib(stats.matmul_host_bytes),
+        attn_bo_mib = mib(stats.attention_bo_bytes),
+        attn_host_mib = mib(stats.attention_host_bytes),
+        slots = stats.slots.len(),
+        top_slots = %top_slots,
+        attn_workers = %attn,
+        "npu scratch"
+    );
 }

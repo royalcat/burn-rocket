@@ -705,7 +705,53 @@ at 3767), so the default allocator behavior stays. Text numerics are unchanged
 text path). The deployed service never calls `/embed`: if it ever does, the
 towers load lazily (+~550 MiB, Q8) and stay resident.
 
-## 15. Deferred
+## 15. Scratch-memory round: chunked full layers + bucketed/trimmed scratch (2026-10-21)
+
+The pure-Rust driver's 8k footprint was dominated by two length-scoped caches:
+the four **full-attention** layers (unchunked `s × s` scores/probs) and the
+matmul per-`(M,K,N)` scratch cache (one exact-`M` slot set per request length).
+The deployed service needed `--defer-towers` and still peaked at 6.68 GB cgroup.
+
+Code changes (no model math change):
+- **Full layers now use the chunked path** like the sliding layers: a query
+  chunk attends to every key (`window = -1`, no mask) instead of materializing
+  `[s, s]`. `src/ext.rs` gained `MaskMode::NoneBlock` so a no-mask block may have
+  `n_q != n_k`; `embeddinggemma/model.rs` chunks every layer when `s > chunk`.
+- **Per-geometry attention contexts** (`Engine.fa: Vec<FaState>`, max 4): emb2's
+  sliding (`head_dim 256`, 2 KV heads) and full (`512`, 1 KV head) layers used to
+  recreate the whole FA context on every geometry switch, reopening 4 fds and
+  discarding the scratch. Each geometry now keeps one context and a two-entry
+  scratch cache (drop-before-allocate, trimmed to the last request's shapes).
+- **Matmul scratch capacity classes** (`M_CLASSES`, ≤25 % padding) with the live
+  `M` planned per call, so padded rows are never computed; lazy `out_all`/`wt_all`
+  (the KACC/resident paths never touch them); `ROCKET_SCRATCH_MB` byte budget
+  (default 1024, 0 = unlimited) with free-before-allocate LRU; `trim_scratch()`
+  called from the existing per-request `trim_after_request` keeps the just-used
+  set and drops earlier requests' sets (`ROCKET_TRIM=0` disables both).
+- `ROCKET_MEM_LOG=1` prints the live split (weights / matmul BO+host / attention
+  BO+host, top slots and worker shapes) after load and per request.
+
+Board A/B (second `serve` on :8399 against the live pre-round binary on :8383,
+same GGUF Q8_0, `--defer-towers --npu --npu-attn npu --attn-chunk 1024`,
+cores 4-7; the board was busy — deposit ~4.2 GiB and load >10 — so timings are
+indicative, memory is exact):
+
+| input | pre-round (live) | new | cosine |
+|---:|---|---:|---:|
+| 1,532 tok | 8.42 s / 181.9 tok/s | 6.89-7.02 s / 218-222 tok/s | 1.0000003 |
+| 6,122 tok | 44.86 s / 136.5 tok/s | 39.23 s / 156.1 tok/s | 1.0000000 |
+| 8,192 tok | not re-run (board tight) | 57.7-62.1 s / 132-142 tok/s | — (6,122 exact) |
+
+Driver scratch at 8,192 tokens (new, `ROCKET_MEM_LOG`): weights 327 MiB, matmul
+681 MiB BO + 300 MiB host, attention 289 MiB BO + 270 MiB host = **1.27 GiB BO +
+0.56 GiB host** (the pre-fix Rust image held 2.8 GB shmem at 8k plus anon; the C
+image 2.1 GB shmem). Peak `RssAnon` 1.49-1.56 GiB. A 3-token request immediately
+after the 8k one trims the same process to **8 MiB matmul BO, 3.5 MiB attention
+BO, 514 MiB anon**, so the ceiling is one request's working set, not a leak.
+The hot set stays resident for repeated same-length requests; a different length
+evicts it on the next trim.
+
+## 16. Deferred
 
 - QAT mobile board re-run (a guarded scope; the f16 text-only profile is now
   3.7 GiB anon plus ~1.2 GiB reclaimable table pages) and the

@@ -166,7 +166,9 @@ prompt token count, `compute_s`, `tok_s`, the model-lock wait `queue_s` and
 `rss_mib` (`RssAnon`); chat requests additionally split the model's own timings
 into `prefill_s`/`prefill_tok_s` and `decode_s`/`decode_tok_s`. Failed requests
 are not logged (they keep their HTTP error), and `/health`/`/v1/models` never
-touch the model:
+touch the model. `ROCKET_MEM_LOG=1` adds one `npu scratch` line after load and
+after every request with the driver's live split (weights / matmul BO+host /
+attention BO+host, top slots and worker shapes). The per-request lines look like:
 
 ```text
 INFO embedding request endpoint=embeddings model=qwen3-embedding-0.6b inputs=2 tokens=13 queue_s=0.0 compute_s=6.335 tok_s=2.1 rss_mib=968.7
@@ -401,6 +403,16 @@ for the 20 sliding layers (a 7764-token run sits at 1068 MiB anon and matches
 the full path's numerics, where the full-matrix path OOM-kills inside a 3 GB
 cgroup), and fused host kernels for gelu·up/RMSNorm/RoPE (`ROCKET_GLUE=0/1` A/B;
 q8 CPU glue on-vs-off cosine 1.0).
+
+Memory round (2026-10-21, log-gemma §15): the four **full** layers now chunk
+query blocks against the whole key axis (no `[s, s]` score matrix; same
+`--attn-chunk` as sliding, default 1024, so keep it below the 8k class), the
+engine keeps one attention context per `(heads, KV heads, head_dim)` geometry,
+and the matmul scratch is keyed by `M` capacity classes with lazy
+streaming/output BOs, a `ROCKET_SCRATCH_MB` budget and a per-request trim. The
+8k footprint is one request's working set (~1.3 GiB BO + ~0.6 GiB host); a
+following short request trims it to ~12 MiB. `ROCKET_MEM_LOG=1` prints the
+split, `ROCKET_M_BUCKET=0` restores exact-`M` slots.
 
 Known limits: audio resampling is exact for 16 kHz mono WAV (other rates go
 through ffmpeg, ~0.994 cosine vs librosa/soxr); batch inputs are processed one

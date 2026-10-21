@@ -157,6 +157,23 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   Text and media outputs are bit-identical deferred vs eager;
   `MALLOC_MMAP_THRESHOLD_=131072` was tried and rejected (no memory gain, +60 %
   wall, log-gemma §14).
+- **Scratch-memory round** (2026-10-21, log-gemma §15): the 8k footprint is now
+  one request's working set. Emb2's **full layers use the chunked attention path**
+  (query chunks against all keys, `MaskMode::NoneBlock`; no `[s, s]` materialization),
+  the engine keeps **one FA context per attention geometry** (emb2 alternates
+  sliding/full head_dim+KV and used to recreate the context every layer), and the
+  matmul scratch cache keys **M capacity classes** (`M_CLASSES`, ≤25 % padding) with
+  per-call live plans (no padded compute), lazy `out_all`/`wt_all`, a byte budget
+  (`ROCKET_SCRATCH_MB`, default 1024, 0 = unlimited) and per-request trimming
+  (`burn_rocket::trim_scratch`, called from `trim_after_request`; `ROCKET_TRIM=0`
+  disables). Attention scratch keeps two shape classes per geometry with the same
+  request-generation trim. `ROCKET_M_BUCKET=0` disables capacity classes.
+  `ROCKET_MEM_LOG=1` prints live weights / matmul BO+host / attention BO+host plus
+  the top slots and worker shapes after load and per request. Board: 1.5k tok
+  8.42 -> 6.9 s (+18 %), 6.1k tok 44.9 -> 39.2 s (+14 %), both cosine 1.0 vs the
+  pre-round binary; 8k driver BO 1.27 GiB + host 0.56 GiB (pre-fix Rust: 2.8 GiB
+  shmem + anon; C: 2.1 GiB shmem); a 3-token request after it trims to 11.5 MiB
+  scratch + 514 MiB anon.
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
@@ -466,23 +483,42 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   the old directory is left in place. Run from the deploy dir (the bench uses the
   relative `data/bench_text.txt`); pin to the A76s with `taskset -c 4-7`.
 - **Live service**: OpenViking's embedding backend. Since 2026-10-08 it is
-  EmbeddingGemma 2; observed 2026-10-16 it runs the GGUF round — container
-  `openviking-embed-1` on `ghcr.io/royalcat/rocket-inference:latest` (`a986d54` at
-  the time) with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024
-  --port 8383 --max-tokens 8192 -hf unsloth/embeddinggemma-2-GGUF:Q8_0`, CPUs 4-7,
-  NPU, `mem_limit` 8g. That image predates the 2026-10-17 `gemma4` tokenizer fix:
-  rebuild it, redeploy, and re-embed the documents indexed in the GGUF-era window
-  (its vectors and queries were self-consistent but up to ~0.016 cosine off the
-  reference on German text). The previous idle-memory image was `b4634c9`
-  (`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`,
-  idle RssAnon 605 MiB at boot / ~780 MiB after long traffic). The stack file is
-  `/home/komodo/.komodo/stacks/openviking/compose.yaml` (on the board; deploy with
-  `docker compose up -d embed` from its directory). Any board run shares the NPU
-  and cores 4-7 with it. Historically (2026-10-05) the backend was qwen3 on
-  `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7, `mem_limit` 8g,
-  weights at `/root/models/qwen3-embedding-0.6b`; that image predates the repo
+  EmbeddingGemma 2; since 2026-10-21 it runs the pure-Rust driver image
+  `ghcr.io/royalcat/rocket-inference:rust-npu-18be74a` (branch `rust-rocket`
+  commit `18be74a`; the branch is unmerged, so CI `:latest` is still the C driver)
+  with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024 --port 8383
+  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`,
+  CPUs 4-7, NPU, `mem_limit` 8g. The 2026-10-21 scratch-memory round
+  (log-gemma §15) is **not** deployed yet: rebuild/redeploy that branch tip and
+  re-measure on an idle board. The previous C/GGUF image `a986d54` predates the
+  2026-10-17 `gemma4` tokenizer fix; the documents indexed in the GGUF-era window
+  may need re-embedding (their vectors and queries were self-consistent but up to
+  ~0.016 cosine off the reference on German text). The earlier idle-memory image
+  was `b4634c9` (`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024
+  --defer-towers`, idle RssAnon 605 MiB at boot / ~780 MiB after long traffic).
+  The stack file is `/home/komodo/.komodo/stacks/openviking/compose.yaml` (on the
+  board; deploy with `docker compose up -d embed` from its directory). Any board
+  run shares the NPU and cores 4-7 with it. Historically (2026-10-05) the backend
+  was qwen3 on `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7,
+  `mem_limit` 8g, weights at `/root/models/qwen3-embedding-0.6b`; that image
+  predates the repo
   inversion. `examples/rocket-inference/docker/build.sh` pushes
   `git.kmsign.org/royalcat/rocket-inference:<sha>`.
+- **A/B against the live service without touching it**: port 8383 is
+  container-internal (not published on the host). Run the candidate binary as a
+  host process on `:8399` with the same flags and `taskset -c 4-7`, then send
+  requests from inside `openviking-embed-1`: `localhost:8383` for the live
+  service and the compose gateway (`172.22.0.1:8399`, from
+  `docker inspect ... .NetworkSettings.Networks[].Gateway`) for the candidate.
+  Start it detached with `setsid env ... taskset -c 4-7 ./rocket-inference ... >
+  serve.log 2>&1 < /dev/null &` (a plain `&` over ssh keeps the session open).
+  `ROCKET_MEM_LOG=1` adds the `npu scratch` line; sample `/proc/<pid>/status`
+  for peak `RssAnon` and stop it with a PID lookup (`ps -eo pid,comm,args`), not
+  `pkill -f` (the pattern matches the ssh wrapper). The memory-round test binary,
+  logs and request fixtures live in `/root/rocket-inference-mem/`; it is not a
+  service. On this board, an 8k text request peaked at ~1.5 GiB `RssAnon` plus
+  ~1.3 GiB of driver BOs and ~0.6 GiB of host scratch while deposit and swap
+  were active.
 - Production A/B (reproducible live): `/opt/llama-ik/bin/llama-server -m
   /var/lib/docker/volumes/llama-swap_models/_data/qwen3-quants/Qwen3-Embedding-0.6B-Q8_0.gguf
   --embedding --pooling last -c 32768 -b 32768 -ub 32768 -np 1 -ctk q8_0 -ctv q8_0 -t 4
@@ -525,12 +561,34 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   one global engine behind a mutex (the driver contexts are not thread-safe), so NPU calls
   serialize. `attention_window(q, k, v, h, kv, d, scale, softcap, window)` (added
   2026-10-07 for EmbeddingGemma 2) applies a bidirectional band mask
-  (`|q - kv| <= window`; `window < 0` = no mask); `attention_window_block(..., window,
+  (`|q - kv| <= window`; `window < 0` = no mask and allows `n_kv != n_q`,
+  `MaskMode::NoneBlock` — the full-layer chunk path); `attention_window_block(..., window,
   q_start, kv_start)` (2026-10-08) runs a query chunk against a *subset* of keys
   (`n_kv != n_q`; key `kv_start + j` visible to query `q_start + i` iff
   `|(q_start + i) - (kv_start + j)| <= window`) — the sliding layers' chunked path,
   with the block mask cached on the translation-invariant offset. Both attention ops
-  cache their f16 masks per shape in the engine.
+  cache their f16 masks per geometry/shape in the engine.
+- Attention geometry + scratch (2026-10-21): `Engine.fa` is a vector of up to 4
+  `FaState`s keyed by `(n_head, n_kv_heads, head_dim)`, so a model that alternates
+  geometries (emb2 sliding 256/2 vs full 512/1) keeps one context per geometry
+  instead of reopening fds and rebuilding scratch every layer. Each `Attention`
+  worker keeps a two-entry `ScratchCache` (sliding chunk / full chunk), drops
+  before allocating, and trims to the shapes touched by the last request via
+  `trim_scratch`; host q/k/v/score/prob matrices shrink when the working shape
+  drops more than 4x. Emb2's full layers use the same `--attn-chunk` (default
+  1024): `chunk >= s` leaves a layer unchunked, so keep it below the 8k class.
+  Library surface: `burn_rocket::{mem_stats, trim_scratch, clear_scratch}` plus
+  the `RocketCtx`/`RocketFaCtx` methods.
+- Matmul scratch policy (2026-10-21): `Context` caches per-shape scratch under
+  `M` **capacity classes** (`M_CLASSES` in `matmul/context.rs`, ≤25 % padding) while
+  the live `M` is planned per call, so resident weights stay valid and padded rows
+  are never computed. `out_all` (CPU-accumulation) and `wt_all` (streaming) are
+  lazy: resident/KACC slots never allocate them. `ROCKET_SCRATCH_MB` (default 1024,
+  0 = unlimited) is a byte budget enforced with free-before-allocate LRU; each
+  `trim_scratch` keeps the just-used slots and drops earlier requests' sets. A
+  single request may exceed the budget (the hot set is never evicted mid-request).
+  `ROCKET_M_BUCKET=0` disables classes (exact-`M` slots). Rows are independent, so
+  capacity classes and trimming are numerically identical to exact-`M` slots.
 - Canonical tiling (2026-10-08, default): `init` creates the context with
   `rocket_ctx_create_ex(threads, ROCKET_CTX_TILING_CANONICAL)`, so a resident weight
   serves any `M >= 4` and small requests no longer pad every matmul to 256 rows
@@ -721,19 +779,17 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
   stack.
-- Long-context NPU attention: emb2's sliding layers now use chunked banded attention
-  (log §12.3), which fixes the memory blow-up there. The *causal* models (qwen3,
-  gemma4 prefill) still build `[n][n]` masks and OOM at ~30k; the same query-chunking
-  idea applies (per-chunk `[C, q1]` causal masks, prefix keys), plus a 30k measurement
-  of the emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
-- Board service: rebuild `openviking-embed-1` from a post-2026-10-17 commit and
-  redeploy (the running `a986d54` GGUF image has the score-based Unigram `gemma4`
-  tokenizer), then re-embed the GGUF-era index window. Keep fp16 `--npu` as the
-  speed config (the int8 g32 path is 2.4x slower, readback-bound). Remaining:
-  re-measure the served latencies on an idle board (the 2026-10-09 numbers were
-  taken while the board was busy), and decide whether the NPU BO shmem (~1.3 GiB)
-  or the long-request glibc high-water (~+0.6 GiB, released by the next request)
-  warrant further work.
+- Long-context NPU attention: emb2's sliding **and full** layers now use chunked
+  attention (log-gemma §15), fixing the 8k memory blow-up (full layers were the
+  remaining `[s, s]` case). The *causal* models (qwen3, gemma4 prefill) still build
+  `[n][n]` masks and OOM at ~30k; the same query-chunking idea applies with a causal
+  block mask (per-chunk `[C, q1]` masks, prefix keys), plus a 30k measurement of the
+  emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
+- Board service: redeploy `openviking-embed-1` with this scratch-memory round (the
+  per-request trim, lazy buffers and emb2 full-layer chunking) and re-measure on an
+  idle board; the 2026-10-21 numbers were taken while deposit/load were busy. The
+  hot 8k set is ~1.3 GiB BO + 0.6 GiB host and a following short request trims it
+  to ~12 MiB scratch, so the ceiling is now one request's working set.
 - QAT mobile board re-run (log-gemma §13): the f16 text-only profile is now 3.7 GiB
   anon plus ~1.2 GiB reclaimable table pages (`--defer-towers`), so a guarded run
   should fit a busy board; then the `ROCKET_NPU_DECODE=1` decode-speed pre-gate
@@ -755,6 +811,8 @@ cargo check -p burn-rocket
 # no-Burn and flex-only variants
 cargo check -p burn-rocket --no-default-features
 cargo check -p burn-rocket --no-default-features --features flex
+# driver unit tests (planner, capacity classes, emitters, layout)
+cargo test -p rocket-npu
 # example npu compile check (the dep is aarch64-gated, so use the target)
 cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
 # formatting + lint gates (both clean)
@@ -830,6 +888,9 @@ ROCKET_GLUE=0 ./rocket-inference gemma bench --model-dir /root/models/embeddingg
 ./rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 --max-new-tokens 256
 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --port 8390
 ./rocket-inference serve --model-dir /root/models/gemma-4-E2B-it --port 8391
+# scratch attribution / policy: one `npu scratch` line per request; a 3-token
+# request after an 8k one should drop the matmul/attention BOs to ~12 MiB
+ROCKET_MEM_LOG=1 ROCKET_SCRATCH_MB=1024 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --port 8399
 ```
 
 Vulkan/wgpu GPU probe (separate binary; built with

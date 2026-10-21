@@ -31,33 +31,48 @@ impl Config {
     }
 }
 
+/// Bytes of the streaming-weight scratch for `plan`.
+pub fn wt_bytes(plan: &Plan) -> usize {
+    plan.nnt * plan.nkt * plan.wt_slot * 2 + CBUF_BANK_SIZE
+}
+
+/// Bytes of the CPU-accumulation output scratch for `plan`.
+pub fn out_bytes(plan: &Plan) -> usize {
+    BATCH * plan.out_slot * 2 + CBUF_BANK_SIZE
+}
+
 /// All BOs of one tiled matmul.
+///
+/// The streaming-weight (`wt_all`) and CPU-accumulation (`out_all`) scratch are
+/// allocated lazily: resident-weight compute and the KACC path never touch them,
+/// and a serving process caches many shapes whose unused N*K and BATCH-tile
+/// buffers would otherwise add up to hundreds of MiB.
 pub struct Bos {
     pub dev: Device,
     pub guard: Bo,
     pub regcmd: Bo,
     pub in_all: Bo,
-    pub wt_all: Bo,
-    pub out_all: Bo,
+    pub wt_all: Option<Bo>,
+    pub out_all: Option<Bo>,
     pub okacc0: Option<Bo>,
     pub pong: Option<Bo>,
     pub prezeroed: bool,
     pub has_pong: bool,
+    wt_sz: usize,
+    out_sz: usize,
 }
 
 impl Bos {
     pub fn new(dev: &Device, plan: &Plan, config: Config) -> Result<Bos> {
         let in_sz = plan.nmt * plan.nkt * plan.in_slot * 2 + CBUF_BANK_SIZE;
-        let wt_sz = plan.nnt * plan.nkt * plan.wt_slot * 2 + CBUF_BANK_SIZE;
+        let wt_sz = wt_bytes(plan);
         let rc_sz = BATCH * RC_STRIDE * 8;
-        let out_sz = BATCH * plan.out_slot * 2 + CBUF_BANK_SIZE;
+        let out_sz = out_bytes(plan);
 
         let guard = dev.alloc_bo(4096)?;
         let regcmd = dev.alloc_bo(rc_sz)?;
         let in_all = dev.alloc_bo(in_sz)?;
-        let wt_all = dev.alloc_bo(wt_sz)?;
-        let out_all = dev.alloc_bo(out_sz)?;
-        check_iova(&[&in_all, &wt_all, &out_all, &regcmd])?;
+        check_iova(&[&in_all, &regcmd])?;
 
         let has_pong = config.kacc;
         let (okacc0, pong) = if has_pong {
@@ -76,17 +91,89 @@ impl Bos {
             guard,
             regcmd,
             in_all,
-            wt_all,
-            out_all,
+            wt_all: None,
+            out_all: None,
             okacc0,
             pong,
             prezeroed: false,
             has_pong,
+            wt_sz,
+            out_sz,
         };
         zero_bo(&mut bos.in_all)?;
-        zero_bo(&mut bos.wt_all)?;
         bos.prezeroed = true;
         Ok(bos)
+    }
+
+    /// Allocate (and zero once) the streaming-weight scratch if it is absent.
+    ///
+    /// Padding lanes must be zero; the scatter only writes live tiles, so the
+    /// zeroing happens on allocation rather than on every pack.
+    pub fn ensure_wt(&mut self) -> Result<&mut Bo> {
+        if self.wt_all.is_none() {
+            let mut bo = self.dev.alloc_bo(self.wt_sz)?;
+            check_iova(&[&bo])?;
+            zero_bo(&mut bo)?;
+            self.wt_all = Some(bo);
+        }
+        Ok(self.wt_all.as_mut().unwrap())
+    }
+
+    /// Allocate the CPU-accumulation output scratch if it is absent.
+    pub fn ensure_out(&mut self) -> Result<&mut Bo> {
+        if self.out_all.is_none() {
+            let bo = self.dev.alloc_bo(self.out_sz)?;
+            check_iova(&[&bo])?;
+            self.out_all = Some(bo);
+        }
+        Ok(self.out_all.as_mut().unwrap())
+    }
+
+    pub fn wt(&self) -> &Bo {
+        self.wt_all
+            .as_ref()
+            .expect("streaming-weight scratch was not allocated")
+    }
+
+    pub fn out(&self) -> &Bo {
+        self.out_all
+            .as_ref()
+            .expect("CPU-accumulation output scratch was not allocated")
+    }
+
+    pub fn out_mut(&mut self) -> &mut Bo {
+        self.out_all
+            .as_mut()
+            .expect("CPU-accumulation output scratch was not allocated")
+    }
+
+    /// Live bytes of this scratch set (host-mapped BOs only).
+    pub fn bytes(&self) -> usize {
+        let mut n = self.guard.len() + self.regcmd.len() + self.in_all.len();
+        if let Some(b) = &self.wt_all {
+            n += b.len();
+        }
+        if let Some(b) = &self.out_all {
+            n += b.len();
+        }
+        if let Some(b) = &self.okacc0 {
+            n += b.len();
+        }
+        if let Some(b) = &self.pong {
+            n += b.len();
+        }
+        n
+    }
+
+    /// Bytes [`Bos::new`] would hold before the lazy `wt_all`/`out_all` are used.
+    pub fn estimate_bytes(plan: &Plan, config: Config) -> usize {
+        let mut n =
+            4096 + BATCH * RC_STRIDE * 8 + plan.nmt * plan.nkt * plan.in_slot * 2 + CBUF_BANK_SIZE;
+        if config.kacc {
+            let ktiles = (plan.nmt * plan.nnt).clamp(1, BATCH);
+            n += 2 * (ktiles * plan.out_slot * 2 + CBUF_BANK_SIZE);
+        }
+        n
     }
 
     pub fn pack_input(&mut self, plan: &Plan, a: &[f16]) -> Result<()> {
@@ -98,7 +185,8 @@ impl Bos {
     }
 
     pub fn pack_weights(&mut self, plan: &Plan, b: &[f16]) -> Result<()> {
-        pack_weights_into(&mut self.wt_all, plan, b)
+        let bo = self.ensure_wt()?;
+        pack_weights_into(bo, plan, b)
     }
 
     pub fn pack_weights_seg(
@@ -107,7 +195,8 @@ impl Bos {
         segs: &[(usize, usize, &[f16])],
         worker_g0: usize,
     ) -> Result<()> {
-        pack_weights_seg_into(&mut self.wt_all, plan, segs, worker_g0)
+        let bo = self.ensure_wt()?;
+        pack_weights_seg_into(bo, plan, segs, worker_g0)
     }
 }
 
@@ -280,7 +369,7 @@ pub fn input_slice<'a>(bo: &'a Bo, plan: &Plan) -> &'a [f16] {
     &f16_words_ref(bo)[..plan.input_elems()]
 }
 
-fn check_iova(bos: &[&Bo]) -> Result<()> {
+pub(crate) fn check_iova(bos: &[&Bo]) -> Result<()> {
     for bo in bos {
         let end = bo.dma_address() + bo.len() as u64;
         if end > (1u64 << 32) {
