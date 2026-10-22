@@ -113,9 +113,9 @@ def cmd_image(args):
     processor = AutoProcessor.from_pretrained(args.model)
     model = AutoModel.from_pretrained(args.model, dtype=torch.float32)
     model.eval()
-    img = Image.open(args.image).convert("RGB")
-    text = args.text if args.text else "<|image|>"
-    inputs = processor(text=text, images=[img], return_tensors="pt")
+    images = [Image.open(p).convert("RGB") for p in args.image]
+    text = args.text if args.text else "<|image|>" * len(images)
+    inputs = processor(text=text, images=images, return_tensors="pt")
     print(
         "input_ids:",
         json.dumps(inputs["input_ids"][0].tolist()[:12]),
@@ -305,7 +305,7 @@ def main():
             sp.add_argument("--no-normalize", dest="normalize", action="store_false")
             sp.add_argument("--out", default=None)
         if name == "image":
-            sp.add_argument("--image", required=True)
+            sp.add_argument("--image", required=True, nargs="+")
             sp.add_argument("--dump-inputs", default=None)
         if name == "video":
             sp.add_argument("--video", required=True)

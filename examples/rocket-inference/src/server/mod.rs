@@ -23,7 +23,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     routing::{get, post},
 };
 
@@ -133,7 +133,11 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
         app = app.route("/v1/chat/completions", post(openai::chat_completions));
         app = app.merge(ollama::router());
     }
-    let app = app.with_state(state);
+    // Base64 images (data URIs) and multi-image batches exceed axum's 2 MiB
+    // default JSON body limit.
+    let app = app
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .with_state(state);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

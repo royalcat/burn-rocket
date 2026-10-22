@@ -751,7 +751,54 @@ BO, 514 MiB anon**, so the ceiling is one request's working set, not a leak.
 The hot set stays resident for repeated same-length requests; a different length
 evicts it on the next trim.
 
-## 16. Deferred
+## 16. OpenRouter multimodal `/v1/embeddings` (2026-10-22)
+
+The embedding endpoint now accepts the OpenRouter multimodal input shape
+(`input: [{"content": [{"type": ...}]}]`) on EmbeddingGemma 2: `text`,
+`image_url` (object or bare string), `input_audio` and `input_video`; one
+embedding per block, encoded jointly in part order. Images may repeat in a
+block (the shared assembly expands the k-th `<|image|>` with image k's own
+soft-token count), audio/video are limited to one each, and `input_file` is
+rejected. Qwen3 accepts text-only blocks and rejects media parts. Also new:
+`dimensions` as an alias of `dim`, an `id` in the response, and a 32 MiB JSON
+body limit (axum's 2 MiB default rejected base64 images).
+
+Media values may be local paths, `data:` URIs or `http(s)` URLs; remote media
+are fetched on the blocking compute thread with a shared client (10 s timeout,
+20 MiB cap, 3 redirects, a User-Agent because Wikimedia rejects anonymous
+requests; `ROCKET_MEDIA_FETCH=0` disables). Base64 uploads and downloads go to
+`$TMPDIR/rocket-inference/` and are deleted by a `ResolvedMedia` guard once the
+forward has read them (the old `/embed` and chat paths leaked these files).
+
+Drive-by fix: the audio tower's zero padding used f32 `Tensor::zeros` against
+dtype-matched activations, which panicked (`cat: dtype mismatch`) whenever the
+towers loaded as bf16 (the default) — q8/f32 was unaffected. Pads now follow
+the activation dtype; audio with q8 text + bf16 towers scores **0.999355**
+cosine vs the HF f32 reference.
+
+Measured on the dev host (`--quant q8 --defer-towers`, native bf16 body, bf16
+towers; native `/embed` is the baseline because it uses the same input
+assembly):
+
+| check | result |
+|---|---|
+| text block vs plain string | cosine 1.0 |
+| image block vs `/embed` image | cosine 1.0 |
+| text+image block vs `/embed` (both part orders) | cosine 1.0 |
+| data-URI image vs local path | cosine 1.0 |
+| audio block vs `/embed` audio | cosine 1.0 |
+| video block vs `/embed` video | cosine 1.0 |
+| 3-item batch (text, image, joint) vs single calls | cosine 1.0 each, indices 0-2 |
+| 2-image block repeat | cosine 1.0 |
+| 2-image joint vs HF f32 (`ref_embeddinggemma2.py image --image a b`) | **0.999268**, n=529 on both |
+| `dimensions: 256` | 256-d vector |
+| 5.8 MB data-URI body | accepted (old 2 MiB limit would 413) |
+| `input_file` / unknown part type | 400 |
+
+The `--image` argument of `tools/ref_embeddinggemma2.py image` now takes several
+files (`nargs="+"`) so multi-image joint inputs can be checked against HF.
+
+## 17. Deferred
 
 - QAT mobile board re-run (a guarded scope; the f16 text-only profile is now
   3.7 GiB anon plus ~1.2 GiB reclaimable table pages) and the

@@ -218,7 +218,7 @@ fn run_gen(args: &Args) -> Result<()> {
         let (img_soft, video_soft) = inputs::media_soft_tokens(&args.gen_model_dir);
         let req = inputs::MediaInputs {
             text: Some(rendered.clone()),
-            image: args.image.clone(),
+            images: args.image.clone().into_iter().collect(),
             video: None,
             audio: args.audio.clone(),
             prompt_prefix: String::new(),

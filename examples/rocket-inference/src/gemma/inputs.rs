@@ -67,7 +67,9 @@ pub trait MediaModel {
 #[derive(Default, Clone)]
 pub struct MediaInputs {
     pub text: Option<String>,
-    pub image: Option<PathBuf>,
+    /// Images in placeholder order; each `<|image|>` expands to that image's
+    /// own soft-token count.
+    pub images: Vec<PathBuf>,
     pub video: Option<PathBuf>,
     pub audio: Option<PathBuf>,
     pub prompt_prefix: String,
@@ -128,12 +130,12 @@ pub fn prepare<M: MediaModel>(
     req: &MediaInputs,
     debug: &DebugPaths,
 ) -> Result<Prepared> {
-    let has_media = req.image.is_some() || req.video.is_some() || req.audio.is_some();
+    let has_media = !req.images.is_empty() || req.video.is_some() || req.audio.is_some();
     let mut text = match &req.text {
         Some(t) => t.clone(),
         None if has_media => {
             let mut t = String::new();
-            if req.image.is_some() {
+            for _ in &req.images {
                 t.push_str("<|image|>");
             }
             if req.video.is_some() {
@@ -152,14 +154,18 @@ pub fn prepare<M: MediaModel>(
 
     let mut positions: Vec<usize> = Vec::new();
     let mut token_rows: Vec<Tensor<2>> = Vec::new();
-    let mut n_image = 0usize;
+    let mut image_counts: Vec<usize> = Vec::new();
     let mut n_video = 0usize;
     let mut n_audio = 0usize;
 
-    if let Some(path) = &req.image {
+    for (index, path) in req.images.iter().enumerate() {
         let vspec = model.vision_spec();
+        let dump_image = debug
+            .dump_image
+            .as_deref()
+            .map(|p| indexed_path(p, index, req.images.len()));
         let decoded = media::load_image(path)?;
-        if let Some(dump) = &debug.dump_image {
+        if let Some(dump) = &dump_image {
             media::dump_rgb(&dump.with_extension("raw"), &decoded)?;
         }
         let resized = media::resize_rgb(
@@ -168,13 +174,15 @@ pub fn prepare<M: MediaModel>(
             req.image_soft_tokens,
             vspec.pooling,
         )?;
-        if let Some(dump) = &debug.dump_image {
+        if let Some(dump) = &dump_image {
             media::dump_rgb(&dump.with_extension("resized.raw"), &resized)?;
         }
         let img = media::patchify(&resized, vspec.patch_size, vspec.pooling)?;
-        n_image = img.num_soft_tokens();
+        let n_image = img.num_soft_tokens();
+        image_counts.push(n_image);
         if let Some(path) = &debug.dump_pixels {
-            dump_f32(path, &img.patches)?;
+            let path = indexed_path(path, index, req.images.len());
+            dump_f32(&path, &img.patches)?;
             println!(
                 "dumped pixels: {} patches x {} ({}x{} grid) to {}",
                 img.num_patches(),
@@ -184,21 +192,23 @@ pub fn prepare<M: MediaModel>(
                 path.display()
             );
         }
-        text = text.replace(
-            "<|image|>",
-            &format!("<|image>{}<image|>", "<|image|>".repeat(n_image)),
-        );
         println!(
-            "image {}x{} patches -> {n_image} soft tokens",
-            img.patch_w, img.patch_h
+            "image {}: {}x{} patches -> {n_image} soft tokens",
+            index + 1,
+            img.patch_w,
+            img.patch_h
         );
+        let dump_vision = debug
+            .dump_vision
+            .as_deref()
+            .map(|p| indexed_path(p, index, req.images.len()));
         let tokens = model.encode_image(
             &img,
             req.attn_chunk,
-            debug.dump_vision.as_deref(),
+            dump_vision.as_deref(),
             debug.dump_vision_layers.as_deref(),
         );
-        if let Some(path) = &debug.dump_vision {
+        if let Some(path) = &dump_vision {
             let values: Vec<f32> = tokens.clone().cast(DType::F32).into_data().try_to_vec()?;
             dump_f32(path, &values)?;
             println!(
@@ -208,6 +218,13 @@ pub fn prepare<M: MediaModel>(
             );
         }
         token_rows.push(tokens);
+    }
+    if !image_counts.is_empty() {
+        let expansions: Vec<String> = image_counts
+            .iter()
+            .map(|n| format!("<|image>{}<image|>", "<|image|>".repeat(*n)))
+            .collect();
+        text = expand_placeholders(&text, "<|image|>", &expansions, "image")?;
     }
 
     if let Some(path) = &req.video {
@@ -311,7 +328,7 @@ pub fn prepare<M: MediaModel>(
         }
         Ok(p)
     };
-    positions.extend(check(n_image, "<|image|>", "image")?);
+    positions.extend(check(image_counts.iter().sum(), "<|image|>", "image")?);
     positions.extend(check(n_video, "<|video|>", "video")?);
     positions.extend(check(n_audio, "<|audio|>", "audio")?);
 
@@ -321,4 +338,83 @@ pub fn prepare<M: MediaModel>(
         Some((positions, Tensor::cat(token_rows, 0)))
     };
     Ok(Prepared { ids, soft })
+}
+
+/// Replace the k-th occurrence of `placeholder` with `expansions[k]`, so each
+/// image expands to its own soft-token count.
+fn expand_placeholders(
+    text: &str,
+    placeholder: &str,
+    expansions: &[String],
+    what: &str,
+) -> Result<String> {
+    let found = text.matches(placeholder).count();
+    if found != expansions.len() {
+        bail!(
+            "{what} placeholder mismatch: {found} placeholders for {} {what} input(s)",
+            expansions.len()
+        );
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    for expansion in expansions {
+        let Some((before, after)) = rest.split_once(placeholder) else {
+            break;
+        };
+        out.push_str(before);
+        out.push_str(expansion);
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Debug dump path for one media item; names get an index suffix when a request
+/// carries several (e.g. `vision-0.raw`, `vision-1.raw`).
+fn indexed_path(path: &Path, index: usize, count: usize) -> PathBuf {
+    if count <= 1 {
+        return path.to_path_buf();
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    path.with_file_name(format!("{stem}-{index}{ext}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_each_placeholder_with_its_own_count() {
+        let out = expand_placeholders(
+            "a <|image|> b <|image|> c",
+            "<|image|>",
+            &[
+                "<|image>X<image|>".to_string(),
+                "<|image>YY<image|>".to_string(),
+            ],
+            "image",
+        )
+        .unwrap();
+        assert_eq!(out, "a <|image>X<image|> b <|image>YY<image|> c");
+    }
+
+    #[test]
+    fn rejects_placeholder_count_mismatch() {
+        let err = expand_placeholders("<|image|>", "<|image|>", &[], "image").unwrap_err();
+        assert!(err.to_string().contains("placeholder mismatch"), "{err}");
+    }
+
+    #[test]
+    fn indexed_paths_only_change_names_when_needed() {
+        let path = Path::new("/tmp/vision.raw");
+        assert_eq!(indexed_path(path, 0, 1), path);
+        assert_eq!(indexed_path(path, 1, 2), PathBuf::from("/tmp/vision-1.raw"));
+    }
 }

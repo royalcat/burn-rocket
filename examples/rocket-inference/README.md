@@ -107,7 +107,7 @@ The routes follow the loaded model — incompatible paths are not registered
 | | `qwen3` | `embeddinggemma` | `intent` | `gemma4` |
 |---|---|---|---|---|
 | `/health`, `/v1/models` | ✓ | ✓ | ✓ | ✓ |
-| `/v1/embeddings` (string/list; ids/base64 for qwen3; `dim`/`prompt` for Gemma) | ✓ | ✓ | — | — |
+| `/v1/embeddings` (OpenAI + OpenRouter: string/list, token ids, `content` blocks; media parts on Gemma only) | ✓ | ✓ | — | — |
 | `/embed` (text/image/video/audio, paths or data URIs) | — | ✓ | — | — |
 | `/v1/chat/completions` (OpenAI; `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, stream=false) | — | — | ✓ | ✓ |
 | `/`, `/api/version`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` (Ollama) | — | — | ✓ | ✓ |
@@ -121,6 +121,18 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
 # multimodal embedding server (OpenAI + native /embed)
 $B serve --model-dir ~/models/embeddinggemma-2 --quant q8 --port 8390
 curl -s localhost:8390/embed -H 'Content-Type: application/json' -d '{"image":"/path/to/cat.jpeg"}'
+
+# OpenRouter-style image input: one embedding per input block, images and text
+# joint in part order (URLs, data: URIs and local paths all work)
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
+  "input": [
+    {"content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]},
+    {"content": [{"type": "text", "text": "a scenic boardwalk"},
+                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}]}
+  ],
+  "encoding_format": "float",
+  "dimensions": 512
+}'
 
 # query-planner server (OpenAI chat + Ollama, litellm/OpenViking-compatible)
 $B serve --model-dir ~/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 \
@@ -159,6 +171,16 @@ as before); Ollama `stream: true` returns one NDJSON content line plus the final
 (application/octet-stream included), while OpenAI chat parts accept
 `image_url` / `input_audio` (one of each per request). Requests serialize on the
 model; panicking forwards are contained (500) instead of poisoning the server.
+
+`/v1/embeddings` also accepts the OpenRouter multimodal shape: `input` may be an
+array of `{"content": [...]}` blocks with `text`, `image_url`, `input_audio` and
+`input_video` parts. One block produces one embedding; images may repeat within
+a block (each expands to its own soft-token count) and are encoded jointly with
+the block's text, while audio and video are limited to one each. `input_file` is
+rejected. An `image_url.url` or media `data` value may be a local path, a
+`data:` URI or an `http(s)` URL — remote media are fetched server-side (10 s
+timeout, 20 MiB cap, `ROCKET_MEDIA_FETCH=0` disables). Request bodies are capped
+at 32 MiB, and `dimensions` is accepted as an alias of `dim`.
 
 Every completed inference request is logged as one `tracing` line (level
 `info`, `RUST_LOG` controls it; default `info`). Embedding requests report the

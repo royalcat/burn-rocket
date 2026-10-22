@@ -6,12 +6,16 @@
 //! rescale to [0, 1], patchify channel-last within each patch, and emit the
 //! (x, y) patch position ids.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use image::RgbImage;
+use reqwest::header::CONTENT_TYPE;
 
 /// One preprocessed image, ready for the vision tower.
 pub struct PreparedImage {
@@ -493,30 +497,135 @@ pub fn patchify(
     })
 }
 
+/// Upper bound for a fetched media file (base64 uploads are bounded by the
+/// HTTP body limit instead).
+pub(crate) const MAX_FETCH_BYTES: u64 = 20 * 1024 * 1024;
+
+/// A media value resolved to a local file. Uploads (base64 data URIs) and
+/// downloaded URLs live in the temp dir and are removed when the guard drops,
+/// so the caller must keep it alive until the media has been decoded.
+pub(crate) struct ResolvedMedia {
+    path: PathBuf,
+    temp: bool,
+}
+
+impl ResolvedMedia {
+    fn local(path: PathBuf) -> Self {
+        Self { path, temp: false }
+    }
+
+    fn temp(path: PathBuf) -> Self {
+        Self { path, temp: true }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ResolvedMedia {
+    fn drop(&mut self) {
+        if self.temp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// A media value is either a filesystem path or a `data:<mime>;base64,<payload>`
 /// blob (written to a temp file so ffmpeg/hound can read it).
-pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<ResolvedMedia, String> {
     let Some(rest) = value.strip_prefix("data:") else {
-        return Ok(PathBuf::from(value));
+        return Ok(ResolvedMedia::local(PathBuf::from(value)));
     };
     let (mime, b64) = rest
         .split_once(";base64,")
         .ok_or("bad data URI (expected data:<mime>;base64,<payload>)")?;
-    // The decoders pick their backend by file extension, so take it from the MIME
-    // type (`image/jpeg` -> jpg, `audio/wav` -> wav) instead of a generic name.
-    let ext = match mime.split('/').nth(1) {
-        Some("jpeg") => "jpg",
-        Some(other) if !other.is_empty() => other,
-        _ => ext,
-    };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("base64: {e}"))?;
+    let path = write_temp(&bytes, &extension_for_mime(mime, ext))?;
+    Ok(ResolvedMedia::temp(path))
+}
+
+/// Like [`resolve_media`], but also downloads `http(s)` URLs. Blocking: call
+/// this from a blocking thread (the server's compute path), never from an async
+/// handler. `ROCKET_MEDIA_FETCH=0` disables the download.
+pub(crate) fn resolve_media_remote(value: &str, ext: &str) -> Result<ResolvedMedia, String> {
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        return resolve_media(value, ext);
+    }
+    if std::env::var("ROCKET_MEDIA_FETCH").ok().as_deref() == Some("0") {
+        return Err("remote media fetching is disabled (ROCKET_MEDIA_FETCH=0)".to_string());
+    }
+    fetch_remote(value, ext)
+}
+
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            // Some hosts (Wikimedia included) reject requests without one.
+            .user_agent(concat!("rocket-inference/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("build the media HTTP client")
+    })
+}
+
+fn fetch_remote(url: &str, ext: &str) -> Result<ResolvedMedia, String> {
+    let resp = http_client()
+        .get(url)
+        .send()
+        .map_err(|e| format!("fetch {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("fetch {url}: HTTP {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length()
+        && len > MAX_FETCH_BYTES
+    {
+        return Err(format!(
+            "fetch {url}: {len} bytes exceeds the {} MiB limit",
+            MAX_FETCH_BYTES / (1024 * 1024)
+        ));
+    }
+    // The decoders pick their backend by file extension, so take it from the
+    // response's MIME type when the server sends one.
+    let mime = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+        .unwrap_or_default();
+    let mut bytes = Vec::new();
+    resp.take(MAX_FETCH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read {url}: {e}"))?;
+    if bytes.len() as u64 > MAX_FETCH_BYTES {
+        return Err(format!(
+            "fetch {url}: response exceeds the {} MiB limit",
+            MAX_FETCH_BYTES / (1024 * 1024)
+        ));
+    }
+    let path = write_temp(&bytes, &extension_for_mime(&mime, ext))?;
+    Ok(ResolvedMedia::temp(path))
+}
+
+fn extension_for_mime(mime: &str, fallback: &str) -> String {
+    match mime.split('/').nth(1) {
+        Some("jpeg") => "jpg".to_string(),
+        Some("quicktime") => "mp4".to_string(),
+        Some(other) if !other.is_empty() => other.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("rocket-inference");
     std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = dir.join(format!("upload-{}-{nanos}.{ext}", std::process::id()));
     std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;

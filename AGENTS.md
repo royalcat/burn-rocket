@@ -174,6 +174,19 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   pre-round binary; 8k driver BO 1.27 GiB + host 0.56 GiB (pre-fix Rust: 2.8 GiB
   shmem + anon; C: 2.1 GiB shmem); a 3-token request after it trims to 11.5 MiB
   scratch + 514 MiB anon.
+- **OpenRouter multimodal /v1/embeddings** (2026-10-22, log-gemma §16): the
+  embedding endpoint takes OpenRouter `input: [{content: [...]}]` blocks on
+  EmbeddingGemma 2 (`text`, `image_url`, `input_audio`, `input_video`; images
+  repeat, audio/video max one each, `input_file` 400) and text-only blocks on
+  qwen3 (media rejected). One block = one joint embedding; `MediaInputs.images`
+  is a vec and each `<|image|>` expands with its own soft-token count;
+  `dimensions` aliases `dim`; bodies cap at 32 MiB. Media values may be paths,
+  data URIs or `http(s)` URLs (blocking fetch in the compute closure: 10 s,
+  20 MiB, 3 redirects, `ROCKET_MEDIA_FETCH=0`; temp uploads/downloads are
+  deleted by `ResolvedMedia` after the forward). Fixed a pre-existing bf16
+  audio-tower panic (f32 zeros in the conv/attention pads; `cat` dtype
+  mismatch). Dev host q8 + bf16 towers: joint text+image 1.0 vs `/embed`, a
+  2-image block 0.999268 vs HF f32 with n=529.
 - **Intent model server** (2026-10-06, log §14): `guoxuter/ov_intent_analysis_sft:v7_q8`
   is Qwen3.5-0.8B — a hybrid decoder (18 Gated DeltaNet + 6 gated full-attention
   layers), not a relative of Qwen3-Embedding. It is implemented as the `intent` family
@@ -845,6 +858,19 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 # robustness: a panicking forward (invalid token id) must 500 and leave the server alive
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"still alive"}'
+# OpenRouter multimodal /v1/embeddings (embeddinggemma): one embedding per
+# block, N images per block, URLs/data URIs/paths, audio+video one each
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
+  "input": [
+    {"content": [{"type": "image_url", "image_url": {"url": "/data/cat.jpeg"}}]},
+    {"content": [{"type": "text", "text": "a cat"},
+                 {"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]}
+  ],
+  "dimensions": 256}'
+# HF parity for a 2-image block (the reference takes several --image files;
+# its text must use the same placeholder spacing as the server: one space)
+/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/ref_embeddinggemma2.py \
+    image --image data/cat.jpeg /tmp/cat_small.png --text '<|image|> <|image|>' --out /tmp/ref2.json
 ```
 
 On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):

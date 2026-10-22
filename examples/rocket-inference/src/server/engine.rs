@@ -13,6 +13,7 @@ use crate::gemma::gemma4::chat::{self, GenOptions};
 use crate::gemma::gemma4::loader::load_towers;
 use crate::gemma::gemma4::model::GenRoot;
 use crate::gemma::inputs::{self, DebugPaths, MediaInputs};
+use crate::gemma::media::{self, ResolvedMedia};
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
 use crate::qwen35_intent::model::IntentModel;
 use crate::util::rope::RopeCache;
@@ -186,13 +187,26 @@ pub struct Completion {
     pub done_reason: &'static str,
 }
 
+/// One content part of an OpenRouter-style multimodal input block.
+#[derive(Debug, Clone)]
+pub enum EmbedPart {
+    Text(String),
+    /// Local path, `data:` URI or `http(s)` URL. Media values are resolved on
+    /// the compute thread (remote fetches are blocking).
+    Image(String),
+    Audio(String),
+    Video(String),
+}
+
 /// One input to `/v1/embeddings`.
 pub enum EmbedInput {
     Text(String),
     Tokens(Vec<u32>),
+    /// A multimodal block: text and media are encoded jointly in part order.
+    Parts(Vec<EmbedPart>),
 }
 
-pub struct EmbedTextsRequest {
+pub struct EmbedBatchRequest {
     pub inputs: Vec<EmbedInput>,
     /// Task-prompt name (`config_sentence_transformers.json`); supported by Emb2.
     pub prompt: Option<String>,
@@ -276,8 +290,107 @@ pub struct Gemma4Engine {
     pub video_soft_tokens: usize,
 }
 
+/// A multimodal block after resolution: text with one placeholder per media
+/// input, the local media paths, and the guards that keep downloaded/uploaded
+/// files alive until the forward has read them.
+struct AssembledBlock {
+    text: String,
+    images: Vec<PathBuf>,
+    video: Option<PathBuf>,
+    audio: Option<PathBuf>,
+    _guards: Vec<ResolvedMedia>,
+}
+
+/// Resolve the parts of one block into text placeholders plus local media.
+/// Images may repeat (each gets its own placeholder); audio and video are
+/// limited to one each because the shared input assembly carries one of each.
+fn assemble_block(parts: Vec<EmbedPart>) -> Result<AssembledBlock, ApiError> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut images = Vec::new();
+    let mut video: Option<PathBuf> = None;
+    let mut audio: Option<PathBuf> = None;
+    let mut guards = Vec::new();
+    for part in parts {
+        match part {
+            EmbedPart::Text(text) => pieces.push(text),
+            EmbedPart::Image(value) => {
+                let media =
+                    media::resolve_media_remote(&value, "img").map_err(ApiError::bad_request)?;
+                images.push(media.path().to_owned());
+                guards.push(media);
+                pieces.push("<|image|>".to_string());
+            }
+            EmbedPart::Audio(value) => {
+                if audio.is_some() {
+                    return Err(ApiError::bad_request(
+                        "at most one audio part per input block",
+                    ));
+                }
+                let media =
+                    media::resolve_media_remote(&value, "wav").map_err(ApiError::bad_request)?;
+                audio = Some(media.path().to_owned());
+                guards.push(media);
+                pieces.push("<|audio|>".to_string());
+            }
+            EmbedPart::Video(value) => {
+                if video.is_some() {
+                    return Err(ApiError::bad_request(
+                        "at most one video part per input block",
+                    ));
+                }
+                let media =
+                    media::resolve_media_remote(&value, "mp4").map_err(ApiError::bad_request)?;
+                video = Some(media.path().to_owned());
+                guards.push(media);
+                pieces.push("<|video|>".to_string());
+            }
+        }
+    }
+    let text = join_pieces(pieces);
+    if text.is_empty() && images.is_empty() && video.is_none() && audio.is_none() {
+        return Err(ApiError::bad_request("empty content block"));
+    }
+    Ok(AssembledBlock {
+        text,
+        images,
+        video,
+        audio,
+        _guards: guards,
+    })
+}
+
+/// Join non-empty text pieces with a single space (media placeholders keep
+/// their position relative to the surrounding text).
+fn join_pieces(pieces: Vec<String>) -> String {
+    pieces
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Text-only projection of a block for models without media support.
+fn join_text_parts(parts: Vec<EmbedPart>) -> Result<String, ApiError> {
+    let mut pieces = Vec::new();
+    for part in parts {
+        match part {
+            EmbedPart::Text(text) => pieces.push(text),
+            _ => {
+                return Err(ApiError::bad_request(
+                    "this model does not accept image/audio/video input",
+                ));
+            }
+        }
+    }
+    let text = join_pieces(pieces);
+    if text.is_empty() {
+        return Err(ApiError::bad_request("empty content block"));
+    }
+    Ok(text)
+}
+
 impl Engine {
-    pub fn embed_texts(&mut self, req: EmbedTextsRequest) -> Result<EmbedResult, ApiError> {
+    pub fn embed_texts(&mut self, req: EmbedBatchRequest) -> Result<EmbedResult, ApiError> {
         match self {
             Self::Qwen3(engine) => engine.embed_texts(req),
             Self::Emb2(engine) => engine.embed_texts(req),
@@ -308,7 +421,7 @@ impl Engine {
 }
 
 impl Qwen3Engine {
-    fn embed_texts(&mut self, req: EmbedTextsRequest) -> Result<EmbedResult, ApiError> {
+    fn embed_texts(&mut self, req: EmbedBatchRequest) -> Result<EmbedResult, ApiError> {
         if req.prompt.is_some() || req.dim.is_some() {
             return Err(ApiError::bad_request(
                 "dim/prompt are not supported by this model (they apply to EmbeddingGemma 2)",
@@ -319,9 +432,20 @@ impl Qwen3Engine {
         }
         let mut vectors = Vec::with_capacity(req.inputs.len());
         let mut tokens = 0;
+        enum OneInput {
+            Text(String),
+            Ids(Vec<u32>),
+        }
         for input in req.inputs {
+            // A block with only text parts is accepted (OpenRouter clients send
+            // the multimodal shape uniformly); media parts are rejected.
+            let input = match input {
+                EmbedInput::Text(text) => OneInput::Text(text),
+                EmbedInput::Tokens(ids) => OneInput::Ids(ids),
+                EmbedInput::Parts(parts) => OneInput::Text(join_text_parts(parts)?),
+            };
             let ids: Vec<i64> = match input {
-                EmbedInput::Text(text) => {
+                OneInput::Text(text) => {
                     let enc = self
                         .tokenizer
                         .encode(text.as_str(), true)
@@ -335,7 +459,7 @@ impl Qwen3Engine {
                     }
                     ids.iter().map(|&t| t as i64).collect()
                 }
-                EmbedInput::Tokens(ids) => {
+                OneInput::Ids(ids) => {
                     if ids.is_empty() {
                         return Err(ApiError::bad_request("input must not be empty"));
                     }
@@ -389,26 +513,65 @@ impl Emb2Engine {
         }
     }
 
-    fn embed_texts(&mut self, req: EmbedTextsRequest) -> Result<EmbedResult, ApiError> {
+    fn embed_texts(&mut self, req: EmbedBatchRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
-        let mut inputs = Vec::with_capacity(req.inputs.len());
+        enum Item {
+            Text(String),
+            Block(AssembledBlock),
+        }
+        let mut items = Vec::with_capacity(req.inputs.len());
+        let mut needs_towers = false;
         for input in req.inputs {
             match input {
-                EmbedInput::Text(text) => inputs.push(text),
+                EmbedInput::Text(text) => items.push(Item::Text(text)),
                 EmbedInput::Tokens(_) => {
                     return Err(ApiError::bad_request(
                         "raw token ids are not supported by this model",
                     ));
                 }
+                EmbedInput::Parts(parts) => {
+                    if parts.is_empty() {
+                        return Err(ApiError::bad_request("empty content block"));
+                    }
+                    let block = assemble_block(parts)?;
+                    needs_towers |=
+                        !block.images.is_empty() || block.video.is_some() || block.audio.is_some();
+                    items.push(Item::Block(block));
+                }
             }
         }
-        if inputs.is_empty() {
+        if items.is_empty() {
             return Err(ApiError::bad_request("empty input"));
         }
-        let mut vectors = Vec::with_capacity(inputs.len());
+        if needs_towers {
+            // Deferred towers (`--defer-towers`) load once for the whole batch.
+            crate::gemma::embeddinggemma::load::load_towers(
+                &mut self.model,
+                &self.model_dir,
+                self.dtype,
+                self.quant_q8,
+                &self.device,
+            )
+            .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
+        }
+        let mut vectors = Vec::with_capacity(items.len());
         let mut tokens = 0;
-        for text in inputs {
-            let (vector, n) = self.embed_one(Some(text), None, None, None, &prefix, req.dim)?;
+        for item in items {
+            let (vector, n) = match &item {
+                Item::Text(text) => {
+                    self.embed_one(Some(text.clone()), Vec::new(), None, None, &prefix, req.dim)?
+                }
+                // The block (and its media guards) stays alive through the
+                // forward; only the paths are cloned into the input assembly.
+                Item::Block(block) => self.embed_one(
+                    Some(block.text.clone()),
+                    block.images.clone(),
+                    block.video.clone(),
+                    block.audio.clone(),
+                    &prefix,
+                    req.dim,
+                )?,
+            };
             tokens += n;
             vectors.push(vector);
         }
@@ -428,29 +591,35 @@ impl Emb2Engine {
             )
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
         }
-        let (vector, tokens) =
-            self.embed_one(req.text, req.image, req.video, req.audio, &prefix, req.dim)?;
+        let (vector, tokens) = self.embed_one(
+            req.text,
+            req.image.into_iter().collect(),
+            req.video,
+            req.audio,
+            &prefix,
+            req.dim,
+        )?;
         Ok(EmbedResult {
             vectors: vec![vector],
             tokens,
         })
     }
 
-    /// One embedding forward (text and/or one media input), L2-normalized.
+    /// One embedding forward (text and/or media inputs), L2-normalized.
     #[allow(clippy::too_many_arguments)]
     fn embed_one(
         &mut self,
         text: Option<String>,
-        image: Option<PathBuf>,
+        images: Vec<PathBuf>,
         video: Option<PathBuf>,
         audio: Option<PathBuf>,
         prompt_prefix: &str,
         dim: Option<usize>,
     ) -> Result<(Vec<f32>, usize), ApiError> {
-        let has_media = image.is_some() || video.is_some() || audio.is_some();
+        let has_media = !images.is_empty() || video.is_some() || audio.is_some();
         let req = MediaInputs {
             text,
-            image,
+            images,
             video,
             audio,
             prompt_prefix: prompt_prefix.to_string(),
@@ -667,7 +836,7 @@ impl Gemma4Engine {
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
         let req = MediaInputs {
             text: Some(rendered),
-            image,
+            images: image.into_iter().collect(),
             video: None,
             audio,
             prompt_prefix: String::new(),
@@ -763,6 +932,19 @@ mod tests {
     fn detect_rejects_unknown_or_missing() {
         assert!(detect_from_value(&config(r#"{"model_type": "llama"}"#)).is_err());
         assert!(detect_from_value(&config(r#"{}"#)).is_err());
+    }
+
+    #[test]
+    fn text_blocks_are_accepted_and_media_parts_rejected() {
+        let text = join_text_parts(vec![
+            EmbedPart::Text("a".to_string()),
+            EmbedPart::Text("b".to_string()),
+        ])
+        .unwrap();
+        assert_eq!(text, "a b");
+
+        let err = join_text_parts(vec![EmbedPart::Image("/tmp/x.jpg".to_string())]).unwrap_err();
+        assert!(err.message.contains("does not accept"), "{}", err.message);
     }
 
     #[test]

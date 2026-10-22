@@ -21,6 +21,13 @@ use crate::gemma::audio_frontend::{AudioFeatures, MEL_BINS, subsample_mask};
 use crate::gemma::config::AudioConfig;
 use crate::gemma::layers::{ClipBounds, ClippableLinear};
 
+/// Zero padding in the same dtype as `like` (the tower runs in the checkpoint
+/// dtype, and a bare `Tensor::zeros` is always f32).
+fn zeros_like<const D: usize>(shape: [usize; D], like: &Tensor<D>) -> Tensor<D> {
+    let zeros: Tensor<D> = Tensor::zeros(shape, &like.device());
+    zeros.cast(like.dtype())
+}
+
 /// Plain-data audio geometry.
 #[derive(Debug, Clone)]
 pub struct AudioSpec {
@@ -220,7 +227,7 @@ impl AudioAttention {
         let blocks = t.div_ceil(c);
         let tp = blocks * c;
         let q_pad = if tp > t {
-            Tensor::cat(vec![q, Tensor::zeros([tp - t, h, d], &device)], 0)
+            Tensor::cat(vec![q.clone(), zeros_like([tp - t, h, d], &q)], 0)
         } else {
             q
         };
@@ -234,9 +241,9 @@ impl AudioAttention {
         let kv_windows = |x: Tensor<3>| -> Tensor<4> {
             let x_pad = Tensor::cat(
                 vec![
-                    Tensor::zeros([pad_l, h, d], &device),
-                    x,
-                    Tensor::zeros([pad_r, h, d], &device),
+                    zeros_like([pad_l, h, d], &x),
+                    x.clone(),
+                    zeros_like([pad_r, h, d], &x),
                 ],
                 0,
             );
@@ -266,7 +273,7 @@ impl AudioAttention {
                 .reshape([h, blocks, c, ctx / 2 + 1]);
         let rows = ctx / 2 + 1;
         let bd = Tensor::cat(
-            vec![bd, Tensor::zeros([h, blocks, c, ctx + 1 - rows], &device)],
+            vec![bd.clone(), zeros_like([h, blocks, c, ctx + 1 - rows], &bd)],
             3,
         )
         .reshape([h, blocks, c * (ctx + 1)])
@@ -417,10 +424,9 @@ impl AudioLightConv1d {
         let h = a * sigmoid(b);
 
         // Causal depthwise conv1d (left pad = kernel - 1).
-        let device = h.device();
         let hc = h.swap_dims(0, 1).unsqueeze_dim::<3>(0);
         let pad = spec.conv_kernel - 1;
-        let hc = Tensor::cat(vec![Tensor::zeros([1, spec.hidden, pad], &device), hc], 2);
+        let hc = Tensor::cat(vec![zeros_like([1, spec.hidden, pad], &hc), hc], 2);
         let hc = self.depthwise_conv1d.forward(hc);
         let h = hc.reshape([spec.hidden, t]).swap_dims(0, 1);
 

@@ -283,7 +283,7 @@ fn build_inputs(
     };
     let req = inputs::MediaInputs {
         text,
-        image: args.image.clone(),
+        images: args.image.clone().into_iter().collect(),
         video: args.video.clone(),
         audio: args.audio.clone(),
         prompt_prefix: prefix,
