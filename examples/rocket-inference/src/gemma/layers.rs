@@ -300,16 +300,19 @@ pub(crate) fn transpose_nk<T: Copy + Default>(values: &[T], k: usize, n: usize) 
     t
 }
 
-/// Pack one `Linear` into NPU memory in its native dtype and register it: f32
-/// packs a resident fp16 weight, bf16 stays native (the bf16 stream re-packs it
-/// per call), f16 packs resident fp16 exactly (no conversion). With `keep_cpu`
-/// the f32 copy stays (prefill-only mode), otherwise it is shrunk to a `[1, 1]`
-/// placeholder (the id is preserved so `lin` still finds the weight).
+/// A `Linear` weight as the NPU pack wants it: `[N, K]` (HF `[out, in]`) in the
+/// weight's native dtype. f32/f16 pack a resident fp16 weight, bf16 stays native
+/// (the bf16 stream re-packs it per call). A Q8-resident weight (`--quant q8`)
+/// is dequantized once here.
+///
+/// Fused groups consume these directly (`pack2`/`pack3` concatenate along N), so
+/// the caller can hand several parts over without materializing the concat.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -> (usize, usize) {
+pub fn weight_nk(lin: &Linear, device: &Device) -> Tensor<2> {
     let w = lin.weight.val();
+    let w = if is_quantized() { w.dequantize() } else { w };
     let [k, n] = w.shape().dims::<2>();
-    let tensor = match w.dtype() {
+    match w.dtype() {
         DType::F32 => {
             let values: Vec<f32> = w.into_data().try_to_vec().expect("f32 projection weights");
             Tensor::<2>::from_data(
@@ -333,15 +336,32 @@ pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -
                 (device, DType::BF16),
             )
         }
-        other => {
-            panic!("pack_linear_into_npu: unsupported weight dtype {other:?} (f32/f16/bf16)")
-        }
-    };
+        other => panic!("weight_nk: unsupported weight dtype {other:?} (f32/f16/bf16)"),
+    }
+}
+
+/// Shrink a packed `Linear`'s CPU copy to a `[1, 1]` placeholder. `Param::map`
+/// keeps the parameter id, so `lin` still resolves the registry entry.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn drop_linear_weight(lin: &mut Linear, device: &Device) {
+    let dev = device.clone();
+    lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
+}
+
+/// Pack one `Linear` into NPU memory in its native dtype and register it: f32
+/// packs a resident fp16 weight, bf16 stays native (the bf16 stream re-packs it
+/// per call), f16 packs resident fp16 exactly (no conversion). A Q8-resident
+/// weight (`--quant q8`) is dequantized once for the pack. With `keep_cpu`
+/// the f32 copy stays (prefill-only mode), otherwise it is shrunk to a `[1, 1]`
+/// placeholder (the id is preserved so `lin` still finds the weight).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn pack_linear_into_npu(lin: &mut Linear, device: &Device, keep_cpu: bool) -> (usize, usize) {
+    let tensor = weight_nk(lin, device);
+    let [n, k] = tensor.shape().dims::<2>();
     let id = burn_rocket::pack(tensor);
     register_npu_weight(&lin.weight, id);
     if !keep_cpu {
-        let dev = device.clone();
-        lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
+        drop_linear_weight(lin, device);
     }
     (n, k)
 }
@@ -390,5 +410,48 @@ impl ClippableLinear {
             Some(c) => y.clamp(c.output_min, c.output_max),
             None => y,
         }
+    }
+
+    /// Pack this linear's weight into resident NPU memory and shrink the CPU
+    /// copy to a `[1, 1]` stub (the `ParamId` is preserved, so `lin` still
+    /// routes the module through the registry).
+    ///
+    /// Returns `(weights, resident bytes)` — one weight — or `None` when the
+    /// linear carries clip bounds: `torch.clamp` runs on the host around the
+    /// GEMM, so a packed weight would silently drop it (Gemma 4's audio and
+    /// vision linears). Q8-resident weights are dequantized once for the pack.
+    ///
+    /// The packed weight is used by every later forward, so the caller must not
+    /// rely on the stub's dtype (it is f32): `weight_dtype` on a packed linear
+    /// reports the stub, not the model's activation dtype.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn pack_npu(&mut self, device: &Device) -> Option<(usize, usize)> {
+        if self.clip.is_some() {
+            return None;
+        }
+        let (n, k) = pack_linear_into_npu(&mut self.linear, device, false);
+        Some((1, n * k * 2))
+    }
+
+    /// `[N, K]` weight for a **fused group** pack (`pack2`/`pack3`), or `None`
+    /// when the linear carries clip bounds: the group GEMM has no per-projection
+    /// clamp, so a clipped linear must stay on the per-projection path.
+    ///
+    /// Unlike [`Self::pack_npu`] this registers nothing; the group handle lives
+    /// on the module and the caller drops the CPU copy afterwards
+    /// ([`Self::drop_weight`]).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn group_weight_nk(&self, device: &Device) -> Option<Tensor<2>> {
+        if self.clip.is_some() {
+            return None;
+        }
+        Some(weight_nk(&self.linear, device))
+    }
+
+    /// Shrink the CPU weight to a `[1, 1]` stub after a group pack (the group
+    /// handle, not the `ParamId` registry, serves the forward).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn drop_weight(&mut self, device: &Device) {
+        drop_linear_weight(&mut self.linear, device);
     }
 }

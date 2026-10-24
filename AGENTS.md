@@ -174,6 +174,44 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   pre-round binary; 8k driver BO 1.27 GiB + host 0.56 GiB (pre-fix Rust: 2.8 GiB
   shmem + anon; C: 2.1 GiB shmem); a 3-token request after it trims to 11.5 MiB
   scratch + 514 MiB anon.
+- **Vision tower round** (2026-10-24, log-gemma §18): the tower now has phase
+  timers (`vision_stats`, `encode=` in `gemma embed|bench`, `encode_s` +
+  `vision_attn` in serve; `ROCKET_VISION_LOG=1` prints one line per forward and,
+  on NPU builds, the NPU split of that forward). `--vision-attn fused|blocked`
+  (emb2 and serve; `fused` is the default since §18.3, Gemma 4 keeps `blocked`)
+  and `--npu` packs the tower's linears: `ClippableLinear::pack_npu` /
+  `VisionTower::pack_npu` pack the 16 layers' q|k|v, o, gate|up, down +
+  `embed_vision` as **65** resident weights (§18.5 fused groups; 113 per
+  projection with `ROCKET_NPU_FUSED=0`), 0.28 GiB resident fp16, pack-and-drop;
+  clipped linears are skipped, so Gemma 4's tower is not wired), wired through
+  `load_towers`/`load_towers_mmproj` from `--npu`/serve and packed on the first
+  media request under `--defer-towers`; `ROCKET_NPU_TOWERS=0` is the A/B
+  off-switch. Under `--npu` the towers' Q8 pass excludes the packed part
+  (`tower_quant_group`), so the vision tower packs **f32** weights while the
+  audio tower keeps Q8 (§18.5.2). Board (2394-patch image, q8+npu): tower
+  23.8-24.8 -> 19.8 (P2) -> **15.2-15.5 s** (§18.5, -22 % again; ~4.2 s of it is
+  routing the MLP's gelu·up through the `ROCKET_GLUE` fused kernel, ~0.5 s the
+  fused groups' NPU time), MLP phase 13.0 -> 4.4 s, `user` CPU -10 % vs the
+  P3-era binary, steady serve media 27.2 -> 20.6 -> **16.4 s**, deferred tower
+  load 30.4 -> 24.8 s (pack 6.2 -> 4.3 s) at 908 MiB anon after load. The driver
+  runs the 723 GFLOP of tower GEMMs at ~183 GF/s, so the CPU attention kernel
+  (~7.6 s, now 50 % of the tower) plus ~3 s of flex norm/RoPE glue dominate.
+  Parity: 0.9999963 (f32+npu) / 0.9998836 (q8+npu, the text Q8 path's floor;
+  0.9996880 before the f32 load policy) image vs HF f32, bit-identical repeats;
+  the fused groups are 0.9999967 vs per-projection (driver N-tiling changes the
+  fp16 accumulation order). NPU vision attention was measured next and
+  **rejected** (log-gemma §18.4): 0.434 vs 0.455 s/layer at best (1.05×, gate
+  1.3×), because head_dim 64 makes the driver's host softmax (68.8M scores/layer)
+  dominate; `--vision-attn` stays `fused|blocked`. f16/bf16 attention operands
+  are slower (§18.5.3: flex casts them to f32 internally), so the kernel stays
+  f32. Frame batching was measured last and **rejected** too (log-gemma §18.6):
+  grouping same-geometry video frames into one `[F*P, hidden]` tower forward
+  cuts the attention op 9-10 % and the calls 4×, but the MLP phase (+13.5 %) and
+  the conversions (+33-56 %) eat it — net **0 to +3 %** at 4-8 frames — so the
+  candidate code was reverted (video stays per-frame) and only the
+  `vision_attn_bench matmul|attn-batch` probes remain. The tower is
+  proportional-to-rows work; NPU vision attention re-opens only once
+  `rocket-npu` has an on-NPU softmax (the host softmax is the §18.4 blocker).
 - **OpenRouter multimodal /v1/embeddings** (2026-10-22, log-gemma §16): the
   embedding endpoint takes OpenRouter `input: [{content: [...]}]` blocks on
   EmbeddingGemma 2 (`text`, `image_url`, `input_audio`, `input_video`; images
@@ -263,6 +301,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, loaders, CLI |
 | `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`), CLI |
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
+| `examples/rocket-inference/src/bin/vision_attn_bench.rs` | vision-tower attention microbenchmark (flex fused vs NPU; `npu` feature, log-gemma §18.4) |
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
@@ -628,6 +667,12 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   (within ~1 s on wall, ~40% more CPU). `--npu` accepts `--dtype f32|f16|bf16` and
   excludes `--quant q8`. `serve` defaults `--npu` on for this build (`--no-npu`
   opts out; `--quant q8` also keeps the CPU path unless `--npu` is explicit).
+  EmbeddingGemma 2's **vision tower** packs its linears the same way — fused
+  q|k|v and gate|up groups plus o/down, **65** resident weights (113 with
+  `ROCKET_NPU_FUSED=0`), 0.28 GiB fp16 — from the emb2 loader, `ROCKET_NPU_TOWERS=0`
+  off; it packs the loaded **f32** weights (the towers' Q8 pass excludes the
+  packed part, `tower_quant_group`), so the audio tower and clipped linears
+  stay on the CPU (log-gemma §18.3/§18.5).
 - With canonical tiling (default) resident weights serve any `M >= 4`; only the
   `M % 4` alignment pad remains. `ROCKET_CTX_CANONICAL=0` restores the legacy
   `M >= 256` pad (A/B only). One pack serves all lengths.
@@ -793,6 +838,14 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
   stack.
+- **On-NPU softmax in `rocket-npu`** is the missing piece for NPU vision attention
+  (log-gemma §18.4, deferred in §18.7). The C librocket NPU has it; the pure-Rust
+  driver's `attention_window` brings the full score matrix host-side and runs a
+  serial scalar softmax there — 12 × 2394² = 68.8M scores per tower layer (138 MB
+  down + 138 MB up) — which is why the NPU path lost 1.05× to flex's fused kernel
+  at head_dim 64. Port the device-side softmax, then re-run
+  `vision_attn_bench 2394 5 1024,2048` and require the §18.4 gate (≥1.3× the fused
+  kernel *and* ≥10 % tower wall) before wiring `--vision-attn npu`.
 - Long-context NPU attention: emb2's sliding **and full** layers now use chunked
   attention (log-gemma §15), fixing the 8k memory blow-up (full layers were the
   remaining `[s, s]` case). The *causal* models (qwen3, gemma4 prefill) still build

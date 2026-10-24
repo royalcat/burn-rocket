@@ -10,6 +10,7 @@ use crate::gemma::gemma4::chat::{self, gen_eos};
 use crate::gemma::gemma4::loader::{self, LoadDtype};
 use crate::gemma::gemma4::model::{gen_stage_stats, gen_stage_stats_reset};
 use crate::gemma::inputs;
+use crate::gemma::vision::VisionAttn;
 use crate::util::checkpoint::Checkpoint;
 use crate::util::device;
 
@@ -228,6 +229,9 @@ fn run_gen(args: &Args) -> Result<()> {
             video_fps: args.video_fps,
             video_max_frames: args.video_max_frames,
             attn_chunk: args.attn_chunk,
+            // The `--vision-attn` A/B is scoped to EmbeddingGemma 2 (P1); the
+            // generation path keeps the tower's blocked default.
+            vision_attn: VisionAttn::Blocked,
         };
         let prepared = inputs::prepare(&model, &tokenizer, &req, &inputs::DebugPaths::default())?;
         (prepared.ids, prepared.soft)

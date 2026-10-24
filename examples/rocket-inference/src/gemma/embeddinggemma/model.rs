@@ -17,7 +17,7 @@ use crate::gemma::audio_frontend::{AudioFeatures, subsample_mask};
 use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
 use crate::gemma::layers::{ClipBounds, lin};
 use crate::gemma::media::PreparedImage;
-use crate::gemma::vision::{MultimodalEmbedder, VisionTower};
+use crate::gemma::vision::{MultimodalEmbedder, VisionAttn, VisionTower};
 use crate::gemma::{chunked_attention, linear_cfg, repeat_kv};
 use std::collections::HashMap;
 
@@ -473,6 +473,24 @@ impl Towers {
             embed_audio: MultimodalEmbedder::new(audio_cfg.output_proj_dims, text_hidden, device),
         }
     }
+
+    /// Pack the vision tower's projections (q/k/v/o + gate/up/down per layer)
+    /// and `embed_vision` into resident NPU memory, dropping the CPU copies:
+    /// 65 weights with the fused groups (q|k|v and gate|up), 113 without
+    /// (`ROCKET_NPU_FUSED=0`). The audio tower and the norms stay on the CPU.
+    /// Returns `(weights, resident bytes)`.
+    ///
+    /// EmbeddingGemma 2's tower has no clip bounds; a tower with clipped linears
+    /// (Gemma 4 E2B) would pack only the unclipped ones, so the loader calls
+    /// this for EmbeddingGemma 2 only.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn pack_npu(&mut self, device: &Device) -> (usize, usize) {
+        let (mut weights, mut bytes) = self.vision_tower.pack_npu(device);
+        let (w, b) = self.embed_vision.pack_npu(device);
+        weights += w;
+        bytes += b;
+        (weights, bytes)
+    }
 }
 
 impl Emb2Model {
@@ -509,9 +527,14 @@ impl Emb2Model {
     }
 
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
-    pub fn image_soft_tokens(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
+    pub fn image_soft_tokens(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        attn: VisionAttn,
+    ) -> Tensor<2> {
         let towers = self.towers();
-        let pooled = towers.vision_tower.forward(img, chunk, None);
+        let pooled = towers.vision_tower.forward(img, chunk, attn, None);
         towers
             .embed_vision
             .forward(pooled, towers.vision_tower.spec().eps)
@@ -585,13 +608,14 @@ impl crate::gemma::inputs::MediaModel for Emb2Model {
         &self,
         img: &PreparedImage,
         chunk: usize,
+        attn: VisionAttn,
         debug_dir: Option<&std::path::Path>,
         layers: Option<&std::path::Path>,
     ) -> Tensor<2> {
         if debug_dir.is_some() {
-            let _ = self.towers().vision_tower.forward(img, chunk, layers);
+            let _ = self.towers().vision_tower.forward(img, chunk, attn, layers);
         }
-        self.image_soft_tokens(img, chunk)
+        self.image_soft_tokens(img, chunk, attn)
     }
 
     fn encode_audio(

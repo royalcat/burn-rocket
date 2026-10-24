@@ -12,7 +12,7 @@ use tokenizers::Tokenizer;
 
 use crate::gemma::audio_frontend::{self, AudioFeatures};
 use crate::gemma::media::{self, PreparedImage};
-use crate::gemma::vision::VisionSpec;
+use crate::gemma::vision::{VisionAttn, VisionSpec};
 
 /// Soft-token budgets from `processor_config.json` (image and video processor
 /// sections), matching the saved checkpoint configuration.
@@ -56,6 +56,7 @@ pub trait MediaModel {
         &self,
         img: &PreparedImage,
         chunk: usize,
+        attn: VisionAttn,
         debug_dir: Option<&Path>,
         layers: Option<&Path>,
     ) -> Tensor<2>;
@@ -80,6 +81,9 @@ pub struct MediaInputs {
     pub video_fps: f64,
     pub video_max_frames: usize,
     pub attn_chunk: usize,
+    /// Vision-tower attention implementation (`--vision-attn`); the text model
+    /// and the audio tower are unaffected.
+    pub vision_attn: VisionAttn,
 }
 
 /// Debug dumps (CLI only).
@@ -205,6 +209,7 @@ pub fn prepare<M: MediaModel>(
         let tokens = model.encode_image(
             &img,
             req.attn_chunk,
+            req.vision_attn,
             dump_vision.as_deref(),
             debug.dump_vision_layers.as_deref(),
         );
@@ -251,7 +256,13 @@ pub fn prepare<M: MediaModel>(
             )?;
             let img = media::patchify(&resized, vspec.patch_size, vspec.pooling)?;
             per_frame = img.num_soft_tokens();
-            frame_tokens.push(model.encode_image(&img, req.attn_chunk, None, None));
+            frame_tokens.push(model.encode_image(
+                &img,
+                req.attn_chunk,
+                req.vision_attn,
+                None,
+                None,
+            ));
         }
         n_video = per_frame * frames.len();
         println!("video: {per_frame} soft tokens per frame, {n_video} total");

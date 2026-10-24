@@ -71,10 +71,12 @@ impl AppState {
             let mut engine = state.lock();
             let queue_s = arrived.elapsed().as_secs_f64();
             let t0 = Instant::now();
+            crate::gemma::vision::vision_stats_reset();
             let out = f(&mut engine)?;
             let timing = RequestTiming {
                 queue_s,
                 compute_s: t0.elapsed().as_secs_f64(),
+                encode_s: crate::gemma::vision::vision_stats().total_s,
             };
             // Long requests leave their transient buffers in the allocator's
             // arenas; hand them back before the next request (`ROCKET_TRIM=0`

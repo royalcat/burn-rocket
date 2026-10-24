@@ -13,6 +13,7 @@ use crate::cli::FlagArgs;
 use crate::gemma::embeddinggemma::load::{NpuOpts, load_model, load_towers};
 use crate::gemma::embeddinggemma::model::{Emb2Model, stage_stats, stage_stats_reset};
 use crate::gemma::inputs;
+use crate::gemma::vision::{VisionAttn, vision_stats, vision_stats_reset};
 use crate::util::checkpoint::Checkpoint;
 use crate::util::device;
 
@@ -50,6 +51,10 @@ struct Args {
     reps: usize,
     out: Option<PathBuf>,
     attn_chunk: usize,
+    /// `--vision-attn`: the vision tower's attention implementation
+    /// (`fused` = the backend kernel, the default; `blocked` = the tensor-op
+    /// chunked parity fallback).
+    vision_attn: VisionAttn,
     dump_pixels: Option<PathBuf>,
     dump_ids: Option<PathBuf>,
     dump_audio: Option<PathBuf>,
@@ -91,6 +96,7 @@ impl Args {
             reps: 3,
             out: None,
             attn_chunk: 1024,
+            vision_attn: VisionAttn::Fused,
             dump_pixels: None,
             dump_ids: None,
             dump_audio: None,
@@ -165,6 +171,9 @@ impl Args {
         }
         if let Some(v) = f.take_parsed("--attn-chunk")? {
             args.attn_chunk = v;
+        }
+        if let Some(v) = f.take_choice("--vision-attn", &["fused", "blocked"])? {
+            args.vision_attn = VisionAttn::parse(&v).expect("validated by take_choice");
         }
         if let Some(v) = f.take("--dump-pixels")? {
             args.dump_pixels = Some(PathBuf::from(v));
@@ -293,6 +302,7 @@ fn build_inputs(
         video_fps: args.video_fps,
         video_max_frames: args.video_max_frames,
         attn_chunk: args.attn_chunk,
+        vision_attn: args.vision_attn,
     };
     let debug = inputs::DebugPaths {
         dump_image: args.dump_image.clone(),
@@ -329,6 +339,7 @@ fn maybe_load_towers(
             &args.model_dir,
             dtype,
             args.quant_q8 && !args.npu_int8,
+            args.npu,
             device,
         )?;
     }
@@ -352,7 +363,14 @@ fn run_embed(args: &Args) -> Result<()> {
         &device,
     )?;
     maybe_load_towers(args, &mut model, dtype, &device)?;
+    vision_stats_reset();
+    let t0_encode = Instant::now();
     let (input, soft, n) = build_inputs(args, &model, &device)?;
+    let encode_s = t0_encode.elapsed().as_secs_f64();
+    let vision = vision_stats();
+    if !vision.is_empty() {
+        println!("{}", vision.line());
+    }
     let rope = model.text().rope_tables(n, dtype, &device);
 
     stage_stats_reset();
@@ -371,7 +389,7 @@ fn run_embed(args: &Args) -> Result<()> {
     }
     let (attn, mlp, norms, ple) = stage_stats();
     println!(
-        "tokens={n} dim={} forward={elapsed:.2}s (attn {attn:.2}s, mlp {mlp:.2}s, norms {norms:.2}s, ple {ple:.2}s) model layers={} hidden={}",
+        "tokens={n} dim={} encode={encode_s:.2}s forward={elapsed:.2}s (attn {attn:.2}s, mlp {mlp:.2}s, norms {norms:.2}s, ple {ple:.2}s) model layers={} hidden={}",
         v.len(),
         cfg.text_config.num_hidden_layers,
         cfg.text_config.hidden_size,
@@ -411,7 +429,14 @@ fn run_bench(args: &Args) -> Result<()> {
         &device,
     )?;
     maybe_load_towers(args, &mut model, dtype, &device)?;
+    vision_stats_reset();
+    let t0_encode = Instant::now();
     let (input, soft, n) = build_inputs(args, &model, &device)?;
+    let encode_s = t0_encode.elapsed().as_secs_f64();
+    let vision = vision_stats();
+    if !vision.is_empty() {
+        println!("{}", vision.line());
+    }
     let rope = model.text().rope_tables(n, dtype, &device);
 
     for rep in 0..args.reps.max(1) {
@@ -422,7 +447,7 @@ fn run_bench(args: &Args) -> Result<()> {
         let wall = t0.elapsed().as_secs_f64();
         let (attn, mlp, norms, ple) = stage_stats();
         println!(
-            "rep {rep}: tokens={n} wall={wall:.2}s ({:.1} tok/s) attn={attn:.2}s mlp={mlp:.2}s norms={norms:.2}s ple={ple:.2}s",
+            "rep {rep}: tokens={n} encode={encode_s:.2}s wall={wall:.2}s ({:.1} tok/s) attn={attn:.2}s mlp={mlp:.2}s norms={norms:.2}s ple={ple:.2}s",
             n as f64 / wall
         );
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]

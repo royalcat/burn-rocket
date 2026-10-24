@@ -14,6 +14,7 @@ use crate::gemma::gemma4::loader::load_towers;
 use crate::gemma::gemma4::model::GenRoot;
 use crate::gemma::inputs::{self, DebugPaths, MediaInputs};
 use crate::gemma::media::{self, ResolvedMedia};
+use crate::gemma::vision::VisionAttn;
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
 use crate::qwen35_intent::model::IntentModel;
 use crate::util::rope::RopeCache;
@@ -259,8 +260,13 @@ pub struct Emb2Engine {
     /// Whether the model's projections are Q8-resident: deferred towers load
     /// with the same quantization.
     pub quant_q8: bool,
+    /// Whether deferred towers pack their vision projections into resident NPU
+    /// memory (`--npu`; `ROCKET_NPU_TOWERS=0` still disables the pack).
+    pub npu_pack: bool,
     pub max_tokens: usize,
     pub attn_chunk: usize,
+    /// `--vision-attn`: the EmbeddingGemma 2 vision tower's attention kernel.
+    pub vision_attn: VisionAttn,
     pub image_soft_tokens: usize,
     pub video_soft_tokens: usize,
     pub video_fps: f64,
@@ -550,6 +556,7 @@ impl Emb2Engine {
                 &self.model_dir,
                 self.dtype,
                 self.quant_q8,
+                self.npu_pack,
                 &self.device,
             )
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
@@ -587,6 +594,7 @@ impl Emb2Engine {
                 &self.model_dir,
                 self.dtype,
                 self.quant_q8,
+                self.npu_pack,
                 &self.device,
             )
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
@@ -633,6 +641,7 @@ impl Emb2Engine {
             video_fps: self.video_fps,
             video_max_frames: self.video_max_frames,
             attn_chunk: self.attn_chunk,
+            vision_attn: self.vision_attn,
         };
         let prepared = inputs::prepare(&self.model, &self.tokenizer, &req, &DebugPaths::default())
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
@@ -846,6 +855,9 @@ impl Gemma4Engine {
             video_fps: 1.0,
             video_max_frames: 32,
             attn_chunk: self.attn_chunk,
+            // Gemma 4 keeps the tower's blocked default (the `--vision-attn`
+            // A/B is scoped to EmbeddingGemma 2).
+            vision_attn: VisionAttn::Blocked,
         };
         let prepared = inputs::prepare(&self.model, &self.tokenizer, &req, &DebugPaths::default())
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;

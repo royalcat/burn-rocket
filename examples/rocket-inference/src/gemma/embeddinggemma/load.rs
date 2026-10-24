@@ -81,6 +81,10 @@ pub fn load_model(
     }
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(opts) = npu {
+        // One NPU engine for the whole process: create it before the eager tower
+        // pack below (the text pack re-inits idempotently).
+        burn_rocket::init(opts.threads)
+            .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
         // int8 packs straight from the model weights (one quantization step, no
         // dequant round trip); the q8 low-RAM mapper only feeds the fp16 pack.
         if quant_q8 && opts.int8 {
@@ -93,7 +97,16 @@ pub fn load_model(
             model = quantize_low_ram(model)?;
         }
         if !defer_towers && towers_available(model_dir) {
-            load_towers(&mut model, model_dir, dtype, quant_q8 && !opts.int8, device)?;
+            // Towers pack into resident fp16 from the f32/Q8 weights and drop
+            // their CPU copies (the audio tower stays on the CPU).
+            load_towers(
+                &mut model,
+                model_dir,
+                dtype,
+                quant_q8 && !opts.int8,
+                true,
+                device,
+            )?;
         }
         return load_npu_text(model, cfg, opts, device);
     }
@@ -102,7 +115,7 @@ pub fn load_model(
         model = quantize_low_ram(model)?;
     }
     if !defer_towers && towers_available(model_dir) {
-        load_towers(&mut model, model_dir, dtype, quant_q8, device)?;
+        load_towers(&mut model, model_dir, dtype, quant_q8, false, device)?;
     }
     Ok((model, cfg))
 }
@@ -118,19 +131,27 @@ fn towers_available(model_dir: &Path) -> bool {
 /// Text-only loads never call this; `--defer-towers` serving calls it on the
 /// first media request. The towers of a `--quant q8` model are mapped to
 /// Q8-resident weights here, matching the eager configuration (`#[module(skip)]`
-/// keeps them out of the text model's quantization pass).
+/// keeps them out of the text model's quantization pass) — except the
+/// NPU-packed vision tower under `--npu`, which stays f32 so the pack starts
+/// from full-precision weights (see [`tower_quant_group`]).
+///
+/// `npu_pack` (the `--npu` decision, NPU build only) packs the tower's
+/// vision projections (pack-and-drop) into resident fp16 NPU weights after the
+/// store pass and the optional Q8 mapping; `ROCKET_NPU_TOWERS=0` disables it
+/// for A/Bs.
 pub fn load_towers(
     model: &mut Emb2Model,
     model_dir: &Path,
     dtype: DType,
     quant_q8: bool,
+    npu_pack: bool,
     device: &Device,
 ) -> Result<()> {
     if model.has_towers() {
         return Ok(());
     }
     if let Some(mmproj) = find_mmproj(model_dir) {
-        return load_towers_mmproj(model, model_dir, &mmproj, dtype, quant_q8, device);
+        return load_towers_mmproj(model, model_dir, &mmproj, dtype, quant_q8, npu_pack, device);
     }
     let path = model_dir.join("model.safetensors");
     if !path.exists() {
@@ -164,19 +185,22 @@ pub fn load_towers(
     // The pass sees the whole checkpoint; only the towers' own parameters are in
     // the tree, so a missing one is an error and the rest report as unused.
     crate::util::store::check_missing(&result, |_| false)?;
+    let npu_towers = npu_towers_enabled(npu_pack);
     if quant_q8 {
         use crate::util::quant::LowRam;
-        let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
+        let mut mapper = LowRam::new(vec![tower_quant_group(npu_towers)?], Vec::new(), None);
         towers = towers.map(&mut mapper);
         crate::util::trim_heap();
     }
+    let packed = pack_towers_npu(&mut towers, device, npu_pack);
     model.set_towers(towers);
     println!(
-        "towers: loaded ({:?}{}) in {:.2}s (resident {:.0} MiB anon)",
+        "towers: loaded ({:?}{}) in {:.2}s (resident {:.0} MiB anon){}",
         dtype,
-        if quant_q8 { ", q8-resident" } else { "" },
+        tower_policy_suffix(quant_q8, npu_towers),
         t0.elapsed().as_secs_f64(),
-        rss_mib()
+        rss_mib(),
+        packed
     );
     Ok(())
 }
@@ -205,6 +229,7 @@ fn load_towers_mmproj(
     mmproj_path: &Path,
     dtype: DType,
     quant_q8: bool,
+    npu_pack: bool,
     device: &Device,
 ) -> Result<()> {
     let cfg =
@@ -229,21 +254,74 @@ fn load_towers_mmproj(
     );
     let result = ckpt.load_into(&mut towers, dtype)?;
     crate::util::store::check_missing(&result, |_| false)?;
+    let npu_towers = npu_towers_enabled(npu_pack);
     if quant_q8 {
         use crate::util::quant::LowRam;
-        let mut mapper = LowRam::new(vec![projection_group()?], Vec::new(), None);
+        let mut mapper = LowRam::new(vec![tower_quant_group(npu_towers)?], Vec::new(), None);
         towers = towers.map(&mut mapper);
         crate::util::trim_heap();
     }
+    let packed = pack_towers_npu(&mut towers, device, npu_pack);
     model.set_towers(towers);
     println!(
-        "towers: loaded from mmproj ({:?}{}) in {:.2}s (resident {:.0} MiB anon)",
+        "towers: loaded from mmproj ({:?}{}) in {:.2}s (resident {:.0} MiB anon){}",
         dtype,
-        if quant_q8 { ", q8-resident" } else { "" },
+        tower_policy_suffix(quant_q8, npu_towers),
         t0.elapsed().as_secs_f64(),
-        rss_mib()
+        rss_mib(),
+        packed
     );
     Ok(())
+}
+
+/// Whether the towers will actually be NPU-packed: `--npu` on an NPU build with
+/// the `ROCKET_NPU_TOWERS=0` A/B switch not set. The pack decision drives the
+/// tower load policy below (a packed tower is loaded in f32, not Q8).
+fn npu_towers_enabled(npu_pack: bool) -> bool {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    {
+        npu_pack && !std::env::var("ROCKET_NPU_TOWERS").is_ok_and(|v| v == "0")
+    }
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    {
+        let _ = npu_pack;
+        false
+    }
+}
+
+/// The `towers: loaded` policy suffix.
+fn tower_policy_suffix(quant_q8: bool, npu_towers: bool) -> &'static str {
+    match (quant_q8, npu_towers) {
+        // The vision tower is packed from f32 weights, so the q8 pass only sees
+        // the audio tower (see `tower_quant_group`).
+        (true, true) => ", q8 audio, f32 vision",
+        (true, false) => ", q8-resident",
+        (false, _) => "",
+    }
+}
+
+/// Pack the loaded towers' vision projections into resident NPU memory when
+/// `--npu` is on; returns the `towers: loaded` line suffix (empty when the pack
+/// is off, or on builds without NPU support).
+///
+/// `ROCKET_NPU_TOWERS=0` is the A/B off-switch (default on under `--npu`): with
+/// it the tower keeps its Q8/f32 CPU weights and `lin` runs on flex.
+fn pack_towers_npu(towers: &mut Towers, device: &Device, npu_pack: bool) -> String {
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    {
+        if npu_towers_enabled(npu_pack) {
+            let t0 = Instant::now();
+            let (weights, bytes) = towers.pack_npu(device);
+            crate::util::trim_heap();
+            return format!(
+                ", +{weights} weights packed ({:.2} GiB NPU in {:.2}s)",
+                bytes as f64 / (1u64 << 30) as f64,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let _ = (towers, device, npu_pack);
+    String::new()
 }
 
 /// Audio `Gemma4ClippableLinear` bounds from the mmproj clip scalars.
@@ -403,6 +481,19 @@ fn projection_group() -> Result<burn::module::ParamGroup> {
     crate::util::quant::param_group(
         r"(q_proj|k_proj|v_proj|o_proj|post|relative_k_proj|gate_proj|up_proj|down_proj|per_layer_model_projection|per_layer_input_gate|per_layer_projection|embedding_projection|input_proj|input_proj_linear|ffw_layer_1|ffw_layer_2|linear_start|linear_end|output_proj)\.(linear\.)?weight$",
     )
+}
+
+/// The Q8 group a towers pass applies: under `--npu` the NPU-packed vision tower
+/// and `embed_vision` are excluded, so the pack starts from f32 weights (the
+/// audio tower, which stays on the CPU, keeps the q8 mapping). Without the pack,
+/// the whole tower tree is mapped as before.
+fn tower_quant_group(npu_towers: bool) -> Result<burn::module::ParamGroup> {
+    let group = projection_group()?;
+    if !npu_towers {
+        return Ok(group);
+    }
+    let packed = crate::util::quant::param_group(r"^(vision_tower|embed_vision)\.")?;
+    Ok(group.exclude(packed))
 }
 
 /// Read the audio tower's `Gemma4ClippableLinear` clip bounds (`input_min` etc.

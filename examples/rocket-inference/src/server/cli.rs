@@ -11,6 +11,7 @@ use crate::cli::FlagArgs;
 use crate::gemma::embeddinggemma::load as emb2_load;
 use crate::gemma::gemma4::loader::{self as gen_loader, LoadDtype};
 use crate::gemma::inputs;
+use crate::gemma::vision::VisionAttn;
 use crate::qwen3_embedding::load as qwen3_load;
 use crate::qwen35_intent::loader as intent_loader;
 use crate::qwen35_intent::loader::IntentLoadOptions;
@@ -122,8 +123,10 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     dtype,
                     model_dir: model_dir.clone(),
                     quant_q8,
+                    npu_pack: npu,
                     max_tokens,
                     attn_chunk: args.attn_chunk.unwrap_or(1024),
+                    vision_attn: args.vision_attn.unwrap_or_default(),
                     image_soft_tokens,
                     video_soft_tokens,
                     video_fps: args.video_fps.unwrap_or(1.0),
@@ -273,6 +276,7 @@ struct Args {
     key_block: Option<usize>,
     attn: Option<bool>,
     attn_chunk: Option<usize>,
+    vision_attn: Option<VisionAttn>,
     video_fps: Option<f64>,
     video_max_frames: Option<usize>,
     delta_chunk: Option<usize>,
@@ -344,6 +348,9 @@ impl Args {
         }
         if let Some(v) = f.take_parsed("--attn-chunk")? {
             args.attn_chunk = Some(v);
+        }
+        if let Some(v) = f.take_choice("--vision-attn", &["fused", "blocked"])? {
+            args.vision_attn = Some(VisionAttn::parse(&v).expect("validated by take_choice"));
         }
         if let Some(v) = f.take_parsed("--video-fps")? {
             args.video_fps = Some(v);
@@ -417,6 +424,7 @@ impl Args {
                 "npu-threads",
                 "npu-attn",
                 "attn-chunk",
+                "vision-attn",
                 "video-fps",
                 "video-max-frames",
                 "defer-towers",
@@ -456,7 +464,7 @@ impl Args {
                 "defer-towers",
             ],
         };
-        let set: [(&str, bool); 26] = [
+        let set: [(&str, bool); 27] = [
             ("model-dir", self.model_dir.is_some()),
             ("family", self.family.is_some()),
             ("backend", self.backend.is_some()),
@@ -475,6 +483,7 @@ impl Args {
             ("key-block", self.key_block.is_some()),
             ("attn", self.attn.is_some()),
             ("attn-chunk", self.attn_chunk.is_some()),
+            ("vision-attn", self.vision_attn.is_some()),
             ("video-fps", self.video_fps.is_some()),
             ("video-max-frames", self.video_max_frames.is_some()),
             ("delta-chunk", self.delta_chunk.is_some()),

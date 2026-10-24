@@ -33,7 +33,7 @@ use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
 use crate::gemma::layers::ClipBounds;
 use crate::gemma::layers::lin;
 use crate::gemma::media::PreparedImage;
-use crate::gemma::vision::{MultimodalEmbedder, VisionSpec, VisionTower};
+use crate::gemma::vision::{MultimodalEmbedder, VisionAttn, VisionSpec, VisionTower};
 use crate::gemma::{linear_cfg, repeat_kv, rms_norm_noscale};
 
 // Stage wall-time instrumentation (microseconds) for the generation path.
@@ -908,13 +908,18 @@ impl GenRoot {
     }
 
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
-    pub fn image_soft_tokens(&self, img: &PreparedImage, chunk: usize) -> Tensor<2> {
+    pub fn image_soft_tokens(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        attn: VisionAttn,
+    ) -> Tensor<2> {
         let towers = self
             .model
             .towers
             .as_ref()
             .expect("vision tower not loaded (see --defer-towers)");
-        let pooled = towers.vision_tower.forward(img, chunk, None);
+        let pooled = towers.vision_tower.forward(img, chunk, attn, None);
         towers
             .embed_vision
             .forward(pooled, towers.vision_tower.spec().eps)
@@ -1006,6 +1011,7 @@ impl crate::gemma::inputs::MediaModel for GenRoot {
         &self,
         img: &PreparedImage,
         chunk: usize,
+        attn: VisionAttn,
         debug_dir: Option<&std::path::Path>,
         layers: Option<&std::path::Path>,
     ) -> Tensor<2> {
@@ -1014,9 +1020,9 @@ impl crate::gemma::inputs::MediaModel for GenRoot {
                 .towers()
                 .expect("vision tower not loaded (see --defer-towers)")
                 .vision_tower
-                .forward(img, chunk, layers);
+                .forward(img, chunk, attn, layers);
         }
-        self.image_soft_tokens(img, chunk)
+        self.image_soft_tokens(img, chunk, attn)
     }
 
     fn encode_audio(

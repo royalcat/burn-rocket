@@ -121,6 +121,12 @@ Frame indices follow the reference: `step = native_fps / fps`,
 | image (cat.jpeg) | 270 | 0.70 s | 385 | 0.21 / 0.36 / 0.02 / 0.08 s |
 | audio (5 s) | 129 | 0.34 s | 376 | 0.10 / 0.17 / 0.01 / 0.05 s |
 
+`wall` here starts after `build_inputs`, so the image and audio rows time only
+the **text pass** of an already-encoded input: they exclude the vision tower,
+the audio frontend and media decode. The tower dominates a media request — see
+§18 (5.1 s f32 on this host for `cat.jpeg`, 25-27 s on the board, against
+0.8-2.4 s of text forward).
+
 - Model load: 4.0 s f32 (896 tensors applied; the 480 audio clip scalars are
   read separately).
 - Resident after load: 2845 MiB anon (f32 weights ~2.9 GB); peak RSS during a
@@ -382,12 +388,12 @@ Verification (dev host, f32 unless noted):
 
 | check | result |
 |---|---|
-| dequantized weights vs HF | **bit-exact** (4-bit `q_proj`, 2-bit MLP `gate_proj`, 4-bit PLE table: `max|d| = 0`) |
+| dequantized weights vs HF | **bit-exact** (4-bit `q_proj`, 2-bit MLP `gate_proj`, 4-bit PLE table: `max\|d\| = 0`) |
 | short prompt, greedy | token-identical to HF f32 (9/9) |
 | system+user prompt | token-identical (7/7) |
 | 631-token prompt | 9/12 (f32), **12/12** (`--f16`) |
 | image prompt (280 soft tokens) | 16/24 (f32) |
-| control: bf16 checkpoint, our logits vs HF | `|d| <= 1e-4` (essentially exact) |
+| control: bf16 checkpoint, our logits vs HF | `\|d\| <= 1e-4` (essentially exact) |
 
 The QAT-specific residual (logits within 0.01-0.7 of ~27) comes from SRQ: it
 rounds activations to an int8 grid, so the f32 accumulation-order difference
@@ -809,7 +815,911 @@ files (`nargs="+"`) so multi-image joint inputs can be checked against HF.
   + native bf16) and `b4634c9` on 2026-10-09 (deferred towers + heap trims, §14;
   idle 2183 -> 605 MiB anon). The deployed config stays `--dtype f32 --quant q8
   --npu --npu-attn npu --attn-chunk 1024` plus `--defer-towers`: the native-bf16
-  default loses ~20–25 % to q8 on the board (log §18).
+  default loses ~20–25 % to q8 on the board (board text comparison, not yet
+  written up).
 - Exposing `--npu-int8` / `--npu-int8-group` on `serve` (the server loads fp16
   text weights today).
-- int8 for the vision/audio towers (small share of the work; text-only today).
+- int8 for the vision/audio towers: a media request is tower-bound (§18), and
+  the q8-resident towers are slower than f32, so this is a memory lever only.
+
+## 18. Vision tower cost (2026-10-24)
+
+The towers had no timing: the CLI started its timer after `build_inputs`, so
+the image row in §5 measured the text pass only and the tower was invisible.
+This round adds instrumentation and establishes the real baseline.
+
+### 18.1 P0: instrumentation and baseline
+
+#### Instrumentation
+
+`gemma/vision.rs` accumulates per-forward wall time in process-global atomic
+microsecond counters (`vision_stats` / `vision_stats_reset`, mirroring the text
+`stage_stats`): total, patch embed + position embeddings, attention (input norm,
+q/k/v and o projections, axial RoPE, chunked attention, post-attention
+norm/residual), MLP (both feed-forward norms, gate/up/down, residual) and
+pooling, plus patch and soft-token counts. Timing is additive only: the same
+image rerun through the instrumented binary is bit-identical (cosine 1.0,
+max|d| 0), and no flag or dtype behavior changed.
+
+- `ROCKET_VISION_LOG=1` prints one stderr line per tower forward (dev f32
+  example): `vision: 2394 patches -> 266 soft tokens, tower 5.10s (patch 0.04, attn 2.22, mlp 2.84, pool 0.00)`.
+- `gemma embed|bench` print the aggregated line whenever media was encoded
+  (regardless of the env var) and add `encode=%.2fs` to their output line.
+  `encode` covers all of `build_inputs`: tokenizer/prompt setup + media
+  decode/resize/patchify + tower + `embed_vision`. The text-only `encode`
+  (~0.6 s) is the tokenizer part, so `encode - text-encode - tower` is the
+  media pipeline outside the tower (≤0.2 s in every run).
+- `serve` reports the tower forwards as `encode_s` in embedding request logs
+  only; the field is absent on text-only requests. `compute_s` still includes
+  media decode, the tower and a deferred tower load.
+- Text-only CLI output is unchanged apart from the new `encode=` field.
+
+#### Dev host (32 threads, release flex, `--defer-towers`)
+
+`data/cat.jpeg` = 57×42 = 2394 patches → 266 soft tokens; text baseline
+`--text 'a photo of a cat'` (7 ids). Mean of 3; `wall` is the whole process and
+includes the text load (~1.1 s) and the tower load (f32 2.3 s, q8 7.2 s, bf16
+2.0 s); `text forward` is the model call (`forward=` in the CLI line).
+
+| config | request | tower | patch / attn / mlp / pool | encode | text forward | wall | user CPU |
+|---|---|---|---|---|---|---|---|
+| f32 | image | 5.10 s | 0.04 / 2.22 / 2.84 / 0.00 | 5.74 s | 0.88 s | 10.53 s | 52.5 s |
+| f32 | text | — | — | 0.64 s | 0.08 s | 1.87 s | 1.9 s |
+| `--quant q8` | image | 7.86 s (7.44-8.19) | 0.07 / 3.45 / 4.34 / 0.00 | 8.49 s | 2.97 s | 21.81 s | 66.4 s |
+| `--quant q8` | text | — | — | 0.56 s | 1.03 s | 4.31 s | 6.4 s |
+| native bf16 | image | 8.14 s | 0.05 / 4.44 / 3.64 / 0.00 | 8.75 s | 1.11 s | 13.32 s | 50.1 s |
+| native bf16 | text | — | — | 0.62 s | 0.10 s | 1.71 s | 1.8 s |
+
+Pooling is 0.00 s everywhere (a spatial mean over the pooled grid). The tower is
+**5.8× (f32), 6.9× (q8) and 7.3× (bf16) the text forward** of the same request.
+
+Video (`data/test.mp4`, `--video-fps 1 --video-max-frames 4`, f32): 4 sampled
+frames, 1170 patches → 130 soft tokens each (4680 patches, 520 soft tokens).
+
+| case | tower per frame | tower total | encode | text forward | wall |
+|---|---|---|---|---|---|
+| 4-frame video, f32 | 2.53-2.62 s | 10.24 s | 11.18 s | 1.49 s | 16.53 s |
+
+These measurements correct the numbers derived before instrumentation: the
+tower is 5.1 s f32 (not ~5.4), 7.9 s q8 (not ~8, and the derived figure included
+part of the 7.2 s q8 tower load), and 8.1 s bf16 (not ~10; `encode` is 8.75 s).
+
+#### Board (`rock-5b-plus`, 4×A76, `taskset -c 4-7`)
+
+Patched 600 MHz NPU module (`rocket_npu_clk_hz=600000000`), `schedutil`, model
+`/root/models/embeddinggemma-2` (safetensors), release `--features npu` build of
+this source. The production embed service (`home-llm-gateway-embed-1`, which
+moved from the old `openviking-embed-1` entry) was stopped for the window and
+restored afterwards; other containers kept running (1-min loadavg 3.6 after the
+stop, 6.5-7.4 before), so wall is a busy-board number. 3 interleaved reps, same
+image and text baseline as above:
+
+- **a** deployed shape: `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`
+- **b** f32 CPU: `--dtype f32 --defer-towers`
+
+| config | request | tower | patch / attn / mlp / pool | encode | text forward | wall | user CPU | tower load |
+|---|---|---|---|---|---|---|---|---|
+| a q8+npu | image | 27.05 s (26.84-27.19) | 0.24 / 14.48 / 12.32 / 0.00 | 29.35 s | 1.00 s | 69.9 s | 104.1 s | 24.4 s |
+| a q8+npu | text | — | — | 2.12 s | 0.22 s | 14.9 s | 13.2 s | — |
+| b f32 | image | 25.08 s (24.13-25.77) | 0.13 / 14.06 / 10.89 / 0.00 | 27.23 s | 2.43 s | 46.1 s | 81.6 s | 11.1 s |
+| b f32 | text | — | — | 1.92 s | 0.53 s | 6.9 s | 6.0 s | — |
+
+`wall` includes the loads (text ~4 s; q8 also quantizes/packs, and the tower
+loads on the first media call). Resident anon from the loader lines: a image
+1069 MiB (text backbone 515 + q8 towers), a text 515; b image 2846, b text 1038.
+Steady-state request latency is the serve row below. Attention is 54 % of the
+tower and MLP 46 % on q8; 56/43 % on f32.
+
+**First media request through `serve`** (config a, `--defer-towers`,
+`ROCKET_VISION_LOG=1`, port 8399, image via `/embed`): RssAnon 619,880 kB after
+text load, 1,232,900 kB after the first image request (tower weights + scratch)
+and unchanged after the next three. First request `compute_s=57.15`
+(`encode_s=31.21`; the extra ~25 s is the deferred q8 tower load); steady
+requests `compute_s` 31.38 / 29.68 / 32.87 s, `encode_s` 29.86 / 28.37 /
+31.38 s, curl wall 31.44 / 29.76 / 32.95 s. A text request immediately after
+logs `compute_s=0.228` with no `encode_s` field.
+
+#### Gate assessment
+
+- The tower **is the dominant media cost**: 25-27 s per 2394-patch image on the
+  board against 0.2-2.4 s of text forward, i.e. 10-27× the text pass and ~95 %
+  of steady request compute; on the dev host 5.1 s against 0.88 s (5.8×).
+- q8-resident towers are **slower** than f32 on both hosts (dev 7.9 vs 5.1 s;
+  board 27.1 vs 25.1 s) and add a 24.4 s deferred load on the board; bf16
+  towers are slower still than f32 on the dev host (8.1 s). The deployed
+  `--quant q8` tower dtype is a memory choice, not a media-latency one — this
+  also corrects §17's "int8 for the towers: small share of the work": a media
+  request is tower-bound.
+- Suggested P1/P2 target: **≥4× tower speedup**, i.e. ≤6-7 s per 2394-patch
+  image on the board (≤1.3 s f32 on the dev host), with attention (~14.5 s
+  board / 2.2 s dev) and MLP (~12.3 s / 2.8 s) as separate budgets; and remove
+  the ~24 s deferred q8 tower-load spike from the first request (f32 towers or
+  a cheaper load-time quantization). A steady image request would then be
+  ~6-7× a text request instead of ~30×.
+
+### 18.2 P1: fused bidirectional vision attention
+
+`--vision-attn fused|blocked` (EmbeddingGemma 2 `gemma embed|bench` and `serve`;
+Gemma 4 shares the tower but keeps `blocked`, its CLI and `serve` were not
+measured) selects how the tower's bidirectional self-attention is computed:
+
+- `blocked` (**default**) — the P0 path, unchanged: `chunked_attention`
+  materializes a `[heads, chunk, patches]` f32 score block per query chunk
+  (`--attn-chunk`, 1024) and softmaxes it.
+- `fused` — `burn::tensor::module::attention(q, k, v, None, None,
+  AttentionModuleOptions { scale: Some(1.0), softcap: None, is_causal: false })`
+  on `[1, heads, patches, head_dim]`: flex's tiled flash path (online softmax,
+  `TILE_KV` = 64, no score matrix), GQA handled inside the kernel, so k/v are
+  passed **unrepeated** (kv_heads == heads in both families today). The scale is
+  exactly 1.0 because q/k go through QK-RMSNorm. bf16/f16 towers cast q/k/v to
+  f32 for the call and the result back — the blocked path also casts its scores
+  to f32 before `softmax`; in an f32 model both casts are no-ops.
+
+Both modes report the mode and a new `kernel` column (the bare attention op;
+`attn` keeps the P0 meaning: q/k/v + RoPE/norms + the op + o_proj) in the vision
+line — `vision: 2394 patches -> 266 soft tokens, vision-attn fused, tower 4.11s
+(patch 0.06, attn 1.27, kernel 0.71, mlp 2.79, pool 0.00)` — and `serve` logs
+`vision_attn="fused"` beside `encode_s` on media requests.
+
+Also in this round: the `[2, 10240, 768]` f32 position-embedding table is read
+once into the tower (`OnceLock<Vec<f32>>`) instead of being copied out of the
+parameter per image. The image embedding is **bit-identical** to the P0 build
+(`cat.jpeg`, f32, `blocked`: cosine 1.0, max|d| 0 vs `p0_img_f32.json`), and the
+patch phase is unchanged within noise (0.05-0.06 s dev, 0.12-0.20 s board) —
+the copy was a modest part of it, and in a bf16 tower it also converted the
+whole table to f32; the cost is ~59 MiB of resident anon after the first image
+(the cached 63 MB table).
+
+#### Dev host (32 threads, release flex, `--defer-towers`)
+
+`data/cat.jpeg` (57×42 = 2394 patches → 266 soft tokens), 3 interleaved reps,
+mean (range); `encode` is all of `build_inputs` (tower + media pipeline),
+`wall` the whole process including the loads (f32 2.3 s / q8 7.2 s / bf16 2.0 s
+tower load), `user` the process CPU.
+
+| config | mode | tower | patch / attn (kernel) / mlp | encode | wall | user CPU |
+|---|---|---|---|---|---|---|
+| f32 | blocked | 5.02 s (4.92-5.14) | 0.05 / 2.21 (1.65) / 2.75 | 5.65 s | 10.34 s | 52.9 s |
+| f32 | fused | **4.11 s** (4.04-4.24) | 0.06 / 1.27 (0.71) / 2.79 | **4.78 s** | 9.46 s | 44.7 s |
+| `--quant q8` | blocked | 7.45 s (7.40-7.49) | 0.06 / 3.13 (1.80) / 4.25 | 8.10 s | 21.26 s | 66.1 s |
+| `--quant q8` | fused | **6.54 s** (6.43-6.66) | 0.08 / 2.15 (0.75) / 4.31 | **7.18 s** | 20.29 s | 57.9 s |
+| native bf16 | blocked | 8.20 s (8.15-8.25) | 0.05 / 4.46 (3.36) / 3.69 | 8.80 s | 13.35 s | 50.9 s |
+| native bf16 | fused | **5.37 s** (5.28-5.54) | 0.06 / 1.82 (0.75) / 3.49 | **5.98 s** | 10.66 s | 41.5 s |
+| f32, 4-frame video | blocked | 9.95 s (9.88-9.99) | 0.04 / 3.44 (1.92) / 6.46 | 10.79 s | 16.08 s | 80.1 s |
+| f32, 4-frame video | fused | **8.44 s** (8.40-8.48) | 0.05 / 2.55 (0.96) / 5.83 | **9.25 s** | 14.71 s | 76.9 s |
+
+Fused/blocked: tower **1.22×** (f32), **1.14×** (q8), **1.53×** (bf16), 1.18×
+(video); attention phase 1.74× / 1.46× / 2.45× / 1.35×; the attention kernel
+alone **2.32× / 2.40× / 4.48× / 2.00×**. `sys` CPU drops from 7.5 to 3.1 s
+(f32) and from 7.7 to 2.6 s (bf16) — the score blocks are gone.
+
+Chunking the fused call over queries was tried and is slower (dev f32 kernel:
+0.73 s whole sequence vs 0.83 s at `--attn-chunk 1024`, 0.89 s at 512, 1.01 s at
+256), so the fused mode makes one kernel call per layer.
+
+#### Board (`rock-5b-plus`, 4×A76, `taskset -c 4-7`)
+
+Patched 600 MHz NPU module, model `/root/models/embeddinggemma-2`, release
+`--features npu` build. The production embed service (`home-llm-gateway-embed-1`)
+was stopped for the window and restored (health ok) afterwards; loadavg was
+6.5-7.4 with the other containers, so wall includes a busy board. 3 interleaved
+reps, mean (range):
+
+- **a** deployed shape: `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`
+- **b** f32 CPU: `--dtype f32 --defer-towers`
+
+| config | mode | tower | patch / attn (kernel) / mlp | encode | wall | user CPU |
+|---|---|---|---|---|---|---|
+| a q8+npu | blocked | 27.28 s (24.86-28.74) | 0.20 / 14.38 (10.35) / 12.69 | 29.64 s | 70.2 s | 101.6 s |
+| a q8+npu | fused | **23.79 s** (23.00-24.59) | 0.20 / 11.00 (7.18) / 12.57 | **26.03 s** | 64.4 s | 100.3 s |
+| b f32 | blocked | 25.85 s (25.09-26.48) | 0.12 / 14.65 (11.35) / 11.08 | 28.01 s | 47.0 s | 78.6 s |
+| b f32 | fused | **21.93 s** (21.51-22.22) | 0.13 / 10.73 (7.24) / 11.06 | **24.03 s** | 46.1 s | 79.9 s |
+| b f32, 4-frame video | blocked | 43.50 s (42.53-44.30) | 0.24 / 19.64 (12.41) / 23.61 | 46.41 s | 70.8 s | 136.4 s |
+| b f32, 4-frame video | fused | **36.72 s** (36.22-37.52) | 0.19 / 13.34 (6.28) / 23.17 | **39.28 s** | 63.9 s | 131.1 s |
+
+Fused/blocked: tower **1.15×** (a), **1.18×** (b), 1.18× (video); attention phase
+1.31× / 1.37× / 1.47×; kernel 1.44× / 1.57× / 1.98×. `sys` CPU halves
+(a 8.9 → 5.1 s — the blocked samples were 11.5 / 5.0 / 10.2 — b 8.5 → 4.0 s),
+`user` is flat.
+
+**First media request through `serve`** (config a, `--vision-attn fused`,
+`--defer-towers`, port 8399): RssAnon 619,888 kB after the text load, 1,292,868
+kB after the first image (+~59 MiB of cached position table vs P0's 1,232,900)
+and unchanged after the next two. `compute_s` 52.87 (first; `encode_s` 25.49,
+the rest the deferred tower load), then 27.34 / 27.18 with `encode_s` 25.65 /
+25.74 — against P0's 31.38 / 29.68 / 32.87 and `encode_s` 29.86 / 28.37 / 31.38,
+i.e. **-13 % steady media latency**; the text request after it logs
+`compute_s=0.207` with no `encode_s`/`vision_attn` fields.
+
+#### Parity
+
+Normalized 768-d embeddings; the reference is
+`tools/ref_embeddinggemma2.py {image,video}` (HF f32, transformers 5.19).
+
+| case | fused vs HF f32 | blocked vs HF f32 | fused vs blocked | max\|d\| |
+|---|---|---|---|---|
+| dev f32 image | 1.000000000 | 1.000000000 | 0.999999999997 | 3.2e-07 |
+| dev f32 video | 1.000000000 | 1.000000000 | 0.999999999999 | 1.4e-07 |
+| dev q8 image | 0.999670037 | 0.999670029 | 0.999999999962 | 1.1e-06 |
+| dev q8 video | 0.999654505 | 0.999654508 | 0.999999999999 | 2.1e-07 |
+| dev bf16 image | 0.999829537 | 0.999886852 | 0.999853746 | 2.1e-03 |
+| dev bf16 video | 0.999941769 | 0.999915897 | 0.999912331 | 1.6e-03 |
+| board f32 image | 1.000000000 | 1.000000000 | 0.999999999992 | 5.1e-07 |
+| board f32 video | 0.999652156 | 0.999652157 | 0.999999999999 | 1.6e-07 |
+| board a image (q8+npu) | 0.999671021 | 0.999669094 | 0.999997856 | 2.3e-04 |
+
+The tower output itself differs by max|d| 8.5e-5 (dev) / 9.0e-5 (board) at
+~1e-5 relative on activations of magnitude ~1200: per-layer f32 reassociation
+grows from 2.9e-7 (layer 0) to 1.4e-5 (layer 15) and the mean pool plus
+`embed_vision` bring the final vector to 1e-7-1e-6 in f32. In the deployed
+q8+npu shape the same 1e-5 soft-token difference is amplified to 2.3e-4 by the
+**NPU f16 text path** (reproducible: two blocked runs are bit-identical, two
+fused runs too, and every cross pair gives 0.999997856); it is far below the
+deployed config's own 0.9992-0.9999 vs HF. bf16 differs more between the modes
+because the blocked path casts its softmax probabilities to bf16 *before* `P @ V`
+while the fused path keeps them f32 — the fused output is not worse, both sit at
+0.99983-0.99994 vs HF f32.
+
+#### Gate assessment
+
+- The gate was **≥2× faster attention phase and ≥1.4× tower on both hosts**:
+  **not met**. Achieved: attention phase 1.35-2.45× (dev f32 1.74×, dev bf16
+  2.45×, dev q8 1.46×, board 1.31-1.47×), tower 1.14-1.53× (dev f32 1.22×,
+  dev bf16 1.53×, dev q8 1.14×, board 1.15-1.18×). Numerics passed everywhere
+  except the strict `fused-vs-blocked ≥0.99999` item in bf16 and in the board's
+  q8+npu shape (both explained above); f32 is ≥0.99999999999.
+- Why: the attention kernel is only 32 % of the tower (dev f32 1.65 of 5.02 s)
+  and 44 % (board b 11.35 of 25.85 s), so even a free kernel would cap the tower
+  at 1.47× dev / 1.54× board. The `attn` *phase* also contains the q/k/v/o
+  projections, RoPE and norms (dev 0.56 s, board 3.81 s), which the mode does not
+  touch, and the fused kernel itself only reaches 1.44-1.57× on the board: flex
+  parallelizes it over the tower's 12 heads (6.48 s single-threaded → 0.72 s on
+  32 threads = 9×; the exp/online-softmax terms are serial per head), while the
+  blocked path's `softmax` spreads over the whole score tensor, so its
+  parallelism advantage shrinks from 32 to 4 cores.
+- Default: **`blocked` stays** (the gate fell short), `fused` is opt-in per
+  command (`--vision-attn fused` on `gemma embed|bench` and `serve`). It is
+  nevertheless a strict, reproducible win in every measured shape — tower
+  -8 %..-15 % on the board, -14 %..-35 % on the dev host, half the `sys` CPU,
+  identical f32 numerics — so flipping the default is a one-line change (the
+  `#[default]` on `VisionAttn` plus the `VisionAttn::Blocked` sites in the
+  Gemma 4 paths, which would then inherit it) once a default swap is wanted
+  (done in §18.3).
+- Not done: NPU attention for the tower (the text model's attention already runs
+  on the NPU at f16; the vision tower would need the same per-layer pack plus
+  `window < 0`) — **measured in §18.4 and rejected: 1.05× at best, because the
+  driver's host softmax dominates at head_dim 64**; and int8/per-row-quantized
+  tower MLPs — after this round the **MLP was the largest tower phase** (12.6 s
+  of 23.8 s deployed on the board; §18.5's fused glue then cut it to 4.4 s, so
+  attention is the largest phase at 50 % now).
+
+### 18.3 P2: NPU-packed vision projections
+
+The tower's GEMMs now run on the NPU as resident fp16 weights. `--npu` packs the
+16 layers' q/k/v/o + gate/up/down (`ClippableLinear::pack_npu`, 112 weights) and
+`embed_vision.embedding_projection` (1) — 113 weights, **0.28 GiB** of resident
+fp16 NPU memory — and shrinks each CPU weight to a `[1, 1]` stub via
+`Param::map`, keeping the `ParamId` so `lin()` still routes through the registry
+(the same pack-and-drop as the text backbone). Q8-resident towers are
+dequantized once per weight while packing, so the packed weights are fp16 in
+both arms. `burn_rocket::pack` gets HF `[N, K]` (Burn `[in, out]` transposed).
+The patch embedder, every RMSNorm, RoPE and the attention kernel stay on the CPU;
+the audio tower is untouched (not the media cost, and its linears carry clip
+bounds). Clipped linears are skipped by `pack_npu`, which is also why Gemma 4's
+tower is not wired: its `use_clipped_linears` would need the bounds applied
+around a host-side GEMM.
+
+Wiring: `load_towers`/`load_towers_mmproj` take an `npu_pack` flag (the CLI's
+`--npu`, `serve`'s resolved NPU decision) and pack after the store pass and the
+optional Q8 mapping. **`ROCKET_NPU_TOWERS=0`** is the A/B off-switch (the pack
+is on by default under `--npu`). The eager path creates the NPU engine before
+loading towers (`burn_rocket::init` is idempotent); the deferred path
+(`--defer-towers`) packs on the first media request, so text-only loads allocate
+nothing and stay bit-identical (serve: RssAnon 619,836 kB after the text load vs
+P1's 619,888; a text request after media is `compute_s=0.198` with no
+`encode_s`). The `towers: loaded` line reports the pack:
+
+```text
+towers: loaded (F32, q8-resident) in 29.92s (resident 1009 MiB anon), +113 projections packed (0.28 GiB NPU in 6.33s)
+```
+
+That line's duration includes the pack; the pack cost alone is the suffix. Also
+in this round: `--vision-attn` now defaults to **`fused`** for EmbeddingGemma 2
+(`VisionAttn`'s `#[default]`; `blocked` remains the parity fallback and Gemma 4
+keeps it explicitly), and `ROCKET_VISION_LOG=1` appends the per-forward NPU
+split to the vision line (`..., npu 112 calls convert 1.27s npu 3.96s`) measured
+from `burn_rocket::stats()` around the layer loop.
+
+#### Pack cost (board, `rocket-inference-p2`, 113 weights, 0.28 GiB)
+
+| arm | tower load (store + q8 map) | pack | tower load total | resident anon after load |
+|---|---|---|---|---|
+| a q8+npu, pack off | 24.1 s | — | 24.1 s | 1069 MiB |
+| a q8+npu, pack on | 24.2 s | **6.26 s** (6.18-6.31) | 30.4 s | **906 MiB** |
+| b f32+npu, pack off | 12.6 s | — | 12.6 s | 2343-2350 MiB |
+| b f32+npu, pack on | 12.8 s | **4.44 s** (4.08-4.76) | 17.2 s | **1745 MiB** |
+
+The q8 arm's extra ~1.8 s is the per-weight Q8 dequant; both arms then convert
+to fp16 (`pack`) and free the host copy. The CPU resident set drops by the
+packed weights (a -163 MiB, b -598 MiB — the f32 tower is 1.2 GiB, Q8 0.14 GiB,
+both become 0.28 GiB of NPU buffers).
+
+#### Board timing (2394-patch image, 3 interleaved reps, mean (range))
+
+`taskset -c 4-7`, patched 600 MHz NPU module, production embed service stopped
+for the window and restored (health ok); other containers kept running, loadavg
+1.9-3.4, so wall carries board noise. `fused` vision attention everywhere.
+
+- **a** deployed shape: `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers --vision-attn fused`
+- **b** f32+npu: `--dtype f32 --npu --npu-attn npu --attn-chunk 1024 --defer-towers --vision-attn fused`
+
+| config | pack | tower | patch / attn (kernel) / mlp | encode | wall | user CPU |
+|---|---|---|---|---|---|---|
+| a q8+npu | off | 24.84 (24.51-25.33) | 0.21 / 11.58 (7.39) / 13.04 | 27.08 | 67.6 s | 112.7 s |
+| a q8+npu | **on** | **19.84** (19.30-20.46) | 0.19 / 11.26 (8.19) / **8.39** | **22.13** | 68.7 s | **92.9 s** |
+| b f32+npu | off | 22.98 (22.63-23.66) | 0.18 / 11.29 (7.50) / 11.50 | 25.28 | 49.5 s | 92.6 s |
+| b f32+npu | **on** | **19.55** (19.34-19.76) | 0.16 / 11.10 (7.85) / **8.28** | **21.81** | 50.4 s | **71.4 s** |
+
+Tower **-20.1 %** (a) / **-14.9 %** (b); MLP phase **-35.7 %** / **-28.0 %**;
+`encode` -18.3 % / -13.7 %; `user` CPU -19.8 s (-17.6 %) / -21.2 s (-22.9 %);
+`sys` rises 5.0 → 7.2 s (a) as the driver's BO mapping/DMA replaces part of the
+CPU GEMM. `wall` is flat because a one-shot CLI run pays the pack (+6.3/+4.4 s)
+and saves the same amount in the tower; for serving only the steady request
+matters. The attention phase barely moves (it is the kernel: 7.4-8.2 s) and the
+kernel itself reads ~0.4-0.6 s slower packed in all six runs (7.39 → 8.19 a,
+7.50 → 7.85 b), i.e. 5-8 % — reproducible but small, plausibly cache/bandwidth
+pressure from the resident BOs; it is why the attention phase gain is only ~3 %.
+
+Video (config a, `data/test.mp4`, 4 frames, 4680 patches): pack off **45.24 s**
+(all MLP 29.18 s), pack on **31.09 s** (MLP 16.84 s) — **-31.3 %**; per frame
+7.48 / 7.73 / 7.89 / 7.98 s. The smaller M = 1170 wins relatively more because
+the CPU GEMM degrades faster than the NPU at that size.
+
+#### Where the time goes (per 2394-patch forward, packed)
+
+`ROCKET_VISION_LOG=1` (`burn_rocket::stats()` deltas around the 16 layers), both
+arms, 2 reps:
+
+| arm | NPU calls | input/output conversion | NPU kernel | GF/s in the driver |
+|---|---|---|---|---|
+| a q8+npu | 112 | 1.22-1.27 s | 3.90-3.96 s | **183** |
+| b f32+npu | 112 | 1.26 s | 3.96 s | **183** |
+| a video, per frame | 112 | 0.62-0.68 s | 1.73-1.90 s | 193 |
+
+The tower's GEMM work is 361.5 GMAC = 723 GFLOP (150.99 M MACs/token × 2394
+patches), so the driver executes it at ~183 GF/s — **not** the 300-380 GF/s the
+round assumed. The rest of the 19.8 s is: attention kernel 8.0 s, conversions
+1.25 s, and ~6.3 s of host marshalling + flex glue (`read_floats_f32` copies
+each activation out of the flex tensor before every matmul, i.e. ~1.2 GB of
+input copies per forward, plus RoPE/norms/residual/`gelu_mul`, patch and pool).
+The unpacked CPU path spends 17.2 s in the same two phases (11.58 - 7.39 = 4.2 s
+of q/k/v/o + 13.04 s of MLP, ~45 GF/s effective), so the packed GEMM+conversion
+cost (5.2 s) is a ~3× win that only shows as -20 % of the tower.
+The practical fp16 throughput is consistent with the driver's own microbenchmarks
+(§Port status: int8 512×3072×1024 in 62-70 ms ≈ 46-52 GF/s, bf16 stream 24-27 ms
+≈ 119-134 GF/s), so the ceiling is the driver/SoC, not this integration.
+
+#### Serve first request (config a, deferred, port 8399)
+
+| request | compute_s | encode_s | RssAnon |
+|---|---|---|---|
+| text load | — | — | 619,836 kB (P1 619,888) |
+| first image (load 24 s + pack 6.33 s) | 51.27 | 18.42 | 1,152,144 kB (P1 1,292,868) |
+| steady image 2-4 | 20.88 / 20.44 / 20.56 | 19.31 / 19.34 / 18.95 | 1,152,148-1,152,176 kB |
+| text after | 0.198 | — | 1,075,7xx kB |
+
+Steady media latency **-24.3 %** vs P1 (27.34 / 27.18 s); the first request is
+**not slower** (51.27 vs P1's 52.87 s): the 6.3 s pack is more than repaid by
+the first forward (18.4 vs 25.5 s), and the deferred load itself is unchanged
+(24.1 s of store+q8 map, P1 24.4). Resident media memory drops 140 MB (P1's +59 MiB
+position-table cache is included in both).
+
+#### Parity
+
+Normalized 768-d embeddings vs the HF f32 reference (`p1_ref_*.json`), and the
+tower's own soft tokens (266 × 512, `--dump-vision`) vs the same binary's f32 CPU
+tower; `packed vs unpacked` compares against `ROCKET_NPU_TOWERS=0` in the same arm.
+
+| case | vs HF f32 | max\|d\| | tower vs f32 CPU | packed vs unpacked |
+|---|---|---|---|---|
+| a q8+npu image | 0.999687984 | 2.4e-03 | 0.996689271 | 0.999987637 |
+| a q8+npu video | 0.999158561 | 6.4e-03 | — | 0.999999433 |
+| b f32+npu image | 0.999997457 | 2.6e-04 | 0.999998817 | 0.999997309 |
+| b f32+npu video | 0.999649904 | 3.0e-03 | — | — |
+
+- The pack itself is **0.99999858-0.99999882** at the tower output (max|d|
+  3.1e-2 on activations of magnitude ~1200, i.e. 2.6e-5 relative), and
+  0.9999876-0.9999973 at the embedding: the fp16 weight rounding lands far
+  below the arm's own gap to HF.
+- The q8 arm's 0.99969 (image) is **better** than P1's unpacked 0.99967 (the
+  packed fp16 weights round the Q8-dequantized values, which happens to help).
+  The tower-only q8 cosine (0.99669) is the Q8 mapping's own error: comparing
+  the same tower with the q8 CPU dump gives 0.99999858, i.e. the pack adds
+  nothing to it.
+- Video's 0.99916 is the q8 + f16 NPU text path, not the pack: pack off gives
+  0.9991587 (pack A/B 0.9999994), and P1's board f32 CPU video was 0.9996522 —
+  the video reference already carries a ~3.5e-4 gap from frame
+  decode/sampling. Likewise f32+npu image is 0.9999975, i.e. the fp16 text
+  GEMMs, not the tower.
+- Determinism: repeated runs are **bit-identical** (cosine 1.0, max|d| 0) in
+  both arms, image and video.
+
+#### Gate assessment
+
+- **Tower ≤12 s: not met.** Achieved 19.84 s (a, -20 %) and 19.55 s (b, -15 %)
+  from 24.84 / 22.98 s. The bound is structural: the CPU attention kernel alone
+  is 7.4-8.2 s, the NPU GEMMs need ≥4 s at the measured 183 GF/s, and the
+  extension's per-call host round-trip adds ~1.3 s of conversions plus several
+  seconds of marshalling. A ≤12 s tower would need the attention kernel on the
+  NPU (P1's remaining lever) and/or a zero-copy `matmul` that keeps activations
+  on the device between layers.
+- **Numerics: passed** for the requested image cases — 0.99969 (q8, gate
+  ≥0.9995) and 0.9999975 (f32, gate ≥0.9999) — and the video difference is
+  attributable to the pre-existing reference/q8 gap, not the pack (A/B
+  0.9999994).
+- **Text-only unchanged**: no towers → no pack, no NPU memory, same loader
+  numbers and RssAnon as P1.
+- Decision: keep the pack **on by default** under `--npu` (strict wall/CPU/memory
+  win on every media shape), `fused` as the vision-attention default, and the
+  env switch as the A/B off. A redeploy of this source therefore gets both
+  without new flags (the live image predates them).
+- Not done / next levers: fused resident packs (`pack3` q|k|v and `pack2`
+  gate|up, as the text loader does) would cut 3 of the 7 per-layer input copies
+  and 1 input conversion each — the cheapest remaining win, **landed in
+  §18.5.1** (packs 113 → 65, calls 112 → 64, but only -0.13 s of tower); NPU
+  attention for
+  the tower (bidirectional `window < 0`, host softmax and a 2394² score
+  matrix are the risks) — **measured in §18.4 and rejected: 1.05× at best,
+  because the driver's host softmax dominates at head_dim 64**; int8 tower
+  weights (readback-bound, memory lever only).
+  The bf16 tower was not re-measured: its fused-vs-blocked near-ties in §18.2
+  (0.99985 / 0.99991) are below the strict 0.99999 bar because the **blocked**
+  path rounds the softmax probabilities to bf16 before `P @ V` while fused keeps
+  them f32 — both modes sit at 0.99983-0.99994 vs HF, so `fused` is not the
+  less accurate one, but a bf16 default should re-run the §18.2 A/B first.
+
+
+### 18.4 P3: NPU vision attention (negative, 2026-10-24)
+
+The P2 tower still spends 7.9-8.2 s per 2394-patch image in the fused CPU
+attention kernel (11.1-11.3 s for the whole attention phase). This round asked
+whether the NPU can run that op faster: the text backbone already offloads
+attention through `burn_rocket::attention_window` (f16 in, `window = -1` = no
+mask), and the vision geometry is the same bidirectional batch-1 shape.
+
+**Decision gate, set before measuring:** the NPU kernel must be **≥1.3× faster**
+than the fused CPU kernel *and* cut tower wall by **≥10 %**. Otherwise stop,
+keep `fused`, and leave the op unimplemented.
+
+#### Microbenchmark
+
+`examples/rocket-inference/src/bin/vision_attn_bench.rs` (bin gated on the `npu`
+feature, aarch64 only) runs one tower layer's attention on the real geometry:
+q/k/v `[1, 12, p, 64]` f32, scale 1.0, bidirectional, `taskset -c 4-7`, NPU at
+the patched 600 MHz module. The production embed service
+(`home-llm-gateway-embed-1`) was stopped for the window and restored each time
+(health ok); the other containers kept the board at loadavg ~1.4-2.5, so wall
+carries some noise. `fused` = `burn::tensor::module::attention`
+(`is_causal: false`); `npu` = `burn_rocket::attention_window(..., 12, 12, 64,
+1.0, None, -1)` on `[1, p, 768]`, whose `convert` (f32→f16 head-major layouts)
+and `npu` (driver call, including its host softmax) are the
+`burn_rocket::stats()` deltas; `npu-chunk-N` = the same through
+`attention_window_block` per query chunk (`window = -1`, `kv_start = 0`).
+
+p = 2394 (57×42 image), 5 reps after a warmup, seconds per layer (`RssAnon` is
+the process's resident anonymous memory after the arm — the NPU scratch stays
+cached, so it is that arm's high-water):
+
+| arm | s/layer | convert | npu | calls | vs fused cos | max\|d\| | RssAnon |
+|---|---|---|---|---|---|---|---|
+| fused CPU kernel | **0.455** | — | — | — | 1 | 0 | 61 MiB |
+| npu (full p) | 0.461 | 0.018 | 0.429 | 1 | 0.999999844 | 3.2e-5 | 195 MiB |
+| npu-chunk-2048 | 0.452 | 0.030 | 0.382 | 2 | 0.999999844 | 3.2e-5 | 122 MiB |
+| npu-chunk-1024 | **0.434** | 0.031 | 0.365 | 3 | 0.999999844 | 3.2e-5 | 148 MiB |
+| npu-chunk-512 (3 reps) | 0.685 | 0.072 | 0.478 | 5 | 0.999999844 | 3.2e-5 | 149 MiB |
+
+p = 1170 (one of the 4 frames of `data/test.mp4`), 3 reps:
+
+| arm | s/layer |
+|---|---|
+| fused CPU kernel | **0.094** |
+| npu (full p) | 0.129 |
+| npu-chunk-1024 | 0.156 |
+| npu-chunk-512 | 0.194 |
+
+Best case at the image size is **1.05×** (chunk 1024: 0.434 vs 0.455); the
+full-sequence call is 0.99×, chunk 2048 1.01×, chunk 512 0.66×, and at the
+video-frame size the CPU kernel wins outright (1.37-2.06×). The op's numerics
+are excellent — 0.999999844 against the f32 fused kernel, max|d| 3.2e-5 on
+outputs of order 0.1, the same for every chunking and bit-identical across
+runs — so accuracy is not what rules it out.
+
+#### Why it cannot win here
+
+Per layer the GEMMs are small and the softmax is not. The QK/AV matmuls are
+only 2 × 2394² × 64 × 12 = 8.8 GMAC (17.6 GFLOP), ~0.1 s at the driver's
+measured ~183 GF/s, while the softmax covers 12 × 2394² = **68.8M scores**. The
+remaining ~0.33 s of the 0.43 s driver call is host-side score work: 138 MB read
+back from the device, the serial scalar softmax over those scores (scale, mask
+add, max, exp, sum, f16 round) and 138 MB uploaded again as the AV operand. That
+is the same arithmetic flex's fused kernel does, except flex overlaps it with
+the GEMMs in one tiled online-softmax pass and spreads it over 12 heads, while
+the driver serializes 3 heads per worker across 4 workers. The per-call
+f32→f16 layout conversion (0.02-0.03 s) is not the limit; the score traffic and
+the scalar softmax are. `rocket-npu` has no on-NPU softmax ("Missing surface" in
+the root AGENTS.md — this is the C library's default host-softmax path), so a
+≥1.3× win would need that or a fused flash kernel in the driver (deferred in
+§18.7).
+
+Extrapolated to the tower: 16 layers × 0.434 s = 6.9 s against P2's 7.9-8.2 s
+kernel, i.e. **-5..-6 % of the 19.8 s tower**, and ~0 on the video path — versus
+the 10 % gate. (P2's in-situ kernel is 0.49-0.51 s/layer, 8-12 % above this
+isolated fused arm, which would flatter the NPU ratio to 1.13-1.18×; still short
+of 1.3×, and the tower delta stays ~6 %.) The f16 attention would also sit on
+top of the q8 arm's existing 0.99969-vs-HF error, where the P3 numerics gate
+(≥0.9999 vs fused) would have needed care. **`--vision-attn npu` was not
+implemented**: the tower keeps
+`fused` as its default, `blocked` as the parity fallback, and its attention on
+the CPU. The bench bin stays in the tree (gated on `npu`) as the reproducer:
+
+```sh
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bin vision_attn_bench
+# on the board, with the embed service stopped for the window:
+taskset -c 4-7 ./vision_attn_bench 2394 5 1024,2048
+```
+
+
+### 18.5 P4: residual overhead + tower load policy
+
+P2 left 19.8 s of tower per 2394-patch image with the GEMMs already on the NPU:
+8.2 s of CPU attention kernel, 1.25 s of f16 conversions and ~6 s that the log
+called "host marshalling + flex glue". This round attacked that last bucket and
+the tower load policy, and re-measured the deployed shapes on a quiet board.
+
+Two windows on `rock-5b-plus` (2026-10-24 06:47-07:03 and 07:09-07:22 board
+time), production `home-llm-gateway-embed-1` stopped for each and restored
+(`/health` ok both times), patched 600 MHz NPU module, `taskset -c 4-7`,
+1-min loadavg 1.5-1.8 (P2's window ran at 1.9-3.4, P3's at 1.4-2.5). Binaries:
+`rocket-inference-p4` (this round) and `rocket-inference-p2` (the P3-era build)
+so the baseline is measured **in the same window** rather than cross-window.
+
+#### 18.5.1 Fused projection groups (landed, `ROCKET_NPU_FUSED`)
+
+The tower now packs q|k|v as one `pack3` weight and gate|up as one `pack2`
+weight (`VisionAttention::pack_npu` / `VisionMlp::pack_npu`, handles stored as
+`#[module(skip)] Option<WeightId>`), and each layer runs one `matmul` per group
+and splits the output along N (`q,k,v` = 768|128|128 columns, `gate,up` =
+3072|3072). The per-projection path stays for non-NPU builds, for clipped
+linears (Gemma 4's tower; `ClippableLinear::group_weight_nk` returns `None` when
+clip bounds exist) and for `ROCKET_NPU_FUSED=0`, the A/B switch. Packed weights
+**113 → 65**, matmuls per forward **112 → 64**; the resident bytes are unchanged
+(0.28 GiB) apart from segmented-pack padding (`weights_mib` 704.7 → 712.7).
+
+Same-window A/B, arm a = the deployed shape (`--dtype f32 --quant q8 --npu
+--npu-attn npu --attn-chunk 1024 --defer-towers --vision-attn fused`), 3
+interleaved reps, mean (range):
+
+| build | tower | patch / attn (kernel) / mlp | calls | convert | npu | user CPU |
+|---|---|---|---|---|---|---|
+| p2 (P3-era) | 19.83 (19.17-20.31) | 0.20 / 11.35 (8.18) / 8.28 | 112 | 1.21 | 3.83 | 92.2 s |
+| p4, `ROCKET_NPU_FUSED=0` | 15.64 (15.02-16.06) | 0.17 / 11.11 (7.94) / 4.36 | 112 | 1.16 | 3.62 | 82.5 s |
+| p4, fused (default) | **15.51** (14.77-16.25) | 0.18 / 10.85 (7.81) / **4.47** | **64** | **1.06** | **3.12** | 82.9 s |
+
+The fusing itself is the small part: **-0.13 s of tower** (inside the ±0.7 s rep
+spread), **-0.50 s of NPU time**, -0.10 s of conversions and -43 % of the calls;
+the two group calls cost ~49 ms each against ~32 ms for the seven separate ones.
+The **4.2 s** in that row is the fused MLP glue, measured separately in window 1
+(1 rep each, arm a): `ROCKET_GLUE=0` tower **19.77 s** (MLP **8.77 s**) vs
+`ROCKET_GLUE=1` **15.56 s** (MLP **4.36 s**). The tower's MLP still computed
+`gelu_approximate(gate) * up` as two flex ops — serial scalar loops over
+2394 x 3072 x 16 layers = 235 M element evaluations — while `lin()` was already
+routed through the NPU; `VisionMlp::forward` now uses `crate::gemma::layers::
+gelu_mul` (the `burn_rocket::gelu_mul` single-pass rayon kernel when the glue is
+on), which is where the 4.4 s of MLP disappeared. CPU modes (`ROCKET_GLUE` off,
+no `--npu`) keep the composite ops bit-identically: the dev host f32 image
+embedding is unchanged (cosine 1.0, max|d| 0 vs the P2 binary).
+
+Parity of the group GEMM vs the per-projection path, at the final normalized
+embedding (same weights, same fp16 pack): a **0.9999967** (max|d| 4.4e-4), b
+**0.9999979** (3.6e-4) — *not* bit-identical, because the driver's plan (and
+with it the fp16 accumulation order) depends on N; both arms are deterministic
+(repeats cosine 1.0, max|d| 0) and both sit 3 orders of magnitude above the
+0.9999 parity gate. Against HF f32 the fused arm is 2.7e-6 below the
+per-projection one in the f32+npu arm (0.9999963 vs 0.9999990) and equal in the
+q8 arm (0.9998836 vs 0.9998878), i.e. the split is correct (a wrong column order
+would not be a 1e-3 perturbation) and the difference is fp16 GEMM noise.
+
+#### 18.5.2 Tower load policy: f32 vision + Q8 audio (landed)
+
+Under `--npu` the towers' Q8 pass now **excludes the packed part**:
+`tower_quant_group(npu_towers)` is `projection_group()` minus
+`^(vision_tower|embed_vision)\.`, so the vision tower (and `embed_vision`) keep
+the load dtype (f32 in the deployed arm) and the pack starts from full-precision
+weights, while the audio tower, which stays on the CPU, keeps its Q8 mapping
+(~0.4 GiB saved) and `embed_audio` stays f32 (3 MiB). Non-NPU `--quant q8`
+behavior is unchanged, and so is `ROCKET_NPU_TOWERS=0` (no pack → no exclusion,
+the whole tower tree is Q8 again). The `towers: loaded` line reports the policy
+(`F32, q8 audio, f32 vision`).
+
+Board, `--defer-towers`, one `towers: loaded` line per run; the store+map
+column is that line's duration minus the pack it reports (window 2 / window 1):
+
+| arm | store + q8 map | pack | tower load total | resident anon after load |
+|---|---|---|---|---|
+| p2 a q8+npu (q8 vision) | 24.20 s | 6.18 s | 30.38 s | 1009 MiB |
+| **p4 a q8+npu (f32 vision)** | **20.5 s** | **4.3 s** (3.9-4.7) | **24.8 s** (24.3-25.4) | **908 MiB** |
+| p2 b f32+npu | ~12.8 s | 4.4 s | 17.16 s | 1745 MiB |
+| p4 b f32+npu | 13.1 s | 4.5 s (4.3-4.7) | 17.6 s (16.6-17.7) | 1745 MiB |
+
+The f32 policy removes ~3.7 s of Q8 mapping from the store pass (24.2 → 20.5 s)
+and ~1.9 s from the pack (the per-weight Q8 dequant, 6.18 → 4.3 s): **-5.6 s of
+deferred load**. The remaining 7.4 s above the f32 arm's 13.1 s store is the
+**audio** tower's Q8 pass (20.5 - 13.1), i.e. the cost of keeping the audio
+weights at 0.4x; the vision tower no longer pays it. Resident anon after load is
+unchanged (**908** vs 906 MiB in P2) because the f32 vision weights are dropped
+as they are packed, and the serve high-water is flat: RssAnon after the text
+load 619,828 kB and 1,184,068 kB after two image requests (P2 1,152,176 kB; the
++32 MB is the fused group's wider matmul scratch slot, `matmul_host_mib` 37 →
+67, not the load policy — the per-projection p4 build measures 1,154,024 kB).
+
+The deployed image's route (`-hf unsloth/embeddinggemma-2-GGUF:Q8_0`, towers from
+`mmproj-Q8_0.gguf`) takes the same policy: `towers: loaded from mmproj (F32, q8
+audio, f32 vision) in 24.3 s (907 MiB anon), +65 weights packed (0.28 GiB NPU in
+4.5 s)`, tower 15.75 s / 64 calls on the 2394-patch image where
+`ROCKET_NPU_TOWERS=0` gives 21.22 s / 1068 MiB — i.e. -26 % of the tower for
+-161 MiB of resident memory on the GGUF path too (smoke run, safetensors not
+involved).
+
+#### 18.5.3 Attention kernel dtype: f16/bf16 rejected (kept f32)
+
+`vision_attn_bench` now runs the fused CPU kernel with f32, f16 and bf16
+operands (plus the NPU arms of §18.4), `taskset -c 4-7`, 3 reps after a warmup:
+
+| arm | p=2394 s/layer | p=1170 s/layer | vs f32 cosine | max\|d\| |
+|---|---|---|---|---|
+| fused f32 (**kept**) | **0.442** | **0.089** | 1 | 0 |
+| fused f16 | 0.483 (+9 %) | 0.104 (+17 %) | 0.999999945 | 1.5e-5 |
+| fused bf16 | 0.468 (+6 %) | 0.112 (+26 %) | 0.999996566 | 1.2e-4 |
+| npu (for reference, §18.4) | 0.452 | 0.104 | 0.999999844 | 3.2e-5 |
+
+The gate was "≥15 % faster **and** cosine ≥0.9995"; the 16-bit arms are *slower*
+at both shapes, because flex dispatches attention by dtype and casts f16/bf16
+operands to f32 for the computation (`dispatch_attention_dtype!` in
+`burn-flex/src/ops/attention.rs`) — 16-bit operands only add two conversions of
+`[1, 12, p, 64]` around the same f32 kernel. No f16 kernel path was
+implemented; the tower keeps casting q/k/v to the kernel's f32 operands (a no-op
+in the f32 arms).
+
+#### 18.5.4 Arms, serve and parity
+
+Window-1 timing, 3 interleaved reps, mean (range), `--defer-towers`:
+
+- **a** deployed: `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --vision-attn fused`
+- **b** f32+npu: `--dtype f32 --npu --npu-attn npu --attn-chunk 1024 --vision-attn fused`
+
+| config | tower | patch / attn (kernel) / mlp | encode | wall | user CPU |
+|---|---|---|---|---|---|
+| a q8+npu | **15.17** (14.78-15.41) | 0.17 / 10.52 (7.56) / 4.47 | 17.4 | 58.6 s | 82.4 s |
+| b f32+npu | **15.41** (14.36-16.14) | 0.20 / 10.56 (7.67) / 4.65 | 17.4 | 46.6 s | 69.2 s |
+
+Against the same-window p2 build (19.83 s, 92.2 s user) the deployed arm is
+**-21.8 % tower** and **-10 % CPU**; against P2's own window (19.84 s, 112.7 s)
+it is -23.5 %. Video (`data/test.mp4`, 4 frames, 4680 patches, arm a): tower
+**21.95 s** (frames 5.57 / 5.42 / 5.81 / 5.14 s, 64 calls and 0.5 s of
+conversions per frame), was 31.09 s in P2 (-29 %).
+
+`serve` steady media (arm a, deferred towers, image-only `/embed`, port 8399):
+
+| build | first request compute_s | steady compute_s | steady encode_s | RssAnon |
+|---|---|---|---|---|
+| p2 | 52.81 | 21.83 | 20.20 | 1,152,176 kB |
+| p4, `ROCKET_NPU_FUSED=0` | 42.71 | 17.46 | 15.83 | 1,154,028 kB |
+| p4, fused | 44.12 | **16.42** | **15.36** | 1,184,068 kB |
+
+Steady media **-24.8 %** vs the same-window p2 build (-20.0 % per-projection).
+A text request right after media logs `compute_s=0.263` with no `encode_s`, and
+a text-only serve load is 619,828 kB RssAnon — the text path is untouched.
+
+Parity, normalized 768-d embeddings vs the HF f32 reference (dev-host
+`p1_ref_cat.json` / `p1_ref_video.json`):
+
+| case | vs HF f32 | P2 |
+|---|---|---|
+| a q8+npu image | **0.9998836** | 0.9996880 |
+| b f32+npu image | **0.9999963** | 0.9999975 |
+| a q8+npu video | **0.9994970** | 0.9991586 |
+| b f32+npu video | 0.9996491 | 0.9996499 |
+
+The q8 arm's image parity improved by 2.0e-4 (its tower now packs f32 weights
+like the f32 arm, so the 1.1e-4 that separates a from b is entirely the **text**
+backbone's Q8 path, which this round does not touch); the video difference is
+the reference's own frame-sampling gap (§18.3). Repeated runs are bit-identical
+(cosine 1.0, max|d| 0), image and video.
+
+#### 18.5.5 Gate assessment and decisions
+
+- **Tower ≤16 s: met.** 15.17 s (a) / 15.41 s (b) from 19.83 s same-window,
+  i.e. -22 %; the gate's alternative "user CPU -20 %" was not reached (-10 %,
+  because the CPU attention kernel is unchanged at 7.6-8.2 s and now dominates
+  the tower at 50 %).
+- **Image cosine ≥0.9999 with the new default: met by the tower** (b f32+npu:
+  0.9999963, i.e. f32-pack numbers) and **not by the q8+npu arm** (0.9998836,
+  up from 0.9996880): both arms now share the same f32-packed tower, so what is
+  left there is the text backbone's Q8-resident weights. The deployed q8 arm is
+  therefore 1.2e-4 short of the bar for a reason outside the tower; `--dtype
+  f32 --npu` without `--quant q8` clears it (0.9999963) at 1745 MiB anon instead
+  of 908.
+- **Text-only path unchanged**: no towers → no pack, same loader numbers, text
+  request `compute_s=0.263`, and the non-NPU f32/q8 image path is unchanged
+  (dev host: f32 cosine 1.0 / max|d| 0 vs the pre-round output, q8 0.999670 vs
+  HF, the P1 value).
+- **Landed defaults**: fused q|k|v and gate|up groups (`ROCKET_NPU_FUSED=0`
+  restores 113 packs), f32 vision tower + Q8 audio under `--npu`, `gelu_mul` in
+  the tower MLP whenever the glue is on, f32 attention kernel. Costs: +8 MiB of
+  NPU weights and ~32 MB of matmul scratch in `serve`; the fused group's tower
+  gain is small (-0.13 s, within rep noise) so the switch is cheap to flip back.
+- **Next levers** (not done): the attention phase's 3.0 s outside the kernel —
+  the two QK-RMSNorms, `AxialRope::apply` (4 slices + 6 elementwise ops + a
+  `cat` per q and k, all flex composite chains on 2394 x 12 x 64) and the `o`
+  projection — is now the largest addressable residual; an axial-RoPE host
+  kernel of the `burn_rocket::rope_apply` kind is the obvious candidate
+  (~2 s by the `gelu_mul` precedent). Then the audio tower's Q8 map (7.4 s of
+  the deferred load) and the q8 text backbone's 1.1e-4 image-parity floor.
+
+### 18.6 P5: frame batching (negative, 2026-10-24)
+
+Hypothesis: video frames sampled at one fps share a geometry, so a batch of
+frames could run as one tower forward — `[F*P, hidden]` projections (one NPU
+matmul per weight instead of `F`) with the fused attention kernel taking `F` as
+its batch dimension — amortizing the per-call conversions/marshalling. Expected
+gate: 4 frames **>=15 %** below `4 x` single-frame, 8 frames >=20 %, image
+latency unchanged, `RssAnon` +<=200 MB.
+
+A candidate build implemented exactly that: `VisionTower::forward_batch`
+(`&[PreparedImage]` of identical geometry -> one `[F*P, hidden]` patch matmul
+with the shared position table, `[F, P, H, D]` RoPE/norms, fused attention
+`[F, 12, P, 64]`, per-frame pooling), `MediaModel::encode_images` (default
+per-image loop, EmbeddingGemma 2 override that groups same-geometry frames and
+projects a group's pooled rows through `embed_vision` as one matmul), and
+`ROCKET_VISION_BATCH` (default 4, `0`/`1` off) windowing the video loop so long
+videos stream in bounded batches. Microbenchmark and gate measurement are the
+same thing here: the real tower on the board, batch 1 vs 4, because a synthetic
+tower cannot capture the allocator/NPU behaviour that turned out to decide it.
+
+Three windows on `rock-5b-plus` (2026-10-24 08:01-08:24, 08:25-08:27 and
+08:37-08:40 board time), production `home-llm-gateway-embed-1` stopped for each
+and restored (`/health` ok), patched 600 MHz NPU module, `taskset -c 4-7`, 1-min
+loadavg 2.3-3.5 (busier than P4's 1.5-1.8). Arm a (deployed shape):
+`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --vision-attn
+fused --defer-towers`; one process per run, so the 21.8 s deferred tower load is
+outside every tower number. Candidate binary and logs:
+`/root/rocket-inference-p5/` (`rocket-inference-p5`, 3 reps interleaved per arm).
+
+#### 18.6.1 Result: batching does not help
+
+Video `data/test.mp4` (1170 patches/frame): 4 frames = 4680 patches,
+8 frames (`--video-fps 2`) = 9360. Tower seconds per run:
+
+| frames | rep | batch 1 | batch 4 | delta |
+|---|---|---|---|---|
+| 4 | 1 | 18.60 | 18.11 | **-2.6 %** |
+| 4 | 2 | 19.14 | 19.71 | +3.0 % |
+| 4 | 3 | 17.39 | 19.16 | +10.2 % |
+| 4 | mean | **18.38** | **18.99** | **+3.3 %** |
+| 8 | 1 | 36.59 | 43.95 | +20.1 % |
+| 8 | 2 | 37.52 | 38.93 | +3.8 % |
+| 8 | 3 | 35.74 | 35.32 | -1.2 % |
+| 8 | mean | **36.62** | **39.40** | **+7.6 %** |
+
+Phase means over the 3 reps (tower seconds; `npu`/`convert` from the per-forward
+lines):
+
+| phase | 4f batch 1 | 4f batch 4 | 8f batch 1 | 8f batch 4 |
+|---|---|---|---|---|
+| patch | 0.20 | 0.22 | 0.32 | 0.31 |
+| attention (of which kernel) | 11.07 (6.99) | 10.71 (6.32) | 22.87 (14.55) | 21.84 (13.21) |
+| mlp | 7.09 | 8.05 | 13.41 | 17.23 |
+| calls | 256 | **64** | 512 | **128** |
+| convert | 1.45 | 1.93 | 2.86 | 4.47 |
+| npu | 4.75 | 5.08 | 9.24 | 9.57 |
+| wall / user CPU | 58.5 s / 89.8 s | 58.9 s / 91.4 s | 79.7 s / 141.1 s | 82.7 s / 149.1 s |
+
+The **only** consistent gain is the attention op itself: **-9.6 %** at 4 and
+**-9.2 %** at 8 frames (109 ms per frame-layer at 1170 patches in the per-frame
+path, 99 ms batched), and the call count drops 4x. That is offset by the MLP
+phase (+13.5 %) and the conversions (+33 % at 4 frames, +56 % at 8), so the net
+tower change is **0 to +3 %** — the gate (-15 % at 4 frames) is missed by an
+order of magnitude, and the 8-frame expectation too. `RssAnon` peaks are
+indistinguishable (2.473-2.495 GB, dominated by the f32 load peak). The 8-frame
+batch-4 mean is pessimistic: rep 1 ran into board contention (6.20 s of
+conversions for the 8 patches-pairs against 2.83 s in rep 3), and the clean rep
+is -1.2 %.
+
+#### 18.6.2 Why: the tower is proportional-to-rows work
+
+`vision_attn_bench` grew two primitive modes (`matmul`, `attn-batch`) that
+isolate what batching could actually change, on the tower's real shapes.
+
+NPU matmuls (16 layers of q|k|v 2304x768, o 768x768, gate|up 6144x768 and
+down 768x3072; 3 reps, one warmup), per row:
+
+| M | q\|k\|v | o | gate\|up | down |
+|---|---|---|---|---|
+| 1170 | 35.2 us | 14.4 us | 72.4 us | 35.6 us |
+| 2340 | 20.9 us | 7.5 us | 65.8 us | 39.2 us |
+| 4680 | 26.7 us | 11.9 us | 66.1 us | 51.9 us |
+| 9360 | 29.6 us | 9.3 us | 64.1 us | 51.7 us |
+
+No consistent per-row gain with `M` (gate|up, the biggest shape, is -11 % from
+1170 to 9360; q|k\|v and down bounce with the board's NPU contention), i.e. the
+driver is compute-bound at ~205 GF/s on these shapes and only per-call setup
+scales with the call count. The real runs say the same: the P4 image (2394
+patches) spends 1.30 ms of NPU time per row and 0.44 ms of conversion per row,
+the 1170-patch frame 1.32 and 0.43. The fused attention op at 1170 patches is
+flat per frame in batch: 0.093 / 0.091 / 0.092 / 0.091 s at B = 1 / 2 / 4 / 8,
+because 12 heads already fill the four threads (the kernel parallelizes over
+`batch * heads`).
+
+So the batchable overhead is the ~0.17 s/frame of per-call setup inside the
+attention phase (layout copies, output allocation, rayon job setup), and the
+larger transient buffers of a batched call (`gate|up`'s 4680x6144 f32 output is
+115 MB against 29 MB per frame) cost at least as much on this board's memory
+path. Frame batching is therefore not the lever — the kernel share (P4's 7.6 s
+of an image's 15.2 s) and the CPU glue are.
+
+#### 18.6.3 Parity, memory and the serve A/B
+
+Batch vs per-frame (independent of the batching code, same weights): normalized
+768-d video cosine **0.999999885** at 4 frames and **0.999999944** at 8,
+max|d| 6.3e-5 / 3.9e-5, i.e. above the 0.99999 gate; repeats of every arm are
+bit-identical (cosine 1.0, max|d| 0). The batch-of-1 refactor is **exact**:
+the P4 binary and the candidate produce bit-identical image vectors
+(cosine 1.0, max|d| 0), and the image/video parity against the HF f32
+references is unchanged (image 0.999883625 = P4's 0.9998836; video 0.9994970
+per-frame vs 0.9994962 batched, P4 0.9994970). The 8-frame arm has no HF
+reference (the reference samples 4 frames at fps 1) and is only compared
+batch-vs-per-frame.
+
+`serve` (deferred towers, port 8399, one request per 4-frame video):
+
+| build | first request compute | steady compute | steady encode | RssAnon | matmul BO / host |
+|---|---|---|---|---|---|
+| batch 1 (kept) | 53.4 s wall | 24.62 / 25.90 | 21.15 / 22.86 | **1.181 GB** | 237 / 48 MB |
+| batch 4 | 51.6 s wall | 25.12 / 24.57 | 21.61 / 21.26 | 1.236 GB | 603 / 129 MB |
+
+Same compute within noise, **+55 MB** of `RssAnon` and 2.5x the NPU matmul
+scratch (the batch's 4680-row capacity classes) for no gain — the memory cap
+(+<=200 MB) would have held, but it buys nothing.
+
+#### 18.6.4 Decision
+
+**Negative; the video path stays per-frame.** The candidate's batching code was
+not kept: `vision.rs`, `inputs.rs` and `embeddinggemma/model.rs` are back at the
+P4 state (verified: the reverted build reproduces the P4 binary's image and
+video vectors bit-for-bit), and `MediaModel` has no `encode_images`. What
+remains from the round is the reproducible probe — `vision_attn_bench matmul
+[reps]` and `vision_attn_bench attn-batch [patches] [reps]` (the candidate
+binary and all logs stay under `/root/rocket-inference-p5/`). Re-open only if
+the NPU matmul becomes call-overhead-bound or the attention kernel stops being
+the largest single share: with a proportional tower, batching can recover at
+most the per-call setup (~5 % of a frame). The NPU attention path's own blocker
+is the driver's host softmax, deferred in §18.7.
+
+### 18.7 Deferred
+
+- **On-NPU softmax in `rocket-npu`** — the one lever that would re-open NPU
+  vision attention. The port has no device-side softmax (root AGENTS.md
+  "Missing surface"; the C library provides it), so `attention_window` /
+  `attention_window_block` bring the full score matrix host-side and softmax it
+  serially: at the tower's head_dim 64 that is 12 × 2394² = **68.8M scores per
+  layer** (138 MB down + 138 MB up, f16) against only ~0.1 s of QK/AV GEMMs per
+  layer, which is why §18.4 landed at 1.05× at best and why `--vision-attn`
+  stays `fused|blocked`. Re-open after the port: re-run
+  `vision_attn_bench 2394 5 1024,2048` and require the §18.4 gate (≥1.3× the
+  fused kernel *and* ≥10 % tower wall) before adding `--vision-attn npu`.
+  Shared with the causal models' long-context NPU attention, which has the same
+  host-softmax limit.
+- The remaining tower levers are the ones §18.5.5 lists (axial-RoPE host kernel
+  ~2 s, the audio tower's Q8 deferred-load map, the q8 text backbone's 1.1e-4
+  image-parity floor); frame batching is closed by §18.6.4.

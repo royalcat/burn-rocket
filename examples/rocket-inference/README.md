@@ -154,8 +154,8 @@ model directory name), `--max-tokens` (prompt/context cap), `--max-new-tokens`
 (default generation cap), `--temperature`, plus the loading flags of the
 detected family (e.g. `--dtype`/`--quant`/`--npu`/`--npu-attn`/`--chunk`/
 `--key-block`/`--attn` for qwen3; `--quant`/`--npu`/`--npu-attn`/`--attn-chunk`/
-`--video-fps`/`--video-max-frames`/`--defer-towers` for EmbeddingGemma 2;
-`--npu`/`--npu-threads`/
+`--vision-attn`/`--video-fps`/`--video-max-frames`/`--defer-towers` for
+EmbeddingGemma 2; `--npu`/`--npu-threads`/
 `--delta-chunk`/`--embed-f16`/`--pure-npu`/`--npu-decode` for the intent model;
 `--f16`/`--quant`/`--npu`/`--attn-chunk`/`--defer-towers` for Gemma 4). A flag
 that does not apply to the detected model is rejected.
@@ -185,12 +185,14 @@ at 32 MiB, and `dimensions` is accepted as an alias of `dim`.
 Every completed inference request is logged as one `tracing` line (level
 `info`, `RUST_LOG` controls it; default `info`). Embedding requests report the
 prompt token count, `compute_s`, `tok_s`, the model-lock wait `queue_s` and
-`rss_mib` (`RssAnon`); chat requests additionally split the model's own timings
-into `prefill_s`/`prefill_tok_s` and `decode_s`/`decode_tok_s`. Failed requests
-are not logged (they keep their HTTP error), and `/health`/`/v1/models` never
-touch the model. `ROCKET_MEM_LOG=1` adds one `npu scratch` line after load and
-after every request with the driver's live split (weights / matmul BO+host /
-attention BO+host, top slots and worker shapes). The per-request lines look like:
+`rss_mib` (`RssAnon`); media requests add `encode_s` (the vision-tower forwards)
+and `vision_attn` (the tower's attention mode), and chat requests split the
+model's own timings into `prefill_s`/`prefill_tok_s` and
+`decode_s`/`decode_tok_s`. Failed requests are not logged (they keep their HTTP
+error), and `/health`/`/v1/models` never touch the model.
+`ROCKET_MEM_LOG=1` adds one `npu scratch` line after load and after every
+request with the driver's live split (weights / matmul BO+host / attention
+BO+host, top slots and worker shapes). The per-request lines look like:
 
 ```text
 INFO embedding request endpoint=embeddings model=qwen3-embedding-0.6b inputs=2 tokens=13 queue_s=0.0 compute_s=6.335 tok_s=2.1 rss_mib=968.7
@@ -367,12 +369,22 @@ Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
 need f32/bf16 range), `--text`,
 `--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
-`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`, `--quant none|q8`,
+`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`,
+`--vision-attn fused|blocked` (vision tower attention: the backend's fused
+flash kernel — the default — vs the tensor-op chunked parity fallback; default
+`fused` since log §18.3, Gemma 4 keeps `blocked`),
+`--quant none|q8`,
 `--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`,
 `--npu-int8-group` (default 32), `--defer-towers`, plus `--dump-*`
 debug hooks. On the NPU build, `ROCKET_CTX_CANONICAL=0` restores the legacy
-pad-to-256 tiling and `ROCKET_GLUE=0/1` toggles the fused host kernels
-(`--npu` enables them; `=1` forces them in CPU modes).
+pad-to-256 tiling, `ROCKET_GLUE=0/1` toggles the fused host kernels
+(`--npu` enables them; `=1` forces them in CPU modes),
+`ROCKET_NPU_TOWERS=0` keeps the vision tower's projections on the CPU instead of
+packing them into resident NPU weights (`--npu` packs them by default),
+`ROCKET_NPU_FUSED=0` packs them one per projection instead of the fused
+q|k|v / gate|up groups (`--npu` fuses them by default), and
+`ROCKET_VISION_LOG=1` prints one vision-tower line per forward (plus the NPU
+split under `--npu`).
 
 Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
 `code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`
@@ -394,6 +406,7 @@ Summary against the HF f32 reference (transformers 5.19; full table in the log):
 | text/image, native bf16 (default) | 0.99995 / 0.99989 (dev host); 0.999905 vs f32 on the board |
 | any modality, `--quant q8` | 0.9996-0.9999 |
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
+| image, packed NPU tower (`--npu`, board) | 0.9999963 (f32) / 0.9998836 (q8+npu) |
 
 Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
@@ -413,8 +426,33 @@ weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) v
 ~20–25 % on the quiet board (log §18: 843 tok 4.5–5.0 s vs 3.6–4.0 s; 4203 tok
 29.3–30.8 s vs 24.5–26.5 s), so the production service keeps
 `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`.
-The vision and audio towers, norms, RoPE and the embedding table stay
-on the CPU.
+The vision tower's projections are packed into resident NPU weights as well
+(§18.3); the audio tower, norms, RoPE and the embedding table stay on the CPU.
+
+NPU vision tower (2026-10-24, log §18.3/§18.5): `--npu` packs the 16 layers'
+linears and `embed_vision` into resident fp16 weights (pack-and-drop) and routes
+those GEMMs through the NPU; q|k|v and gate|up pack as fused groups, so a layer
+needs 4 matmuls instead of 7 and the whole tower **65** resident weights (0.28
+GiB), `113` with `ROCKET_NPU_FUSED=0`. `ROCKET_NPU_TOWERS=0` keeps them on the
+CPU. The tower is loaded in **f32** under `--npu` (the pack then carries
+full-precision weights) while the audio tower keeps its Q8 mapping: the q8+npu
+arm now reaches f32-pack parity. On the board a 2394-patch image's tower went
+24.8 s → 19.8 s (§18.3, -20 %) → **15.2-15.5 s** (§18.5, -22 % again, of which
+~4.2 s is the MLP gelu·up fused kernel and ~0.5 s the fused groups' NPU time);
+media `compute_s` through `serve` 27.2 → 20.6 → **16.4 s**, the deferred tower
+load 30.4 → **24.8 s** (pack 6.2 → 4.3 s) at the same 908 MiB anon (1.18 GiB with
+a media request vs 1.15 before). The remaining tower cost is the CPU attention
+kernel (~7.6 s) plus ~3 s of flex norm/RoPE glue in the attention phase; the
+driver executes the ~723 GFLOP of tower GEMMs at ~183 GF/s, so the tower lands
+at ~15.3 s. Parity: 0.9999963 (f32+npu image), 0.9998836 (q8+npu, the text Q8
+path's floor), bit-identical repeats; f16/bf16 attention operands were measured
+and are slower (§18.5.3), so the kernel stays f32. `ROCKET_VISION_LOG=1` prints
+one tower line per forward (`patch`/`attn`/`kernel`/`mlp`/`pool`, plus the NPU
+split under `--npu`), and `serve` logs `encode_s` + `vision_attn` on media
+requests. Video frames are still encoded one at a time: batching same-geometry
+frames into one tower forward cut the attention op ~10 % but the MLP phase and
+the conversions ate it (net 0 to +3 %, §18.6), so the candidate code was
+reverted and only the `vision_attn_bench` probes remain.
 
 Performance round (2026-10-08, log §12; board timings in §12.5):
 canonical tiling (short requests no longer pad every matmul to 256 rows),

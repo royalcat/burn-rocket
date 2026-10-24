@@ -17,6 +17,9 @@ pub(crate) struct RequestTiming {
     pub queue_s: f64,
     /// Time inside the model lock (tokenize/prefill/decode/readback).
     pub compute_s: f64,
+    /// Vision-tower forward time inside `compute_s` (image/video inputs only;
+    /// 0 for text-only and audio-only requests).
+    pub encode_s: f64,
 }
 
 fn round(v: f64, scale: f64) -> f64 {
@@ -24,7 +27,9 @@ fn round(v: f64, scale: f64) -> f64 {
 }
 
 /// `/v1/embeddings` and `/embed`: `tokens` is the prompt-token count across all
-/// inputs; media preparation is included in `compute_s`.
+/// inputs; media preparation is included in `compute_s`, `encode_s` splits out
+/// the vision-tower forwards and `vision_attn` names the tower's attention mode
+/// (both absent for text-only requests).
 pub(crate) fn embedding(
     state: &AppState,
     endpoint: &'static str,
@@ -40,6 +45,9 @@ pub(crate) fn embedding(
         queue_s = round(timing.queue_s, 1000.0),
         compute_s = round(timing.compute_s, 1000.0),
         tok_s = round(tokens as f64 / timing.compute_s.max(1e-9), 10.0),
+        encode_s = (timing.encode_s > 0.0).then(|| round(timing.encode_s, 1000.0)),
+        vision_attn = (timing.encode_s > 0.0)
+            .then(|| crate::gemma::vision::vision_stats().attn_mode.name()),
         rss_mib = round(rss_mib(), 10.0),
         "embedding request"
     );

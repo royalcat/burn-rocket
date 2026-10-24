@@ -28,6 +28,13 @@ name = "wgpu_probe"
 path = "src/bin/wgpu_probe.rs"
 required-features = ["gpu"]
 
+# Vision-tower attention microbenchmark (flex fused kernel vs NPU); see
+# docs/experiment-log-gemma.md §18.4. aarch64 + NPU only.
+[[bin]]
+name = "vision_attn_bench"
+path = "src/bin/vision_attn_bench.rs"
+required-features = ["npu"]
+
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 burn-rocket = { path = "../..", default-features = false, optional = true }
 
