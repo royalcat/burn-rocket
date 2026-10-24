@@ -53,8 +53,13 @@ RUN set -eux; \
     install -Dm755 "$bin" /src/out/rocket-inference
 
 FROM debian:trixie-slim
+# ffmpeg/ffprobe decode video (and non-WAV audio) inputs at request time; the
+# model itself never links libav*. Debian's package ships both binaries, so the
+# two version calls fail the build if a future split moves one of them.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends curl ca-certificates ffmpeg \
+ && ffmpeg -version >/dev/null \
+ && ffprobe -version >/dev/null \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/out/rocket-inference /usr/local/bin/rocket-inference

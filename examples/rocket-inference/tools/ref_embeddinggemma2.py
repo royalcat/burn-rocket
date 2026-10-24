@@ -13,6 +13,10 @@ Subcommands:
   tokens  - token ids for `prompt prefix + text` (add_special_tokens)
   embed   - sentence embedding, dumped as JSON
   hidden  - per-token hidden states for debugging comparison
+  image   - image embedding (one shared context for all `--image` files)
+  video   - video embedding from ffmpeg-decoded frames (1 fps, max 32 frames)
+  mixed   - text + images + video in one shared context (`--text` placeholders)
+  audio   - audio embedding
 """
 
 import argparse
@@ -216,24 +220,23 @@ def cmd_audio(args):
         print(_json.dumps(vec[:8]) + f" ... len={len(vec)}")
 
 
-def cmd_video(args):
-    import numpy as np
-    import torch
-    from transformers import AutoModel, AutoProcessor
+def _decode_video(path: str):
+    """Decode every frame with ffmpeg and build `VideoMetadata`.
 
-    processor = AutoProcessor.from_pretrained(args.model)
-    model = AutoModel.from_pretrained(args.model, dtype=torch.float32)
-    model.eval()
-    text = args.text if args.text else "<|video|>"
-    # Decode frames with ffmpeg and hand the processor an explicit frame array +
-    # metadata (torchcodec/torchvision video decoding is unavailable on this host).
+    torchcodec/torchvision video decoding is unavailable on this host, so the
+    reference stack gets an explicit frame array plus metadata, exactly like the
+    CLI's ffmpeg path.
+    """
     import json as _json
     import subprocess
+
+    import numpy as np
+    from transformers.video_utils import VideoMetadata
 
     probe = subprocess.run(
         [
             "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-            "stream=width,height,r_frame_rate,nb_frames,duration", "-of", "json", args.video,
+            "stream=width,height,r_frame_rate,nb_frames,duration", "-of", "json", path,
         ],
         capture_output=True,
         text=True,
@@ -244,35 +247,24 @@ def cmd_video(args):
     num, den = info["r_frame_rate"].split("/")
     native_fps = float(num) / float(den)
     raw = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", args.video, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        ["ffmpeg", "-v", "error", "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
         capture_output=True,
         check=True,
     ).stdout
     frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, h, w, 3)
     print(f"decoded {len(frames)} frames at {native_fps} fps, {w}x{h}")
-    from transformers.video_utils import VideoMetadata
-
     metadata = VideoMetadata(
         fps=native_fps,
         duration=len(frames) / native_fps,
         total_num_frames=len(frames),
     )
-    inputs = processor(text=text, videos=[frames], video_metadata=[metadata], return_tensors="pt")
-    ids = inputs["input_ids"][0]
-    print(
-        "input_ids n=",
-        int(ids.shape[0]),
-        "video placeholders=",
-        int((ids == processor.tokenizer.convert_tokens_to_ids("<|video|>")).sum()),
-        "pixel_values_videos=",
-        tuple(inputs["pixel_values_videos"].shape),
-        "frames_per_video=",
-        inputs["num_frames_per_video"],
-    )
-    if args.dump_inputs:
-        np.save(args.dump_inputs + ".ids.npy", ids.numpy())
-        np.save(args.dump_inputs + ".pix.npy", inputs["pixel_values_videos"].numpy())
-        print(f"dumped processor inputs to {args.dump_inputs}.*.npy")
+    return frames, metadata
+
+
+def _finish(model, inputs, args):
+    """Run the model, mean-pool, MRL-truncate, normalize and write the vector."""
+    import torch
+
     with torch.no_grad():
         out = model(**inputs)
     h = out.last_hidden_state.mean(dim=1)[0]
@@ -289,26 +281,122 @@ def cmd_video(args):
         print(json.dumps(vec[:8]) + f" ... len={len(vec)}")
 
 
+def cmd_video(args):
+    import numpy as np
+    import torch
+    from transformers import AutoModel, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(args.model)
+    model = AutoModel.from_pretrained(args.model, dtype=torch.float32)
+    model.eval()
+    text = args.text if args.text else "<|video|>"
+    frames, metadata = _decode_video(args.video)
+    inputs = processor(
+        text=text,
+        videos=[frames],
+        video_metadata=[metadata],
+        return_metadata=True,
+        return_tensors="pt",
+    )
+    ids = inputs["input_ids"][0]
+    print(
+        "input_ids n=",
+        int(ids.shape[0]),
+        "video placeholders=",
+        int((ids == processor.tokenizer.convert_tokens_to_ids("<|video|>")).sum()),
+        "pixel_values_videos=",
+        tuple(inputs["pixel_values_videos"].shape),
+        "frames_per_video=",
+        inputs["num_frames_per_video"],
+    )
+    if args.dump_inputs:
+        np.save(args.dump_inputs + ".ids.npy", ids.numpy())
+        np.save(args.dump_inputs + ".pix.npy", inputs["pixel_values_videos"].numpy())
+        np.save(
+            args.dump_inputs + ".indices.npy",
+            np.asarray(inputs["video_metadata"][0].frames_indices),
+        )
+        print(f"dumped processor inputs to {args.dump_inputs}.*.npy")
+    inputs.pop("video_metadata", None)
+    _finish(model, inputs, args)
+
+
+def cmd_mixed(args):
+    """Text + images + video in one shared context (the model card's interleaved
+    multimodal input), optionally dumping the processor's token ids."""
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor
+
+    images = [Image.open(p).convert("RGB") for p in args.image] if args.image else []
+    video = _decode_video(args.video) if args.video else None
+    processor = AutoProcessor.from_pretrained(args.model)
+    model = AutoModel.from_pretrained(args.model, dtype=torch.float32)
+    model.eval()
+    text = args.text
+    if text is None:
+        text = "<|image|>" * len(images) + ("<|video|>" if video else "")
+    inputs = processor(
+        text=text,
+        images=images or None,
+        videos=[video[0]] if video else None,
+        video_metadata=[video[1]] if video else None,
+        return_metadata=True,
+        return_tensors="pt",
+    )
+    ids = inputs["input_ids"][0]
+    video_id = processor.tokenizer.convert_tokens_to_ids("<|video|>")
+    image_id = processor.tokenizer.convert_tokens_to_ids("<|image|>")
+    print(
+        "input_ids n=",
+        int(ids.shape[0]),
+        "video placeholders=",
+        int((ids == video_id).sum()),
+        "image placeholders=",
+        int((ids == image_id).sum()),
+        "pixel_values=",
+        tuple(inputs["pixel_values"].shape) if "pixel_values" in inputs else None,
+        "pixel_values_videos=",
+        tuple(inputs["pixel_values_videos"].shape)
+        if "pixel_values_videos" in inputs
+        else None,
+        "frames_per_video=",
+        inputs["num_frames_per_video"] if "num_frames_per_video" in inputs else None,
+    )
+    if args.dump_inputs:
+        np.save(args.dump_inputs + ".ids.npy", ids.numpy())
+        if video:
+            np.save(args.dump_inputs + ".pix.npy", inputs["pixel_values_videos"].numpy())
+            np.save(
+                args.dump_inputs + ".indices.npy",
+                np.asarray(inputs["video_metadata"][0].frames_indices),
+            )
+        print(f"dumped processor inputs to {args.dump_inputs}.*.npy")
+    inputs.pop("video_metadata", None)
+    _finish(model, inputs, args)
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    for name in ("tokens", "embed", "hidden", "image", "video", "audio"):
+    for name in ("tokens", "embed", "hidden", "image", "video", "mixed", "audio"):
         sp = sub.add_parser(name)
         sp.add_argument("--model", default="/mnt/hub/models/embeddinggemma-2")
         sp.add_argument("--text", default=None)
         sp.add_argument("--text-file", default=None)
         sp.add_argument("--prompt-prefix", default="")
         sp.add_argument("--prompt", default=None)
-        if name in ("embed", "image", "video", "audio"):
+        if name in ("embed", "image", "video", "mixed", "audio"):
             sp.add_argument("--dim", type=int, default=None)
             sp.add_argument("--no-normalize", dest="normalize", action="store_false")
             sp.add_argument("--out", default=None)
-        if name == "image":
-            sp.add_argument("--image", required=True, nargs="+")
-            sp.add_argument("--dump-inputs", default=None)
-        if name == "video":
-            sp.add_argument("--video", required=True)
+        if name in ("image", "mixed"):
+            sp.add_argument("--image", required=(name == "image"), nargs="+")
+        if name in ("video", "mixed"):
+            sp.add_argument("--video", required=(name == "video"))
+        if name in ("image", "video", "mixed"):
             sp.add_argument("--dump-inputs", default=None)
         if name == "audio":
             sp.add_argument("--audio", required=True)
@@ -324,6 +412,7 @@ def main():
         "hidden": cmd_hidden,
         "image": cmd_image,
         "video": cmd_video,
+        "mixed": cmd_mixed,
         "audio": cmd_audio,
     }[args.cmd](args)
 

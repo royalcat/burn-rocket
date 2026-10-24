@@ -266,8 +266,7 @@ pub fn prepare<M: MediaModel>(
         }
         n_video = per_frame * frames.len();
         println!("video: {per_frame} soft tokens per frame, {n_video} total");
-        let frame_str = format!("<|image>{}<image|>", "<|video|>".repeat(per_frame));
-        text = text.replace("<|video|>", &frame_str.repeat(frames.len()));
+        text = expand_video_placeholder(&text, frames.len(), per_frame)?;
         token_rows.push(Tensor::cat(frame_tokens, 0));
     }
 
@@ -380,6 +379,27 @@ fn expand_placeholders(
     Ok(out)
 }
 
+/// Expand the single `<|video|>` placeholder into the reference processor's
+/// visual-only video layout (`EmbeddingGemma2Processor::replace_video_token`
+/// with `add_timestamps=false`): one `BOI + <|video|> * soft_tokens + EOI`
+/// block per sampled frame, concatenated without separators, so each frame owns
+/// its own placeholder run in the shared context.
+fn expand_video_placeholder(
+    text: &str,
+    frames: usize,
+    soft_tokens_per_frame: usize,
+) -> Result<String> {
+    let found = text.matches("<|video|>").count();
+    if found != 1 {
+        bail!("video placeholder mismatch: {found} <|video|> tokens for one video input");
+    }
+    let block = format!(
+        "<|image>{}<image|>",
+        "<|video|>".repeat(soft_tokens_per_frame)
+    );
+    Ok(text.replace("<|video|>", &block.repeat(frames)))
+}
+
 /// Debug dump path for one media item; names get an index suffix when a request
 /// carries several (e.g. `vision-0.raw`, `vision-1.raw`).
 fn indexed_path(path: &Path, index: usize, count: usize) -> PathBuf {
@@ -419,6 +439,23 @@ mod tests {
     #[test]
     fn rejects_placeholder_count_mismatch() {
         let err = expand_placeholders("<|image|>", "<|image|>", &[], "image").unwrap_err();
+        assert!(err.to_string().contains("placeholder mismatch"), "{err}");
+    }
+
+    #[test]
+    fn video_placeholder_expands_to_one_block_per_frame() {
+        let out = expand_video_placeholder("before <|video|> after", 2, 3).unwrap();
+        assert_eq!(
+            out,
+            "before \
+             <|image><|video|><|video|><|video|><image|>\
+             <|image><|video|><|video|><|video|><image|> after"
+        );
+    }
+
+    #[test]
+    fn video_placeholder_requires_exactly_one_token() {
+        let err = expand_video_placeholder("<|video|><|video|>", 1, 1).unwrap_err();
         assert!(err.to_string().contains("placeholder mismatch"), "{err}");
     }
 

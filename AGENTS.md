@@ -26,8 +26,9 @@ plus `--no-default-features` and `flex`) and `-p rocket-inference` (default `cpu
 cross-builds of the example (`--features npu`) and of `--example probe`, plus a tokenize +
 q8 embed smoke run. The git remotes changed on 2026-10-07: `origin` is GitHub
 `royalcat/burn-rocket.git` and is the push target; the old Gitea remote is kept as
-`self-hosted` (`git.kmsign.org/royalcat/embeddings-fast.git`, stale). `main` still
-*tracks* `self-hosted/main`, so push explicitly with `git push origin main`. Board
+`self-hosted` (`git.kmsign.org/royalcat/embeddings-fast.git`, stale). `main`
+tracks `origin/main` now (it tracked the stale `self-hosted/main` until
+2026-10-24, so older notes say to push explicitly). Board
 artifacts deployed before that date live under `/root/embeddings-fast/`; new deploys
 go to `/root/rocket-inference/`.
 
@@ -280,6 +281,19 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   default-mode serve was bit-identical to the explicit `--vision-attn npu`.
   P0→S2 end-to-end: 2394-patch tower 27.0 → 10.6 s, steady serve image
   27.2 → 12.4 s, 4-frame video 31.1 → 17.2 s.
+- **Video + container ffmpeg round** (2026-10-24, log-gemma §21): the
+  EmbeddingGemma 2 video context already matched the reference processor — one
+  `<|video|>` placeholder expands to `BOI + <|video|>*n + EOI` per sampled frame
+  (140 soft tokens/frame), 1 fps with a uniform cap to 32 frames, all frames in
+  the single shared context; ids are identical and cosine 1.0 vs HF f32 for
+  video-only (530 ids), interleaved text+image+video (817 ids) and a 40 s
+  overflow clip (4226 ids). `extract_frames` no longer collapses repeated
+  sampled indices (ffmpeg `select` matches once; the reference keeps the
+  repeats), and the sampler plus the per-frame expansion are unit-tested.
+  `tools/video_parity.py` reproduces the A/B. The runtime image now installs
+  `ffmpeg`/`ffprobe` (video and non-WAV audio failed in the deployed container
+  before; amd64 image 809 MB). Still one video per request, no
+  `add_timestamps`, uniform overflow only.
 - **OpenRouter multimodal /v1/embeddings** (2026-10-22, log-gemma §16): the
   embedding endpoint takes OpenRouter `input: [{content: [...]}]` blocks on
   EmbeddingGemma 2 (`text`, `image_url`, `input_audio`, `input_video`; images
@@ -327,6 +341,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   AVX2-capable CPU). `serve` now defaults to NPU offload on NPU builds (`--no-npu`
   opts out; `--quant q8` keeps the CPU path unless `--npu` is explicit), so the image
   CMD is arch-uniform; the standalone `qwen3`/`gemma`/`intent` commands keep `--npu`
+  opt-in. The runtime stage also installs Debian's `ffmpeg` 7.1.5 (`ffmpeg` +
+  `ffprobe`, gated on `-version` at build time) for EmbeddingGemma 2 video and
+  non-WAV audio (+426 MiB in `/usr`, 207 packages; `libavfilter`/`libavdevice`
+  pull Mesa/X11/SDL; the amd64 runtime image is 809 MB). Before 2026-10-24 the
+  image had no decoder, so `input_video`/`/embed` video and non-WAV audio
+  requests failed in the deployed container (log-gemma §21).
 - **Port status**: fp16 one-shot/streaming/resident/segmented matmul, group-wise int8,
   the native bf16 stream and masked GQA attention are ported. Planner and regcmd output
   are byte-equal to the C library; fp16/bf16 cosine >= 0.99999 and int8 matches its
@@ -377,7 +397,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
-| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`) and the GGUF tokenizer parity check (`tokenizer_parity.py`) |
+| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`) and the video parity check (`video_parity.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
@@ -618,7 +638,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   a redeploy from `main` brings the fast host softmax to the text path
   (qwen3 2777-token −11 % wall / −26 % CPU; emb2 2594-token attention −17 %) and
   the NPU vision-attention default for media; the text-only config needs no flag
-  change and the deployed service never calls `/embed`. The previous C/GGUF image
+  change and the deployed service never calls `/embed`. It also predates the
+  2026-10-24 ffmpeg install (log-gemma §21), so `input_video` blocks and non-WAV
+  audio fail in that container until a redeploy. The previous C/GGUF image
   `a986d54` predates the 2026-10-17 `gemma4` tokenizer fix; the documents indexed
   in the GGUF-era window may need re-embedding (their vectors and queries were
   self-consistent but up to ~0.016 cosine off the reference on German text). The
@@ -939,12 +961,16 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   block mask (per-chunk `[C, q1]` masks, prefix keys), plus a 30k measurement of the
   emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
 - Board service: redeploy `home-llm-gateway-embed-1` from `main` to pick up the
-  S1 fast host softmax and the S2 NPU vision default (the deployed `:latest` is
-  `94f99bd`, pre-S1/S2), then re-measure the text path on an idle board (the S1
-  A/B: qwen3 2777-token −11 % wall / −26 % CPU). The scratch-memory round
-  (log-gemma §15) is already in that image; the hot 8k set is ~1.3 GiB BO +
-  0.6 GiB host and a following short request trims it to ~12 MiB scratch, so the
-  ceiling is now one request's working set.
+  S1 fast host softmax, the S2 NPU vision default and the ffmpeg runtime (the
+  deployed `:latest` is `94f99bd`, pre-S1/S2 and pre-ffmpeg), then re-measure the
+  text path on an idle board (the S1 A/B: qwen3 2777-token −11 % wall / −26 %
+  CPU). The scratch-memory round (log-gemma §15) is already in that image; the hot
+  8k set is ~1.3 GiB BO + 0.6 GiB host and a following short request trims it to
+  ~12 MiB scratch, so the ceiling is now one request's working set.
+- EmbeddingGemma 2 video: the context layout, sampling and per-frame expansion
+  match the reference processor (one video; `tools/video_parity.py`, log-gemma
+  §21). Not implemented: multiple videos per request, `add_timestamps` (mm:ss
+  frame prefixes) and `overflow_strategy=truncate`.
 - QAT mobile board re-run (log-gemma §13): the f16 text-only profile is now 3.7 GiB
   anon plus ~1.2 GiB reclaimable table pages (`--defer-towers`), so a guarded run
   should fit a busy board; then the `ROCKET_NPU_DECODE=1` decode-speed pre-gate
@@ -999,6 +1025,10 @@ cargo run --release -- qwen3 embed --backend flex --dtype f32 --quant q8 --text-
 /mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/tokenizer_parity.py \
     --gguf /tmp/opencode/emb-compare/embeddinggemma-2-Q8_0.gguf \
     --ref /mnt/hub/models/embeddinggemma-2/tokenizer.json
+# video parity (embeddinggemma): ids, sampled-frame count and cosine vs the HF f32
+# reference for video-only, text+image+video and a 40 s overflow clip (log-gemma §21)
+/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/video_parity.py \
+    --bin $CARGO_TARGET_DIR/release/rocket-inference
 # server smoke test (one command for every model; family auto-detected)
 cargo run --release -- serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 &
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"hi"}'

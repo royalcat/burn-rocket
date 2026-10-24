@@ -172,8 +172,16 @@ pub fn sample_frame_indices(info: &VideoInfo, fps: f64, max_frames: usize) -> Ve
 }
 
 /// Extract the selected frames (by native index) as RGB images.
+///
+/// `select` matches a frame at most once, so duplicates in `indices` (the
+/// sampler clamps, so a duration that overestimates the frame count can repeat
+/// the last index) are requested once and replicated afterwards — the reference
+/// indexes the decoded array (`video[indices]`) and keeps every repeat.
 pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Result<Vec<RgbImage>> {
-    let sel = indices
+    let mut unique = indices.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let sel = unique
         .iter()
         .map(|i| format!("eq(n\\,{i})"))
         .collect::<Vec<_>>()
@@ -208,11 +216,25 @@ pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Resul
             data.len()
         );
     }
-    let mut frames = Vec::with_capacity(data.len() / frame_bytes);
+    let mut decoded = Vec::with_capacity(unique.len());
     for chunk in data.chunks_exact(frame_bytes) {
         let img = RgbImage::from_raw(info.width as u32, info.height as u32, chunk.to_vec())
             .context("build frame image")?;
-        frames.push(img);
+        decoded.push(img);
+    }
+    if decoded.len() != unique.len() {
+        bail!(
+            "ffmpeg returned {} frames for {} requested indices",
+            decoded.len(),
+            unique.len()
+        );
+    }
+    // Frames come back in decode (index) order, so a binary search maps each
+    // requested index (duplicates included) to its frame.
+    let mut frames = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let pos = unique.binary_search(&index).expect("requested index");
+        frames.push(decoded[pos].clone());
     }
     Ok(frames)
 }
@@ -630,4 +652,98 @@ fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
     let path = dir.join(format!("upload-{}-{nanos}.{ext}", std::process::id()));
     std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(fps: f64, duration: f64, total_frames: usize) -> VideoInfo {
+        VideoInfo {
+            width: 480,
+            height: 360,
+            fps,
+            duration,
+            total_frames,
+        }
+    }
+
+    /// Expected indices from the reference `EmbeddingGemma2VideoProcessor`
+    /// (`sample_frames`: fps sampling, then a `linspace` uniform overflow cap).
+    #[test]
+    fn frame_indices_match_the_reference_processor() {
+        let cases: &[(f64, f64, usize, f64, usize, &[usize])] = &[
+            // `data/test.mp4`: 4 s at 8 fps -> 4 frames at the 1 fps default.
+            (8.0, 4.0, 32, 1.0, 32, &[0, 8, 16, 24]),
+            // 40 s at 8 fps -> 40 sampled -> uniform overflow to the 32-frame budget.
+            (
+                8.0,
+                40.0,
+                320,
+                1.0,
+                32,
+                &[
+                    0, 8, 16, 24, 40, 48, 56, 64, 80, 88, 96, 104, 120, 128, 136, 144, 160, 168,
+                    176, 184, 200, 208, 216, 224, 240, 248, 256, 264, 280, 288, 296, 312,
+                ],
+            ),
+            // 10 s at 30 fps -> 10 frames, no overflow.
+            (
+                30.0,
+                10.0,
+                300,
+                1.0,
+                32,
+                &[0, 30, 60, 90, 120, 150, 180, 210, 240, 270],
+            ),
+            // NTSC rate (30000/1001); `int(i * step)` truncates each index.
+            (
+                30000.0 / 1001.0,
+                10.01,
+                300,
+                1.0,
+                32,
+                &[0, 29, 59, 89, 119, 149, 179, 209, 239, 269],
+            ),
+            // Sampling at the native rate keeps every frame.
+            (
+                8.0,
+                4.0,
+                32,
+                8.0,
+                32,
+                &[
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                    22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                ],
+            ),
+            // A one-frame budget keeps the first sampled frame.
+            (8.0, 4.0, 32, 1.0, 1, &[0]),
+        ];
+        for &(fps, duration, total_frames, target_fps, max_frames, expected) in cases {
+            let indices =
+                sample_frame_indices(&info(fps, duration, total_frames), target_fps, max_frames);
+            assert_eq!(
+                indices.as_slice(),
+                expected,
+                "fps {fps} duration {duration} total {total_frames} \
+                 target {target_fps} max {max_frames}"
+            );
+        }
+    }
+
+    /// The index is clamped to the last decoded frame when the container
+    /// duration overestimates the frame count.
+    #[test]
+    fn frame_indices_are_clamped_to_the_last_frame() {
+        let indices = sample_frame_indices(&info(8.0, 5.0, 32), 1.0, 32);
+        assert_eq!(indices, vec![0, 8, 16, 24, 31]);
+    }
+
+    #[test]
+    fn parses_rational_frame_rates() {
+        assert!((parse_rate("30000/1001").unwrap() - 29.970_029_970_03).abs() < 1e-9);
+        assert!(parse_rate("0/0").is_err());
+        assert!(parse_rate("25").is_err());
+    }
 }

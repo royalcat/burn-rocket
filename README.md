@@ -32,6 +32,10 @@ standard clients work unchanged:
 | EmbeddingGemma 2 (text/image/video/audio) | OpenAI/OpenRouter `/v1/embeddings` (text + `image_url`/`input_audio`/`input_video` blocks) + native multimodal `/embed` | `rocket-inference serve --model-dir /models/embeddinggemma-2` |
 | Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/gemma-4-E2B-it` |
 
+The container image ships `ffmpeg`/`ffprobe`, so EmbeddingGemma 2's
+`/v1/embeddings` accepts `input_video` blocks and non-WAV audio without extra
+host packages.
+
 One `serve` command covers every model: it detects the checkpoint's family and
 registers exactly the endpoints that model supports (embedding models get
 `/v1/embeddings`/`/embed`, chat models get both the OpenAI chat and the Ollama

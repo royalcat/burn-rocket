@@ -2050,3 +2050,87 @@ done
 ROCKET_VISION_LOG=1 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 \
     --dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers --port 8399
 ```
+
+## 21. Video input: reference layout, frame extraction, container ffmpeg (2026-10-24)
+
+The video path (§4) put frames in the shared context from the start, but the
+deployment image never had a decoder: the runtime stage installed only
+`curl`/`ca-certificates`, so `/embed` video, `/v1/embeddings` `input_video` and
+non-WAV audio failed in the container with `run ffprobe (is it installed?)` /
+`run ffmpeg`. This round pins the reference layout in code and tests and ships
+ffmpeg in the image.
+
+### 21.1 Layout (already the documented one)
+
+`EmbeddingGemma2Processor.replace_video_token` (transformers 5.19) with
+`add_timestamps=false` — the checkpoint's `video_processor` config — expands one
+`<|video|>` placeholder into `num_frames` blocks of
+`BOI + <|video|> * n + EOI`, concatenated without separators, where `n` is the
+per-frame soft-token count (140 at the default `max_soft_tokens`) and `BOI`/`EOI`
+are `<|image>`/`<image|>`. Frames are sampled at 1 fps
+(`step = native_fps / fps`, `min(total-1, int(i * step))`) and capped to
+`max_frames` with `np.linspace(0, n-1, max_frames)`
+(`overflow_strategy="uniform"`). That is what the app already did; measured
+against the HF f32 reference on the dev host (`--dtype f32`,
+`tools/video_parity.py`):
+
+| case | ids (ref = ours) | frames | cosine |
+|---|---|---|---|
+| video only (`data/test.mp4`, 4 s at 8 fps) | 530 | 4 | 1.000000000 |
+| text + image + video (model-card interleaving) | 817 (520 video + 266 image soft tokens) | 4 | 1.000000000 |
+| 40 s clip, uniform overflow | 4226 | 32 | 1.000000000 |
+
+The 40 s row also pins the sampler: 40 frames at 1 fps are uniformly re-sampled
+to 32, and both sides encode the same 32 native indices.
+
+### 21.2 Frame extraction fix
+
+`extract_frames` asked ffmpeg for the sampled indices with
+`select='eq(n\,i)+...'`. `select` matches a frame at most once, so repeated
+indices (the sampler clamps to `total-1`, so metadata that overestimates the
+frame count repeats the last index) silently produced fewer frames than
+requested, while the reference indexes the decoded array and keeps the repeats.
+It now requests the distinct indices once and replicates them, so
+`frames.len() == indices.len()`. The pathological clip that exposed this
+(`-stream_loop` + `-c copy`: ffprobe reports 40 fps / 40.21 s while 322 frames
+decode) is not the fixture — the parity script re-encodes its 40 s clip at 8 fps
+so the container metadata is exact.
+
+Unit tests pin both halves without a model or ffmpeg:
+`media::tests::frame_indices_match_the_reference_processor` (six rate/overflow
+cases, including NTSC 30000/1001 and the clamp) and
+`inputs::tests::video_placeholder_expands_to_one_block_per_frame`.
+
+### 21.3 Container
+
+The runtime stage now installs Debian's `ffmpeg` 7.1.5 (`ffmpeg` + `ffprobe`,
+`--no-install-recommends`, gated on `-version` in the build). Measured on
+`debian:trixie-slim` (amd64): `/usr` grows 78.5 MB → 503 MB (**+426 MiB**, 207
+packages; `libavfilter` and `libavdevice` pull Mesa/X11/SDL), the apt layer is
+464 MB per `docker history`, and the runtime image is **809 MB** (562 MB rootfs;
+the pre-change image was base + binary only). The build-time
+`ffmpeg -version`/`ffprobe -version` calls fail the image build if a future
+package split moves either binary.
+
+Container smoke (amd64 image, `serve --backend flex --dtype f32`, model mounted
+read-only, port 8395):
+
+| request | result |
+|---|---|
+| `POST /embed {"video": "/data/test.mp4"}` | 200, 768-d, cosine **1.000000000000** vs the CLI f32 vector (530 tokens, `encode_s=9.401`) |
+| `POST /v1/embeddings` with an `input_video` `data:video/mp4;base64,...` block | 200, 768-d, cosine **1.000000000000** vs the same vector |
+| `POST /embed {"audio": "/media/speech5s.mp3"}` (non-WAV) | 200, 768-d, norm 1.0; mp3-vs-WAV cosine 0.985605 (lossy codec) |
+
+These requests were decoded by the installed package — nothing else in the
+container provides ffmpeg, and the pre-change image answered
+`run ffprobe (is it installed?)`.
+
+### 21.4 Reproduce
+
+```sh
+cargo build --release -p rocket-inference --no-default-features
+/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/video_parity.py \
+    --bin $CARGO_TARGET_DIR/release/rocket-inference
+docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:video .
+docker run --rm --entrypoint ffprobe rocket-inference:video -version
+```

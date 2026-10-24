@@ -37,7 +37,7 @@ measurements and verification results.
 | `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, CLI |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
-| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) and the video parity check (`video_parity.py`) |
 
 ## GGUF models (`-hf`)
 
@@ -88,6 +88,14 @@ image:
 # on the board (or any aarch64 host)
 docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
 ```
+
+The runtime stage is `debian:trixie-slim` plus `curl`, `ca-certificates` and
+`ffmpeg`/`ffprobe` (video decoding and non-WAV audio; the build fails if the
+package stops shipping either binary). The ffmpeg install adds ~426 MiB of
+packages (a 464 MB layer; the amd64 runtime image is 809 MB), which is the price
+of decoding without linking libav* into the binary. Smoke-tested in the image:
+`/embed` video and `/v1/embeddings` `input_video` (data URI) both reproduce the
+CLI f32 vector at cosine 1.000000000000 (log §21.3).
 
 ## Serving
 
@@ -357,7 +365,8 @@ $B gemma embed --model-dir $M --quant q8 --text-file data/one_long.txt --out out
 
 # image (the placeholder <|image|> is expanded to BOI + soft tokens + EOI)
 $B gemma embed --model-dir $M --image data/cat.jpeg --out img.json
-# video (1 fps, at most 32 frames) and audio (16 kHz mono WAV; else ffmpeg)
+# video (1 fps, max 32 frames; each frame expands to BOI + <|video|>*140 + EOI in
+# the shared context) and audio (16 kHz mono WAV; else ffmpeg)
 $B gemma embed --model-dir $M --video data/test.mp4 --out vid.json
 $B gemma embed --model-dir $M --audio data/speech5s.wav --out audio.json
 
@@ -365,6 +374,10 @@ $B gemma embed --model-dir $M --audio data/speech5s.wav --out audio.json
 $B gemma bench --model-dir $M --text-file data/one_long.txt --reps 2
 $B gemma tokenize --model-dir $M --text "hello"
 ```
+
+Video decoding and non-WAV audio shell out to `ffmpeg`/`ffprobe`; the container
+image installs both (the Dockerfile gates the build on `-version`), so a bare
+host needs the packages (`apt-get install ffmpeg`).
 
 Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
 `--dtype f32|bf16` (default: native bf16; f16 is rejected — RMSNorm/softmax/PLE
@@ -412,6 +425,17 @@ Summary against the HF f32 reference (transformers 5.19; full table in the log):
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
 | image, packed NPU tower (`--npu`, board) | 0.9999963 (f32) / 0.9998836 (q8+npu) |
 | image, packed NPU tower + NPU attention (`--npu`, §20) | 0.9999900 (f32) / 0.9998844 (q8+npu) |
+
+Video is checked end to end against the same reference (`tools/video_parity.py`):
+the token ids, the sampled-frame count and the embedding for video-only (530 ids),
+the model card's interleaved text + image + video (817 ids) and a generated 40 s
+clip that exercises the uniform overflow to 32 frames (4226 ids) — ids identical
+and cosine 1.000000000 in all three (log §21).
+
+```sh
+/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/video_parity.py \
+    --bin $CARGO_TARGET_DIR/release/rocket-inference
+```
 
 Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
