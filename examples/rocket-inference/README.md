@@ -163,7 +163,9 @@ that does not apply to the detected model is rejected.
 `serve` defaults to NPU offload on builds that have it (aarch64 + `--features npu`);
 `--no-npu` forces the flex CPU path, and `--quant q8` (the CPU low-RAM mode) keeps
 the CPU path unless `--npu` is explicit. The standalone `qwen3`/`gemma`/`intent`
-commands keep `--npu` opt-in.
+commands keep `--npu` opt-in. On EmbeddingGemma 2 the vision tower's attention
+follows the same rule: `npu` whenever the NPU path is active, `fused` otherwise
+(`--vision-attn fused` forces the CPU kernel, `blocked` is the parity fallback).
 
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final
@@ -370,9 +372,11 @@ need f32/bf16 range), `--text`,
 `--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
 `--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
 `--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`,
-`--vision-attn fused|blocked` (vision tower attention: the backend's fused
-flash kernel — the default — vs the tensor-op chunked parity fallback; default
-`fused` since log §18.3, Gemma 4 keeps `blocked`),
+`--vision-attn npu|fused|blocked` (vision tower attention: `npu` = the NPU
+attention op, the default under `--npu`; `fused` = the backend's fused flash
+kernel, the CPU default since log §18.3 and the explicit CPU fallback; `blocked`
+= the tensor-op chunked parity fallback. `npu` requires `--npu` on an aarch64
+`npu` build; Gemma 4 keeps `blocked` and rejects the flag),
 `--quant none|q8`,
 `--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`,
 `--npu-int8-group` (default 32), `--defer-towers`, plus `--dump-*`
@@ -407,6 +411,7 @@ Summary against the HF f32 reference (transformers 5.19; full table in the log):
 | any modality, `--quant q8` | 0.9996-0.9999 |
 | any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
 | image, packed NPU tower (`--npu`, board) | 0.9999963 (f32) / 0.9998836 (q8+npu) |
+| image, packed NPU tower + NPU attention (`--npu`, §20) | 0.9999900 (f32) / 0.9998844 (q8+npu) |
 
 Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
@@ -438,15 +443,24 @@ CPU. The tower is loaded in **f32** under `--npu` (the pack then carries
 full-precision weights) while the audio tower keeps its Q8 mapping: the q8+npu
 arm now reaches f32-pack parity. On the board a 2394-patch image's tower went
 24.8 s → 19.8 s (§18.3, -20 %) → **15.2-15.5 s** (§18.5, -22 % again, of which
-~4.2 s is the MLP gelu·up fused kernel and ~0.5 s the fused groups' NPU time);
-media `compute_s` through `serve` 27.2 → 20.6 → **16.4 s**, the deferred tower
+~4.2 s is the MLP gelu·up fused kernel and ~0.5 s the fused groups' NPU time)
+→ **10.6 s** (§20: the S1 fast host softmax put the tower's attention op on the
+NPU, -24 %, the default under `--npu`); the deferred tower
 load 30.4 → **24.8 s** (pack 6.2 → 4.3 s) at the same 908 MiB anon (1.18 GiB with
-a media request vs 1.15 before). The remaining tower cost is the CPU attention
-kernel (~7.6 s) plus ~3 s of flex norm/RoPE glue in the attention phase; the
-driver executes the ~723 GFLOP of tower GEMMs at ~183 GF/s, so the tower lands
-at ~15.3 s. Parity: 0.9999963 (f32+npu image), 0.9998836 (q8+npu, the text Q8
-path's floor), bit-identical repeats; f16/bf16 attention operands were measured
-and are slower (§18.5.3), so the kernel stays f32. `ROCKET_VISION_LOG=1` prints
+a media request before S2's attention context vs 1.15 before). With the attention
+on the NPU the tower splits
+~0.2 s patch + 6.0 s attention (3.4 s op) + 4.4 s MLP on the image; the driver
+executes the ~723 GFLOP of tower GEMMs at ~183 GF/s, so what is left is the
+attention phase's ~2.5 s of CPU glue (axial RoPE, norms, o projection) and the
+MLP glue. Media `compute_s` through `serve` (steady image, same-window A/B):
+**13.5 s fused → 12.4 s npu** (-8 %; the warm fused kernel is faster than the
+cold CLI's, so the serve delta is smaller than the CLI's), +101 MiB anon for the
+attention context, text requests unchanged. Parity: 0.9999963 (f32+npu image),
+0.9998836 (q8+npu, the text Q8 path's floor), the npu attention 0.9999900 /
+0.9998844 — within 1e-5 of the fused kernel — and fused-vs-npu 0.9999864
+(image; 0.9999983 video), bit-identical repeats; f16/bf16 attention operands
+were measured and are slower (§18.5.3), so the kernel stays f32.
+`ROCKET_VISION_LOG=1` prints
 one tower line per forward (`patch`/`attn`/`kernel`/`mlp`/`pool`, plus the NPU
 split under `--npu`), and `serve` logs `encode_s` + `vision_attn` on media
 requests. Video frames are still encoded one at a time: batching same-geometry

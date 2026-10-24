@@ -32,7 +32,9 @@
 //! - int8: resident **group-wise** W8A8 only ([`matmul::I8Context`]);
 //! - bf16: the native streaming path only ([`matmul::Bf16Stream`]);
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
-//!   ([`attn::Attention`]).
+//!   ([`attn::Attention`]); the host softmax has a fast branch-free `exp` path
+//!   ([`attn::Softmax`]) and keeps the original scalar one behind
+//!   `SOFTMAX_EXACT=1`.
 //!
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):

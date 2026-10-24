@@ -66,6 +66,18 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let dtype = args
         .dtype
         .unwrap_or_else(|| crate::util::checkpoint::default_dtype_in_dir(&model_dir));
+    // The EmbeddingGemma 2 tower's attention: resolved before loading so a bad
+    // `--vision-attn npu` fails fast (the flag is rejected for other families
+    // by `validate`).
+    let vision_attn = (family == Family::Emb2)
+        .then(|| {
+            resolve_vision_attn(
+                cfg!(all(feature = "npu", target_arch = "aarch64")),
+                args.vision_attn,
+                npu,
+            )
+        })
+        .transpose()?;
     let (engine, capabilities) = match family {
         Family::Qwen3Embed => {
             let mut ckpt = crate::util::checkpoint::open_in_dir(&model_dir)?;
@@ -115,6 +127,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )?;
             let tokenizer = tokenizer()?;
             let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&model_dir);
+            let vision_attn = vision_attn.expect("resolved for EmbeddingGemma 2");
             (
                 Engine::Emb2(Box::new(Emb2Engine {
                     model,
@@ -126,7 +139,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     npu_pack: npu,
                     max_tokens,
                     attn_chunk: args.attn_chunk.unwrap_or(1024),
-                    vision_attn: args.vision_attn.unwrap_or_default(),
+                    vision_attn,
                     image_soft_tokens,
                     video_soft_tokens,
                     video_fps: args.video_fps.unwrap_or(1.0),
@@ -349,7 +362,7 @@ impl Args {
         if let Some(v) = f.take_parsed("--attn-chunk")? {
             args.attn_chunk = Some(v);
         }
-        if let Some(v) = f.take_choice("--vision-attn", &["fused", "blocked"])? {
+        if let Some(v) = f.take_choice("--vision-attn", &["npu", "fused", "blocked"])? {
             args.vision_attn = Some(VisionAttn::parse(&v).expect("validated by take_choice"));
         }
         if let Some(v) = f.take_parsed("--video-fps")? {
@@ -513,9 +526,36 @@ fn resolve_npu(available: bool, npu_flag: Option<bool>, no_npu: bool, quant_q8: 
     npu_flag.unwrap_or(available && !quant_q8) && !no_npu
 }
 
+/// `--vision-attn` for the EmbeddingGemma 2 tower: an explicit value, else the
+/// NPU kernel when the NPU path is in use (`--npu` on an aarch64 `npu` build)
+/// and the fused CPU kernel otherwise. `npu` is rejected without that path
+/// (there is no off-device implementation to fall back to).
+fn resolve_vision_attn(
+    available: bool,
+    requested: Option<VisionAttn>,
+    npu: bool,
+) -> Result<VisionAttn> {
+    if requested == Some(VisionAttn::Npu) {
+        if !available {
+            bail!("--vision-attn npu requires an aarch64 build with --features npu");
+        }
+        if !npu {
+            bail!(
+                "--vision-attn npu requires --npu (the vision tower's attention runs on the NPU)"
+            );
+        }
+    }
+    Ok(match requested {
+        Some(mode) => mode,
+        None if npu && available => VisionAttn::Npu,
+        None => VisionAttn::Fused,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_npu;
+    use super::{resolve_npu, resolve_vision_attn};
+    use crate::gemma::vision::VisionAttn;
 
     #[test]
     fn npu_defaults_on_only_when_available() {
@@ -540,5 +580,32 @@ mod tests {
     fn explicit_npu_reaches_the_loader() {
         assert!(resolve_npu(true, Some(true), false, false));
         assert!(resolve_npu(false, Some(true), false, false));
+    }
+
+    #[test]
+    fn vision_attn_defaults_to_npu_only_with_the_npu_path() {
+        assert_eq!(
+            resolve_vision_attn(true, None, true).unwrap(),
+            VisionAttn::Npu
+        );
+        assert_eq!(
+            resolve_vision_attn(true, None, false).unwrap(),
+            VisionAttn::Fused
+        );
+        assert_eq!(
+            resolve_vision_attn(false, None, false).unwrap(),
+            VisionAttn::Fused
+        );
+        // An explicit CPU mode wins even when the NPU path is active.
+        for mode in [VisionAttn::Fused, VisionAttn::Blocked] {
+            assert_eq!(resolve_vision_attn(true, Some(mode), true).unwrap(), mode);
+        }
+        // `npu` is scoped to the NPU path.
+        assert!(resolve_vision_attn(false, Some(VisionAttn::Npu), false).is_err());
+        assert!(resolve_vision_attn(true, Some(VisionAttn::Npu), false).is_err());
+        assert_eq!(
+            resolve_vision_attn(true, Some(VisionAttn::Npu), true).unwrap(),
+            VisionAttn::Npu
+        );
     }
 }

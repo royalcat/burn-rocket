@@ -11,7 +11,9 @@
 //! Scores are brought host-side for the mandatory additive mask, scale, optional
 //! soft-cap and softmax, then uploaded as the AV operand (the C default,
 //! `ROCKET_ATTN_HOST_SOFTMAX=1`). Heads split into contiguous ranges across worker
-//! fds, one per NPU scheduling entity.
+//! fds, one per NPU scheduling entity. The host softmax itself is
+//! [`softmax::Softmax`] (fast polynomial `exp` by default, `SOFTMAX_EXACT=1` for
+//! the original scalar path).
 
 use std::thread;
 
@@ -26,7 +28,10 @@ use crate::matmul::bos::Bos;
 use crate::matmul::plan::Plan;
 use crate::matmul::run::{compute_cpu, compute_kacc};
 
-const PAD_KEY_SCORE: f32 = -30000.0;
+mod softmax;
+
+pub use softmax::{Softmax, SoftmaxMode};
+
 const MAX_WORKERS: usize = 8;
 
 struct Scratch {
@@ -161,6 +166,8 @@ struct Worker {
     scores: Vec<f16>,
     ctx: Vec<f16>,
     out: Vec<f16>,
+    /// Reused row buffer + kernel mode for the host softmax.
+    sm: Softmax,
     head_dim: usize,
     dv: usize,
     tp: usize,
@@ -198,6 +205,7 @@ impl Worker {
             scores: Vec::new(),
             ctx: Vec::new(),
             out: Vec::new(),
+            sm: Softmax::new(),
             head_dim: 0,
             dv: 0,
             tp: 0,
@@ -282,7 +290,7 @@ impl Worker {
             self.qk
                 .current_mut()
                 .matmul(&self.qh, &self.kh, &mut self.scores)?;
-            softmax(
+            self.sm.run(
                 &self.scores,
                 &mut self.p,
                 mask,
@@ -425,57 +433,6 @@ impl Attention {
             out[h0 * n_tokens * dv..h0 * n_tokens * dv + n].copy_from_slice(&w.out[..n]);
         }
         Ok(())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn softmax(
-    sc: &[f16],
-    p: &mut [f16],
-    mask: Option<&[f16]>,
-    n_tokens: usize,
-    n_kv: usize,
-    tp: usize,
-    kn: usize,
-    scale: f32,
-    softcap: f32,
-) {
-    let mut rowbuf = vec![0.0f32; kn];
-    for i in 0..tp {
-        let srow = &sc[i * kn..(i + 1) * kn];
-        let mrow = mask
-            .filter(|_| i < n_tokens)
-            .map(|m| &m[i * n_kv..i * n_kv + n_kv]);
-        let mut mx = PAD_KEY_SCORE;
-        for (j, slot) in rowbuf.iter_mut().enumerate().take(kn) {
-            let s = if j < n_kv {
-                let mut s = srow[j].to_f32() * scale;
-                if softcap != 0.0 {
-                    s = softcap * (s / softcap).tanh();
-                }
-                if let Some(m) = mrow {
-                    s += m[j].to_f32();
-                }
-                s.max(PAD_KEY_SCORE)
-            } else {
-                PAD_KEY_SCORE
-            };
-            *slot = s;
-            if s > mx {
-                mx = s;
-            }
-        }
-        let mut sum = 0.0f32;
-        for v in rowbuf.iter_mut() {
-            let e = (*v - mx).exp();
-            *v = e;
-            sum += e;
-        }
-        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
-        let prow = &mut p[i * kn..(i + 1) * kn];
-        for j in 0..kn {
-            prow[j] = f16::from_f32(rowbuf[j] * inv);
-        }
     }
 }
 

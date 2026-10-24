@@ -1723,3 +1723,330 @@ is the driver's host softmax, deferred in §18.7.
 - The remaining tower levers are the ones §18.5.5 lists (axial-RoPE host kernel
   ~2 s, the audio tower's Q8 deferred-load map, the q8 text backbone's 1.1e-4
   image-parity floor); frame batching is closed by §18.6.4.
+
+## 19. S1: fast host softmax (2026-10-24)
+
+§18.4 closed NPU vision attention at 1.05× the fused CPU kernel and blamed the
+host score pass: 12 × 2394² = 68.8M scores per layer, a serial scalar
+`f32::exp` over them, 138 MB read back and 138 MB uploaded as the AV operand.
+The C library's on-NPU softmax is not the fix (it is a composed, transfer-bound
+op — host row-max, NPU EXP LUT, NPU reduce, host reciprocal, NPU row scale — and
+its own FA comment says it is 5-10 % *slower* than the host pass, which is why
+the C FA defaults to host softmax). S1 instead made the **host pass fast**,
+dependency-free, and measured whether that alone re-opens the gate.
+
+### 19.1 Implementation (`crates/rocket-npu/src/attn/softmax.rs`)
+
+`Attention::flash` no longer carries a local `softmax()`; each worker owns a
+`Softmax` (`attn::Softmax`, `SoftmaxMode`) with one reused `f32` row buffer.
+Two kernels:
+
+- **Fast (default)** — `exp(x)` as `2^(x·log2 e)`: a degree-6 Chebyshev fit of
+  `2^f` on `[-0.5, 0.5]` (`C0` pinned to 1, ≤2.5e-9 in f64, ~1e-7 in f32) with
+  the exponent assembled from bits, branch-free (clamped at `2^-126`). On
+  aarch64 the rows run 8 lanes per step: `fcvtl` f16→f32, vector max, 4-lane
+  exp2 (`frintm` + `fma` Horner + `shl` exponent), `fcvtn` f32→f16, hardware
+  throughout (`.cargo/config.toml` sets `+fp16`). The mask-free, softcap-free
+  rows — the whole vision workload — take a single fully branch-free kernel;
+  the masked path vectorizes `score·scale + mask` the same way, and the
+  soft-cap path stays scalar (`tanh` has no cheap vector form) with the fast
+  `exp`. Three passes over an L1-resident row (scale+max, exp+sum,
+  `·1/sum`+f16), no per-row allocation.
+- **Exact** — the pre-spike scalar `f32::exp` implementation, unchanged and
+  bit-identical (`SOFTMAX_EXACT=1` or `ROCKET_SOFTMAX_EXACT=1` selects it
+  process-wide; `Softmax::with_mode` selects per value). Semantics are shared:
+  `clamp(softcap·tanh(s/softcap) + mask, -30000)`, a fully clamped row is
+  uniform over `kn`, padded columns are clamped like masked-out keys.
+
+`vision_attn_bench softmax [kn] [reps] [tp]` times the entry point alone on a
+synthetic f16 `[tp, kn]` matrix (padded like the driver, `tp % 4`, `kn % 32`),
+exact vs fast, with and without a causal mask, and prints the fast path's
+deviation. Unit tests compare both kernels against the pre-spike reference on
+random rows (f16 code distance ≤1 ULP, cosine >0.9999999), plus exp accuracy
+vs `f32::exp`, monotonicity, padded columns, fully masked rows and soft-cap;
+the NEON kernels were also run under `qemu-aarch64` (`cargo test -p rocket-npu
+--target aarch64-unknown-linux-gnu`).
+
+### 19.2 Softmax alone (board, 4 A76 threads not needed — one core)
+
+`taskset -c 4-7`, production embed service stopped for the window, patched
+600 MHz NPU module, 5 reps after a warmup. `GB/s` counts the f16 traffic
+(read the scores + write the probabilities); one `exp` per element.
+
+| shape | mask | exact | fast | speedup | fast GB/s | fast Gexp/s |
+|---|---|---|---|---|---|---|
+| 2396×2400 (vision, 2394²) | none (the tower) | 0.0672 s | **0.0155 s** | **4.33×** | 1.48 | 0.370 |
+| 2396×2400 | causal | 0.0684 s | **0.0190 s** | **3.60×** | 1.21 | 0.302 |
+| 64×3648 (text, 3633 keys) | none | 0.0031 s | **0.0006 s** | **4.86×** | 1.48 | 0.370 |
+| 64×3648 | causal | 0.0027 s | **0.0006 s** | **4.28×** | 1.49 | 0.372 |
+
+Both shapes sit at ~0.085 Gexp/s for the exact path and ~0.37 Gexp/s (2.7
+ns/element, ~6 cycles) for the fast one, i.e. the cost is per-element, not
+per-shape. Deviations from exact: cosine 0.999999999-1.0, max|d| 1.5e-5 (vision)
+/ 7.6e-6 (text), **≤1 f16 ULP** everywhere (the f16 probability grid is 1e-3
+relative, so the exp error is far below the output's own quantization).
+
+The isolated number also corrects §18.4's attribution: the host pass is
+0.067 s per head, and the op runs 3 heads per worker, so it is **~0.20 s of the
+0.43 s op (47 %)**, not 0.33 s. The rest (~0.15 s after the softmax) is the
+QK/AV GEMMs plus the two 138 MB BO transfers.
+
+### 19.3 Op A/B (p = 2394, image size)
+
+Three interleaved rounds (exact, fast, exact, fast, exact, fast), 1 warmup + 1
+measured run each, `vision_attn_bench 2394 1 1024,2048`; medians below. The
+`npu` column is the `burn_rocket::stats()` driver call (which contains the
+softmax); `total` adds the f32→f16 head-major conversion.
+
+| arm | npu call | total s/layer | vs fused CPU |
+|---|---|---|---|
+| fused CPU kernel (reference) | — | 0.456 | 1.00× |
+| NPU, exact softmax | 0.432 | 0.459 | 0.99× |
+| **NPU, fast softmax** | **0.204** | **0.229** | **1.99×** |
+| NPU chunk-2048, exact | 0.438 | 0.444 | 1.03× |
+| NPU chunk-2048, fast | 0.227 | 0.271 | 1.68× |
+| NPU chunk-1024, exact | 0.436 | 0.436 | 1.05× |
+| NPU chunk-1024, fast | 0.267 | 0.302 | 1.51× |
+
+The softmax share of the driver call drops from 47 % to **25 %** (0.20 → 0.05 s
+per layer), and the whole op from parity with the CPU kernel to ~2×. Whole-bench
+CPU time per round: user 17.9-18.6 s exact vs 13.8-14.9 s fast (−21 %). Full
+sequence beats chunking now (the per-chunk conversion and BO setup were what
+chunking bought back when the softmax dominated); `RssAnon` is 174 MiB for the
+full call vs 90-122 MiB chunked.
+
+At the video-frame size (p = 1170, 2 reps) the same change turns §18.4's
+0.73× into a win: fused CPU 0.088, NPU exact 0.097 (npu 0.087), **NPU fast
+0.082 (npu 0.068) = 1.07×**.
+
+Op-level parity against the f32 fused kernel is unchanged by the fast path:
+cosine 0.999999844 / max|d| 3.19e-5 at p = 2394 and 0.999999872 / 4.12e-5 at
+p = 1170, identical to the exact arm at the printed precision, bit-identical
+across runs.
+
+### 19.4 Text paths (general mask/soft-cap semantics)
+
+Both runs on cores 0-3 with the production service live (contended wall, the
+numbers are for direction only); repeats of the same mode are bit-identical, so
+the deltas below are the mode difference.
+
+| model | tokens | exact | fast | delta |
+|---|---|---|---|---|
+| qwen3 embed (causal mask, `--npu`) | 2777 | 58.38 s (47.6 tok/s), user 121.5 s | 50.0-50.3 s (55.6 tok/s), user 89.6 s | wall −11 %, CPU −26 %, cosine 0.999998366 |
+| emb2 text (window/full masks, q8+npu attention) | 2594 | forward 26.76 s (attn 14.19) | forward 24.04-24.23 s (attn 11.79) | attn −17 %, forward −10 %, cosine 0.999977266 |
+
+Both deltas are far below the models' own quantization floor (q8 text sits at
+0.9996-0.9999 vs HF f32) and come from ≤1 ULP f16 probability differences
+amplified by the layer stack; the deployed text embeddings change by ≤2.3e-5
+cosine, and `SOFTMAX_EXACT=1` reproduces the old vectors bit-for-bit.
+
+### 19.5 Gate and decision
+
+The S1 gate was "op ≤0.35 s/layer **or** at least parity with the CPU kernel".
+Fast NPU attention is 0.229 s/layer at p = 2394 (**1.99×** the 0.456 s fused
+kernel) and 0.082 s at p = 1170 (1.07×), so it **passes** with margin.
+
+**S2 should wire NPU attention as the tower default**: the tower's kernel time
+(7.9-8.2 s per image, §18.4) becomes ~3.5 s and the 15.2-15.5 s tower ~11 s
+before any in-situ overhead, clearing the §18.4 ≥10 % wall gate. Do not port the
+C library's on-NPU softmax for this: the host pass is now 0.05 s/layer, and the
+remaining op time is GEMM + BO traffic. The causal models' long-context NPU
+attention benefits from the same path (qwen3 2777 tokens: −11 % wall, −26 %
+CPU) with no separate work.
+
+Reproduce (board, in a service-free window):
+
+```sh
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bins
+# exact vs fast, both shapes, plus the op A/B (SOFTMAX_EXACT=1 = exact arm)
+taskset -c 4-7 ./vision_attn_bench softmax 2394 5
+taskset -c 4-7 ./vision_attn_bench softmax 3633 5 64
+SOFTMAX_EXACT=1 taskset -c 4-7 ./vision_attn_bench 2394 5 1024,2048
+taskset -c 4-7 ./vision_attn_bench 2394 5 1024,2048
+```
+
+## 20. S2: NPU vision attention wired (2026-10-24)
+
+§19 left the decision made and the code unwired: the fast host softmax took
+`attention_window` to 1.99× flex's fused kernel at the tower's image geometry,
+so the tower's attention should move to the NPU. S2 adds the mode, makes it the
+`--npu` default for EmbeddingGemma 2, and measures the tower, the serve path and
+the parity on the board.
+
+### 20.1 Implementation
+
+- `VisionAttn` gains `Npu`; `--vision-attn` accepts `npu|fused|blocked` on the
+  `gemma` CLI and on `serve` (EmbeddingGemma 2 only; Gemma 4 keeps its hardcoded
+  `blocked` tower and rejects the flag). `npu` is scoped: it requires `--npu` on
+  an aarch64 build with `--features npu` and is rejected with a clear message
+  otherwise (`--vision-attn npu requires --npu (the vision tower's attention
+  runs on the NPU)`, `... requires an aarch64 build with --features npu`). There
+  is no off-device implementation to fall back to, so it is not silently
+  downgraded.
+- `VisionAttention::forward`'s NPU arm calls
+  `burn_rocket::attention_window(q, k, v, heads, kv_heads, head_dim, 1.0, None,
+  -1)` on the `[1, patches, H*D]` layout, i.e. the whole patch sequence, no mask,
+  scale 1.0 — exactly the P3 bench's `npu` arm (§18.4). The projection outputs
+  are `[patches, heads, head_dim]`, which reshape to `[1, patches, H*D]` for the
+  op; its `[1, patches, H*D]` result reshapes back for the packed `o_proj`. No
+  chunking: after S1 the full sequence is the fastest arm at both the image and
+  the video shape (§19.3). The fused and blocked arms run exactly the previous
+  ops (their `[h, p, d] -> [p, H*D]` reshape just moved inside the arm).
+- Default resolution, both entry points: an explicit `--vision-attn` wins; else
+  `npu` when the tower's NPU attention path is actually in use (`serve`'s
+  resolved `npu`: default-on for an aarch64 `npu` build, so `--no-npu` or a
+  `--quant q8` without an explicit `--npu` falls back to `fused`) and `fused`
+  otherwise (CPU builds, `--no-npu`, Gemma 4). `serve` prints the resolved mode
+  as `vision_attn="npu"` on every media request log line, and the tower line
+  names it too.
+- The tower's attention is independent of `--npu-attn` (that flag stays the text
+  backbone's). `ROCKET_NPU_TOWERS=0` (tower projections on the CPU) combines
+  with `--vision-attn npu`: only the attention op moves to the device then.
+
+### 20.2 Board A/B (2026-10-24, 07:22-07:46 UTC)
+
+Window: production `home-llm-gateway-embed-1` stopped and restored (`/health`
+ok), patched 600 MHz NPU module, `taskset -c 4-7`, 1-min loadavg 1.9 at the
+start rising to 3.6-4.3 with the board's other containers during the window.
+Safetensors model `/root/models/embeddinggemma-2`, one process per run
+(`gemma embed`), `--defer-towers` so the tower load (14.7-15.4 s in the f32
+arms, 22.3-23.2 s with the q8 audio map) stays outside every tower number;
+3 interleaved reps per arm (order per rep: a image fused,
+b image fused, a image npu, b image npu, then the same for video). Arms:
+
+- **a** deployed shape: `--dtype f32 --quant q8 --npu --npu-attn npu
+  --attn-chunk 1024 --defer-towers --vision-attn <mode>`
+- **b** f32+npu: the same without `--quant q8`
+
+#### Image (2394 patches, `data/cat.jpeg`)
+
+Mean of 3 reps (range in parentheses), tower seconds:
+
+| arm | vision-attn | tower | patch / attn (kernel) / mlp | encode | wall | user CPU | peak RssAnon |
+|---|---|---|---|---|---|---|---|
+| a q8+npu | fused | 13.84 (13.51-14.03) | 0.16 / 9.98 (**7.73**) / 3.70 | 15.95 | 53.8 s | 76.4 s | 2419 MiB |
+| a q8+npu | **npu** | **10.57** (9.47-11.47) | 0.17 / 5.99 (**3.44**) / 4.41 | **12.66** | 50.5 s | **58.6 s** | 2420 MiB |
+| b f32+npu | fused | 14.07 (13.85-14.21) | 0.15 / 9.79 (**7.60**) / 4.13 | 16.17 | 41.5 s | 62.0 s | 2408 MiB |
+| b f32+npu | **npu** | **10.58** (10.46-10.66) | 0.16 / 5.89 (**3.48**) / 4.52 | **12.71** | 37.7 s | **44.1 s** | 2510 MiB |
+
+The tower drops **-23.6 %** (a) / **-24.8 %** (b) and the attention op **-55 %**
+(7.7 → 3.4 s); everything else in the attention phase (norms, axial RoPE, the
+`o` projection) is unchanged, so the phase goes 10.0 → 6.0 s while the MLP phase
+does not depend on the mode (see below). Whole-process wall -6.1 % / -9.2 % and
+**user CPU -23 % / -29 %** on the image, which is the point of the offload: the
+process now needs 58.6 s of user CPU instead of 76.4 s. Peak `RssAnon` is
+unchanged in the q8 arm (the ~2.4 GiB f32 load peak dominates) and +102 MiB in
+the f32 arm (the attention context; the S1 bench measured its geometry at
+72 MiB of device BO + 44 MiB of host scratch).
+
+#### Video (`data/test.mp4`, 4 frames, 4680 patches)
+
+| arm | vision-attn | tower | patch / attn (kernel) / mlp | encode | wall | user CPU | peak RssAnon |
+|---|---|---|---|---|---|---|---|
+| a q8+npu | fused | 18.55 (17.87-19.50) | 0.17 / 11.39 (**7.17**) / 6.98 | 21.16 | 60.1 s | 82.6 s | 2418 MiB |
+| a q8+npu | **npu** | **17.21** (16.92-17.56) | 0.22 / 8.50 (**4.00**) / 8.48 | 19.84 | 58.5 s | **70.9 s** | 2424 MiB |
+| b f32+npu | fused | 18.57 (18.29-18.83) | 0.20 / 11.57 (**7.31**) / 6.79 | 21.18 | 47.8 s | 69.0 s | 2391 MiB |
+| b f32+npu | **npu** | **17.28** (15.58-18.13) | 0.19 / 8.21 (**3.80**) / 8.83 | 19.88 | 46.4 s | **58.0 s** | 2389 MiB |
+
+At the frame shape the op win is still large (**-44 % / -48 %**, 7.2-7.3 →
+3.8-4.0 s) but the tower only improves **-7 %**: the per-frame attention phase
+falls 11.4 → 8.5 s, yet the MLP phase reads 1.5-2.0 s higher in that arm, which
+eats most of it. That is window drift, not a cost of the NPU attention: a
+second, busier window (07:50-07:57 UTC, loadavg 2.0 → 4.4) that alternated modes
+(`npu, fused, fused, npu`, video, then image) reproduced the MLP phase at a
+higher level in *both* modes — video MLP **8.73 / 8.79 s fused** vs **9.08 /
+10.37 s npu** with the same tower 22.0-22.2 vs 18.4-21.1 s, and image MLP
+**4.70 fused / 4.78 npu** (tower 15.48 → 11.75). The CPU-side phases of that
+window ran 12-25 % slower than the A/B's (its fused video tower is 22.1 s
+against 18.6 s), i.e. the A/B's MLP difference is the board's contention ramping
+between the earlier and later runs of each group, not the attention mode. The
+video arm's real gain is the CPU relief (-14 % / -16 % user) and a small wall win
+(-2.6 % / -2.9 %).
+
+### 20.3 Parity and determinism
+
+Normalized 768-d embeddings vs the HF f32 reference (regenerated on the dev host
+with `tools/ref_embeddinggemma2.py`, transformers 5.19 CPU f32; the P4 column is
+§18.5.4's number for the same reference):
+
+| case | fused | **npu** | P4 fused |
+|---|---|---|---|
+| a q8+npu image | 0.999883357 | **0.999884446** | 0.9998836 |
+| b f32+npu image | 0.999997076 | **0.999989974** | 0.9999963 |
+| a q8+npu video | 0.999496202 | **0.999505592** | 0.9994970 |
+| b f32+npu video | 0.999649039 | **0.999653036** | 0.9996491 |
+
+The NPU arm is within **1e-5** of the fused one in both directions — 7.1e-6
+lower on the f32 image, 1.1-9.4e-6 higher at the other three points, i.e. the
+S1 softmax deviation is the same order as the fp16 GEMM noise the tower already
+carries. Fused-vs-npu at the
+final embedding: **0.999986356** (image, max|d| 6.3e-4) and **0.999998268**
+(video, 3.7e-4), i.e. above the 0.9999 op-parity gate, and both arms' repeats
+are **bit-identical** (cosine 1.0, max|d| 0, three runs each, image and video).
+The video reference's own ~3.5e-4 frame-sampling gap (§18.3) is unchanged.
+
+The serve path is the same vector: an image request through the default
+(`--npu`, no `--vision-attn`) is bit-identical to the CLI's `--vision-attn npu`
+run, and a text request is bit-identical between the fused and npu serves
+(cosine 1.0) — the text backbone does not see the tower.
+
+### 20.4 Serve steady state (image, port 8399)
+
+Both modes: `--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024
+--defer-towers`, deferred towers, image-only `/embed`, first request then 3
+steady requests, then a text request (`compute_s` from the request log):
+
+| vision-attn | first compute (encode) | steady compute | steady encode | RssAnon | text compute |
+|---|---|---|---|---|---|
+| fused | 40.26 s (12.66) | 13.38 / 13.73 / 13.51 (**13.54**) | 12.07-12.36 (**12.17**) | 1161 MiB | 0.263 s |
+| **npu** | **38.58 s** (10.50) | 12.39 / 12.25 / 12.69 (**12.44**) | 10.82-11.37 (**11.06**) | 1262 MiB | 0.251 s |
+
+Steady media **-8.1 %** compute and **-9.1 %** tower, +101 MiB anon (the
+attention context). The tower's geometry (12 heads, 12 KV heads, head_dim 64) is
+a third entry in the engine's per-geometry attention-context cache — the text
+backbone's sliding (4, 2, 256) and full (4, 1, 512) layers are the other two —
+so no context is created per layer or per request, and the slot count stays
+inside the engine's four. The per-request tower lines show the same split as
+the CLI
+(kernel 6.2 → 3.3-3.8 s; 64 → 80 NPU calls, +0.45 s of conversions, +3.5 s of
+device time for 16 layers ≈ the S1 op's 0.22 s/layer); the fused serve's kernel
+is faster than its CLI number (6.2 vs 7.7 s), presumably because the steady
+process's longer-lived buffers and warm caches suit flex's kernel better, so the
+same-window serve delta is the smaller -9 % and the CLI's -24 % is the
+cold-request number. Text is untouched (0.263 → 0.251 s, within noise).
+
+### 20.5 Gate and decision
+
+- Gate: image tower **-24 %** on the CLI harness — the §18.4 ≥10 % tower-wall ask
+  is met (the warm serve harness lands at -9 %, because the fused kernel speeds
+  up more with warm buffers); parity **≥0.9995** q8+npu (0.999884) and
+  **≥0.9999** f32+npu (0.999990), fused-vs-npu **≥0.9999** (0.999986);
+  determinism bit-identical; text unchanged.
+- **Landed:** `VisionAttn::Npu`, `--vision-attn npu|fused|blocked`, and `npu` as
+  the EmbeddingGemma 2 default whenever the NPU path is active (`--npu` on an
+  aarch64 `npu` build, including `serve`'s default-on NPU offload);
+  `--vision-attn fused` stays the explicit CPU fallback and `blocked` the parity
+  reference. Cost: +101 MiB anon on media requests, +16 NPU calls and ~0.45 s of
+  host conversions per forward; no loader change, no change to the text path.
+- The next tower levers are now the attention phase's ~2.5 s outside the op
+  (two QK-RMSNorms, axial RoPE, o projection — an axial-RoPE host kernel is the
+  §18.5.5 candidate) and the CPU-side MLP glue; the kernel itself is 3.4 s of
+  the 10.6 s tower. On the causal text models the same S1 softmax already
+  applies, and the tower's `npu` default does not change their budget.
+
+Reproduce (board, service-free window, `--bins` for the bench):
+
+```sh
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bins
+# A/B (one process per run; the tower load is printed by the `towers:` line)
+for mode in fused npu; do
+  taskset -c 4-7 ./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 \
+      --dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers \
+      --vision-attn $mode --image data/cat.jpeg --out /tmp/$mode.json
+done
+# serve steady state (logs vision_attn= and encode_s per request)
+ROCKET_VISION_LOG=1 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 \
+    --dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers --port 8399
+```

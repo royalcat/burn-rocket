@@ -28,18 +28,23 @@ use crate::gemma::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
 
 /// How the tower computes its bidirectional self-attention.
 ///
+/// * [`VisionAttn::Npu`] — `burn_rocket::attention_window` (no mask, whole patch
+///   sequence) on the RK3588. Since the S1 fast host softmax (log-gemma §19) it
+///   is 1.99× the fused CPU kernel at the image size and 1.07× at the video-frame
+///   size, so it is the default for `--npu` on an aarch64 `npu` build (S2).
 /// * [`VisionAttn::Fused`] — the backend's flash-attention kernel
 ///   (`burn::tensor::module::attention`, `is_causal: false`): tiled online
-///   softmax, no full score matrix, GQA handled inside the kernel. The default
-///   since log §18.3 (a strict win in every measured shape).
+///   softmax, no full score matrix, GQA handled inside the kernel. The CPU
+///   default since log §18.3 (a strict win in every measured shape).
 /// * [`VisionAttn::Blocked`] — the tensor-op path ([`chunked_attention`]): the
 ///   full `[heads, chunk, patches]` score block is materialized per query chunk.
 ///   The parity fallback; Gemma 4 keeps it (its tower was not re-measured).
 ///
-/// Both compute the same function; the scale is exactly 1.0 because the tower
-/// normalizes q and k (QK-RMSNorm replaces the usual `1/sqrt(head_dim)`).
+/// All three compute the same function; the scale is exactly 1.0 because the
+/// tower normalizes q and k (QK-RMSNorm replaces the usual `1/sqrt(head_dim)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VisionAttn {
+    Npu,
     #[default]
     Fused,
     Blocked,
@@ -48,14 +53,18 @@ pub enum VisionAttn {
 impl VisionAttn {
     pub fn name(self) -> &'static str {
         match self {
+            Self::Npu => "npu",
             Self::Fused => "fused",
             Self::Blocked => "blocked",
         }
     }
 
-    /// Parse `fused|blocked` (the `--vision-attn` flag value).
+    /// Parse `npu|fused|blocked` (the `--vision-attn` flag value). `npu` still
+    /// needs the NPU attention path itself (`--npu` on an aarch64 `npu` build);
+    /// the CLIs reject it otherwise.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
+            "npu" => Some(Self::Npu),
             "fused" => Some(Self::Fused),
             "blocked" => Some(Self::Blocked),
             _ => None,
@@ -64,16 +73,17 @@ impl VisionAttn {
 
     fn code(self) -> u64 {
         match self {
-            Self::Fused => 1,
             Self::Blocked => 0,
+            Self::Fused => 1,
+            Self::Npu => 2,
         }
     }
 
     fn from_code(code: u64) -> Self {
-        if code == 1 {
-            Self::Fused
-        } else {
-            Self::Blocked
+        match code {
+            0 => Self::Blocked,
+            2 => Self::Npu,
+            _ => Self::Fused,
         }
     }
 }
@@ -469,23 +479,34 @@ impl VisionAttention {
         let k = rope.apply(self.k_norm.forward(k));
         let v = rms_norm_noscale(v, spec.eps);
 
-        let q = q.swap_dims(0, 1).unsqueeze_dim::<4>(0);
-        let k = k.swap_dims(0, 1).unsqueeze_dim::<4>(0);
-        let v = v.swap_dims(0, 1).unsqueeze_dim::<4>(0);
         let t0 = Instant::now();
-        let o = match attn {
+        // Every arm returns the output in the `[patches, heads * head_dim]`
+        // layout the packed `o_proj` expects.
+        let o: Tensor<2> = match attn {
+            VisionAttn::Npu => npu_attention(q, k, v, spec),
             // The blocked path keeps every head's own K/V copy (its per-chunk
             // score tensor is `[heads, ..]`); the fused kernel maps each query
             // head to its shared K/V head, so k/v stay unrepeated there.
             VisionAttn::Blocked => {
-                let k = repeat_kv(k, h / kv);
-                let v = repeat_kv(v, h / kv);
+                let q = q.swap_dims(0, 1).unsqueeze_dim::<4>(0);
+                let k = repeat_kv(k.swap_dims(0, 1).unsqueeze_dim::<4>(0), h / kv);
+                let v = repeat_kv(v.swap_dims(0, 1).unsqueeze_dim::<4>(0), h / kv);
                 chunked_attention(q, k, v, None, chunk)
+                    .reshape([h, p, d])
+                    .swap_dims(0, 1)
+                    .reshape([p, h * d])
             }
-            VisionAttn::Fused => fused_attention(q, k, v),
+            VisionAttn::Fused => {
+                let q = q.swap_dims(0, 1).unsqueeze_dim::<4>(0);
+                let k = k.swap_dims(0, 1).unsqueeze_dim::<4>(0);
+                let v = v.swap_dims(0, 1).unsqueeze_dim::<4>(0);
+                fused_attention(q, k, v)
+                    .reshape([h, p, d])
+                    .swap_dims(0, 1)
+                    .reshape([p, h * d])
+            }
         };
         let kernel = t0.elapsed();
-        let o = o.reshape([h, p, d]).swap_dims(0, 1).reshape([p, h * d]);
         (self.o_proj.forward(o), kernel)
     }
 
@@ -533,6 +554,41 @@ impl VisionAttention {
         }
         (weights, bytes)
     }
+}
+
+/// NPU attention (`--vision-attn npu`): bidirectional, no mask, whole patch
+/// sequence through `burn_rocket::attention_window` (the S1 fast host softmax,
+/// log-gemma §19).
+///
+/// `q`/`k`/`v` arrive as `[patches, heads, head_dim]` / `[patches, kv_heads,
+/// head_dim]`; the op takes the batch-1 token-major `[1, patches, H*D]` layout
+/// and returns `[1, patches, H*D]`, which is exactly what the packed `o_proj`
+/// consumes. The scale is 1.0 (QK-RMSNorm) and `window = -1` means no mask. Not
+/// chunked: since S1 the full sequence is the fastest arm at both the image and
+/// the video-frame size (§19.3).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn npu_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, spec: &VisionSpec) -> Tensor<2> {
+    let p = q.dims()[0];
+    let (h, kv, d) = (spec.heads, spec.kv_heads, spec.head_dim);
+    let o = burn_rocket::attention_window(
+        q.reshape([1, p, h * d]),
+        k.reshape([1, p, kv * d]),
+        v.reshape([1, p, kv * d]),
+        h,
+        kv,
+        d,
+        1.0,
+        None,
+        -1,
+    );
+    o.reshape([p, h * d])
+}
+
+/// Off-device `--vision-attn npu` is rejected by both CLIs before a forward
+/// runs (`requires an aarch64 build with --features npu and --npu`).
+#[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+fn npu_attention(_q: Tensor<3>, _k: Tensor<3>, _v: Tensor<3>, _spec: &VisionSpec) -> Tensor<2> {
+    unreachable!("--vision-attn npu requires an aarch64 build with --features npu")
 }
 
 /// Bidirectional non-causal attention through the backend's fused kernel
@@ -1015,14 +1071,16 @@ mod tests {
 
     #[test]
     fn attn_mode_parses_and_roundtrips() {
+        assert_eq!(VisionAttn::parse("npu"), Some(VisionAttn::Npu));
         assert_eq!(VisionAttn::parse("fused"), Some(VisionAttn::Fused));
         assert_eq!(VisionAttn::parse("blocked"), Some(VisionAttn::Blocked));
         assert_eq!(VisionAttn::parse("flash"), None);
-        for mode in [VisionAttn::Fused, VisionAttn::Blocked] {
+        for mode in [VisionAttn::Npu, VisionAttn::Fused, VisionAttn::Blocked] {
             assert_eq!(VisionAttn::parse(mode.name()), Some(mode));
             assert_eq!(VisionAttn::from_code(mode.code()), mode);
         }
-        // Fused is the default since log §18.3; `blocked` is the parity fallback.
+        // The enum default is fused (non-NPU builds); `--vision-attn npu`
+        // defaults on separately, from the CLI's resolved `--npu`.
         assert_eq!(VisionAttn::default(), VisionAttn::Fused);
     }
 }

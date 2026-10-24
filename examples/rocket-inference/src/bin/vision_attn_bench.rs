@@ -28,6 +28,12 @@
 //!   the same per-frame work: whether the kernel's `batch * heads` parallelism
 //!   helps at a given frame count (12 heads already fill 4 threads).
 //!
+//! `softmax [kn] [reps] [tp]` times the host softmax alone (S1 spike: the host
+//! score pass was the §18.4 blocker, log-gemma §19): a synthetic f16 `[tp, kn]`
+//! score matrix (padded like the driver: `tp` to 4, `kn` to 32) through
+//! `burn_rocket::npu::attn::Softmax`, exact vs fast, with and without a causal
+//! mask, plus the fast path's deviation from exact.
+//!
 //! Build (aarch64, NPU; the bin is gated on the `npu` feature):
 //!   cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 //!       --no-default-features --features npu --bin vision_attn_bench
@@ -36,6 +42,7 @@
 //!   ./vision_attn_bench [patches] [reps] [chunk,chunk,...]
 //!   ./vision_attn_bench matmul [reps]
 //!   ./vision_attn_bench attn-batch [patches] [reps]
+//!   ./vision_attn_bench softmax [kn] [reps] [tp]
 
 use std::time::Instant;
 
@@ -43,6 +50,8 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
+use burn_rocket::half::f16;
+use burn_rocket::npu::attn::{Softmax, SoftmaxMode};
 
 const HEADS: usize = 12;
 const HEAD_DIM: usize = 64;
@@ -62,6 +71,12 @@ fn main() {
             let p: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(1170);
             let reps: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(3);
             attention_batch(p, reps);
+        }
+        Some("softmax") => {
+            let kn: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(2394);
+            let reps: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(5);
+            let tp: usize = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(kn);
+            softmax_bench(kn, reps, tp);
         }
         _ => attention_arms(&args),
     }
@@ -357,6 +372,103 @@ fn attention_batch(p: usize, reps: usize) {
             rss_anon_mib()
         );
     }
+}
+
+/// The host softmax alone: exact vs fast through `Softmax::run`, with and
+/// without a causal mask (the text backbone's mask mode), on a padded score
+/// matrix shaped like the attention driver's (`tp % 4`, `kn % 32`).
+///
+/// One `exp` per element, so `Gelem/s` is the `exp/s` rate; `GB/s` counts the
+/// f16 traffic the op pays (read the scores, write the probabilities).
+fn softmax_bench(kn: usize, reps: usize, tp: usize) {
+    let (kn_real, tp_real) = (kn, tp);
+    let kn = kn.div_ceil(32) * 32;
+    let tp = tp.div_ceil(4) * 4;
+    let n_tokens = tp.saturating_sub(4);
+    let kernel = if cfg!(all(target_arch = "aarch64", target_feature = "fp16")) {
+        "NEON 8-lane, hardware f16"
+    } else {
+        "scalar"
+    };
+    println!(
+        "host softmax: tp {tp} ({tp_real} rows), kn {kn} ({kn_real} keys), {kernel}, reps {reps}",
+    );
+    println!("start RssAnon {} MiB", rss_anon_mib());
+
+    let mut state = 0x5eed_1234_9abc_def0u64;
+    let mut rnd = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 / (1u64 << 31) as f32 - 0.5) * 32.0
+    };
+    let scores: Vec<f16> = (0..tp * kn).map(|_| f16::from_f32(rnd())).collect();
+    let mut causal = vec![f16::ZERO; n_tokens * kn_real];
+    for i in 0..n_tokens {
+        for j in (i + 1)..kn_real {
+            causal[i * kn_real + j] = f16::NEG_INFINITY;
+        }
+    }
+
+    let elems = (tp * kn) as f64;
+    for (mask_name, mask) in [("none", None), ("causal", Some(&causal[..]))] {
+        let mut arms = [
+            (
+                "exact",
+                SoftmaxMode::Exact,
+                vec![f16::ZERO; tp * kn],
+                0.0f64,
+            ),
+            ("fast", SoftmaxMode::Fast, vec![f16::ZERO; tp * kn], 0.0f64),
+        ];
+        // Warm up both arms (first-touch pages, row buffer growth).
+        for (_, mode, out, _) in arms.iter_mut() {
+            Softmax::with_mode(*mode).run(&scores, out, mask, n_tokens, kn_real, tp, kn, 1.0, 0.0);
+        }
+        for rep in 0..reps {
+            let order: [usize; 2] = if rep % 2 == 0 { [0, 1] } else { [1, 0] };
+            for a in order {
+                let (_, mode, out, total) = &mut arms[a];
+                let t0 = Instant::now();
+                Softmax::with_mode(*mode)
+                    .run(&scores, out, mask, n_tokens, kn_real, tp, kn, 1.0, 0.0);
+                *total += t0.elapsed().as_secs_f64();
+            }
+        }
+        let mut s = [0.0f64; 2];
+        for (i, (name, _, _, total)) in arms.iter().enumerate() {
+            s[i] = total / reps as f64;
+            println!(
+                "mask {mask_name:<6} {name:<5} {:8.4} s/rep  {:6.3} GB/s  {:6.3} Gexp/s",
+                s[i],
+                elems * 4.0 / s[i] / 1e9,
+                elems / s[i] / 1e9
+            );
+        }
+        let (cos, maxd, ulps) = compare_f16(&arms[1].2, &arms[0].2);
+        println!(
+            "  fast/exact {:.2}x  cos {cos:.9}  max|d| {maxd:.2e}  max {ulps} f16 ulp  RssAnon {} MiB",
+            s[0] / s[1],
+            rss_anon_mib()
+        );
+    }
+}
+
+/// Cosine, max|d| and max f16-code distance between two non-negative f16
+/// matrices.
+fn compare_f16(a: &[f16], b: &[f16]) -> (f64, f32, u32) {
+    let (mut dot, mut na, mut nb, mut maxd) = (0.0f64, 0.0f64, 0.0f64, 0.0f32);
+    let mut ulps = 0u32;
+    for (&x, &y) in a.iter().zip(b) {
+        let (xf, yf) = (x.to_f64(), y.to_f64());
+        dot += xf * yf;
+        na += xf * xf;
+        nb += yf * yf;
+        maxd = maxd.max((xf - yf).abs() as f32);
+        // Probabilities are non-negative, so the f16 code order is monotone.
+        ulps = ulps.max(u32::from(x.to_bits()).abs_diff(u32::from(y.to_bits())));
+    }
+    (dot / (na.sqrt() * nb.sqrt()), maxd, ulps)
 }
 
 /// Deterministic pseudo-random f32 values in [-0.05, 0.05).

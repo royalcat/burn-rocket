@@ -41,7 +41,11 @@ OpenViking's embedding backend in production on a Rock 5B+ is EmbeddingGemma 2
 (`rocket-inference serve --dtype f32 --quant q8 --npu --npu-attn npu
 --defer-towers`): the text-only service idles at 605 MiB anon (2183 MiB before the
 idle-memory round; the vision/audio towers load only if a media request ever
-arrives). Its 3,633-token predecessor configuration (Qwen3-Embedding-0.6B on the
+arrives). On a media request the towers' projections and the vision tower's
+attention now run on the NPU (`--vision-attn` defaults to `npu`): a
+2394-patch image's tower is 10.6 s against 15.2 s with the CPU attention kernel,
+and a served image request takes 12.4 s instead of 13.5 s at +101 MiB anon. Its
+3,633-token predecessor configuration (Qwen3-Embedding-0.6B on the
 NPU, `--npu --npu-attn cpu --max-tokens 8192`) ran a 3,633-token input in ~87 s
 (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds than the CPU-only flex path
 (the default NPU attention is slightly faster: ~45 tok/s, -51% CPU). The intent
@@ -183,7 +187,11 @@ on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resi
 605 MiB anon idle in the deployed text-only `--defer-towers` configuration)
 and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
 fp16 weights plus chunked sliding **and full** attention, for 1.61x wall and -33 %
-user CPU vs the CPU baseline (2587-token text). Gemma 4 E2B-it greedily reproduces
+user CPU vs the CPU baseline (2587-token text). Its vision tower packs 65 resident
+projections and runs its attention on the NPU too (`--vision-attn npu`, the
+`--npu` default): a 2394-patch image's tower is 10.6 s (15.2 s with the CPU
+attention kernel) at cosine 0.99999 vs the HF f32 reference in the f32 arm and
+0.99988 with the deployed q8 text backbone. Gemma 4 E2B-it greedily reproduces
 the HF reference token-for-token, and its QAT mobile checkpoints load bit-exactly.
 
 ## License

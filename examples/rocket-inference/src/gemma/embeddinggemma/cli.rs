@@ -51,10 +51,9 @@ struct Args {
     reps: usize,
     out: Option<PathBuf>,
     attn_chunk: usize,
-    /// `--vision-attn`: the vision tower's attention implementation
-    /// (`fused` = the backend kernel, the default; `blocked` = the tensor-op
-    /// chunked parity fallback).
-    vision_attn: VisionAttn,
+    /// `--vision-attn`: the vision tower's attention implementation, or `None`
+    /// for the default (see [`Args::vision_attn`]).
+    vision_attn: Option<VisionAttn>,
     dump_pixels: Option<PathBuf>,
     dump_ids: Option<PathBuf>,
     dump_audio: Option<PathBuf>,
@@ -96,7 +95,7 @@ impl Args {
             reps: 3,
             out: None,
             attn_chunk: 1024,
-            vision_attn: VisionAttn::Fused,
+            vision_attn: None,
             dump_pixels: None,
             dump_ids: None,
             dump_audio: None,
@@ -172,8 +171,8 @@ impl Args {
         if let Some(v) = f.take_parsed("--attn-chunk")? {
             args.attn_chunk = v;
         }
-        if let Some(v) = f.take_choice("--vision-attn", &["fused", "blocked"])? {
-            args.vision_attn = VisionAttn::parse(&v).expect("validated by take_choice");
+        if let Some(v) = f.take_choice("--vision-attn", &["npu", "fused", "blocked"])? {
+            args.vision_attn = Some(VisionAttn::parse(&v).expect("validated by take_choice"));
         }
         if let Some(v) = f.take("--dump-pixels")? {
             args.dump_pixels = Some(PathBuf::from(v));
@@ -220,8 +219,31 @@ impl Args {
         if let Some(v) = f.take_choice("--npu-attn", &["npu", "cpu"])? {
             args.npu_attn = v == "npu";
         }
+        if args.vision_attn == Some(VisionAttn::Npu) {
+            if !cfg!(all(feature = "npu", target_arch = "aarch64")) {
+                bail!("--vision-attn npu requires an aarch64 build with --features npu");
+            }
+            if !args.npu {
+                bail!(
+                    "--vision-attn npu requires --npu (the vision tower's attention runs on the NPU)"
+                );
+            }
+        }
         f.finish(&format!("gemma {cmd}"))?;
         Ok(args)
+    }
+
+    /// Resolved tower attention: an explicit `--vision-attn`, else `npu` when
+    /// the NPU attention path is in use (`--npu` on an aarch64 `npu` build; the
+    /// tower default since S2, log-gemma §20) and `fused` otherwise.
+    fn vision_attn(&self) -> VisionAttn {
+        self.vision_attn.unwrap_or(
+            if self.npu && cfg!(all(feature = "npu", target_arch = "aarch64")) {
+                VisionAttn::Npu
+            } else {
+                VisionAttn::Fused
+            },
+        )
     }
 
     /// The resolved model dtype: the checkpoint's native float dtype unless
@@ -302,7 +324,7 @@ fn build_inputs(
         video_fps: args.video_fps,
         video_max_frames: args.video_max_frames,
         attn_chunk: args.attn_chunk,
-        vision_attn: args.vision_attn,
+        vision_attn: args.vision_attn(),
     };
     let debug = inputs::DebugPaths {
         dump_image: args.dump_image.clone(),
