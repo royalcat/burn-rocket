@@ -1013,3 +1013,112 @@ scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/q8_bench root@rock-5b-pl
 taskset -c 0-3 ./q8_bench --reps 3                       # the five qwen3 shapes, group 32
 taskset -c 0-3 ./q8_bench --reps 3 --rows 128 --groups 32,128,512,1024 2777 1024 3072 2777 4096 1024
 ```
+
+## 21. RoPE on the NPU: measured and rejected (P2c, 2026-10-25)
+
+Rotary position embedding is the last per-layer elementwise chain the `--npu`
+path runs on the CPU: each of the 28 layers rotates q (`[S, 16, 128]`) and k
+(`[S, 8, 128]`), i.e. 8.5 M element-passes per layer, 238 M per 2777-token
+forward. The driver now has the conv-main EW binary ops
+(`ops::activation::{ew_mul, ew_add, ew_sub}`, fp16, `out[i] = a[i] (op) b[i]`),
+which is enough to express rotate-half RoPE as `out = x·cos + rot(x)·sin` with a
+host gather — so the question was whether the NPU version beats the fused host
+kernel (`burn_rocket::rope_apply` → `src/host.rs::rope_row`, one rayon pass).
+
+**Probe** (`examples/rocket-inference/src/bin/rope_bench.rs`, permanent; aarch64
+`npu` bin). Three arms in one process, interleaved inside each rep, median of 3
+measured reps (plus a warmup), qwen3-embedding-0.6B's geometry, and the whole
+model's RoPE work per arm (28 layers × q and k, a fresh input per layer):
+
+* `host-fused` — `burn_rocket::rope_apply(x, rope.cos_rows(0, s),
+  rope.sin_rows(0, s))`, the deployed one-pass kernel (2 table slices + 1 pass
+  over the tensor per call);
+* `host-composite` — `RopeCache::apply`, the flex tensor-op form (`x1·cos −
+  x2·sin`, `x2·cos + x1·sin`, `cat`; 15 tensor ops per call), which is what the
+  `--npu` path actually calls today (see the side finding);
+* `npu-ew` — host narrow to f16 + host rotate-half gather
+  (`rot = [−x2, x1]`), `ew_mul(x, cos)`, `ew_mul(rot, sin)`, `ew_add`, host
+  widen. The EW op takes two equal-length flat arrays (no broadcast), so the
+  cos/sin tables are replicated to the full `[S, H, D]` element layout and built
+  once per forward inside the timed region.
+
+Board `rock-5b-plus`, cores 0-3 (the live emb2 service untouched on 4-7),
+600 MHz patched module, busy board (load average 8.7-9.2), f32 and bf16 bodies,
+`--reps 3` (median; the spread is the min-max of the three):
+
+| M | dtype | arm | wall | CPU | ms/layer | ratio (wall vs fused) |
+|---|---|---|---|---|---|---|
+| 82 | f32 | host-fused | 0.084 s | 0.111 s | 3.0 | 1.00x |
+| 82 | f32 | host-composite | 0.084 s | 0.082 s | 3.0 | 0.99x |
+| 82 | f32 | npu-ew | 1.380 s | 1.041 s | 49.3 | **16.3x** |
+| 82 | bf16 | host-fused | 0.058 s | 0.091 s | 2.1 | 1.00x |
+| 82 | bf16 | host-composite | 0.075 s | 0.073 s | 2.7 | 1.31x |
+| 82 | bf16 | npu-ew | 1.179 s | 0.928 s | 42.1 | **20.5x** |
+| 2777 | f32 | host-fused | 1.794 s | 2.872 s | 64.1 | 1.00x |
+| 2777 | f32 | host-composite | 3.428 s | 3.289 s | 122.4 | 1.91x |
+| 2777 | f32 | npu-ew | 34.350 s | 25.412 s | 1226.8 | **19.15x** |
+| 2777 | bf16 | host-fused | 1.783 s | 2.828 s | 63.7 | 1.00x |
+| 2777 | bf16 | host-composite | 3.361 s | 3.261 s | 120.0 | 1.88x |
+| 2777 | bf16 | npu-ew | 33.570 s | 25.141 s | 1198.9 | **18.83x** |
+
+A second window with the final binary reproduced the verdict (f32, 2777 tokens:
+fused 1.763 s, composite 2.917 s = 1.65x, NPU 32.043 s = 18.18x, identical
+numerics), so board drift moves the composite ratio by ~0.2 but not the decision.
+
+The NPU arm's own split at 2777 (f32 / bf16): tables 0.033 / 0.021 s, host glue
+3.288 / 4.330 s, device 24.437 / 29.533 s — so the *host plumbing alone* (f32
+readback, narrow, gather, widen, rebuild the tensor) is 1.83x the entire fused
+arm before a single submit. Numerics are not the problem: cosine 0.999999935
+(f32) / 0.999999288 (bf16) vs the fused kernel, max|d| 7.45e-4 / 2.27e-3
+(40.7 % / 67.2 % of the q values differ at f16 granularity) — inside the
+`>= 0.99999` gate, as expected for an f16 kernel.
+
+**Why it loses — submit-bound, exactly as the op's own cost note says.** The EW
+path tiles a flat array at `[1020, 32]` = 32,640 elements per submit, with one
+submit + one fence wait and 5 BO alloc/free per call. At 2777 tokens one EW call
+over q is 175 submits (k: 88), so the composition is 3 × (175 + 88) = 789
+submits per layer, **22,092 per forward** (168 EW calls). A single `ew_mul` on
+the full q layout measures 0.225-0.248 s, i.e. **1.3 ms per submit** and 0.10
+GB/s of the 2×2-byte move — the arm's 24.4 s device time is 22,092 × 1.1 ms,
+nothing else. Two structural consequences:
+
+* the EW op has **no broadcast operand**, so `cos`/`sin` must be materialized at
+  the full element layout (34 MB f16 for both tensors at 2777 tokens, 98 MB at
+  8k) instead of the fused/composite arms' `[S, D/2]` tables. Running per head
+  instead (head-major q, `[S, D]` tables reused 16x) would cut the table bytes
+  but multiply the submit count by 16 — the wrong direction when submits are
+  the cost.
+* even a hypothetical zero-cost device path would not win: the host glue
+  (3.3 s f32) already exceeds the fused arm (1.79 s), and a fused
+  multiply-add EW op (2 submits-worth instead of 3) would only cut the 24 s
+  device part by a third.
+
+**Decision: no app path.** The gate was ">10 % faster than the fused host kernel
+at M = 2777 with the gather and tables included"; the NPU arm is **18.8-19.2x
+slower** (8.9x the CPU), so `qwen3_embedding/model.rs` is untouched and there is
+no `ROCKET_ROPE_NPU` flag. The fused host kernel stays the baseline: it is one
+rayon pass per call (64 ms per layer for 66,648 q+k head-rows at 2777 tokens) and
+it is bit-identical to the composite (max|d| 0.0 in f32 and bf16 on every
+measured case). A resident-EW
+context in the driver would remove the 5-BO churn per call but not the
+`22,092`-submit tiling, so it would not change this verdict either.
+
+**Side finding (not changed here, model path out of P2c's scope).** The `--npu`
+model path does not use the fused kernel today: `Qwen3Attention::project`
+returns early on the `qkv_fused` handle (`let q = rope.apply(...)`), and that
+handle is set for every layer by the `--npu` loader, so RoPE there is the
+composite at 1.88-1.91x the fused kernel (a 1.63 s/forward cost at 2777 tokens,
+bf16 or f32). Both are bit-identical, so wiring `rope_apply` into that branch is
+a free win worth a follow-up; it is deliberately not part of this probe.
+
+Reproduce (board, cores 0-3; the full run is ~7 min, mostly the NPU arm):
+
+```sh
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bin rope_bench
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rope_bench \
+    root@rock-5b-plus.lan:/root/rocket-p2c/
+taskset -c 0-3 ./rope_bench                       # 82 + 2777 tokens, f32 + bf16
+taskset -c 0-3 ./rope_bench --tokens 2777 --dtypes f32 --layers 2 --reps 1   # quick shape
+taskset -c 0-3 ./rope_bench --skip-npu            # the two host arms only
+```

@@ -998,8 +998,9 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
 | `examples/rocket-inference/src/bin/vision_attn_bench.rs` | vision-tower attention/softmax microbenchmark (`fused-f16/bf16`, `npu`, `npu-chunk`, `matmul`, `attn-batch`, `softmax`; `npu` feature, log-gemma §18.4/§19/§20) |
 | `examples/rocket-inference/src/bin/causal_attn_bench.rs` | causal block attention probe (P2a): the chunked NPU path (`util/causal.rs` compiled from the same source) vs the dense masked op and `attn::flash_attn_ref`, `--window`/`--ref`/`--reps` (`npu` feature) |
+| `examples/rocket-inference/src/bin/rope_bench.rs` | RoPE probe (P2c): `burn_rocket::rope_apply` (fused host kernel) vs `RopeCache::apply` (composite) vs an `ops::activation::ew_mul`/`ew_add` composition on the NPU, at qwen3's q/k shapes, `--tokens`/`--dtypes`/`--layers`/`--reps`/`--skip-npu` (`npu` feature, log §21) |
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
-| `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
+| `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
 | `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`) and the video parity check (`video_parity.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
@@ -1574,6 +1575,18 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
   stack.
+- **RoPE on the NPU — measured and rejected** (P2c, 2026-10-25, log §21): rotate-half
+  RoPE is expressible with the conv-main EW ops (2 `ew_mul` + 1 `ew_add` + a host
+  gather), but the op has **no broadcast** (cos/sin replicate to the full `[S, H, D]`
+  layout) and tiles at 32,640 elements per submit+fence, so a 2777-token qwen3 forward
+  is 22,092 submits × ~1.2 ms = **18.8-19.2x** the fused host kernel (`rope_bench`;
+  numerics were fine at cos 0.999999935, and the arm's host half alone is 1.8x the
+  fused arm). No app path, no flag — do not retry without a resident-EW context *and*
+  a broadcast operand, and even then the host round-trip dominates. The probe stays as
+  `examples/rocket-inference/src/bin/rope_bench.rs`. Side finding worth acting on
+  separately: `--npu`'s `qkv_fused` branch calls the composite `RopeCache::apply`, not
+  the fused `rope_apply` (1.88-1.91x = ~1.6 s/forward at 2777 tokens), and the two are
+  bit-identical, so wiring the fused kernel in is free (not done here).
 - **On-NPU softmax in `rocket-npu`** is no longer on the critical path: the S1
   host pass (log-gemma §19) cut the host softmax to 0.05 s/layer, so
   `attention_window` now beats flex's fused kernel 1.99× at the tower geometry
@@ -1603,6 +1616,19 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   checkpoint is 8.9 GiB (12.5 GiB f32), which the board cannot host alongside the live
   services, so that path is validated structurally + by the shared qwen3 shapes and the
   geometry-agnostic probe.
+- **RoPE on the NPU — measured and rejected** (P2c, 2026-10-25, log §21): the fused
+  host `rope_apply` kernel stays the baseline. The conv-main EW ops can express
+  rotate-half RoPE (2 `ew_mul` + 1 `ew_add` + a host gather), but they have no
+  broadcast (cos/sin replicate to `[S, H, D]`, 34 MB f16 at 2777 tokens) and tile at
+  32,640 elements per submit+fence, so qwen3's 2777-token forward is 22,092 submits
+  (168 EW calls, 1.1-1.3 ms each): the probe measures **18.8-19.2x** the fused kernel
+  (34.35 vs 1.79 s for 28 layers, f32, 8.9x the CPU; cos 0.999999935) and the arm's
+  host half alone (3.29 s) exceeds the whole fused arm. No app path, no flag; the
+  permanent probe is `examples/rocket-inference/src/bin/rope_bench.rs` (the P2c gate
+  matrix: 82/2777 tokens x f32/bf16, `--skip-npu` for the host arms, `--layers/--reps`).
+  Side finding: `--npu`'s `qkv_fused` branch uses the composite `rope.apply`
+  (1.88-1.91x the fused kernel = ~1.6 s/forward at 2777 tokens), and the two are
+  bit-identical — a free follow-up, not changed here.
 - Board service: redeploy `home-llm-gateway-embed-1` from `main` to pick up the
   S1 fast host softmax, the S2 NPU vision default and the ffmpeg runtime (the
   deployed `:latest` is `94f99bd`, pre-S1/S2 and pre-ffmpeg), then re-measure the
@@ -1787,6 +1813,13 @@ ROCKET_CAUSAL_CHUNK=0 ./rocket-inference qwen3 embed --model-dir /root/models/qw
     --text-file data/long30k.txt --tokens 8000 --out /tmp/chunk8k.json
 ROCKET_CAUSAL_CHUNK=512 ./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b \
     --dtype f32 --npu --text-file data/long30k.txt --tokens 30000 --out /tmp/chunk30k.json
+# RoPE probe (P2c, log §21): fused host kernel vs composite vs the NPU EW composition;
+# ~7 min for the full matrix on a busy board, the NPU arm is 18.8-19.2x the fused one
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bin rope_bench
+./rope_bench                                      # 82 + 2777 tokens, f32 + bf16
+./rope_bench --tokens 2777 --dtypes f32 --layers 2 --reps 1   # quick shape check
+./rope_bench --skip-npu                           # the two host arms only
 # example npu compile check (the dep is aarch64-gated, so use the target)
 cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
 # formatting + lint gates (both clean)

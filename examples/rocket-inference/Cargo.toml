@@ -42,6 +42,13 @@ name = "causal_attn_bench"
 path = "src/bin/causal_attn_bench.rs"
 required-features = ["npu"]
 
+# RoPE probe (P2c): the fused host kernel vs the composite tensor-op path vs an
+# NPU elementwise composition. aarch64 + NPU only.
+[[bin]]
+name = "rope_bench"
+path = "src/bin/rope_bench.rs"
+required-features = ["npu"]
+
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 burn-rocket = { path = "../..", default-features = false, optional = true }
 
