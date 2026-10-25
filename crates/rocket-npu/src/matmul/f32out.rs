@@ -146,7 +146,7 @@ fn compute(dev: &Device, plan: &Plan, s: &mut Scratch, c: &mut [f32]) -> Result<
                     let in_handles: [Handle; 3] =
                         [s.in_all.handle(), s.wt_all.handle(), s.regcmd.handle()];
                     let out_handles = [s.out_all.handle()];
-                    submit(dev, &tasks, &in_handles, &out_handles)?;
+                    submit(dev, &tasks, &in_handles, &out_handles, 0)?;
                     prof.mark(b'u');
                     s.out_all.prep(wait_ns())?;
                     prof.mark(b'w');

@@ -23,11 +23,6 @@
 //! tasks one per IRQ, so [`enabled`] defaults to false and only `ROCKET_BATCH_SUBMIT=1`
 //! turns it on — and only on a kernel that honors `DRM_ROCKET_JOB_BATCHED`.
 
-// M1a lands the layout ahead of its caller (`matmul::Context` batching and the attention
-// path in M1b/M5), so nothing in the library calls these yet; the unit tests at the
-// bottom are the host gate. Drop this attribute with the first caller.
-#![allow(dead_code)]
-
 use std::sync::{Once, OnceLock};
 
 use crate::device::uapi::DrmRocketTask;
@@ -94,6 +89,74 @@ fn trailer_fail(where_: &str) {
              file a bug); run the chain layout gate."
         );
     });
+}
+
+/// Report (once per process) that a group of `group` tasks was submitted down the gapped
+/// per-task path even though chaining was requested, because the chained layout could not
+/// describe it: `reason`, with the first two offending word counts.
+///
+/// The gapped layout is always correct — this only costs the group its single IRQ. It is
+/// logged once because a ragged matmul produces one such group per submit batch, and the
+/// condition is a property of the shape, not of the data.
+fn warn_heterogeneous(group: usize, a: u32, b: u32) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        log_warn!(
+            "rocket_chain: ROCKET_BATCH_SUBMIT is on but a {group}-task group mixes \
+             regcmd lengths ({a} vs {b} words), so that group runs down the gapped \
+             per-task path. The chained layout advances the PC by one stride, so every \
+             program in a chain must have the same word count."
+        );
+    });
+}
+
+/// The overflow sibling of [`warn_heterogeneous`]: the group's programs are uniform but
+/// the contiguous run would not fit the regcmd BO.
+fn warn_overflow(group: usize, words_per_task: usize, cap_words: usize) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        log_warn!(
+            "rocket_chain: ROCKET_BATCH_SUBMIT is on but a {group}-task group needs \
+             {words_per_task} words per task ({} total) in a {cap_words}-word regcmd BO, \
+             so that group runs down the gapped per-task path.",
+            words_per_task.saturating_mul(group)
+        );
+    });
+}
+
+/// Whether a group of `g` already-generated programs may go down the contiguous chained
+/// layout: chaining has to be requested, every program must have the same word count (the
+/// PC's per-task advance and the trailer's encoded successor length are both derived from
+/// it), and the whole contiguous run must fit `cap_words` words of regcmd BO.
+///
+/// `counts` is one word count per program. Anything that does not qualify falls back to
+/// the gapped per-task layout for that group alone, with one loud diagnostic — the gapped
+/// layout is always correct, it just costs one IRQ per task.
+///
+/// The emitters' op count depends on the tile geometry, not on the data, so a uniform
+/// group is the normal case; only a caller mixing shapes in one job can break it.
+pub fn group_chained(
+    want: bool,
+    g: usize,
+    counts: impl Iterator<Item = u32>,
+    cap_words: usize,
+) -> bool {
+    if !want || g == 0 {
+        return false;
+    }
+    let mut counts = counts;
+    let Some(first) = counts.next() else {
+        return false;
+    };
+    if let Some(other) = counts.find(|c| *c != first) {
+        warn_heterogeneous(g, first, other);
+        return false;
+    }
+    if words(first) * g > cap_words {
+        warn_overflow(g, words(first), cap_words);
+        return false;
+    }
+    true
 }
 
 /// Index of the trailer's `PC_REGISTER_AMOUNTS` op and its encoded amount. Scans from the
@@ -447,7 +510,7 @@ pub fn verify(dst: &[u64], base_addr: u32, tasks: &[DrmRocketTask], stride: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::regcmd::desc::{OP_40, OP_ENABLE, PC};
+    use crate::regcmd::desc::{BATCH, OP_40, OP_ENABLE, PC, RC_STRIDE};
     use crate::regcmd::fp16::{MatmulParams, emit};
 
     /// An arbitrary low IOVA for a synthetic regcmd buffer.
@@ -808,6 +871,37 @@ mod tests {
             tasks[1].regcmd_count, 0,
             "a failed pack fills no descriptor"
         );
+    }
+
+    #[test]
+    fn a_uniform_group_chains_and_a_ragged_one_falls_back() {
+        const CAP: usize = BATCH * RC_STRIDE;
+        let uniform = [126u32, 126, 126];
+        assert!(group_chained(true, 3, uniform.iter().copied(), CAP));
+        assert!(
+            !group_chained(false, 3, uniform.iter().copied(), CAP),
+            "chaining is opt-in"
+        );
+
+        // One program of a different length: the PC advance would not describe the run.
+        let ragged = [126u32, 128, 126];
+        assert!(!group_chained(true, 3, ragged.iter().copied(), CAP));
+        assert!(!group_chained(true, 0, std::iter::empty(), CAP));
+
+        // Uniform but the contiguous run does not fit the BO.
+        let words_each = RC_STRIDE as u32;
+        assert!(!group_chained(
+            true,
+            BATCH,
+            std::iter::repeat_n(words_each, BATCH),
+            BATCH * (RC_STRIDE - 2)
+        ));
+        assert!(group_chained(
+            true,
+            BATCH,
+            std::iter::repeat_n(words_each, BATCH),
+            CAP
+        ));
     }
 
     #[test]

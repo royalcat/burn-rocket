@@ -33,11 +33,15 @@
 //!   counters and the post-init `fence::set_busy_poll_us`, sysfs core enumeration,
 //!   big-core detection and worker pinning;
 //! - the contiguous self-chaining regcmd layout (`matmul::chain`, the port of
-//!   `rocket_chain.c`) as host-testable slice helpers: `enabled`, `words`,
-//!   `amount_encode`, `pack`, `pack_at`, `verify`;
-//! - fp16: one-shot, one-shot multi-fd (`_mt`) and fp32-output (`_f32out`),
-//!   streaming, resident and segmented-resident matmul, canonical and legacy tiling,
-//!   KACC and CPU-accumulation, per-shape scratch cache;
+//!   `rocket_chain.c`), wired into the fp16 CPU-accumulation path and the batched matmul
+//!   behind `ROCKET_BATCH_SUBMIT`: `enabled`, `words`, `amount_encode`, `pack`,
+//!   `pack_at`, `verify`, `group_chained`;
+//! - fp16: one-shot, one-shot multi-fd (`_mt`) and fp32-output (`_f32out`), streaming,
+//!   resident and segmented-resident matmul, canonical and legacy tiling, KACC and
+//!   CPU-accumulation, per-shape scratch cache;
+//! - fp16 batching: [`matmul::MmBatch`] (the persistent `rocket_mm_batch_*` context,
+//!   pack-once/resident BOs) and the one-shot [`matmul::batch()`]
+//!   (`rocket_matmul_fp16_batch`);
 //! - int8: resident **group-wise** W8A8 only ([`matmul::I8Context`]);
 //! - bf16: the native streaming path ([`matmul::Bf16Stream`]) plus the one-shot
 //!   `_bf16`/`_mt` wrappers over it;
@@ -51,21 +55,22 @@
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):
 //!
-//! - fp16 `_batch`/`rocket_mm_batch_*` and the public `rocket_stream_*` aliases (use
-//!   [`matmul::Context`] for the resident and streaming forms);
+//! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
+//!   streaming forms);
 //! - dense/per-channel int8 (`rocket_matmul_int8*` without `_gw`), one-shot
 //!   `rocket_matmul_int8_groupwise`, and the int8 planner's dense variant;
 //! - all int4, int16 and tf32 entries (one-shot, resident, group-wise, plans);
 //! - a resident bf16 weight (the C library has none either);
 //! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
 //!   transposed-output variants, and the RK3576-specific entries;
-//! - the matmul batch wrappers (`rocket_matmul_fp16_batch`, `rocket_mm_batch_*`) and
-//!   the Context/attention paths that would *use* the chained layout — `matmul::chain`
-//!   provides the layout and the submit seam it needs, but no engine batches yet, so
-//!   `ROCKET_BATCH_SUBMIT` currently changes nothing;
+//! - the non-fp16 batch wrappers (`rocket_mm_batch_*` for int8/int4);
+//! - chaining outside the fp16 CPU-accumulation and batched paths: the KACC submit loop
+//!   (one group per K-tile from its own loop — the C library chains it, this port leaves
+//!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
 //! - the long-context tiled attention path (`ROCKET_FA_TILE_KV`), on-NPU softmax,
-//!   and chained per-head attention batching;
+//!   and chained per-head attention batching (M1d: flash attention still submits one
+//!   task per matmul, so `ROCKET_BATCH_SUBMIT` changes nothing for attention);
 //! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
 //!   reduce, resize/upsample, encoder, SAM/SigLIP and graph execution.
 //!

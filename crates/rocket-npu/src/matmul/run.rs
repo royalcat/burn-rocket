@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use half::f16;
 
-use crate::device::uapi::DrmRocketTask;
+use crate::device::uapi::{DRM_ROCKET_JOB_BATCHED, DrmRocketTask};
 use crate::device::{Bo, Handle, MemRef};
 use crate::error::{Error, Result};
 use crate::knobs;
@@ -150,93 +150,134 @@ pub(crate) fn submit(
     tasks: &[DrmRocketTask],
     in_handles: &[Handle],
     out_handles: &[Handle],
+    flags: u32,
 ) -> Result<()> {
-    dev.submit(tasks, in_handles, out_handles, 0)
+    dev.submit(tasks, in_handles, out_handles, flags)
 }
 
 /// CPU fp32 accumulation over every K-tile (the byte-exact reference path).
+///
+/// Tiles are submitted in groups of up to [`BATCH`], one submit + one fence wait per
+/// group. With `ROCKET_BATCH_SUBMIT=1` (see the crate-internal `matmul::chain`) a group
+/// whose programs all
+/// have the same word count is laid out contiguously and self-chained, so the group also
+/// costs one completion IRQ; otherwise — and always when chaining is off, which is the
+/// default — it keeps the gapped per-task layout byte-for-byte.
 pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Result<()> {
     bos.ensure_out()?;
     let mut prof = Prof::new();
     let mut acc = vec![0.0f32; plan.m * plan.n];
     let total = plan.jobs();
-    let mut done = 0usize;
-    let mut nb = 0usize;
-    let mut tasks: Vec<DrmRocketTask> = Vec::with_capacity(BATCH);
+    let chain_want = super::chain::enabled();
+    // The group's programs are buffered until the layout is decided: a chained task's
+    // trailer encodes its SUCCESSOR's length, so the last task cannot be written before
+    // its successors are known. `spans` holds each program's (offset, word count).
+    let mut group: Vec<u64> = Vec::new();
+    let mut spans: Vec<(usize, u32)> = Vec::with_capacity(BATCH);
     let mut meta: Vec<(usize, usize)> = Vec::with_capacity(BATCH);
+    let mut tasks: Vec<DrmRocketTask> = Vec::with_capacity(BATCH);
     let mut ops = Vec::with_capacity(160);
+    let mut done = 0usize;
 
-    for mi in 0..plan.nmt {
-        for ni in 0..plan.nnt {
-            for ki in 0..plan.nkt {
-                if nb == 0 {
-                    bos.regcmd.prep(0)?;
-                }
-                prof.mark(b'g');
-                let out_off = nb * plan.out_slot;
-                let output_dma = (bos.out().dma_address() + (out_off * 2) as u64) as u32;
-                let input =
-                    bos.in_all.dma_address() + ((mi * plan.nkt + ki) * plan.in_slot * 2) as u64;
-                let weights = wt.dma + ((ni * plan.nkt + ki) * plan.wt_slot * 2) as u64;
-                let mut p = MatmulParams::new(
-                    plan.m_tile(mi) as u32,
-                    plan.k_tile(ki) as u32,
-                    plan.n_tile(ni) as u32,
-                    input as u32,
-                    weights as u32,
-                    output_dma,
-                );
-                p.fp32_to_fp16 = true;
-                ops.clear();
-                let count = emit(&p, &mut ops)?;
-                let regcmd = write_regcmd(&mut bos.regcmd, nb, &ops)?;
-                tasks.push(DrmRocketTask {
-                    regcmd,
-                    regcmd_count: count as u32,
-                });
-                meta.push((mi, ni));
-                let _ = out_off;
-                nb += 1;
-                done += 1;
+    while done < total {
+        let g = (total - done).min(BATCH);
 
-                if nb == BATCH || done == total {
-                    bos.regcmd.fini()?;
-                    prof.mark(b's');
-                    bos.out_mut().prep(0)?;
-                    bos.out_mut().fini()?;
-                    prof.mark(b's');
-                    let in_handles = [bos.in_all.handle(), wt.handle, bos.regcmd.handle()];
-                    let out_handles = [bos.out().handle()];
-                    let dev = bos.dev.clone();
-                    submit(&dev, &tasks, &in_handles, &out_handles)?;
-                    prof.mark(b'u');
-                    bos.out_mut().prep(wait_ns())?;
-                    prof.mark(b'w');
+        // 1) Generate the group's programs, ki innermost.
+        prof.mark(b'g');
+        group.clear();
+        spans.clear();
+        meta.clear();
+        for j in done..done + g {
+            let (mi, ni, ki) = plan.tile_of(j);
+            let out_off = (j - done) * plan.out_slot;
+            let output_dma = (bos.out().dma_address() + (out_off * 2) as u64) as u32;
+            let input = bos.in_all.dma_address() + ((mi * plan.nkt + ki) * plan.in_slot * 2) as u64;
+            let weights = wt.dma + ((ni * plan.nkt + ki) * plan.wt_slot * 2) as u64;
+            let mut p = MatmulParams::new(
+                plan.m_tile(mi) as u32,
+                plan.k_tile(ki) as u32,
+                plan.n_tile(ni) as u32,
+                input as u32,
+                weights as u32,
+                output_dma,
+            );
+            p.fp32_to_fp16 = true;
+            ops.clear();
+            let count = emit(&p, &mut ops)?;
+            if count > RC_STRIDE {
+                log_error!("regcmd slot overflow: {count} > {RC_STRIDE}");
+                return Err(Error::tiling("regcmd"));
+            }
+            spans.push((group.len(), count as u32));
+            group.extend(ops.iter().map(|op| op.0));
+            meta.push((mi, ni));
+        }
+        prof.mark(b'g');
 
-                    let bytes = bos.out().as_slice();
-                    let words = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr().cast::<f16>(), bytes.len() / 2)
-                    };
-                    for (j, &(mi, ni)) in meta.iter().enumerate() {
-                        let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
-                        layout::detile_accum(
-                            &mut acc,
-                            plan.n,
-                            slot,
-                            mi * plan.mt,
-                            ni * plan.nt,
-                            plan.m_tile(mi),
-                            plan.n_tile(ni),
-                        );
-                    }
-                    bos.out_mut().fini()?;
-                    prof.mark(b'r');
-                    nb = 0;
-                    tasks.clear();
-                    meta.clear();
-                }
+        // 2) Lay the group down: contiguous + self-chained when it fits that contract,
+        //    gapped per-task otherwise.
+        let chained = super::chain::group_chained(
+            chain_want,
+            g,
+            spans.iter().map(|s| s.1),
+            BATCH * RC_STRIDE,
+        );
+        bos.regcmd.prep(0)?;
+        let base = bos.regcmd.dma_address() as u32;
+        tasks.clear();
+        tasks.resize(g, DrmRocketTask::default());
+        {
+            let dst = super::bos::u64_words(&mut bos.regcmd);
+            for (i, &(off, count)) in spans.iter().enumerate() {
+                super::chain::pack(
+                    chained,
+                    dst,
+                    base,
+                    &mut tasks,
+                    i,
+                    &group[off..off + count as usize],
+                    count,
+                    RC_STRIDE,
+                )?;
+            }
+            if chained {
+                super::chain::verify(dst, base, &tasks, super::chain::words(spans[0].1))?;
             }
         }
+        bos.regcmd.fini()?;
+        prof.mark(b's');
+        bos.out_mut().prep(0)?;
+        bos.out_mut().fini()?;
+        prof.mark(b's');
+        let in_handles = [bos.in_all.handle(), wt.handle, bos.regcmd.handle()];
+        let out_handles = [bos.out().handle()];
+        // A chained group must be submitted with the batched flag, or the kernel runs the
+        // self-linked layout down the per-task path and stalls.
+        let flags = if chained { DRM_ROCKET_JOB_BATCHED } else { 0 };
+        let dev = bos.dev.clone();
+        submit(&dev, &tasks, &in_handles, &out_handles, flags)?;
+        prof.mark(b'u');
+        bos.out_mut().prep(wait_ns())?;
+        prof.mark(b'w');
+
+        let bytes = bos.out().as_slice();
+        let words =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f16>(), bytes.len() / 2) };
+        for (j, &(mi, ni)) in meta.iter().enumerate() {
+            let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
+            layout::detile_accum(
+                &mut acc,
+                plan.n,
+                slot,
+                mi * plan.mt,
+                ni * plan.nt,
+                plan.m_tile(mi),
+                plan.n_tile(ni),
+            );
+        }
+        bos.out_mut().fini()?;
+        prof.mark(b'r');
+        done += g;
     }
 
     let out = &mut c[..plan.m * plan.n];
@@ -382,7 +423,10 @@ pub fn compute_kacc(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Re
                 bos.pong.as_ref().unwrap().handle()
             }];
             let dev = bos.dev.clone();
-            submit(&dev, &tasks, &in_handles, &out_handles)?;
+            // KACC keeps the stock gapped per-task layout: it generates its groups one
+            // K-tile at a time from its own loop, which this pass did not convert (the C
+            // library does chain it).
+            submit(&dev, &tasks, &in_handles, &out_handles, 0)?;
             prof.mark(b'u');
             {
                 let dst = if dst_is_ping {

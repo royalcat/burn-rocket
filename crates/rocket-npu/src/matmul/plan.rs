@@ -152,6 +152,21 @@ impl Plan {
     pub fn k_tile(&self, ki: usize) -> usize {
         (self.k - ki * self.kt).min(self.kt)
     }
+
+    /// Decode a global job index into `(mi, ni, ki)` in the submission order: `mi`
+    /// outermost, then `ni`, then `ki` innermost.
+    ///
+    /// `ki` innermost is load-bearing, not cosmetic: the CPU-accumulation paths add one
+    /// output tile's K-partials in ascending `ki`, so this order is what keeps the fp32
+    /// sum identical across the one-shot, batched and resident forms.
+    pub fn tile_of(&self, job: usize) -> (usize, usize, usize) {
+        let job = job % self.jobs();
+        (
+            job / (self.nnt * self.nkt),
+            (job / self.nkt) % self.nnt,
+            job % self.nkt,
+        )
+    }
 }
 
 fn rup(x: usize, a: usize) -> usize {
@@ -359,5 +374,27 @@ mod tests {
         assert_eq!(full.kt, small.kt);
         assert_eq!(full.nt, small.nt);
         assert_eq!(small.mt, 4);
+    }
+
+    #[test]
+    fn tile_of_walks_mi_ni_ki_with_ki_innermost() {
+        for (m, k, n) in [(4, 64, 16), (264, 1024, 512), (512, 2560, 4096)] {
+            let p = Plan::new(m, k, n).unwrap();
+            let mut want = Vec::with_capacity(p.jobs());
+            for mi in 0..p.nmt {
+                for ni in 0..p.nnt {
+                    for ki in 0..p.nkt {
+                        want.push((mi, ni, ki));
+                    }
+                }
+            }
+            let got: Vec<_> = (0..p.jobs()).map(|j| p.tile_of(j)).collect();
+            assert_eq!(got, want, "M={m} K={k} N={n}");
+        }
+        let p = Plan::new(264, 1024, 512).unwrap();
+        assert!(
+            p.nmt > 1 && p.nnt > 1 && p.nkt > 1,
+            "the decode test must not be vacuous: {p:?}"
+        );
     }
 }

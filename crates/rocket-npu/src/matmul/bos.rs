@@ -200,7 +200,7 @@ impl Bos {
     }
 }
 
-fn f16_words(bo: &mut Bo) -> &mut [f16] {
+pub(crate) fn f16_words(bo: &mut Bo) -> &mut [f16] {
     let bytes = bo.as_mut_slice();
     assert_eq!(bytes.len() % 2, 0);
     // SAFETY: `f16` is a 2-byte plain-old-data type, the BO mapping is page-aligned,
@@ -208,11 +208,19 @@ fn f16_words(bo: &mut Bo) -> &mut [f16] {
     unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f16>(), bytes.len() / 2) }
 }
 
-fn f16_words_ref(bo: &Bo) -> &[f16] {
+pub(crate) fn f16_words_ref(bo: &Bo) -> &[f16] {
     let bytes = bo.as_slice();
     assert_eq!(bytes.len() % 2, 0);
     // SAFETY: see f16_words.
     unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f16>(), bytes.len() / 2) }
+}
+
+/// The BO as `u64` words, the form a register program is laid out in.
+pub(crate) fn u64_words(bo: &mut Bo) -> &mut [u64] {
+    let bytes = bo.as_mut_slice();
+    assert_eq!(bytes.len() % 8, 0);
+    // SAFETY: a BO mapping is page-aligned and the regcmd BO is a multiple of 8 bytes.
+    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u64>(), bytes.len() / 8) }
 }
 
 pub fn zero_bo(bo: &mut Bo) -> Result<()> {
@@ -265,31 +273,36 @@ pub fn load_input_into(bo: &mut Bo, plan: &Plan, packed: &[f16]) -> Result<()> {
     bo.fini()
 }
 
+/// Scatter a whole `B[N,K]` into the weight slots of `dst`. Padding lanes must already
+/// be zero: only the live tile lanes are written.
+pub fn scatter_weights(plan: &Plan, dst: &mut [f16], b: &[f16]) {
+    assert_eq!(b.len(), plan.n * plan.k);
+    assert!(dst.len() >= plan.nnt * plan.nkt * plan.wt_slot);
+    for ni in 0..plan.nnt {
+        let n0 = ni * plan.nt;
+        let ntile = plan.n_tile(ni);
+        for ki in 0..plan.nkt {
+            let k0 = ki * plan.kt;
+            let ktile = plan.k_tile(ki);
+            let off = (ni * plan.nkt + ki) * plan.wt_slot;
+            layout::wt_scatter_tile(
+                &mut dst[off..off + plan.wt_slot],
+                b,
+                plan.k,
+                n0,
+                k0,
+                ntile,
+                ktile,
+            );
+        }
+    }
+}
+
 /// Scatter a whole `B[N,K]` into `bo`'s weight slots. Padding lanes must be zero.
 pub fn pack_weights_into(bo: &mut Bo, plan: &Plan, b: &[f16]) -> Result<()> {
     assert_eq!(b.len(), plan.n * plan.k);
     bo.prep(0)?;
-    {
-        let words = f16_words(bo);
-        for ni in 0..plan.nnt {
-            let n0 = ni * plan.nt;
-            let ntile = plan.n_tile(ni);
-            for ki in 0..plan.nkt {
-                let k0 = ki * plan.kt;
-                let ktile = plan.k_tile(ki);
-                let off = (ni * plan.nkt + ki) * plan.wt_slot;
-                layout::wt_scatter_tile(
-                    &mut words[off..off + plan.wt_slot],
-                    b,
-                    plan.k,
-                    n0,
-                    k0,
-                    ntile,
-                    ktile,
-                );
-            }
-        }
-    }
+    scatter_weights(plan, f16_words(bo), b);
     bo.fini()
 }
 
