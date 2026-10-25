@@ -76,6 +76,52 @@ structs, moved the safetensors load-report checks into `util/store.rs`, and made
 workspace is `cargo fmt --all --check` clean. All builds below are warning-free and
 `cargo clippy -p rocket-inference --no-default-features` is clean.
 
+## C-library parity port (2026-10-25)
+
+`main` contains the C-library parity port (fast-forward from the `npu-parity` branch):
+the RK3588 surface of `librocketnpu` is implemented in `crates/rocket-npu` with the
+same planners, register programs and numerics. The per-milestone write-up is in
+"Port status" below (M0-M10); the app measurements are in
+`examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
+`crates/rocket-npu/src/lib.rs` ("Surface covered and deliberately missing") and
+`README.md` ("Missing surface") rather than re-deriving the surface.
+
+- **Reference + gate**: the C source is pinned at commit `b43a9ae`; the read-only copy
+  used for the port was `/tmp/opencode/ref-rocket-userspace` (ephemeral). Re-sync it
+  and build the host oracle with `tools/c-oracle/README.md` (the oracle needs a host
+  build of `librocketnpu`; `tools/c-oracle/build.sh <src> <host-build> [out]`).
+  `python3 tools/c-oracle/parity.py` must print `RESULT: PASS`: byte-identical plans
+  and programs for the six matmul dtypes, the PPU pool, conv (direct/depthwise/act)
+  and int8 conv. The board selftests are `selftest`, `attn_selftest`, `int8_selftest`,
+  `int4_selftest`, `int16_selftest`, `bf16_selftest`, `tf32_selftest`,
+  `activation_selftest`, `reduce_selftest`, `ops_selftest`, `conv_selftest`,
+  `encoders_selftest`, `q8_bench`, `causal_attn_bench` and `rope_bench`; the C A/B
+  driver is `tools/c-oracle/ab_compare.py` (its `ab_board` must be built natively on
+  the board — a cross-built C binary cannot open the device).
+- **App-visible changes**: defaults and flags are unchanged. The NPU build gained the
+  chained per-head attention (`ROCKET_FA_CHAIN`, default on), the tiled long-context
+  path (`ROCKET_FA_TILE_KV`, opt-in), the on-NPU softmax switch
+  (`ROCKET_ATTN_HOST_SOFTMAX=0`, global — do not leak it into a deployment env; the
+  host fast pass is the default) and the query-chunked causal path
+  (`ROCKET_CAUSAL_CHUNK`, default 1024). qwen3 `--npu` now uses the fused RoPE in the
+  `qkv_fused` branch (bit-identical, 64.8 -> 58.8 s at 2777 tokens). The Q8_0-native
+  int8 projection route and NPU RoPE were measured and rejected (log §20/§21); do not
+  re-open them without reading those numbers.
+- **Redeploy**: the live image `94f99bd` predates S1/S2, ffmpeg and this port. A
+  rebuild from `main` picks them up with no flag change; the emb2 service also gains
+  the M1d FA chaining (its sliding layers were 1.08x) and the qwen3 fused-RoPE fix
+  applies only to qwen3.
+- **Board caution**: DRM BOs are not charged to a process memory cgroup, so
+  `systemd-run -p MemoryMax=...` does not contain NPU work; a large dense attention
+  allocation can push the box into global OOM (during the P2a probes `deposit` was
+  killed twice and auto-restarted). Run long-context gates only with >=5 GB free; a
+  30k-token f32 qwen3 forward peaks at ~4.08 GiB anon and did not complete on the busy
+  board even though every op fits.
+- **Still out** (deliberate; see `lib.rs`): RK3576 entries and the RK3576 graph
+  runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants,
+  non-fp16 batch wrappers, tiled MLA, the fused-FFN cube-residency mechanism,
+  `ROCKET_CONV_BATCH`, and resident bf16 (the C library has none).
+
 ## Status (2026-10-06, extended 2026-10-07/08)
 
 - **Library**: `burn-rocket` exposes the NPU as a Burn backend extension
@@ -1343,6 +1389,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   verified there. It is not the deployed service build.
 - The board was later reported busy with another workload: re-run an A/B only on an idle
   board.
+- **2026-10-25 parity port**: for the redeploy, the app-visible knob changes and the
+  DRM-BO/cgroup caution, see "C-library parity port" above. The deployed service's
+  flags need no change.
 
 ## NPU offload (`--npu`, aarch64)
 
