@@ -114,6 +114,39 @@ pub fn detile_accum(
     }
 }
 
+/// Accumulate one **fp32** output-cube tile into the f64 accumulator.
+///
+/// The fp32 accumulator cube is C2=4 (16 B per 4-channel group), so the de-tile is
+/// the `out_idx_i16` index the int32/bf16/tf32 paths read; the fp16-output
+/// [`detile_accum`] above is the C2=8 sibling.
+pub fn detile_accum_f32(
+    acc: &mut [f64],
+    n: usize,
+    slot: &[f32],
+    m0: usize,
+    n0: usize,
+    mtile: usize,
+    ntile: usize,
+) {
+    let h = mtile;
+    for row in 0..mtile {
+        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
+        let mut col = 0;
+        while col + 4 <= ntile {
+            let g = col / 4;
+            let src = &slot[g * h * 4 + 4 * row..][..4];
+            for (j, v) in src.iter().enumerate() {
+                d[col + j] += *v as f64;
+            }
+            col += 4;
+        }
+        while col < ntile {
+            d[col] += slot[out_idx_i16(h, col + 1, row + 1)] as f64;
+            col += 1;
+        }
+    }
+}
+
 /// Copy one output-cube tile into the caller's row-major fp16 output.
 pub fn detile_store(
     c: &mut [f16],
@@ -219,6 +252,36 @@ mod tests {
                 assert_eq!(slot[wt_idx(32, kk + 1, cc + 1)], b[(16 + kk) * k + 32 + cc]);
             }
         }
+    }
+
+    #[test]
+    fn f32_cube_detiles_at_the_c2_4_index() {
+        // A ragged (mtile % 4, ntile % 4) fp32 cube placed at a non-zero origin: the
+        // f32 output cube is C2=4, so the element at (row, col) sits at
+        // out_idx_i16(mtile, col + 1, row + 1), not at the fp16 C2=8 index.
+        let (mt, nt): (usize, usize) = (5, 6);
+        let (alloc_m, alloc_n) = (mt.div_ceil(4) * 4, nt.div_ceil(4) * 4);
+        let slot: Vec<f32> = (0..alloc_m * alloc_n).map(|i| i as f32 * 0.5).collect();
+        let (n, m0, n0) = (20, 4, 4);
+        let mut acc = vec![0.0f64; (m0 + mt + 1) * n];
+        // A pre-existing partial (a K-tile already accumulated) must be added to.
+        acc[(m0 + 2) * n + n0 + 1] = 7.0;
+        detile_accum_f32(&mut acc, n, &slot, m0, n0, mt, nt);
+        for row in 0..mt {
+            for col in 0..nt {
+                let want = slot[out_idx_i16(mt, col + 1, row + 1)] as f64;
+                let want = if (row, col) == (2, 1) {
+                    want + 7.0
+                } else {
+                    want
+                };
+                assert_eq!(acc[(m0 + row) * n + n0 + col], want, "row={row} col={col}");
+            }
+        }
+        // Outside the tile nothing moved.
+        assert_eq!(acc[0], 0.0);
+        assert_eq!(acc[(m0 + mt) * n + n0], 0.0);
+        assert_eq!(acc[m0 * n + n0 + nt], 0.0);
     }
 }
 
@@ -408,7 +471,8 @@ pub fn wt_scatter_tile_bf16(
     }
 }
 
-/// Accumulate one fp32 output cube into the f64 accumulator.
+/// Accumulate one fp32 output cube into the f64 accumulator (the bf16 stream's name
+/// for the shared C2=4 fp32 de-tile, [`detile_accum_f32`]).
 pub fn detile_accum_bf16(
     acc: &mut [f64],
     n: usize,
@@ -418,23 +482,7 @@ pub fn detile_accum_bf16(
     mtile: usize,
     ntile: usize,
 ) {
-    let h = mtile;
-    for row in 0..mtile {
-        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
-        let mut col = 0;
-        while col + 4 <= ntile {
-            let g = col / 4;
-            let src = &slot[g * h * 4 + 4 * row..][..4];
-            for (j, v) in src.iter().enumerate() {
-                d[col + j] += *v as f64;
-            }
-            col += 4;
-        }
-        while col < ntile {
-            d[col] += slot[out_idx_i16(h, col + 1, row + 1)] as f64;
-            col += 1;
-        }
-    }
+    detile_accum_f32(acc, n, slot, m0, n0, mtile, ntile);
 }
 
 #[cfg(test)]

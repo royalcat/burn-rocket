@@ -6,18 +6,22 @@ use std::time::Instant;
 use half::f16;
 
 use crate::device::uapi::DrmRocketTask;
-use crate::device::{Handle, MemRef};
+use crate::device::{Bo, Handle, MemRef};
 use crate::error::{Error, Result};
 use crate::knobs;
 use crate::log::log_error;
 use crate::regcmd::fp16::{MatmulParams, emit};
 
+use super::bf16::Bf16Stream;
 use super::bos::{Bos, Config};
+use super::context::Weight;
+use super::int8::I8Weight;
 use super::layout;
 use super::plan::Plan;
 use crate::regcmd::desc::{BATCH, RC_STRIDE};
 
-struct Prof {
+/// Phase timers for one compute path, gated by `ROCKET_MM_PROFILE`.
+pub(crate) struct Prof {
     on: bool,
     gen_ms: f64,
     sync: f64,
@@ -28,7 +32,7 @@ struct Prof {
 }
 
 impl Prof {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             on: knobs::present("ROCKET_MM_PROFILE"),
             gen_ms: 0.0,
@@ -39,7 +43,7 @@ impl Prof {
             t: Instant::now(),
         }
     }
-    fn mark(&mut self, bucket: u8) {
+    pub(crate) fn mark(&mut self, bucket: u8) {
         if !self.on {
             return;
         }
@@ -54,7 +58,7 @@ impl Prof {
             _ => {}
         }
     }
-    fn dump(&self, plan: &Plan) {
+    pub(crate) fn dump(&self, plan: &Plan) {
         if !self.on {
             return;
         }
@@ -122,31 +126,32 @@ pub fn one_shot(
     Ok(())
 }
 
-fn write_regcmd(bos: &mut Bos, slot: usize, ops: &[crate::regcmd::desc::NpuOp]) -> Result<u32> {
+pub(crate) fn write_regcmd(
+    regcmd: &mut Bo,
+    slot: usize,
+    ops: &[crate::regcmd::desc::NpuOp],
+) -> Result<u32> {
     if ops.len() > RC_STRIDE {
         log_error!("regcmd slot overflow: {} > {RC_STRIDE}", ops.len());
         return Err(Error::tiling("regcmd"));
     }
     let base = slot * RC_STRIDE * 8;
     {
-        let bytes = bos.regcmd.as_mut_slice();
+        let bytes = regcmd.as_mut_slice();
         for (i, op) in ops.iter().enumerate() {
             bytes[base + i * 8..base + i * 8 + 8].copy_from_slice(&op.0.to_ne_bytes());
         }
     }
-    Ok((bos.regcmd.dma_address() + base as u64) as u32)
+    Ok((regcmd.dma_address() + base as u64) as u32)
 }
 
-fn submit(
+pub(crate) fn submit(
     dev: &crate::Device,
-    bos: &mut Bos,
     tasks: &[DrmRocketTask],
     in_handles: &[Handle],
     out_handles: &[Handle],
 ) -> Result<()> {
-    dev.submit(tasks, in_handles, out_handles, 0)?;
-    let _ = bos;
-    Ok(())
+    dev.submit(tasks, in_handles, out_handles, 0)
 }
 
 /// CPU fp32 accumulation over every K-tile (the byte-exact reference path).
@@ -184,7 +189,7 @@ pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Res
                 p.fp32_to_fp16 = true;
                 ops.clear();
                 let count = emit(&p, &mut ops)?;
-                let regcmd = write_regcmd(bos, nb, &ops)?;
+                let regcmd = write_regcmd(&mut bos.regcmd, nb, &ops)?;
                 tasks.push(DrmRocketTask {
                     regcmd,
                     regcmd_count: count as u32,
@@ -203,7 +208,7 @@ pub fn compute_cpu(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Res
                     let in_handles = [bos.in_all.handle(), wt.handle, bos.regcmd.handle()];
                     let out_handles = [bos.out().handle()];
                     let dev = bos.dev.clone();
-                    submit(&dev, bos, &tasks, &in_handles, &out_handles)?;
+                    submit(&dev, &tasks, &in_handles, &out_handles)?;
                     prof.mark(b'u');
                     bos.out_mut().prep(wait_ns())?;
                     prof.mark(b'w');
@@ -328,7 +333,7 @@ pub fn compute_kacc(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Re
                 p.data_reuse = dr;
                 ops.clear();
                 let count = emit(&p, &mut ops)?;
-                let regcmd = write_regcmd(bos, gi, &ops)?;
+                let regcmd = write_regcmd(&mut bos.regcmd, gi, &ops)?;
                 tasks.push(DrmRocketTask {
                     regcmd,
                     regcmd_count: count as u32,
@@ -377,7 +382,7 @@ pub fn compute_kacc(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Re
                 bos.pong.as_ref().unwrap().handle()
             }];
             let dev = bos.dev.clone();
-            submit(&dev, bos, &tasks, &in_handles, &out_handles)?;
+            submit(&dev, &tasks, &in_handles, &out_handles)?;
             prof.mark(b'u');
             {
                 let dst = if dst_is_ping {
@@ -421,4 +426,165 @@ pub fn compute_kacc(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Re
     }
     prof.dump(plan);
     Ok(())
+}
+
+// ── the remaining one-shot entry points of the C library ────────────────────────
+
+/// `rocket_matmul_fp16_mt`: N split across `nthreads` worker fds, each running the
+/// tiled matmul on its column slice (one scheduling entity per fd is what lets the
+/// driver spread the job over the NPU cores).
+///
+/// Opens and drops its own context, like the C per-call `_mt` wrapper; `nthreads` is
+/// clamped to 1..=8 by [`Context::new`]. `M == 1` is padded to 4 rows (the C `_mt`
+/// delegates to `rocket_matmul_fp16`, whose height-1 shim does the same); other
+/// ragged `M` are rejected by the planner, as in C.
+pub fn one_shot_mt(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f16],
+    b: &[f16],
+    c: &mut [f16],
+    nthreads: usize,
+) -> Result<()> {
+    // C `rocket_matmul_fp16_mt`: split the output columns N into >=16-aligned slices,
+    // give each worker its own fd, and run the unchanged single-fd path on its slice.
+    // This is the stateless per-call fan-out; `Context` is the resident/streaming form.
+    let threads = nthreads.clamp(1, 8);
+    if m == 1 {
+        if c.len() < n {
+            return Err(Error::shape("fp16_mt/output"));
+        }
+        let (mp, ap) = pad_m(m, k, a);
+        let mut cp = vec![f16::ZERO; mp * n];
+        one_shot_mt(mp, k, n, &ap, b, &mut cp, threads)?;
+        c[..n].copy_from_slice(&cp[..n]);
+        return Ok(());
+    }
+    if a.len() < m * k || b.len() < n * k || c.len() < m * n {
+        return Err(Error::shape("fp16_mt/buffers"));
+    }
+    let step = (n.div_ceil(threads).div_ceil(16) * 16).max(16);
+    let slices: Vec<(usize, usize)> = (0..threads)
+        .map(|t| (t * step, ((t + 1) * step).min(n)))
+        .filter(|(n0, n1)| n0 < n1)
+        .collect();
+    let base = crate::device::affinity::base();
+    let results: Vec<Result<(usize, Vec<f16>)>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(slices.len());
+        for (i, &(n0, n1)) in slices.iter().enumerate() {
+            handles.push(scope.spawn(move || -> Result<(usize, Vec<f16>)> {
+                crate::device::affinity::pin_current(i, base);
+                let dev = crate::Device::open()?;
+                let nsub = n1 - n0;
+                let mut sub = vec![f16::ZERO; m * nsub];
+                one_shot(&dev, m, k, nsub, a, &b[n0 * k..n1 * k], &mut sub)?;
+                Ok((n0, sub))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(Error::device("fp16_mt/worker", 0)))
+            })
+            .collect()
+    });
+    for r in results {
+        let (n0, sub) = r?;
+        let nsub = sub.len() / m;
+        for row in 0..m {
+            c[row * n + n0..][..nsub].copy_from_slice(&sub[row * nsub..][..nsub]);
+        }
+    }
+    Ok(())
+}
+
+/// `rocket_matmul_bf16`: single-fd one-shot bf16 (f32 A/B, truncated to bf16 on the
+/// scatter; f32 output).
+///
+/// A thin wrapper over the streaming engine, which is the only bf16 engine (the C
+/// library documents the two as the same product). The shape contract is therefore
+/// the stream's: `M % 4 == 0`, `K % 32 == 0`, `N % 16 == 0` — pad ragged row counts
+/// with [`pad_m`] (the C one-shot pads `M == 1` itself; the resident stream does not).
+pub fn one_shot_bf16(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+) -> Result<()> {
+    let mut s = Bf16Stream::new(1)?;
+    s.matmul(m, k, n, a, b, c)
+}
+
+/// `rocket_matmul_bf16_mt`: the bf16 one-shot with N spread over `nthreads` worker
+/// fds (`nthreads` clamped to 1..=8). Same shape contract as [`one_shot_bf16`].
+pub fn one_shot_bf16_mt(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    nthreads: usize,
+) -> Result<()> {
+    Bf16Stream::matmul_mt(m, k, n, a, b, c, nthreads)
+}
+
+/// `rocket_weights_bytes`: resident NPU-BO footprint of a packed fp16 weight (the
+/// per-worker weight tiles; the shared scratch is cached across weights and not
+/// counted).
+pub fn weights_bytes(w: &Weight) -> usize {
+    w.bytes()
+}
+
+/// `rocket_i8_weights_bytes`: the int8 sibling of [`weights_bytes`].
+pub fn i8_weights_bytes(w: &I8Weight) -> usize {
+    w.bytes()
+}
+
+/// The documented `rocket_pad_m` contract: zero-pad `A[M,K]` to a multiple of 4 rows.
+///
+/// Returns `(M', A_padded)`. The height-1 GEMV is the case the HW mis-computes, which
+/// is why every one-shot path in the C library pads `M == 1`; the resident int8 path
+/// requires `M % 4` outright and leaves the pad to the caller. Note that the C tree in
+/// this snapshot documents `rocket_pad_m` (API.md) but does not define it, so this is
+/// the documented behaviour rather than a port of an existing body.
+pub fn pad_m(m: usize, k: usize, a: &[f16]) -> (usize, Vec<f16>) {
+    assert_eq!(a.len(), m * k, "pad_m: A is [M,K]");
+    let mp = m.div_ceil(4) * 4;
+    if mp == m {
+        return (m, a.to_vec());
+    }
+    let mut out = vec![f16::ZERO; mp * k];
+    out[..m * k].copy_from_slice(a);
+    (mp, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_m_zero_pads_to_a_multiple_of_four_rows() {
+        let k = 3;
+        let a: Vec<f16> = (0..5 * k).map(|i| f16::from_f32(i as f32)).collect();
+        let (mp, ap) = pad_m(5, k, &a);
+        assert_eq!(mp, 8);
+        assert_eq!(ap.len(), 8 * k);
+        assert_eq!(&ap[..5 * k], &a[..]);
+        assert!(ap[5 * k..].iter().all(|v| *v == f16::ZERO));
+
+        let (m1, one) = pad_m(1, 2, &[f16::ONE, f16::from_f32(2.0)]);
+        assert_eq!(m1, 4);
+        assert_eq!(one.len(), 4 * 2);
+        assert_eq!(&one[..2], &[f16::ONE, f16::from_f32(2.0)]);
+        assert!(one[2..].iter().all(|v| *v == f16::ZERO));
+
+        let (m4, aligned) = pad_m(4, 2, &[f16::ONE; 8]);
+        assert_eq!(m4, 4);
+        assert_eq!(aligned.len(), 8);
+    }
 }

@@ -52,6 +52,11 @@ impl I8Weight {
     pub fn shape(&self) -> (usize, usize, usize, usize) {
         (self.m, self.k, self.n, self.group)
     }
+
+    /// Live bytes of the per-worker resident weight BOs.
+    pub fn bytes(&self) -> usize {
+        self.bos.iter().map(Bo::len).sum()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
