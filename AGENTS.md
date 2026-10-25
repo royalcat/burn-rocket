@@ -320,6 +320,24 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   copies) runs decode on the NPU too: 1.5 tok/s, 1.29 GB anon. The OpenViking planner
   wiring ran live 2026-10-06 → reverted 2026-10-07 (planner back on OpenCode Zen, model
   removed from the board; log §14.4) — the server stays in the example for a re-enable.
+- **Q8_0-native int8 projections — measured and rejected** (P2b, 2026-10-25, log §20):
+  a Q8_0 GGUF's 32-value blocks are layout-identical to the driver's resident W8A8
+  group-wise weight at `group = 32`, so the app could feed `I8Context` with no
+  requantization and a resident weight 1.88x smaller than fp16. The probe
+  (`crates/rocket-npu/src/bin/q8_bench.rs`, both arms timed like `src/ext.rs` with
+  the activation conversion included, one Q8_0-stored weight per shape, f64
+  reference) says it is **1.6-2.2x** slower at 82x1024x1024 and **3.6-7.0x** slower
+  at the 2777-token q|k|v|o / gate|up / down shapes, with 2-11x the CPU — while
+  numerics are fine (0.9999929 vs the dequantized reference at every shape, i.e.
+  block-wise int8 weights cost nothing; the loss is the activation's group
+  quantize). The cause is structural: `matmul_gw` reads back one int32 partial per
+  K-tile and applies the group scales on the host (no NPU-side int8 K-accumulation),
+  so the traffic is `M*N*(K/32)*4` bytes — 128 B per output element at K=1024, 512 B
+  at K=4096, ~5.1 GB per layer at 2777 tokens, readback ≈1.1 GB/s. No app path was
+  added: `--npu` keeps packing Q8_0/bf16/f16 weights to resident fp16 at load and
+  `--quant q8` keeps the CPU dequant path. Even requantizing to 16x wider groups
+  (not Q8_0-native, worse weight fidelity) only ties on K=1024 and wins ~1.35x on
+  the K=4096 down projection alone (log §20).
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
   + Burn's wgpu backend was measured with `examples/rocket-inference/src/bin/wgpu_probe.rs`.
   Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
@@ -966,7 +984,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`) |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1543,7 +1561,15 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   speed gap with production. flex has none; the candidates are the `burn-cpu`
   (CubeCL/LLVM) backend (CPU quantized matmul unverified, cannot cross-compile — would
   need a native build + JIT on the board) or a custom int8 microkernel (upstream
-  contribution). The NPU int8 path (emb2) is done (log §12.2).
+  contribution). The NPU int8 path (emb2) is done (log §12.2), and the
+  Q8_0-native int8 projection route is **measured and rejected** (P2b, log §20:
+  1.6-7x slower at qwen3's shapes because `matmul_gw` reads back one int32 partial
+  per 32-value K-group, ~5 GB per layer at 2777 tokens). The only surviving niche is
+  a *requantized* wide-group int8 route: at group 512 the probe hits 0.74x (1.35x
+  faster) on the K=4096 down projection but only 1.03x on the K=1024 ones, at +25 %
+  CPU, and wider groups cost weight fidelity on real (outlier-bearing) weights — it
+  would need a real-checkpoint numerics gate before anyone wires it, and it is not
+  Q8_0-native.
 - **Vulkan/GPU path is closed** (log §13): measured 3.8-79 GF/s with CubeCL on panvk,
   panvk compiler crashes on CubeCL SPIR-V, and the panthor job watchdog kills the
   dispatches this workload needs. Re-open only with a materially faster CubeCL/panvk
@@ -1888,6 +1914,12 @@ taskset -c 0-3 ./int4_selftest --prepacked-gw 64 264 320 320
 taskset -c 0-3 ./int16_selftest 64 256 128
 taskset -c 0-3 ./tf32_selftest
 taskset -c 0-3 ./tf32_selftest 512 1024 512
+# Q8_0-native projection probe (P2b, log §20): resident f16 vs group-wise int8 at
+# qwen3's shapes, activation quantize included; the int8/f16 ratio is the verdict
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin q8_bench
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/q8_bench root@rock-5b-plus.lan:/root/rocket-p2b/
+taskset -c 0-3 ./q8_bench --reps 3                    # the five qwen3 shapes, group 32
+taskset -c 0-3 ./q8_bench --reps 3 --rows 128 --groups 32,128,512,1024 2777 1024 3072 2777 4096 1024
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
 taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1

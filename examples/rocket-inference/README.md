@@ -302,6 +302,14 @@ conversion: 2026-10-09 board A/B (log §17) 54.4 vs 57.8 tok/s (`--dtype f32`) a
 cosine 0.999845 vs f32 — a 6 % gap, down from 26 % when bf16 used the library's
 stream; `--npu` excludes `--quant q8`.
 
+A Q8_0 checkpoint does not get an int8 projection path: Q8_0's 32-value blocks are
+layout-identical to the driver's resident W8A8 group-wise weight at `group = 32`, but
+the group-wise kernel reads back one int32 partial per K-group on the host, so the
+probe (`crates/rocket-npu/src/bin/q8_bench.rs`, log §20) measures it 1.64x slower at
+82x1024x1024 and 4.0-7.0x slower at the 2777-token q/k/v/o, gate/up and down shapes
+(numerics were fine, 0.9999929) — packing Q8_0 to resident fp16 at load stays the
+route (log §20).
+
 ## Qwen3.5-0.8B intent (`intent`)
 
 `guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder

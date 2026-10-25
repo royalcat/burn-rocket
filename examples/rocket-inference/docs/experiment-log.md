@@ -911,3 +911,105 @@ length. Its scratch does not grow with the key count (§ "M5b" in `AGENTS.md`:
 materialized score matrices alone would need ~14 GiB for two workers). The
 caller's `[n][n]` additive mask remains O(n²), so a *model* run at 30k still
 needs the app-side causal block mask.
+
+## 20. Q8_0-native int8 projections: measured and rejected (P2b, 2026-10-25)
+
+`--quant q8` keeps llama.cpp Q8_0 blocks on the CPU and dequantizes each
+projection per forward, and the driver's resident W8A8 group-wise path
+(`I8Context::pack_weight_gw` / `matmul_gw`) has exactly Q8_0's layout at
+`group = 32` (per-output-channel codes + one f16 scale per 32-value block), so a
+Q8_0 GGUF could feed the NPU with **no requantization** and a resident weight
+1.88x smaller than fp16 (34 vs 64 bytes per 32 values). The question was whether
+that path is also faster; the M2 round had already measured emb2's in-model
+group-32 int8 at 2.4x *slower* than resident fp16 (readback-bound), so it was
+re-measured at qwen3's own projection shapes before any app work.
+
+**Probe** (`crates/rocket-npu/src/bin/q8_bench.rs`, permanent): one synthetic
+`[N, K]` weight per shape, stored the way a Q8_0 GGUF stores it (34-byte blocks,
+scale rounded to f16, codes quantized against the stored scale), fed to both
+arms — the f16 arm packs the *dequantized* blocks, the int8 arm packs the raw
+codes + widened scales, so neither arm carries a requantization error and the
+int8 arm's only extra loss is the activation's own per-32-group int8. Both arms
+are timed the way `src/ext.rs` runs them: f32 activations in, the arm's own input
+conversion included (f32->f16 + the `M % 4` pad copy for f16; the per-row
+per-group f32->i8 quantize for int8), matmul alone, f32 readback out (the int8
+arm needs no output narrow — `matmul_gw` applies the scales on readback). Pack
+`M = 512` (canonical tiling), live `M` padded to `% 4`, reference = f64 product
+with the dequantized weight over the first 256 rows. Board `rock-5b-plus`,
+cores 0-3, 4 threads, 600 MHz module, busy board (load ~10, the live emb2 service
+untouched on 4-7), `--reps 3`:
+
+| M | K | N | f16 wall | f16 CPU | int8 wall | int8 CPU | of which quantize | int8/f16 wall | int8/f16 CPU | int8 cosine | max\|d\| |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 82 | 1024 | 1024 | 9.4 ms | 7.4 ms | 15.4 ms | 14.8 ms | 0.8 ms | 1.64x | 2.0x | 0.99999294 | 8.7e-2 |
+| 512 | 1024 | 1024 | 18.5 ms | 18.9 ms | 62.1 ms | 113.9 ms | 2.0 ms | 3.35x | 6.0x | 0.99999291 | 9.7e-2 |
+| 2777 | 1024 | 1024 | 85.2 ms | 102.2 ms | 341.9 ms | 583.2 ms | 6.7 ms | 4.01x | 5.7x | 0.99999292 | 9.1e-2 |
+| 2777 | 1024 | 3072 | 137.0 ms | 187.9 ms | 964.3 ms | 1798.8 ms | 6.8 ms | **7.04x** | 9.6x | 0.99999292 | 9.5e-2 |
+| 2777 | 4096 | 1024 | 203.8 ms | 237.8 ms | 1228.1 ms | 2550.7 ms | 16.7 ms | **6.02x** | 10.7x | 0.99999290 | 1.8e-1 |
+
+A second window (same binary, load ~9.5) reproduced the picture:
+2.2x / 3.9x / 3.6x / 5.8x / 6.0x with the same cosines — the absolute walls
+scatter with board load, the verdict does not.
+
+Numerics were never the problem: the Q8_0 weight itself is 0.99999293 on the
+exact f32 weight and every shape lands at 0.9999929 against its own dequantized
+reference (gate was 0.9995) — i.e. block-wise int8 weights cost essentially
+nothing; the loss is the activation's group quantize. The f16 arm on the same
+weight is 0.9999999.
+
+**Why it loses** is structural, not a tuning miss: the group-wise path reads back
+one int32 partial per K-tile and applies `a_scale[m,g]*b_scale[n,g]` on the host
+(`int8.rs`: "there is no NPU-side int8 K-accumulation"), so the traffic is
+`M*N*(K/group)*4` bytes — 128 bytes per output element at K=1024 and 512 bytes at
+K=4096, i.e. 0.36 GB for one 1024x1024 projection at 2777 tokens and 1.46 GB for
+the down projection, ~5.1 GB per layer over all seven. Measured readback ≈1.1
+GB/s (342 ms for 364 MB), so the int8 arm is dominated by scalar detile+scale
+host work (CPU 5.7-10.7x the f16 arm at the long shapes). Extrapolating the
+measured per-projection walls to the seven projections of all 28 layers at 2777
+tokens: int8 ≈127 s vs f16 ≈23 s for the same weights.
+
+**Group sweep** (same probe/window, the weight requantized to a wider group —
+no longer Q8_0-native, so not a candidate, but it shows the curve;
+`--groups 32,128,512,1024 --reps 3`):
+
+| group | 2777x1024x3072 | 2777x4096x1024 | stored weight cosine | readback bytes/output |
+|---|---|---|---|---|
+| 32 (Q8_0) | 5.83x | 4.99x | 0.99999292 | 128 / 512 |
+| 128 | 2.29x | 1.76x | 0.99998758 | 32 / 128 |
+| 512 | 1.03x | **0.74x** (0.73-0.74x over 3 windows) | 0.99998617 | 8 / 32 |
+| 1024 | 1.14x | 0.81x | 0.99998594 | 4 / 16 |
+
+So even 16x wider groups only tie on the K=1024 shapes (the per-tile submit and
+host detile do not shrink with K) and win ~1.35x wall only on the K=4096 down
+projection — at +25 % CPU, at a weight-fidelity cost this synthetic uniform
+matrix understates (real weights have per-channel outliers: the emb2 M2 round
+measured group 512 at 0.9992 vs HF f32 against 0.99985 at group 32), and
+without being Q8_0-native at all (it needs a load-time requant).
+
+The one thing the int8 route would buy is memory: the resident BOs measured
+2.4 -> 1.1 MiB (1024x1024), 6.1 -> 3.1 MiB (1024x3072) and 8.4 -> 4.1 MiB
+(4096x1024), i.e. qwen3's 196 projections would go from 0.82 GiB to ~0.44 GiB
+(1.88x, ~0.39 GiB saved) — at 1.6-7x the wall and 2-11x the CPU of the fp16 path,
+which is the wrong trade on a board where the NPU's value is freeing CPU.
+
+**Decision: no app path.** `--npu` keeps packing Q8_0 (and bf16/f16) weights to
+resident fp16 at load — one dequantize, 2x the file size in NPU memory, and
+`--quant q8` keeps the CPU dequant path. A Q8_0-native int8 projection route
+would be 1.6-7x slower; the idea is dead unless the NPU gains an epilogue that
+applies per-group scales on device (or an int8 K-accumulation), which is where
+the readback comes from.
+
+Load-side facts worth keeping: the int8 pack is 2-8x the f16 pack
+(85-156 ms vs 8-93 ms per projection, so ~1.5 s more for qwen3's 196 shapes —
+irrelevant), and `I8Context` keys its scratch by exact `M` with no capacity
+classes, so a server would hold one fd set per distinct prompt length (up to 32,
+FIFO-evicted) instead of the f16 context's handful of `M` classes.
+
+Reproduce (board, cores 0-3; ~40 s including the f64 references):
+
+```sh
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin q8_bench
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/q8_bench root@rock-5b-plus.lan:/root/rocket-p2b/
+taskset -c 0-3 ./q8_bench --reps 3                       # the five qwen3 shapes, group 32
+taskset -c 0-3 ./q8_bench --reps 3 --rows 128 --groups 32,128,512,1024 2777 1024 3072 2777 4096 1024
+```
