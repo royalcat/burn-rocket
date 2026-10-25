@@ -347,21 +347,24 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   pull Mesa/X11/SDL; the amd64 runtime image is 809 MB). Before 2026-10-24 the
   image had no decoder, so `input_video`/`/embed` video and non-WAV audio
   requests failed in the deployed container (log-gemma §21).
-- **Port status**: fp16 one-shot/streaming/resident/segmented matmul, group-wise int8,
-  the native bf16 stream and masked GQA attention are ported. Planner and regcmd output
-  are byte-equal to the C library; fp16/bf16 cosine >= 0.99999 and int8 matches its
-  dequantized reference. Board microbenchmarks: int8 512x3072x1024 62-70 ms vs C
-  59-66, bf16 stream 24-27 ms vs C 22-26. Attention uses a per-worker head split (no chained
-  per-head batch yet): 2587-token 8-head attention was 367 ms vs the C library's
-  295 ms before the S1 fast host softmax (log-gemma §19), which cut the host score
-  pass 4.3× (≤1 f16 ULP) and text attention 11-17 %; EmbeddingGemma 2's vision
-  tower now runs its attention on the NPU by default under `--npu` (S2, §20).
-  End-to-end: qwen3 3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
+- **Port status**: fp16 one-shot/streaming/resident/segmented/multi-fd/fp32-out and
+  batched matmul, group-wise int8, the native bf16 stream and masked GQA attention are
+  ported. Planner and regcmd output are byte-equal to the C library (dtype parity
+  harness: `tools/c-oracle` + `parity.py`); fp16/bf16 cosine >= 0.99999 and int8
+  matches its dequantized reference. Board microbenchmarks: int8 512x3072x1024
+  62-70 ms vs C 59-66, bf16 stream 24-27 ms vs C 22-26. Attention uses a per-worker
+  head split and batches each worker's per-head QK/AV matmuls into one job
+  (`ROCKET_FA_CHAIN`, default on, `ROCKET_FA_CHAIN_ELEMS` = 32M cap): bit-identical,
+  2394-patch vision 1.11× and emb2 sliding 1.08×, parity on the deployed KACC-on text
+  shapes, 1.2-1.4× with `ROCKET_NO_KACC=1` (M1d, 2026-10-25). The S1 fast host softmax
+  cut the score pass 4.3× (log-gemma §19); EmbeddingGemma 2's vision tower runs its
+  attention on the NPU by default under `--npu` (S2, §20). End-to-end: qwen3
+  3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): dense/per-channel
-  int8, one-shot int8 group-wise, int4/int16/tf32, one-shot/resident bf16 (stream only),
-  `mha_self`, `*_ref` host references, `_planes`/transposed variants, RK3576 entries,
-  batched/chained submit, multi-job submit, public `rocket_stream_*`/`rocket_mm_batch_*`
-  aliases, tiled long-context attention, on-NPU softmax, and all non-matmul op families.
+  int8, one-shot int8 group-wise, int4/int16/tf32, resident bf16 (the C library has no
+  variant either), `mha_self`, `*_ref` host references, `_planes`/transposed variants,
+  RK3576 entries, the public `rocket_stream_*` aliases, tiled long-context attention,
+  on-NPU softmax, and all non-matmul op families.
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for

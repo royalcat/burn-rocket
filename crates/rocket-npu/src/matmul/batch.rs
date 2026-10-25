@@ -12,7 +12,10 @@
 //! Bit-identical to calling [`one_shot`] per item: same plan, same fp16 pack, same CPU
 //! fp32 K-accumulation and de-tile/narrow, and the tiles are visited in `(item, mi, ni,
 //! ki)` order with `ki` innermost, so each output tile's K-partials accumulate in
-//! ascending `ki` exactly as [`super::compute_cpu`] does. It deliberately does NOT
+//! ascending `ki` exactly as [`super::compute_cpu`] does. A shape whose K axis is a
+//! single tile skips the accumulator outright and stores the cube's f16 result straight
+//! into the caller's output (what [`super::compute_kacc`] does) — the same bits, because
+//! an f16 tile narrowed through f32 and back is unchanged. It deliberately does NOT
 //! consult `ROCKET_KACC`/`ROCKET_REUSE`/`ROCKET_MM_PIPE` — those are single-matmul
 //! performance variants, orthogonal to the batch lever. (A bit-for-bit A/B against
 //! `one_shot` therefore needs `ROCKET_NO_KACC=1`, since `one_shot` may route to the
@@ -111,6 +114,23 @@ impl MmBatch {
         })
     }
 
+    /// Drop the grow-only `in_all`/`wt_all`/`out_all` packs and the fp32 accumulators,
+    /// keeping the (fixed-size) guard and regcmd BOs.
+    ///
+    /// The release half of a request-scoped trim: a caller that holds a context across
+    /// requests (`attn::Attention` does, one per shape per worker) drops what a much
+    /// larger request grew. Nothing is lost — every run re-packs its host matrices
+    /// anyway — but the whole-BO zero of the input/weight packs is paid again on the
+    /// next run, because "zeroed once stays zero" only holds for a BO that survived.
+    pub fn trim(&mut self) {
+        self.in_all = None;
+        self.wt_all = None;
+        self.out_all = None;
+        self.prezeroed = false;
+        self.last = None;
+        self.acc = Vec::new();
+    }
+
     /// Live bytes of the context's NPU buffer objects (guard, regcmd and the grown
     /// in/wt/out BOs).
     pub fn bytes(&self) -> usize {
@@ -164,6 +184,14 @@ impl MmBatch {
         let wt_sz = bytes_of(nbatch, wt_item, "mm_batch/wt-size")? + CBUF_BANK_SIZE;
         let out_sz = BATCH * plan.out_slot * 2 + CBUF_BANK_SIZE;
 
+        // A single K-tile needs no accumulation: the cube already holds this item's final
+        // f16 result, so the readback stores it straight into the caller's output (what
+        // `compute_kacc` does too) instead of round-tripping through the fp32
+        // accumulator. Same bits — `detile_accum` + `narrow_f32_to_f16` is lossless on an
+        // f16-origin tile — at a fraction of the host readback cost, which is the shape
+        // attention's QK (K = head dim) and short-context AV (K = key axis) run.
+        let direct_out = plan.nkt == 1;
+
         // From here to the end of the pack the padding state of in_all/wt_all is not
         // known: a failed grow leaves a fresh BO behind, so the "already zeroed" claim is
         // only re-established once both packs have finished. `prezeroed` therefore
@@ -207,14 +235,16 @@ impl MmBatch {
         self.last = Some(layout);
 
         // `nbatch * M * N` fp32 accumulators: grow-only, zeroed every run (they
-        // accumulate K-tiles).
+        // accumulate K-tiles). A single-K-tile shape stores its tiles directly instead.
         let acc_n = nbatch
             .checked_mul(m * n)
             .ok_or_else(|| Error::shape("mm_batch/acc"))?;
-        if self.acc.len() < acc_n {
-            self.acc.resize(acc_n, 0.0);
+        if !direct_out {
+            if self.acc.len() < acc_n {
+                self.acc.resize(acc_n, 0.0);
+            }
+            self.acc[..acc_n].fill(0.0);
         }
-        self.acc[..acc_n].fill(0.0);
 
         let jobs = plan.jobs();
         let total = nbatch * jobs;
@@ -329,8 +359,20 @@ impl MmBatch {
                 let words = bos::f16_words_ref(bo);
                 for t in &tiles {
                     let slot = &words[t.out_off..t.out_off + plan.out_slot];
-                    let acc = &mut self.acc[t.item * m * n..(t.item + 1) * m * n];
-                    layout::detile_accum(acc, n, slot, t.m0, t.n0, t.mtile, t.ntile);
+                    if direct_out {
+                        layout::detile_store(
+                            &mut c[t.item][..m * n],
+                            n,
+                            slot,
+                            t.m0,
+                            t.n0,
+                            t.mtile,
+                            t.ntile,
+                        );
+                    } else {
+                        let acc = &mut self.acc[t.item * m * n..(t.item + 1) * m * n];
+                        layout::detile_accum(acc, n, slot, t.m0, t.n0, t.mtile, t.ntile);
+                    }
                 }
             }
             self.out_all.as_mut().expect("grown above").fini()?;
@@ -338,8 +380,10 @@ impl MmBatch {
             done += g;
         }
 
-        for (it, ci) in c.iter_mut().enumerate() {
-            layout::narrow_f32_to_f16(&mut ci[..m * n], &self.acc[it * m * n..][..m * n]);
+        if !direct_out {
+            for (it, ci) in c.iter_mut().enumerate() {
+                layout::narrow_f32_to_f16(&mut ci[..m * n], &self.acc[it * m * n..][..m * n]);
+            }
         }
         Ok(())
     }

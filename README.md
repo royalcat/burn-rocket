@@ -155,17 +155,18 @@ are at or above the C library's speed.
 ### Missing surface
 
 `rocket-npu` is a focused matmul/attention driver, not a full replacement of every
-`librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented matmul,
-resident group-wise int8, the native bf16 stream, masked GQA attention, and the
-device/BO/submit primitives.
+`librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
+fp32-out and batched matmul, resident group-wise int8, the native bf16 stream, masked
+GQA attention with chained per-head QK/AV batching, the device/BO/submit primitives
+(including multi-job submit and the opt-in chained layout), and the dtype parity
+harness (`tools/c-oracle` + `parity.py`).
 
 Not exposed yet: dense/per-channel int8, one-shot int8 group-wise, int4/int16/tf32,
-one-shot bf16 and resident bf16, `mha_self`, the `*_ref` host references, the
-`_planes`/transposed variants, RK3576 entries, batched/chained submit, multi-job
-submit, the public `rocket_stream_*`/`rocket_mm_batch_*` aliases, the long-context
-tiled attention path, on-NPU softmax, and every non-matmul op family (conv, pool,
-activation, norm, FFN, softmax, reduce, resize, encoders, graph). See the
-`rocket-npu` crate docs for the full list.
+resident bf16 (the C library has no variant either), `mha_self`, the `*_ref` host
+references, the `_planes`/transposed variants, RK3576 entries, the public
+`rocket_stream_*` aliases, the long-context tiled attention path, on-NPU softmax, and
+every non-matmul op family (conv, pool, activation, norm, FFN, softmax, reduce,
+resize, encoders, graph). See the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and

@@ -50,7 +50,11 @@
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`]); the host softmax has a fast branch-free `exp` path
 //!   ([`attn::Softmax`]) and keeps the original scalar one behind
-//!   `SOFTMAX_EXACT=1`.
+//!   `SOFTMAX_EXACT=1`. Each worker batches its per-head QK and AV matmuls into one
+//!   [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of the C
+//!   `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a shape
+//!   that needs more than one fp16 K-accumulation tile stays on the per-head path so
+//!   the two remain bit-identical);
 //!
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):
@@ -68,9 +72,9 @@
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
 //!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
-//! - the long-context tiled attention path (`ROCKET_FA_TILE_KV`), on-NPU softmax,
-//!   and chained per-head attention batching (M1d: flash attention still submits one
-//!   task per matmul, so `ROCKET_BATCH_SUBMIT` changes nothing for attention);
+//! - the long-context tiled attention path (`ROCKET_FA_TILE_KV`) and the on-NPU
+//!   attention softmax (the FA path always brings the scores host-side for the additive
+//!   mask, where the C library measures the round-trip as slower);
 //! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
 //!   reduce, resize/upsample, encoder, SAM/SigLIP and graph execution.
 //!
