@@ -562,6 +562,41 @@ pub fn detile_accum_i16(
     }
 }
 
+/// Accumulate one int16 output cube into `acc`, adding `scale * value`.
+///
+/// The int4 group-wise readback: every K-tile is one quant group, so its int16 partial
+/// takes that group's `a_scale[m,g] * b_scale[n,g]` as it is folded in. The cube is
+/// C2=8 ([`out_idx_i4`]), the same one [`detile_accum_i16`] walks.
+#[allow(clippy::too_many_arguments)]
+pub fn detile_accum_i16_scaled(
+    acc: &mut [f32],
+    n: usize,
+    slot: &[i16],
+    m0: usize,
+    n0: usize,
+    mtile: usize,
+    ntile: usize,
+    scale: impl Fn(usize, usize) -> f32,
+) {
+    let h = mtile;
+    for row in 0..mtile {
+        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
+        let mut col = 0;
+        while col + 8 <= ntile {
+            let g = col / 8;
+            let src = &slot[g * h * 8 + 8 * row..][..8];
+            for (j, v) in src.iter().enumerate() {
+                d[col + j] += scale(m0 + row, n0 + col + j) * (*v as f32);
+            }
+            col += 8;
+        }
+        while col < ntile {
+            d[col] += scale(m0 + row, n0 + col) * slot[out_idx_i4(h, col + 1, row + 1)] as f32;
+            col += 1;
+        }
+    }
+}
+
 // ── bf16 cubes: feature/weight == int16, fp32 output C2=4 ─────────────────────
 
 #[inline]
@@ -784,6 +819,69 @@ mod int4_tests {
         assert_eq!(acc[0], 0);
         assert_eq!(acc[(m0 + mt) * n + n0], 0);
         assert_eq!(acc[m0 * n + n0 + nt], 0);
+    }
+
+    #[test]
+    fn int4_group_wise_weight_tiles_round_trip_and_rescatter_identically() {
+        // The group-wise resident pack tiles K at `Kt = group`, so one slot is exactly
+        // one quant group of `group` nibbles per output channel. Walk every (N-tile,
+        // K-tile) slot of a full weight and check (a) the nibbles land at
+        // `wt_idx_i4(Kt=group, ·)` and (b) re-scattering a slot is idempotent — the C
+        // `rk4_scatter_weights` calls `i4_wt_scatter` `Ntile` times in a row, which is
+        // redundant rather than part of the layout.
+        let (n, k, group) = (128usize, 256usize, 64usize);
+        let (nt, kt) = (128usize, group);
+        let b: Vec<i8> = (0..n * k).map(code).collect();
+        let slot_bytes = nt.div_ceil(64) * 64 * kt.div_ceil(32) * 32 / 2;
+        for ni in 0..n / nt {
+            for ki in 0..k / kt {
+                let (n0, k0) = (ni * nt, ki * kt);
+                let mut slot = vec![0u8; slot_bytes];
+                wt_scatter_tile_i4(&mut slot, &b, k, n0, k0, nt, kt);
+                let mut again = vec![0u8; slot_bytes];
+                for _ in 0..nt {
+                    wt_scatter_tile_i4(&mut again, &b, k, n0, k0, nt, kt);
+                }
+                assert_eq!(again, slot, "re-scatter must be idempotent n0={n0} k0={k0}");
+                for kk in 0..nt {
+                    for cc in 0..kt {
+                        assert_eq!(
+                            get_nib(&slot, wt_idx_i4(kt, kk + 1, cc + 1)),
+                            b[(n0 + kk) * k + k0 + cc],
+                            "n0={n0} k0={k0} kk={kk} cc={cc}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn int4_int16_cube_detiles_scaled_per_group() {
+        // The group-wise readback: each tile's int16 cube is one quant group, folded in
+        // as `a_scale[row,g] * b_scale[col,g] * partial`, with a pre-existing f32
+        // partial (an earlier group) added to.
+        let (mt, nt): (usize, usize) = (5, 6);
+        let (alloc_m, alloc_n) = (mt.div_ceil(4) * 4, nt.div_ceil(8) * 8);
+        let slot: Vec<i16> = (0..alloc_m * alloc_n).map(|i| i as i16 * 3 - 20).collect();
+        let (n, m0, n0, g) = (20, 4, 4, 2usize);
+        let mut acc = vec![0.0f32; (m0 + mt + 1) * n];
+        acc[(m0 + 2) * n + n0 + 1] = 0.5;
+        let scale = |row: usize, col: usize| (row as f32 + 1.0) * (col as f32 + 0.5) * g as f32;
+        detile_accum_i16_scaled(&mut acc, n, &slot, m0, n0, mt, nt, scale);
+        for row in 0..mt {
+            for col in 0..nt {
+                let v = slot[out_idx_i4(mt, col + 1, row + 1)] as f32;
+                let mut want = scale(m0 + row, n0 + col) * v;
+                if (row, col) == (2, 1) {
+                    want += 0.5;
+                }
+                assert_eq!(acc[(m0 + row) * n + n0 + col], want, "row={row} col={col}");
+            }
+        }
+        assert_eq!(acc[0], 0.0);
+        assert_eq!(acc[(m0 + mt) * n + n0], 0.0);
+        assert_eq!(acc[m0 * n + n0 + nt], 0.0);
     }
 
     #[test]

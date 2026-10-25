@@ -17,7 +17,15 @@
 //! - There is no NPU-side integer K-accumulation (the C leaves the int4 DPU-EW path
 //!   unimplemented), so every tile's partial comes back to the host, as for int8.
 //!
-//! Group-wise int4 and the resident `I4Context` are not ported yet.
+//! Two entry points differ only in the readback:
+//!
+//! - [`one_shot_int4`] / [`one_shot_int4_ex`] sum the raw int16 partials in int64
+//!   (integer-exact up to the int16 saturation the hardware applies per tile) and
+//!   write a raw int32 `C[M,N]` — the C `rocket_matmul_int4`.
+//! - [`one_shot_int4_groupwise`] forces `Kt = group`, so every K-tile stays inside one
+//!   quant group, and applies that group's `a_scale[m,g] * b_scale[n,g]` to its
+//!   partial in f32 — the C `rocket_matmul_int4_groupwise`, and the one-shot twin of
+//!   the resident [`super::int4_context::I4Context::matmul_gw`].
 
 use crate::Device;
 use crate::device::uapi::DrmRocketTask;
@@ -153,11 +161,27 @@ impl Shots {
     }
 }
 
-/// Submit every tile in groups of [`BATCH`] and accumulate the int16 partials in int64.
-fn run(plan: &Plan, shots: &mut Shots, acc: &mut [i64]) -> Result<()> {
+/// How a tile's int16 partial is folded into the host accumulator.
+enum Readback<'a> {
+    /// Dense: exact int64 sum of the raw int16 partials (the C `acc`), then narrowed.
+    Int64(&'a mut [i64]),
+    /// Group-wise: `f32 += a_scale[m,g] * b_scale[n,g] * partial`. `ng = K/group`.
+    Scaled {
+        acc: &'a mut [f32],
+        a_scale: &'a [f32],
+        b_scale: &'a [f32],
+        ng: usize,
+    },
+}
+
+/// Submit every tile in groups of [`BATCH`] and accumulate the partials.
+///
+/// `kt_per_group` is the number of K-tiles inside one quant group (0 for the dense
+/// path, 1 for group-wise, which forces one tile per group).
+fn run(plan: &Plan, shots: &mut Shots, kt_per_group: usize, rb: &mut Readback<'_>) -> Result<()> {
     let total = plan.jobs();
     let mut tasks: Vec<DrmRocketTask> = Vec::with_capacity(BATCH);
-    let mut meta: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(BATCH);
+    let mut meta: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(BATCH);
     let mut ops = Vec::with_capacity(160);
     let mut done = 0usize;
     let mut nb = 0usize;
@@ -196,7 +220,7 @@ fn run(plan: &Plan, shots: &mut Shots, acc: &mut [i64]) -> Result<()> {
                     regcmd,
                     regcmd_count: count as u32,
                 });
-                meta.push((m0, n0, mtile, ntile));
+                meta.push((m0, n0, mtile, ntile, ki / kt_per_group.max(1)));
                 nb += 1;
                 done += 1;
 
@@ -214,9 +238,28 @@ fn run(plan: &Plan, shots: &mut Shots, acc: &mut [i64]) -> Result<()> {
                     shots.out_all.prep(wait_ns())?;
                     {
                         let words = i16_words_ref(&shots.out_all);
-                        for (j, &(m0, n0, mtile, ntile)) in meta.iter().enumerate() {
+                        for (j, &(m0, n0, mtile, ntile, g)) in meta.iter().enumerate() {
                             let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
-                            layout::detile_accum_i16(acc, plan.n, slot, m0, n0, mtile, ntile);
+                            match rb {
+                                Readback::Int64(acc) => layout::detile_accum_i16(
+                                    acc, plan.n, slot, m0, n0, mtile, ntile,
+                                ),
+                                Readback::Scaled {
+                                    acc,
+                                    a_scale,
+                                    b_scale,
+                                    ng,
+                                } => layout::detile_accum_i16_scaled(
+                                    acc,
+                                    plan.n,
+                                    slot,
+                                    m0,
+                                    n0,
+                                    mtile,
+                                    ntile,
+                                    |row, col| a_scale[row * *ng + g] * b_scale[col * *ng + g],
+                                ),
+                            }
                         }
                     }
                     shots.out_all.fini()?;
@@ -299,10 +342,95 @@ pub fn one_shot_int4_ex(
     shots.pack_input(&plan, a)?;
 
     let mut acc = vec![0i64; m * n];
-    run(&plan, &mut shots, &mut acc)?;
+    run(&plan, &mut shots, 0, &mut Readback::Int64(&mut acc))?;
     for (d, s) in c[..m * n].iter_mut().zip(&acc) {
         *d = *s as i32;
     }
+    Ok(())
+}
+
+/// The group-wise int4 group contract: `group >= 32`, `group % 32 == 0`, `group | K`
+/// and `49*group < 32767`.
+///
+/// The last bound is the C's int16-saturation guard: with `[-7,7]` codes a K-tile of
+/// `group` elements bounds `|partial| <= 49*group`, so the tile partial the hardware
+/// writes as int16 cannot saturate. `group | K` additionally makes every K-tile exactly
+/// one group, which is what lets the readback apply a single scale per tile. Shared by
+/// [`one_shot_int4_groupwise`] and [`super::int4_context::I4Context`].
+pub(crate) fn check_group(group: usize, k: usize) -> Result<()> {
+    if group < 32
+        || !group.is_multiple_of(32)
+        || !k.is_multiple_of(group)
+        || 49 * group as u64 >= 32767
+    {
+        return Err(Error::shape("int4_gw/group"));
+    }
+    Ok(())
+}
+
+/// `Cf[M,N] = sum_g a_scale[m,g] * b_scale[n,g] * (A_g * B_g^T)`, f32 output (the C
+/// `rocket_matmul_int4_groupwise`).
+///
+/// The W4 quality lever over the per-channel scales of [`one_shot_int4`]: one dequant
+/// scale per K-group bounds the int4 error to a narrow slice of K. A and B are
+/// pre-quantized int4 codes (one per `i8`), `a_scale` is `[M, K/group]` and `b_scale`
+/// `[N, K/group]` row-major. The tiling is the dense int4 plan with `Kt` forced to
+/// `group`, so each tile IS one quant group and its int16 partial is scaled on
+/// readback and accumulated in f32.
+///
+/// There is no `M == 1` pad here (a padded row would need a padded `a_scale`; a single
+/// vector is padded caller-side), so `M % 4 == 0` is required outright, as in C.
+///
+/// Bit-identical to [`super::int4_context::I4Context::matmul_gw`] for the same shape:
+/// both pin `Kt` to `group` and int4's `Nt` is M-independent, so the two resolve the
+/// same tiles and the same f32 accumulation order — unlike int8's group-wise pair,
+/// where a group wider than the CBUF `Kt` can resolve a different `Kt` per path.
+#[allow(clippy::too_many_arguments)]
+pub fn one_shot_int4_groupwise(
+    dev: &Device,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: &[i8],
+    b: &[i8],
+    a_scale: &[f32],
+    b_scale: &[f32],
+    cf: &mut [f32],
+    group: usize,
+) -> Result<()> {
+    if m == 0 || !m.is_multiple_of(4) {
+        return Err(Error::shape("int4_gw/m"));
+    }
+    check_group(group, k)?;
+    if a.len() < m * k || b.len() < n * k || cf.len() < m * n {
+        return Err(Error::shape("int4_gw/buffers"));
+    }
+    let ng = k / group;
+    if a_scale.len() < m * ng || b_scale.len() < n * ng {
+        return Err(Error::shape("int4_gw/scales"));
+    }
+    // Plan at the call's M and then override Kt, exactly as the C does: the group is
+    // small enough (<= 640 by `check_group`) that the pair always fits the CBUF, and
+    // `emit` rejects a tile that would not.
+    let (mt, _kt, nt) = plan_int4(m, k, n)?;
+    let plan = int4_plan(m, k, n, mt, group, nt);
+    let mut shots = Shots::new(dev, &plan)?;
+    shots.pack_weights(&plan, b)?;
+    shots.pack_input(&plan, a)?;
+
+    let mut facc = vec![0f32; m * n];
+    run(
+        &plan,
+        &mut shots,
+        1,
+        &mut Readback::Scaled {
+            acc: &mut facc,
+            a_scale,
+            b_scale,
+            ng,
+        },
+    )?;
+    cf[..m * n].copy_from_slice(&facc);
     Ok(())
 }
 
@@ -341,6 +469,45 @@ mod tests {
         assert!(plan_int4(4, 48, 64).is_err()); // K % 32
         assert!(plan_int4(4, 64, 32).is_err()); // N % 64 (int8's 32 is not enough)
         assert!(plan_int4(4, 64, 64).is_ok());
+    }
+
+    #[test]
+    fn the_group_contract_matches_the_c() {
+        // `group >= 32`, `% 32`, `| K`, `49*group < 32767` (the C's int16-saturation
+        // bound for [-7,7] codes). 640 is the widest group that passes; 672 does not.
+        for (group, k) in [
+            (32usize, 1280usize),
+            (64, 1280),
+            (128, 1280),
+            (256, 1280),
+            (512, 1024),
+            (640, 1280),
+        ] {
+            assert!(check_group(group, k).is_ok(), "group={group} k={k}");
+        }
+        assert!(check_group(0, 1024).is_err()); // no group
+        assert!(check_group(16, 1024).is_err()); // < 32
+        assert!(check_group(48, 1024).is_err()); // not % 32
+        assert!(check_group(64, 96).is_err()); // group does not divide K
+        assert!(check_group(672, 1344).is_err()); // 49*672 = 32928 >= 32767
+        assert!(check_group(640, 1280).is_ok());
+    }
+
+    #[test]
+    fn the_group_wise_plan_is_one_k_tile_per_group() {
+        let (m, k, n, group) = (264, 1024, 384, 128);
+        let (mt, planned_kt, nt) = plan_int4(m, k, n).unwrap();
+        let p = int4_plan(m, k, n, mt, group, nt);
+        // The plan is the dense one with Kt overridden: Nt/Mt and the cube slots follow
+        // the int4 geometry, and the K tiling is exactly the quant groups.
+        assert_eq!(p.kt, group);
+        assert_eq!(p.nkt, k / group);
+        assert_ne!(planned_kt, group, "the override must actually bind here");
+        assert_eq!(p.jobs(), p.nmt * p.nnt * p.nkt);
+        assert_eq!(p.wt_slot, rup(nt, 64) * group);
+        // One group's tile partial cannot saturate int16 for [-7,7] codes, which is
+        // what `check_group` bounds (64*group would be the [-8,7] worst case).
+        assert!(64 * group < 32767);
     }
 
     #[test]

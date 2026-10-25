@@ -50,10 +50,13 @@
 //!   `pack_weight_gw`/`matmul_gw` scaling each K-tile's partial in f32);
 //! - int4: the dense `int4 x int4 -> int16` one-shot
 //!   ([`matmul::one_shot_int4`] / [`matmul::one_shot_int4_ex`] with the C's int16
-//!   saturation `kt_cap`, host int64 K-accumulation of the int16 partials), its planner
-//!   ([`matmul::plan_int4`], half a byte per element, N align 64) and its nibble cube
-//!   host pack/gather ([`matmul::layout`]). Group-wise int4 and the resident
-//!   `I4Context` are not ported;
+//!   saturation `kt_cap`, host int64 K-accumulation of the int16 partials), the
+//!   one-shot group-wise [`matmul::one_shot_int4_groupwise`], their planner
+//!   ([`matmul::plan_int4`], half a byte per element, N align 64) and the nibble cube
+//!   host pack/gather ([`matmul::layout`]), plus the resident W4A4 weights in both
+//!   modes ([`matmul::I4Context`]: per-channel `pack_weight`/`matmul` returning raw
+//!   int32, group-wise `pack_weight_gw`/`matmul_gw` scaling each K-tile's int16
+//!   partial in f32);
 //! - int16: [`matmul::one_shot_int16_exact`], the bit-exact `int16 x int16 -> int64`
 //!   decomposition into four int8 products (inputs clamped to `[-32768, 32639]`);
 //! - bf16: the native streaming path ([`matmul::Bf16Stream`]) plus the one-shot
@@ -74,8 +77,7 @@
 //!
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
-//! - tf32 (one-shot, resident, group-wise, plans) and the group-wise int4 plus the
-//!   resident int4 `I4Context` (`pack_weight`/`matmul` over prepacked nibbles);
+//! - tf32 (one-shot, resident, group-wise, plans);
 //! - a resident bf16 weight (the C library has none either);
 //! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
 //!   transposed-output variants, and the RK3576-specific entries;

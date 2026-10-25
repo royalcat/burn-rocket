@@ -147,8 +147,9 @@ The example app builds with `--no-default-features --features npu` (aarch64) or
 
 Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
 dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weights),
-dense int4 (one-shot with the C's int16-saturation `kt_cap`, plus its planner),
-`int16_exact`, the native bf16 stream and masked GQA attention are ported and
+dense and group-wise int4 (one-shot with the C's int16-saturation `kt_cap`, plus the
+resident `I4Context` in both modes and its planner), `int16_exact`, the native bf16
+stream and masked GQA attention are ported and
 validated on the board. Planner and regcmd output are byte-equal to the C library for
 fp16/int8/int8-group-wise/int4/bf16; fp16/bf16 cosine >= 0.99999, int8 matches its
 dequantized reference and int4 is int32-exact against the int64 CPU reference. Qwen3
@@ -160,14 +161,14 @@ are at or above the C library's speed.
 `rocket-npu` is a focused matmul/attention driver, not a full replacement of every
 `librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
 fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
-and resident group-wise), dense int4 (one-shot, nibble-packed host pack/gather),
-`int16_exact`, the native bf16 stream, masked
+and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
+both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
+masked
 GQA attention with chained per-head QK/AV batching, the device/BO/submit primitives
 (including multi-job submit and the opt-in chained layout), and the dtype parity
 harness (`tools/c-oracle` + `parity.py`).
 
-Not exposed yet: tf32 (one-shot, resident, group-wise, plans), group-wise int4 and the
-resident int4 context, resident bf16
+Not exposed yet: tf32 (one-shot, resident, group-wise, plans), resident bf16
 (the C library has no variant either), `mha_self`, the `*_ref` host references, the
 `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
 the long-context tiled attention path, on-NPU softmax, and every non-matmul op family
