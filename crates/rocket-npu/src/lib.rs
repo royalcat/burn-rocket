@@ -80,7 +80,12 @@
 //!   one [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of
 //!   the C `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a
 //!   shape that needs more than one fp16 K-accumulation tile stays on the per-head path
-//!   so the two remain bit-identical);
+//!   so the two remain bit-identical). The long-context path
+//!   ([`attn::tile_kv_width`], `ROCKET_FA_TILE_KV`) walks the key axis in tiles and
+//!   carries the online softmax ([`attn::Online`]) instead of materializing the
+//!   `[Tp, Kn]` score matrix, so the attention scratch stops growing with the key
+//!   count; it is opt-in (default 0 = off) and engages only above
+//!   `ROCKET_FA_TILE_MIN_KV` (default 8192 padded keys) and for `dv == dk`;
 //!
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):
@@ -96,9 +101,12 @@
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
 //!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
-//! - the long-context tiled attention path (`ROCKET_FA_TILE_KV`) and the on-NPU
-//!   attention softmax (the FA path always brings the scores host-side for the additive
-//!   mask, where the C library measures the round-trip as slower);
+//! - the on-NPU attention softmax (the FA path always brings the scores host-side for
+//!   the additive mask, where the C library measures the round-trip as slower; the
+//!   tiled path is host-softmax by construction, since its running rescale is
+//!   sequential across tiles);
+//! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
+//!   the head dim (`mha_self` is the only user) stays on the materialized path;
 //! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
 //!   reduce, resize/upsample, encoder, SAM/SigLIP and graph execution.
 //!

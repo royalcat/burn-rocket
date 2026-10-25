@@ -9,6 +9,12 @@
 //! measurements put the scalar pass at ~0.20 s of it (0.0672 s per head on one
 //! A76 core × 3 heads per worker), which the fast path cuts to ~0.05 s.
 //!
+//! [`Online`] is the tiled long-context form (`ROCKET_FA_TILE_KV`): instead of one
+//! softmax over the full key axis it folds one key tile at a time into the
+//! FlashAttention-2 running state (row max `m`, denominator `l`, unnormalized output
+//! `acc`), so the score matrix it touches is one tile wide. It runs the same scale /
+//! mask / soft-cap row kernels and the same `exp` as [`Softmax`].
+//!
 //! Two implementations live here, selected per [`Softmax`] value:
 //!
 //! - [`SoftmaxMode::Fast`] (default): a branch-free `exp` built on a degree-6
@@ -252,6 +258,212 @@ impl Softmax {
             let sum = kern::row_exp(row, mx);
             let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
             kern::row_write(row, &mut p[i * kn..(i + 1) * kn], inv);
+        }
+    }
+}
+
+/// A tile row whose best visible score sits at or below this has no visible key at
+/// all: the mask clamp [`PAD_KEY_SCORE`] plus one (the C `fa_heads_range_tiled` test).
+const NO_VISIBLE_KEY: f32 = PAD_KEY_SCORE + 1.0;
+
+/// The tiled long-context path's running softmax state, one head at a time.
+///
+/// Port of the C `fa_heads_range_tiled` fold (`fa_scratch.fm/fl/facc` plus the row
+/// buffer it walks): [`Online::begin`] resets the state, [`Online::fold`] folds one
+/// key tile in, [`Online::add`] accumulates that tile's `P·V`, and [`Online::finish`]
+/// normalizes. All fp32 — the running max/rescale is inherently sequential across
+/// tiles and needs the scores in f32, which is also why the tiled path is
+/// host-softmax only.
+///
+/// Grow-only: the buffers keep the largest shape they have served, so a persistent
+/// attention context reallocates neither `acc` (`[tp, dv]`) nor the row buffer.
+#[derive(Debug)]
+pub struct Online {
+    mode: SoftmaxMode,
+    /// f32 working row over one tile's columns.
+    row: Vec<f32>,
+    /// Running per-row max `m`.
+    m: Vec<f32>,
+    /// Running per-row denominator `l`.
+    l: Vec<f32>,
+    /// Running unnormalized output, `[tp, dv]`.
+    acc: Vec<f32>,
+}
+
+impl Default for Online {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Online {
+    /// The process default mode (as [`Softmax::new`]).
+    pub fn new() -> Self {
+        Self::with_mode(Softmax::new().mode)
+    }
+
+    /// An explicit kernel mode (benchmarks, the self-test).
+    pub fn with_mode(mode: SoftmaxMode) -> Self {
+        Online {
+            mode,
+            row: Vec::new(),
+            m: Vec::new(),
+            l: Vec::new(),
+            acc: Vec::new(),
+        }
+    }
+
+    /// Grow to the tile shape and reset the running state (`m = -inf`, `l = 0`,
+    /// `acc = 0`).
+    pub fn begin(&mut self, tp: usize, wp: usize, dv: usize) {
+        if self.row.len() < wp {
+            self.row.resize(wp, 0.0);
+        }
+        if self.m.len() < tp {
+            self.m.resize(tp, f32::NEG_INFINITY);
+        }
+        if self.l.len() < tp {
+            self.l.resize(tp, 0.0);
+        }
+        if self.acc.len() < tp * dv {
+            self.acc.resize(tp * dv, 0.0);
+        }
+        self.m[..tp].fill(f32::NEG_INFINITY);
+        self.l[..tp].fill(0.0);
+        self.acc[..tp * dv].fill(0.0);
+    }
+
+    /// Fold key tile `[j0, j0 + w)` into the running state, writing that tile's
+    /// unnormalized `exp(s - m_new)` probabilities as f16 to `p`.
+    ///
+    /// `scores` is the tile's QK result `[tp, wp]`; `mask` the full additive
+    /// `[n_tokens, n_kv]` mask (row `i < n_tokens`) whose columns start at `j0`;
+    /// `wp >= w` with the pad columns treated like masked-out keys. A row whose every
+    /// key in this tile is masked is skipped outright — its `p` row is zeroed (so the
+    /// AV matmul adds nothing) and its running state is left untouched, which is what
+    /// keeps a causal or sliding-window tile outside the row's range from weighting
+    /// the mask clamp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold(
+        &mut self,
+        scores: &[f16],
+        p: &mut [f16],
+        mask: Option<&[f16]>,
+        j0: usize,
+        n_tokens: usize,
+        n_kv: usize,
+        w: usize,
+        tp: usize,
+        wp: usize,
+        dv: usize,
+        scale: f32,
+        softcap: f32,
+    ) {
+        if tp == 0 || wp == 0 {
+            return;
+        }
+        debug_assert!(w <= wp && w <= n_kv && scores.len() >= tp * wp && p.len() >= tp * wp);
+        debug_assert!(self.row.len() >= wp && self.m.len() >= tp && self.acc.len() >= tp * dv);
+        let capped = softcap != 0.0;
+        let mode = self.mode;
+        for i in 0..tp {
+            let srow = &scores[i * wp..(i + 1) * wp];
+            let mrow = mask
+                .filter(|_| i < n_tokens)
+                .map(|m| &m[i * n_kv + j0..i * n_kv + j0 + w]);
+            let row = &mut self.row[..wp];
+            let tmax = match (mrow, capped) {
+                (None, false) => kern::row_scores_plain(srow, row, w, scale),
+                (Some(m), false) => kern::row_scores_masked(srow, row, m, w, scale),
+                (m, true) => kern::row_scores_softcap(srow, row, m, w, scale, softcap),
+            };
+            let prow = &mut p[i * wp..(i + 1) * wp];
+            if tmax <= NO_VISIBLE_KEY {
+                prow.fill(f16::ZERO);
+                continue;
+            }
+            let m_old = self.m[i];
+            let m_new = if m_old > tmax { m_old } else { tmax };
+            let corr = if m_old == f32::NEG_INFINITY {
+                0.0
+            } else {
+                exp_mode(mode, m_old - m_new)
+            };
+            let rs = exp_row_mode(mode, row, m_new);
+            kern::row_write(row, prow, 1.0);
+            self.l[i] = self.l[i] * corr + rs;
+            if corr != 1.0 {
+                for v in self.acc[i * dv..(i + 1) * dv].iter_mut() {
+                    *v *= corr;
+                }
+            }
+            self.m[i] = m_new;
+        }
+    }
+
+    /// `acc += ctx` for the tile just multiplied (`ctx` is the `[tp, dv]` AV result).
+    pub fn add(&mut self, ctx: &[f16], tp: usize, dv: usize) {
+        debug_assert!(self.acc.len() >= tp * dv && ctx.len() >= tp * dv);
+        for (a, &c) in self.acc[..tp * dv].iter_mut().zip(&ctx[..tp * dv]) {
+            *a += c.to_f32();
+        }
+    }
+
+    /// Write `out[t, dv] = acc / l`, with a row that saw no visible key at all
+    /// (`l == 0`) written as zeros — the C finalize.
+    pub fn finish(&self, out: &mut [f16], t: usize, dv: usize) {
+        for row in 0..t {
+            let l = self.l[row];
+            let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+            let ar = &self.acc[row * dv..(row + 1) * dv];
+            let orow = &mut out[row * dv..(row + 1) * dv];
+            for (o, &a) in orow.iter_mut().zip(ar) {
+                *o = f16::from_f32(a * inv);
+            }
+        }
+    }
+
+    /// Live bytes of the running state.
+    pub fn bytes(&self) -> usize {
+        (self.row.len() + self.m.len() + self.l.len() + self.acc.len()) * size_of::<f32>()
+    }
+
+    /// Whether the state is far larger than a `(tp, wp, dv)` call needs (the same
+    /// 4x rule the attention scratch uses).
+    pub fn oversized(&self, tp: usize, wp: usize, dv: usize) -> bool {
+        self.row.len() > 4 * wp || self.acc.len() > 4 * tp * dv
+    }
+
+    /// Release everything; the next [`Online::begin`] reallocates.
+    pub fn release(&mut self) {
+        self.row = Vec::new();
+        self.m = Vec::new();
+        self.l = Vec::new();
+        self.acc = Vec::new();
+    }
+}
+
+/// `exp(x)` for `x <= 0` in `mode` (the materialized path's [`Softmax`] and the tiled
+/// [`Online`] share both kernels).
+fn exp_mode(mode: SoftmaxMode, x: f32) -> f32 {
+    match mode {
+        SoftmaxMode::Fast => exp_neg(x),
+        SoftmaxMode::Exact => x.exp(),
+    }
+}
+
+/// Replace `row` with `exp(row - mx)` and return the sum, in `mode`.
+fn exp_row_mode(mode: SoftmaxMode, row: &mut [f32], mx: f32) -> f32 {
+    match mode {
+        SoftmaxMode::Fast => kern::row_exp(row, mx),
+        SoftmaxMode::Exact => {
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                let e = exp_mode(mode, *v - mx);
+                *v = e;
+                sum += e;
+            }
+            sum
         }
     }
 }

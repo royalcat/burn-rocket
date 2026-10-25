@@ -887,3 +887,27 @@ repeated runs of the *same* config (q8 reported 0.7–0.8 GiB in run 1 and
 the 8 GiB guard. **Decision: the deployed service keeps `--dtype f32 --quant q8
 --npu --npu-attn npu --attn-chunk 1024`** on `4a8657b` (q8's 0.99965 cosine;
 bf16's 0.999939 could be traded in if quality ever outweighs the ~20 % speed).
+
+## 19. Tiled long-context attention (`ROCKET_FA_TILE_KV`, M5b, 2026-10-25)
+
+The driver's tiled attention path (§10's op, the port of the C
+`fa_heads_range_tiled`) was checked end to end on the qwen3-embedding-0.6B NPU
+path: `qwen3 embed --backend flex --dtype f32 --npu`, `data/long8k.txt` cut to
+3,600 tokens, 16 heads / 8 kv / d=128 over 4 workers, `data`-relative binary at
+`/root/rocket-inference/rocket-inference-m5b`. `ROCKET_FA_TILE_KV=2048
+ROCKET_FA_TILE_MIN_KV=0` versus the default (materialized), A/B/A/B order on a
+busy board (load 10-12; the live emb2 service untouched):
+
+| arm | wall (3600 tok) | cosine vs materialized | repeat |
+|---|---|---|---|
+| materialized (default) | 86.6 / 93.1 s | — | bit-identical |
+| tiled, `Kbp=2048` | 87.6 / 89.1 s | 0.99999395 | bit-identical |
+
+So at 3.6k tokens the model-level wall is parity (0.96-1.01x) and the numerics
+sit inside the fp16-weight envelope by a wide margin (the q8 production
+reference is 0.9993); the path is a memory lever, not a speed one, at this
+length. Its scratch does not grow with the key count (§ "M5b" in `AGENTS.md`:
+14x less at 512x30,016, 6.4x at 16,384², a 30k-key request in ~1 GiB where the
+materialized score matrices alone would need ~14 GiB for two workers). The
+caller's `[n][n]` additive mask remains O(n²), so a *model* run at 30k still
+needs the app-side causal block mask.

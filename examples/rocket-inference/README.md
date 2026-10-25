@@ -401,7 +401,13 @@ packing them into resident NPU weights (`--npu` packs them by default),
 `ROCKET_NPU_FUSED=0` packs them one per projection instead of the fused
 q|k|v / gate|up groups (`--npu` fuses them by default), and
 `ROCKET_VISION_LOG=1` prints one vision-tower line per forward (plus the NPU
-split under `--npu`).
+split under `--npu`). `ROCKET_FA_TILE_KV=<width>` switches the NPU attention
+op to its tiled long-context path (default 0 = off: the materialized
+`[tokens, keys]` score matrix; `2048` is the tuned width) and
+`ROCKET_FA_TILE_MIN_KV=<keys>` moves the crossover below which it stays
+materialized (default 8192) — the path keeps the attention scratch flat in the
+key count, so a 30k-token request that would need ~14 GiB of score matrix for
+two workers runs in ~1 GiB.
 
 Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
 `code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`

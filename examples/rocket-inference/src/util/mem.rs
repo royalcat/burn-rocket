@@ -104,10 +104,12 @@ fn log_npu_mem_impl() {
         .attn_workers
         .iter()
         .map(|w| {
+            // `@t` is the tiled path's key-tile width (0 = materialized).
             format!(
-                "{}x{}:{:.1}/{:.1}",
+                "{}x{}@t{}:{:.1}/{:.1}",
                 w.tp,
                 w.kn,
+                w.tile,
                 mib(w.bo_bytes),
                 mib(w.host_bytes)
             )

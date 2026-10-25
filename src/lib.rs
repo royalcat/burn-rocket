@@ -57,6 +57,9 @@ pub struct AttnMem {
     /// Padded `(query, key)` shape the scratch is sized for.
     pub tp: usize,
     pub kn: usize,
+    /// The `ROCKET_FA_TILE_KV` key-tile width this worker last used; 0 = the
+    /// materialized (full-key-axis) path.
+    pub tile: usize,
     pub bo_bytes: usize,
     pub host_bytes: usize,
 }

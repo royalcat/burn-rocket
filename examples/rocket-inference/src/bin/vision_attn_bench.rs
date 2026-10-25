@@ -268,9 +268,10 @@ fn attention_arms(args: &[String]) {
         );
         if let Some(w) = m.attn_workers.first() {
             println!(
-                "npu attention worker shape {}x{} over {} workers",
+                "npu attention worker shape {}x{} (tile {}) over {} workers",
                 w.tp,
                 w.kn,
+                w.tile,
                 m.attn_workers.len()
             );
         }

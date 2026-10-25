@@ -214,6 +214,7 @@ pub fn mem_stats() -> Option<MemStats> {
                 .map(|w| AttnMem {
                     tp: w.shape.0,
                     kn: w.shape.1,
+                    tile: w.tile,
                     bo_bytes: w.bo_bytes,
                     host_bytes: w.host_bytes,
                 })

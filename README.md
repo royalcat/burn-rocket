@@ -159,6 +159,16 @@ int64 CPU reference and tf32 matches a tf32-rounded f64 reference. Qwen3
 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16 microbenchmarks
 are at or above the C library's speed.
 
+Attention also has its long-context form, the opt-in tiled path
+(`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
+one key tile at a time with the online softmax, instead of the `[Tp, Kn]` score
+matrix. It is bit-for-bit independent of `ROCKET_FA_CHAIN`, matches the f64 reference
+at cosine 0.9999999 (30,016 keys, causal, GQA 8/2) and cuts the attention scratch
+14x at that length (37 vs 529 MiB) and 6.4x at 16k (248 vs 1597 MiB), which is what
+takes a 30k-key request from OOM to a 1 GiB working set. Wall is parity to ±20 %:
+it wins once the key axis dominates the query block (0.88-0.95x measured) and pays
+more, smaller submits at a square 8k with a 2k tile.
+
 ### Missing surface
 
 `rocket-npu` is a focused matmul/attention driver, not a full replacement of every
@@ -168,16 +178,25 @@ and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Conte
 both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
 the tf32 one-shot and its planner, masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
-the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching, the
-two f64 host oracles (`flash_attn_ref`, `mha_self_ref`), the device/BO/submit
-primitives (including multi-job submit and the opt-in chained layout), and the dtype
-parity harness (`tools/c-oracle` + `parity.py`).
+the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
+the tiled long-context path (`ROCKET_FA_TILE_KV`: online softmax over key tiles, no
+`[Tp, Kn]` score matrix), the two f64 host oracles (`flash_attn_ref`,
+`mha_self_ref`), the device/BO/submit primitives (including multi-job submit and the
+opt-in chained layout), and the dtype parity harness (`tools/c-oracle` + `parity.py`).
+
+`ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
+`ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
+rather than the score matrix dominates), needs `dv == dk`, and never chains. Set it to
+the tile width you want (`2048` is the tuned value) and the attention scratch stops
+growing with the key count; it trades more, smaller NPU submits for the flat footprint
+and the cache-resident score tile.
 
 Not exposed yet: resident bf16 (the C library has no variant either, and it has none
 for tf32 either — that surface is complete), the `*_ref_fp16` host references of the
 non-matmul families, the
 `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*`
-aliases, the non-fp16 batch wrappers, the long-context tiled attention path, on-NPU
+aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stays
+materialized), on-NPU
 softmax, and every non-matmul op family (conv, pool, activation, norm, FFN, softmax,
 reduce, resize, encoders, graph). See the `rocket-npu` crate docs for the full list.
 

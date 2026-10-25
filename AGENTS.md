@@ -396,12 +396,49 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   0.99999927 (d=512, T=82) / 0.99999812 (d=1024, T=257) vs its f64 ref. Deviations
   from C: host (fast) softmax both places, and the scores stay f32 between matmul and
   softmax instead of round-tripping f16.
+  **M5b tiled long-context attention** (`ROCKET_FA_TILE_KV`, 2026-10-25): the port of
+  `fa_heads_range_tiled`. `attn::tile_kv_width(kn)` resolves the knob per call exactly
+  as C (`0` = off by default, width rounded up to 32 with a 32 floor, engages only while
+  `kn > ROCKET_FA_TILE_MIN_KV` (default 8192) and `kbp < kn`); `Worker::prepare` sizes a
+  separate `TileScratch` (`kh [wp,dk]`, `vh [dv,wp]`, `sc`/`P` `[Tp,wp]`, `ctx`, plus
+  `attn::Online`: the fp32 `m`/`l`/`acc` running state and its f32 row buffer) and drops
+  the `[Tp,Kn]` host matrices and BOs a materialized call at that length would hold
+  (host only when bigger than one tiled score matrix, so a mixed sliding/full model
+  keeps its short buffers; per-head BOs any scratch whose `n`/`k` reaches `Kn`; the
+  chained group scratch once its key axis reaches `Kn`); `Worker::run`
+  dispatches it before the chained and per-head paths when `dv == dk`, and
+  `ROCKET_FA_CHAIN` never applies. Board (`attn_selftest --tile`, cores 0-3, busy board
+  at load 10-13, 600 MHz NPU): tiled vs the f64 `flash_attn_ref` cosine **0.99999994**
+  at 30,016 keys (T=512, GQA 8/2, d=64, causal; materialized 0.99999996) and 0.99999993
+  at 1024 keys with a 256-wide tile; tiled vs materialized 0.99999982-0.99999992 (online
+  reassociation; max_abs one f16 ULP around 0.5), and the tiled output is bit-identical
+  with `ROCKET_FA_CHAIN=0` vs `1` in every run. Scratch, bo+host from `mem_stats`:
+  512x30,016 132+397 -> 27+10 MiB (**14x**), 2,048x16,384 174+267 -> 54+37, 8,192²
+  314+528 -> 113+145, 16,384² 549+1,048 -> 95+153 (**6.4x**), 30,000² 1.07 GiB
+  total where the materialized path would need 429 MiB *per head* of score matrix
+  (~14 GiB over two workers) — the 30k request that used to OOM now runs in ~1 GiB; a
+  3-token request after it trims to 0.7 MiB bo / 0.1 MiB host. Flat in `Kn`: 2,048 x
+  30,016 keeps the same 18.5 MiB host per worker as 2,048 x 16,384 (the BO is 47.3 vs
+  27.0 MiB because a key axis that is not a multiple of the tile adds a second
+  last-tile class to the two-entry scratch cache). Wall is parity to slightly faster
+  and never the point: 8,192² 0.95x (median of 3), 16,384² 0.97x, 2,048x16,384
+  0.95x, 512x30,016 0.88x, vision 2,400² 0.99x; one 8k window read 1.40x at load
+  12, i.e. board noise is +-20 %. Forced on below its crossover it loses as expected
+  (1,024 keys, 256 tile: 1.39x), which is why the default `min_kv` is 8,192. The
+  caller's `[n][n]` additive mask is still O(n²), so a *model* run at 30k still needs
+  the app-side causal block mask. The round also fixed a **pre-existing MLA bug**: the
+  chained group path indexed the V groups with the QK stride (`Kn*dk`) while
+  `GroupBufs::ensure` sized them `Kn*dv`, so a `dv != dk` shape panicked when `dv < dk`
+  and read the wrong columns when `dv > dk` (the M5a binary panics the same way). The C
+  `fa_heads_range` skips the batched path for MLA and now so do we (per-head path;
+  verified at 3,008 keys with dk/dv 64/32 and 32/64, cosine 1.0 vs the materialized
+  arm, and `mha_self` unchanged).
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *non-matmul* families,
   `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
-  the non-fp16 batch wrappers, tiled long-context attention, on-NPU softmax, and all
-  non-matmul op families.
+  the non-fp16 batch wrappers, tiled MLA (a `dv != dk` geometry), on-NPU softmax, and
+  all non-matmul op families. (The tiled long-context path *is* implemented — M5b above.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -997,10 +1034,15 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   gets the same host-pass improvement (qwen3 2777 tok: −11 % wall, −26 % CPU).
 - Long-context NPU attention: emb2's sliding **and full** layers now use chunked
   attention (log-gemma §15), fixing the 8k memory blow-up (full layers were the
-  remaining `[s, s]` case). The *causal* models (qwen3, gemma4 prefill) still build
-  `[n][n]` masks and OOM at ~30k; the same query-chunking idea applies with a causal
-  block mask (per-chunk `[C, q1]` masks, prefix keys), plus a 30k measurement of the
-  emb2 chunked path (the CPU path does 52.4 tok/s at 32 dev threads).
+  remaining `[s, s]` case). The driver-side `[Tp, Kn]` score matrix is no longer
+  required either: the M5b tiled path (`ROCKET_FA_TILE_KV`, opt-in, default off)
+  walks the key axis in tiles at a flat footprint (see "Port status"). What still
+  scales with the *context²* in a model run is the **caller's** additive mask: the
+  example's `masks.rs` / `build_causal_mask` materialize `[n][n]` f16, so qwen3 and
+  gemma4 prefill still OOM at ~30k. The next step is the same query-chunking idea
+  with a causal block mask (per-chunk `[C, q1]` masks, prefix keys) on the app side,
+  then a 30k measurement of both the emb2 chunked path and the tiled attention path
+  (the CPU path does 52.4 tok/s at 32 dev threads).
 - Board service: redeploy `home-llm-gateway-embed-1` from `main` to pick up the
   S1 fast host softmax, the S2 NPU vision default and the ffmpeg runtime (the
   deployed `:latest` is `94f99bd`, pre-S1/S2 and pre-ffmpeg), then re-measure the
@@ -1127,10 +1169,21 @@ cd /root/rocket-inference
 #   flash_attn_ref and asserts single-fd == mt; --mha does the same for
 #   mha_self vs mha_self_ref at d = --dk * heads. --mask none|causal|window,
 #   --softcap F, --mt N and --ref 0|1 pick the case (the f64 oracle auto-skips
-#   above 2e9 MACs).
+#   above 2e9 MACs). --tile KBP switches to the tiled long-context A/B
+#   (ROCKET_FA_TILE_KV=KBP, --tile-min KV, default 8192): it runs the case
+#   materialized and tiled, reports each arm's cosine/max-abs vs the f64 ref and
+#   vs the other, its wall/CPU, the mem_stats footprint each leaves (Tp/Kn/tile,
+#   bo/host), and asserts the tiled output ignores ROCKET_FA_CHAIN; --tile-only
+#   skips the materialized arm (use it at 16k+ keys, where the [Tp,Kn] matrix the
+#   path avoids is what would OOM); --mem adds the 3-token + trim_scratch check.
 taskset -c 0-3 ./attn_selftest 257 257 8 2 --oneshot --mt 4 --mask causal --softcap 30
 taskset -c 0-3 ./attn_selftest 2394 2394 12 12 --dk 64 --dv 64 --mask none --oneshot --ref 1
 taskset -c 0-3 ./attn_selftest 82 82 8 8 --dk 64 --mha --mt 2
+# tiled long-context A/B: small case with the f64 ref (tiling forced on), then the
+# long cases (ref skipped, materialized arm skipped where it would not fit)
+taskset -c 0-3 ./attn_selftest 1024 1024 8 2 --dk 64 --dv 64 --mask causal --ref 1 --tile 256 --tile-min 0
+taskset -c 0-3 ./attn_selftest 4096 4096 8 2 --mask causal --tile 2048 --tile-min 0 --reps 3
+taskset -c 0-3 ./attn_selftest 512 16384 8 2 --dk 64 --mask causal --tile 2048 --tile-only
 taskset -c 0-3 ./int8_selftest --dense 264 320 288
 taskset -c 0-3 ./int8_selftest --gw-one-shot 512 1024 512 32
 taskset -c 0-3 ./int4_selftest 64 256 128
@@ -1149,6 +1202,11 @@ taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --token
 # CPU modes of the same NPU binary (projections are loaded explicitly there)
 ./rocket-inference qwen3 embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
 ./rocket-inference qwen3 embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
+# tiled long-context attention on the model path (env knob, no flag): compare the
+# embedding and the wall against the default materialized run (log §19: parity at
+# 3.6k, cosine 0.999994) and watch ROCKET_MEM_LOG's attention BO/host
+ROCKET_FA_TILE_KV=2048 ROCKET_FA_TILE_MIN_KV=0 ./rocket-inference qwen3 embed --backend flex \
+  --dtype f32 --npu --text-file data/long8k.txt --tokens 3600 --out /tmp/tile_3633.json
 # intent model (model at /root/models/ov-intent-analysis-sft)
 ./rocket-inference intent gen --model-dir /root/models/ov-intent-analysis-sft --text "Hello!" --raw --max-new-tokens 32
 # Gemma family (models at /root/models/embeddinggemma-2, /root/models/gemma-4-E2B-it)

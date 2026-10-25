@@ -34,7 +34,9 @@
 //! The group is bounded by the score-matrix budget `ROCKET_FA_CHAIN_ELEMS` (default 32M
 //! padded `Tp*Kn` elements): `G = clamp(budget / (Tp*Kn), 1, heads_in_range)`, so a long
 //! context shrinks toward one head and `G == 1` runs the per-head path outright.
-//! `ROCKET_FA_CHAIN=0` forces the per-head path for every call (the A/B switch).
+//! `ROCKET_FA_CHAIN=0` forces the per-head path for every call (the A/B switch). MLA
+//! (`dv != dk`) never chains — the group buffers carry one stride per head for both
+//! operands, which only holds while the value dim is the head dim (as in C).
 //!
 //! Numerics: the batched path is bit-identical to the per-head one only while both
 //! accumulate the same way. [`MmBatch`] always accumulates the K-tiles in fp32 on the
@@ -46,6 +48,26 @@
 //! is the head dim (one tile for every geometry in use), the AV shape's K is the padded
 //! key count (one tile up to `kt` keys, so a long context tiles it). `ROCKET_NO_KACC=1`
 //! removes the divergence and chains both shapes at any length.
+//!
+//! # Online/tiled long context (`ROCKET_FA_TILE_KV`, default OFF)
+//!
+//! Port of the C `fa_heads_range_tiled`. The materialized path computes scores over the
+//! FULL key axis in one QK matmul, so its `[Tp, Kn]` score matrix grows with the key
+//! count (and streams to DRAM and back for the host mask + softmax). The tiled path
+//! walks the key axis in tiles of [`tile_kv_width`] keys and carries the
+//! FlashAttention-2 running softmax ([`Online`]: max `m[Tp]`, denominator `l[Tp]`,
+//! unnormalized output `acc[Tp, dv]`, all fp32), so the working score tile is only
+//! `[Tp, Kbp]` and the resident footprint stops growing with `Kn`.
+//!
+//! It engages only when `dv == dk` (MLA stays materialized), the padded key count is
+//! above `ROCKET_FA_TILE_MIN_KV` (default 8192) and the tile is a real subdivision.
+//! It is checked BEFORE the chained path and never chains (`ROCKET_FA_CHAIN` does not
+//! apply): the per-tile GEMMs are small and the submit floor is not what limits a long
+//! context, and the path owns its own scratch — `sc/P/kh/vh` are one tile wide, which
+//! is the point. Numerics are not bit-identical to the materialized path (the online
+//! rescale reassociates the sum), but the arithmetic is fp32 throughout the
+//! accumulation and at least as accurate.
+//!
 
 use std::thread;
 
@@ -68,7 +90,7 @@ mod softmax;
 pub use oneshot::{
     flash_attn, flash_attn_mt, flash_attn_ref, fully_masked_rows, mha_self, mha_self_ref,
 };
-pub use softmax::{Softmax, SoftmaxMode};
+pub use softmax::{Online, Softmax, SoftmaxMode};
 
 const MAX_WORKERS: usize = 8;
 
@@ -105,6 +127,44 @@ fn group_size(budget: u64, tp: usize, kn: usize, heads: usize) -> usize {
     let per_head = (tp as u64).saturating_mul(kn as u64);
     let g = budget.checked_div(per_head).unwrap_or(heads as u64);
     g.clamp(1, heads as u64) as usize
+}
+
+/// `ROCKET_FA_TILE_KV` default: off (opt-in until the crossover is tuned).
+const TILE_KV_DEFAULT: i64 = 0;
+
+/// `ROCKET_FA_TILE_MIN_KV` default: the padded key count above which the tiled path
+/// engages (C `ROCKET_FA_TILE_MIN_KV_DEFAULT`).
+const TILE_MIN_KV_DEFAULT: i64 = 8192;
+
+/// The tiled path's key-tile width for a padded key count `kn_padded`, or 0 to use
+/// the materialized path (C `fa_tile_kv_width`).
+///
+/// `ROCKET_FA_TILE_KV` (default 0 = off) is the requested width, rounded UP to a
+/// multiple of 32 (the score/key/value tile column granularity, minimum 32). The path
+/// engages only above `ROCKET_FA_TILE_MIN_KV` (default 8192) padded keys — short and
+/// mid context keeps the materialized + chained path, where the small-GEMM dispatch
+/// floor rather than the score matrix dominates — and only when the tile is a real
+/// subdivision (`kbp < kn`).
+///
+/// Read fresh on every call (a `getenv` per attention call is free) so one process can
+/// A/B the paths, exactly like the C library. `Worker::prepare` and the dispatch in
+/// `Worker::run` both resolve it from the same padded `Kn`, so the scratch sizing and
+/// the path taken always agree.
+pub fn tile_kv_width(kn_padded: usize) -> usize {
+    let kb = knobs::int("ROCKET_FA_TILE_KV").unwrap_or(TILE_KV_DEFAULT);
+    if kb <= 0 {
+        return 0;
+    }
+    let min_kv = knobs::int("ROCKET_FA_TILE_MIN_KV").unwrap_or(TILE_MIN_KV_DEFAULT);
+    if kn_padded as i64 <= min_kv {
+        return 0;
+    }
+    let kbp = (kb as usize).saturating_add(31) & !31;
+    let kbp = kbp.max(32);
+    if kbp >= kn_padded {
+        return 0;
+    }
+    kbp
 }
 
 /// Copy `Q[h]`'s `t` live rows into a zero-padded `[tp, dk]` tile.
@@ -146,6 +206,39 @@ fn scatter_ctx(out: &mut [f16], ctx: &[f16], oi: usize, t: usize, dv: usize) {
     }
 }
 
+/// Copy key rows `[j0, j0 + w)` of `K[hk]` into a zero-padded `[wp, dk]` tile — one
+/// key tile's QK B operand.
+fn gather_k_tile(dst: &mut [f16], k: &[f16], hk: usize, kv: usize, dk: usize, j0: usize, w: usize) {
+    dst.fill(f16::ZERO);
+    let base = hk * kv * dk;
+    for row in 0..w {
+        let src = base + (j0 + row) * dk;
+        let d = row * dk;
+        dst[d..d + dk].copy_from_slice(&k[src..src + dk]);
+    }
+}
+
+/// Transpose value columns `[j0, j0 + w)` of `V[hk]` (`[dv, kv]`, stride `kv`) into a
+/// zero-padded `[dv, wp]` tile — one key tile's AV B operand.
+#[allow(clippy::too_many_arguments)]
+fn gather_v_tile(
+    dst: &mut [f16],
+    v: &[f16],
+    hk: usize,
+    kv: usize,
+    dv: usize,
+    j0: usize,
+    w: usize,
+    wp: usize,
+) {
+    dst.fill(f16::ZERO);
+    for c in 0..dv {
+        let src = (hk * dv + c) * kv + j0;
+        let d = c * wp;
+        dst[d..d + w].copy_from_slice(&v[src..src + w]);
+    }
+}
+
 /// Host scratch for one chained head group: `cap` heads' worth of every per-head matrix
 /// the group path touches, head-major.
 ///
@@ -157,6 +250,9 @@ fn scatter_ctx(out: &mut [f16], ctx: &[f16], oi: usize, t: usize, dv: usize) {
 struct GroupBufs {
     /// Heads the buffers are sized for.
     cap: usize,
+    /// Padded query/key shape the heads are sized for (0 = never used).
+    tp: usize,
+    kn: usize,
     /// Group queries, `cap * tp*dk`.
     qh: Vec<f16>,
     /// Group keys, `cap * kn*dk`.
@@ -187,6 +283,14 @@ impl GroupBufs {
             }
         }
         self.cap = self.cap.max(heads);
+        self.tp = self.tp.max(tp);
+        self.kn = self.kn.max(kn);
+    }
+
+    /// Whether the group scratch is sized for a key axis at least `kn` long — i.e. the
+    /// materialized chained path at this (or a longer) context, which tiling replaces.
+    fn key_axis_at_least(&self, kn: usize) -> bool {
+        self.cap > 0 && self.kn >= kn
     }
 
     /// Live fp16 elements held by the group buffers.
@@ -218,11 +322,89 @@ struct Scratch {
     stamp: u64,
 }
 
+/// The tiled long-context path's scratch (`ROCKET_FA_TILE_KV`): ONE key tile's
+/// score/key/value matrices plus the fp32 running softmax.
+///
+/// Kept separate from the materialized per-head buffers so the memory win is real: a
+/// tiled call never sizes anything to the full padded key count `Kn`, so nothing here
+/// grows with the context length except the query axis. Grow-only like the rest of the
+/// worker scratch (`prepare` reserves, `trim_scratch` applies the 4x rule), and the
+/// matmul BOs are the worker's separate tiled [`ScratchCache`]s.
+#[derive(Debug, Default)]
+struct TileScratch {
+    /// Query rows (`Tp`) the matrices are sized for.
+    tp: usize,
+    /// Tile width (`Kbp`, a multiple of 32) the matrices are sized for.
+    wp: usize,
+    /// Head dim / value dim the matrices are sized for.
+    dk: usize,
+    dv: usize,
+    /// One head's padded queries, `tp*dk`.
+    qh: Vec<f16>,
+    /// One key tile, `wp*dk` (`[wp, dk]`, the QK B operand).
+    kh: Vec<f16>,
+    /// One value tile transposed, `dv*wp` (`[dv, wp]`, the AV B operand).
+    vh: Vec<f16>,
+    /// One tile's scores, `tp*wp`.
+    sc: Vec<f16>,
+    /// One tile's unnormalized probabilities, `tp*wp`.
+    p: Vec<f16>,
+    /// One tile's `P·V`, `tp*dv`.
+    ctx: Vec<f16>,
+    /// The running max/denominator/output over the tiles (C `fm`/`fl`/`facc`).
+    online: Online,
+}
+
+impl TileScratch {
+    /// Grow to `(tp, wp, dk, dv)`; never shrinks here (see [`TileScratch::trim`]).
+    fn ensure(&mut self, tp: usize, wp: usize, dk: usize, dv: usize) {
+        self.tp = self.tp.max(tp);
+        self.wp = self.wp.max(wp);
+        self.dk = self.dk.max(dk);
+        self.dv = self.dv.max(dv);
+        self.qh.resize(self.tp * self.dk, f16::ZERO);
+        self.kh.resize(self.wp * self.dk, f16::ZERO);
+        self.vh.resize(self.dv * self.wp, f16::ZERO);
+        self.sc.resize(self.tp * self.wp, f16::ZERO);
+        self.p.resize(self.tp * self.wp, f16::ZERO);
+        self.ctx.resize(self.tp * self.dv, f16::ZERO);
+    }
+
+    /// Live bytes: the f16 tiles plus the fp32 running state.
+    fn host_bytes(&self) -> usize {
+        let f16_elems = self.qh.capacity()
+            + self.kh.capacity()
+            + self.vh.capacity()
+            + self.sc.capacity()
+            + self.p.capacity()
+            + self.ctx.capacity();
+        f16_elems * size_of::<f16>() + self.online.bytes()
+    }
+
+    /// Release the scratch when the request that just finished would have needed far
+    /// less — `need` is its own `Tp*Kbp` on the tiled path, or its `Tp*Kn` on the
+    /// materialized one (which it used instead), so a short request after a long tiled
+    /// one returns the memory and a model that alternates the two paths keeps both
+    /// while they stay comparable (the same 4x rule the per-head matrices use).
+    fn trim(&mut self, need: usize) {
+        if need == 0 {
+            return;
+        }
+        if self.sc.len() > 4 * need {
+            *self = TileScratch::default();
+        } else if self.online.oversized(self.tp, self.wp, self.dv) {
+            self.online.release();
+        }
+    }
+}
+
 /// Per-worker attention scratch accounting.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScratchMem {
     /// Padded query/key shape the worker's buffers are sized for.
     pub shape: (usize, usize),
+    /// The `ROCKET_FA_TILE_KV` tile width this worker last used; 0 = materialized.
+    pub tile: usize,
     pub bo_bytes: usize,
     pub host_bytes: usize,
 }
@@ -331,6 +513,15 @@ impl ScratchCache {
         self.entries.retain(|s| s.stamp > self.last_trim);
         self.last_trim = mark;
     }
+
+    /// Drop the entries sized for a key axis of at least `kn` — i.e. the materialized
+    /// scratch a call at this context length would have needed, which is exactly the
+    /// allocation the tiled path replaces. Shorter (still materialized) shapes keep
+    /// theirs, so a model that mixes a tiled long context with short sliding layers
+    /// does not reallocate on every layer.
+    fn drop_key_axis_at_least(&mut self, kn: usize) {
+        self.entries.retain(|s| s.plan.n < kn && s.plan.k < kn);
+    }
 }
 
 struct Worker {
@@ -343,12 +534,21 @@ struct Worker {
     /// use so the per-head path allocates neither.
     bqk: Option<MmBatch>,
     bav: Option<MmBatch>,
+    /// The tiled long-context path's per-tile matmul scratch, one cache per operand
+    /// shape, created on first tiled use. Two entries each hold the full tile width and
+    /// the (narrower) last tile, so a head range reuses both across heads and calls.
+    tqk: Option<ScratchCache>,
+    tav: Option<ScratchCache>,
     /// Host scratch for one chained head group.
     grp: GroupBufs,
+    /// The tiled path's host tiles + running softmax.
+    tiles: TileScratch,
     /// Whether this shape's QK / AV matmul may batch and stay bit-identical to the
     /// per-head path (see [`Worker::resolve_batching`]).
     qk_batch: bool,
     av_batch: bool,
+    /// The tile width the last [`Worker::prepare`] resolved: 0 = materialized.
+    tile_w: usize,
     qh: Vec<f16>,
     kh: Vec<f16>,
     vh: Vec<f16>,
@@ -376,10 +576,13 @@ impl Worker {
             + self.grp.host_elems();
         let batch = self.bqk.as_ref().map_or(0, MmBatch::bytes)
             + self.bav.as_ref().map_or(0, MmBatch::bytes);
+        let tiled = self.tqk.as_ref().map_or(0, ScratchCache::bo_bytes)
+            + self.tav.as_ref().map_or(0, ScratchCache::bo_bytes);
         ScratchMem {
-            bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes() + batch,
-            host_bytes: host * 2,
+            bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes() + batch + tiled,
+            host_bytes: host * size_of::<f16>() + self.tiles.host_bytes(),
             shape: (self.tp, self.kn),
+            tile: self.tile_w,
         }
     }
 
@@ -393,9 +596,13 @@ impl Worker {
             av,
             bqk: None,
             bav: None,
+            tqk: None,
+            tav: None,
             grp: GroupBufs::default(),
+            tiles: TileScratch::default(),
             qk_batch: false,
             av_batch: false,
+            tile_w: 0,
             qh: Vec::new(),
             kh: Vec::new(),
             vh: Vec::new(),
@@ -419,6 +626,16 @@ impl Worker {
         if self.kn == 0 || self.tp == 0 {
             return Err(Error::shape("flash_attn/empty"));
         }
+        // C `fa_scratch_ensure`: MLA (`dv != dk`) never tiles, so the scratch sizing
+        // here and the dispatch in `run` can never disagree.
+        self.tile_w = if dk == dv { tile_kv_width(self.kn) } else { 0 };
+        if self.tile_w > 0 {
+            // One tile of key/value/score, never `[Tp, Kn]` (the C rule): that is the
+            // whole point of the path.
+            self.tiles.ensure(self.tp, self.tile_w, dk, dv);
+            self.release_materialized();
+            return Ok(());
+        }
         self.qh.resize(self.tp * dk, f16::ZERO);
         self.kh.resize(self.kn * dk, f16::ZERO);
         self.vh.resize(dv * self.kn, f16::ZERO);
@@ -430,6 +647,40 @@ impl Worker {
         self.av.get(&self.dev, self.tp, self.kn, dv)?;
         self.resolve_batching(dk, dv);
         Ok(())
+    }
+
+    /// Drop the full-key-axis scratch a materialized call at this length would hold.
+    ///
+    /// The tiled path sizes its own tiles to `Kbp`, so keeping a `[Tp, Kn]` host matrix
+    /// or BO from an earlier materialized call would give back exactly the memory the
+    /// path exists to save. Only scratch *bigger than one tiled score matrix* goes: a
+    /// shorter materialized shape (a sliding layer behind its own shorter key axis)
+    /// keeps its buffers and its BOs, so a model that alternates a tiled long context
+    /// with short materialized layers does not reallocate per layer, while the tiled
+    /// path never retains more host score memory than it uses itself. The per-head BO
+    /// caches lose every entry whose key axis reaches `Kn`, and the chained path's group
+    /// scratch goes once it is sized for a key axis at least this long (it is only ever
+    /// built below the `ROCKET_FA_CHAIN_ELEMS` budget, so it is the smaller leftover).
+    fn release_materialized(&mut self) {
+        if self.scores.len() > self.tp * self.tile_w {
+            self.qh = Vec::new();
+            self.kh = Vec::new();
+            self.vh = Vec::new();
+            self.scores = Vec::new();
+            self.p = Vec::new();
+            self.ctx = Vec::new();
+        }
+        self.qk.drop_key_axis_at_least(self.kn);
+        self.av.drop_key_axis_at_least(self.kn);
+        if self.grp.key_axis_at_least(self.kn) {
+            self.grp.release();
+            if let Some(b) = &mut self.bqk {
+                b.trim();
+            }
+            if let Some(b) = &mut self.bav {
+                b.trim();
+            }
+        }
     }
 
     /// Decide, per operand shape, whether the chained path can be bit-identical to the
@@ -447,6 +698,25 @@ impl Worker {
         let kacc = self.qk.current_mut().bos.has_pong;
         self.qk_batch = batch_matches_per_head(kacc, Plan::new(self.tp, dk, self.kn));
         self.av_batch = batch_matches_per_head(kacc, Plan::new(self.tp, self.kn, dv));
+    }
+
+    /// The score-matrix size the just-finished request needed on the path it took:
+    /// `Tp*Kbp` when it tiled, else the materialized `Tp*Kn`.
+    fn tile_need(&self) -> usize {
+        if self.tile_w > 0 {
+            self.tp * self.tile_w
+        } else {
+            self.tp * self.kn
+        }
+    }
+
+    /// Release the output staging buffer when this request was much smaller than the
+    /// largest one it has served (it is sized `heads * t * dv`, so it follows the
+    /// query count). Refilled by `run` on every call, so dropping it is free.
+    fn shrink_out(&mut self) {
+        if self.out.capacity() > 4 * self.out.len() {
+            self.out = Vec::new();
+        }
     }
 
     /// Release the long-request host matrices once the working shape is much
@@ -479,9 +749,18 @@ impl Worker {
         let dv = self.dv;
         self.out.clear();
         self.out.resize(heads.len() * t * dv, f16::ZERO);
+        // Long context: the tiled path owns the scratch sizing (`prepare` resolved it
+        // from the same padded Kn) and never chains or batches, so it is dispatched
+        // before either. MLA (`dv != dk`) always resolved `tile_w == 0`.
+        if self.tile_w > 0 && self.head_dim == dv {
+            return self.run_tiled(t, kv, heads, gqa, scale, softcap, q, k, v, mask);
+        }
         // A group of one chains nothing, so it takes the per-head path — and so does a
-        // worker whose two shapes both need their own fp16 K-accumulation.
-        let g = if chain_enabled() && (self.qk_batch || self.av_batch) {
+        // worker whose two shapes both need their own fp16 K-accumulation. MLA
+        // (`dv != dk`) never chains: the group buffers carry one stride per head for
+        // both operands, which only holds while the value dim is the head dim (the C
+        // `fa_heads_range` skips the batched path on the same condition).
+        let g = if self.head_dim == dv && chain_enabled() && (self.qk_batch || self.av_batch) {
             group_size(chain_elems(), self.tp, self.kn, heads.len())
         } else {
             1
@@ -491,6 +770,93 @@ impl Worker {
         } else {
             self.run_per_head(t, kv, heads, gqa, scale, softcap, q, k, v, mask)
         }
+    }
+
+    /// `ROCKET_FA_TILE_KV`: the key axis in tiles of [`Worker::tile_w`] keys, carrying
+    /// the FlashAttention-2 running softmax (C `fa_heads_range_tiled`).
+    ///
+    /// Per tile: gather the key/value tile, QK matmul `Tp x dk x wp`, scale and
+    /// soft-cap and mask the tile (pad columns to the clamp), fold it into `m`/`l`/`acc`
+    /// with an f16 unnormalized `P`, AV matmul `Tp x wp x dv`, then `acc += ctx`. Per
+    /// head: `out = acc / l`. Host softmax only, `dv == dk` only, and never chained —
+    /// the per-tile GEMMs are already small, so the submit floor the chained path
+    /// attacks is not what limits a long context; the score traffic is.
+    #[allow(clippy::too_many_arguments)]
+    fn run_tiled(
+        &mut self,
+        t: usize,
+        kv: usize,
+        heads: &[usize],
+        gqa: usize,
+        scale: f32,
+        softcap: f32,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        mask: Option<&[f16]>,
+    ) -> Result<()> {
+        let dk = self.head_dim;
+        let dv = self.dv;
+        let tp = self.tp;
+        let kbp = self.tile_w;
+        let Worker {
+            dev,
+            tiles,
+            tqk,
+            tav,
+            out,
+            ..
+        } = self;
+        for (oi, &h) in heads.iter().enumerate() {
+            let hk = h / gqa;
+            gather_q(&mut tiles.qh[..tp * dk], q, h, t, dk);
+            tiles.online.begin(tp, kbp, dv);
+            let mut j0 = 0;
+            while j0 < kv {
+                // The last tile is narrower; its pad columns are masked and its V
+                // columns are zero, so the extra work is wasted GEMM only.
+                let w = (kv - j0).min(kbp);
+                let wp = w.div_ceil(32) * 32;
+                gather_k_tile(&mut tiles.kh[..wp * dk], k, hk, kv, dk, j0, w);
+                gather_v_tile(&mut tiles.vh[..dv * wp], v, hk, kv, dv, j0, w, wp);
+                {
+                    let qk = tile_scratch(tqk, dev, tp, dk, wp)?;
+                    qk.matmul(
+                        &tiles.qh[..tp * dk],
+                        &tiles.kh[..wp * dk],
+                        &mut tiles.sc[..tp * wp],
+                    )?;
+                }
+                tiles.online.fold(
+                    &tiles.sc[..tp * wp],
+                    &mut tiles.p[..tp * wp],
+                    mask,
+                    j0,
+                    t,
+                    kv,
+                    w,
+                    tp,
+                    wp,
+                    dv,
+                    scale,
+                    softcap,
+                );
+                {
+                    let av = tile_scratch(tav, dev, tp, wp, dv)?;
+                    av.matmul(
+                        &tiles.p[..tp * wp],
+                        &tiles.vh[..dv * wp],
+                        &mut tiles.ctx[..tp * dv],
+                    )?;
+                }
+                tiles.online.add(&tiles.ctx[..tp * dv], tp, dv);
+                j0 += kbp;
+            }
+            tiles
+                .online
+                .finish(&mut out[oi * t * dv..][..t * dv], t, dv);
+        }
+        Ok(())
     }
 
     /// `ROCKET_FA_CHAIN=0`: one submit + fence wait per head matmul.
@@ -671,6 +1037,26 @@ fn batch_context<'a>(slot: &'a mut Option<MmBatch>, dev: &Device) -> Result<&'a 
     Ok(slot.as_mut().expect("created above"))
 }
 
+/// The tiled path's matmul scratch for one tile width, created on first use.
+///
+/// The C tiled loop calls `rocket_matmul_fp16`, which allocates its BOs per call; this
+/// keeps a two-entry [`ScratchCache`] per operand shape instead (the full tile width
+/// and the narrower last tile), so a head range and a repeated request reuse them.
+fn tile_scratch<'a>(
+    slot: &'a mut Option<ScratchCache>,
+    dev: &Device,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<&'a mut Scratch> {
+    if slot.is_none() {
+        *slot = Some(ScratchCache::new(dev, m, k, n)?);
+    }
+    let cache = slot.as_mut().expect("created above");
+    cache.get(dev, m, k, n)?;
+    Ok(cache.current_mut())
+}
+
 /// The masked-GQA shape contract of the C library (`rocket_flash_attn_fp16`'s checks),
 /// shared by the device context and the host reference so the two agree. Returns the
 /// GQA ratio (`n_head / n_kv_heads`).
@@ -749,6 +1135,18 @@ impl Attention {
             w.qk.trim();
             w.av.trim();
             w.shrink_host();
+            w.shrink_out();
+            // The tiled path's host tiles and per-tile BOs follow the same rule: a
+            // request much shorter than the last one returns the memory, a steady
+            // request stream never reallocates. The reference it is measured against is
+            // what this request itself needed on this path (see `TileScratch::trim`).
+            w.tiles.trim(w.tile_need());
+            if let Some(c) = &mut w.tqk {
+                c.trim();
+            }
+            if let Some(c) = &mut w.tav {
+                c.trim();
+            }
             // The chained path's request-scoped scratch: sized by the same shapes, so
             // it follows the same 4x rule as the per-head host matrices and keeps the
             // just-used group (a steady request stream never reallocates).
@@ -945,5 +1343,226 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The knobs are process-wide and cargo runs the tests in parallel, so every test
+    /// that setenv's holds `ENV_LOCK` for its whole body.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_tile_knobs(kv: &str, min_kv: Option<&str>) {
+        unsafe {
+            std::env::set_var("ROCKET_FA_TILE_KV", kv);
+            match min_kv {
+                Some(v) => std::env::set_var("ROCKET_FA_TILE_MIN_KV", v),
+                None => std::env::remove_var("ROCKET_FA_TILE_MIN_KV"),
+            }
+        }
+    }
+
+    #[test]
+    fn tile_kv_width_matches_the_c_rule() {
+        let _g = ENV_LOCK.lock().unwrap();
+
+        // Off by default, and 0 means off whatever the threshold is.
+        unsafe { std::env::remove_var("ROCKET_FA_TILE_KV") };
+        unsafe { std::env::remove_var("ROCKET_FA_TILE_MIN_KV") };
+        assert_eq!(tile_kv_width(32768), 0, "unset = off");
+        with_tile_knobs("0", None);
+        assert_eq!(tile_kv_width(32768), 0, "0 = off");
+
+        // Above the default 8192 threshold, rounded up to 32.
+        with_tile_knobs("2048", None);
+        assert_eq!(tile_kv_width(8192), 0, "not above min_kv");
+        assert_eq!(tile_kv_width(8224), 2048);
+        assert_eq!(tile_kv_width(32768), 2048);
+        with_tile_knobs("1000", None);
+        assert_eq!(tile_kv_width(32768), 1024, "rounded up to 32");
+        with_tile_knobs("1", None);
+        assert_eq!(tile_kv_width(32768), 32, "the 32 floor");
+
+        // A tile that is not a real subdivision is no tiling at all.
+        with_tile_knobs("4096", Some("0"));
+        assert_eq!(tile_kv_width(4096), 0, "one tile == full");
+        assert_eq!(tile_kv_width(4128), 4096);
+
+        // The threshold is configurable, and equal-to-threshold never engages.
+        with_tile_knobs("2048", Some("0"));
+        assert_eq!(tile_kv_width(32), 0, "kbp >= kn");
+        assert_eq!(tile_kv_width(2048), 0);
+        assert_eq!(tile_kv_width(2080), 2048);
+        with_tile_knobs("2048", Some("100000"));
+        assert_eq!(tile_kv_width(32768), 0, "below min_kv");
+        with_tile_knobs("1", Some("-1"));
+        assert_eq!(tile_kv_width(64), 32, "a negative threshold always engages");
+
+        // A huge requested width is clamped by the key axis, not by the parser.
+        with_tile_knobs("99999999", Some("0"));
+        assert_eq!(tile_kv_width(32768), 0);
+        with_tile_knobs("2048", Some("8192"));
+        unsafe { std::env::remove_var("ROCKET_FA_TILE_KV") };
+        unsafe { std::env::remove_var("ROCKET_FA_TILE_MIN_KV") };
+        assert_eq!(tile_kv_width(32768), 0, "unset again = off");
+    }
+
+    #[test]
+    fn tile_gathers_take_the_live_slice_and_zero_the_pad() {
+        // K: two heads of 5 rows over dk=32; the tile is rows [2,5) of head 1 inside
+        // a wp=4-slot tile (3 real rows).
+        let dk = 32usize;
+        let (kv, j0, w, wp) = (5usize, 2usize, 3usize, 32usize);
+        let k: Vec<f16> = (0..2 * kv * dk).map(|i| f16::from_f32(i as f32)).collect();
+        let mut tile = vec![f16::ONE; wp * dk];
+        gather_k_tile(&mut tile, &k, 1, kv, dk, j0, w);
+        for row in 0..w {
+            let src = (kv + j0 + row) * dk;
+            assert_eq!(&tile[row * dk..(row + 1) * dk], &k[src..src + dk]);
+        }
+        assert!(tile[w * dk..].iter().all(|v| *v == f16::ZERO));
+
+        // V is [dv, kv] with stride kv: the tile keeps each channel's [j0, j0+w).
+        let dv = 16usize;
+        let v: Vec<f16> = (0..2 * dv * kv).map(|i| f16::from_f32(i as f32)).collect();
+        let mut vtile = vec![f16::ONE; dv * wp];
+        gather_v_tile(&mut vtile, &v, 1, kv, dv, j0, w, wp);
+        for c in 0..dv {
+            let src = (dv + c) * kv + j0;
+            assert_eq!(&vtile[c * wp..c * wp + w], &v[src..src + w]);
+            assert!(
+                vtile[c * wp + w..(c + 1) * wp]
+                    .iter()
+                    .all(|v| *v == f16::ZERO)
+            );
+        }
+    }
+
+    /// One head's tiled attention over host f32 `acc`, using the same fold the worker
+    /// runs, so the online state can be checked against a materialized reference with
+    /// no device involved.
+    #[allow(clippy::too_many_arguments)]
+    fn tiled_host(
+        scores: &[f16],
+        mask: Option<&[f16]>,
+        t: usize,
+        kv: usize,
+        dk: usize,
+        tp: usize,
+        scale: f32,
+        softcap: f32,
+        kbp: usize,
+    ) -> Vec<f16> {
+        // The values are the score matrix's own second operand stand-in: a deterministic
+        // [dk, kv] matrix so a wrong tile offset shows up as a wrong output.
+        let v: Vec<f16> = (0..dk * kv)
+            .map(|i| f16::from_f32(((i * 37) % 101) as f32 / 101.0 - 0.5))
+            .collect();
+        let mut out = vec![f16::ZERO; t * dk];
+        let mut online = Online::with_mode(SoftmaxMode::Fast);
+        let mut p = vec![f16::ZERO; tp * (kbp + 32)];
+        let mut ctx = vec![f16::ZERO; tp * dk];
+        online.begin(tp, kbp, dk);
+        let mut j0 = 0;
+        while j0 < kv {
+            let w = (kv - j0).min(kbp);
+            let wp = w.div_ceil(32) * 32;
+            // This tile's scores, taken from the full matrix the reference folds in one
+            // pass (the QK matmul itself is not what these tests exercise).
+            let mut sc = vec![f16::ZERO; tp * wp];
+            for i in 0..tp {
+                for j in 0..w {
+                    sc[i * wp + j] = scores[i * kv + j0 + j];
+                }
+            }
+            online.fold(
+                &sc,
+                &mut p[..tp * wp],
+                mask,
+                j0,
+                t,
+                kv,
+                w,
+                tp,
+                wp,
+                dk,
+                scale,
+                softcap,
+            );
+            // P.T · V for this tile, in f32, into the [tp, dk] AV stand-in (the pad
+            // columns' values are zero, so only the real `w` columns can contribute).
+            for i in 0..tp {
+                for c in 0..dk {
+                    let mut sum = 0.0f32;
+                    for j in 0..w {
+                        sum += p[i * wp + j].to_f32() * v[c * kv + j0 + j].to_f32();
+                    }
+                    ctx[i * dk + c] = f16::from_f32(sum);
+                }
+            }
+            online.add(&ctx[..tp * dk], tp, dk);
+            j0 += kbp;
+        }
+        online.finish(&mut out, t, dk);
+        out
+    }
+
+    #[test]
+    fn the_online_fold_matches_one_materialized_pass() {
+        let (t, tp, kv, dk) = (6usize, 8usize, 300usize, 32usize);
+        let scale = 1.0 / (dk as f32).sqrt();
+        let mut seed = 0x5eed_1234_9876_4321u64;
+        let scores: Vec<f16> = (0..tp * kv)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                f16::from_f32(((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+            })
+            .collect();
+        // Causal rows 0..t see keys <= their row; the rest is masked out.
+        let mut mask = vec![f16::ZERO; t * kv];
+        for row in 0..t {
+            for j in (row + 1)..kv {
+                mask[row * kv + j] = f16::NEG_INFINITY;
+            }
+        }
+
+        // Reference for the same host pipeline: one tile over the whole key axis (the
+        // tile width is a multiple of 32, so 320 covers all 300 keys in one fold).
+        let one = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 320);
+        for kbp in [32usize, 128, 288, 512] {
+            let many = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, kbp);
+            let (mut cos, mut na, mut nb, mut max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in one.iter().zip(&many) {
+                let (a, b) = (a.to_f64(), b.to_f64());
+                cos += a * b;
+                na += a * a;
+                nb += b * b;
+                max = max.max((a - b).abs());
+            }
+            let cos = cos / (na.sqrt() * nb.sqrt());
+            assert!(cos > 0.9999, "kbp={kbp}: cosine {cos:.8} vs one tile");
+            assert!(max < 1e-3, "kbp={kbp}: max_abs {max:.6}");
+        }
+    }
+
+    #[test]
+    fn a_fully_masked_tile_leaves_the_running_state_alone() {
+        // A causal row 0 sees only key 0; every later tile is entirely masked for it.
+        // The fold must skip those tiles, not weight their clamp by exp(-30000) — the
+        // failure mode would be a uniform (rather than key-0) row.
+        let (t, tp, kv, dk) = (1usize, 4usize, 96usize, 32usize);
+        let scale = 1.0 / (dk as f32).sqrt();
+        let scores: Vec<f16> = (0..tp * kv).map(|_| f16::from_f32(0.25)).collect();
+        let mut mask = vec![f16::NEG_INFINITY; t * kv];
+        mask[0] = f16::ZERO;
+        let got = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 32);
+        // Only key 0 is visible, and every visible score is equal, so its probability
+        // is 1 whatever the tile layout: the output is V's column 0.
+        let want = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 320);
+        assert_eq!(got, want, "tile layout must not change a one-key row");
+
+        // And a row with no visible key at all (a padding row) is zero, not uniform.
+        let empty = vec![f16::NEG_INFINITY; t * kv];
+        let zeros = tiled_host(&scores, Some(&empty), t, kv, dk, tp, scale, 0.0, 32);
+        assert!(zeros.iter().all(|v| *v == f16::ZERO));
     }
 }
