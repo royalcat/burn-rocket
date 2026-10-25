@@ -170,7 +170,7 @@ class Runner:
         return self.run_files(name, args, [src], out_f32, n_out)
 
     def run_files(self, name: str, args: list[str], inputs: list[Path], out_f32: bool,
-                  n_out: int,
+                  n_out: int, c_args: list[str] | None = None,
                   kind: str | None = None) -> tuple[list[float], list[float]]:
         """Run both binaries on `inputs` (the trailing files of the `--io` layout).
 
@@ -190,8 +190,8 @@ class Runner:
             print(f"  {name}: rust exited {r.returncode}: {r.stderr.strip()}")
             self.fail = True
             return [], []
-        c = subprocess.run([str(self.cbin), *args, *ins, str(c_out)],
-                           capture_output=True, text=True)
+        c = subprocess.run([str(self.cbin), *(c_args if c_args is not None else args),
+                            *ins, str(c_out)], capture_output=True, text=True)
         if c.returncode != 0:
             print(f"  {name}: C exited {c.returncode}: {c.stderr.strip()}")
             self.fail = True
@@ -231,13 +231,26 @@ def main() -> int:
                     help="the ops_selftest binary (M7 families; skipped when missing)")
     ap.add_argument("--conv", type=Path,
                     help="the conv_selftest binary (M8a/M8b families; skipped when missing)")
+    ap.add_argument("--enc", type=Path,
+                    help="the encoders_selftest binary (M9 SAM/SigLIP; skipped when missing)")
     ap.add_argument("--c", required=True, type=Path)
     ap.add_argument("--work", default=Path("/tmp/ab_m6b"), type=Path)
     ap.add_argument("--no-wide", action="store_true",
                     help="skip the 257x1000 softmax case")
+    ap.add_argument("--enc-only", action="store_true",
+                    help="run only the M9 encoder section (needs --enc)")
     args = ap.parse_args()
 
     run = Runner(args.rust, args.c, args.work)
+
+    if args.enc_only:
+        if args.enc is None:
+            print("--enc-only needs --enc")
+            return 2
+        m9(run, args.enc)
+        print()
+        print("ab_compare:", "FAIL" if run.fail else "PASS")
+        return 1 if run.fail else 0
 
     # ── Spatial pools ──────────────────────────────────────────────────────────
     print("spatial pools:")
@@ -313,6 +326,9 @@ def main() -> int:
     if args.conv is not None:
         m8a(run, args.conv)
         m8b(run, args.conv)
+
+    if args.enc is not None:
+        m9(run, args.enc)
 
     print()
     print("ab_compare:", "FAIL" if run.fail else "PASS")
@@ -696,5 +712,124 @@ def m8b(run: "Runner", conv: Path) -> None:
     run.rust = m6b
 
 
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 1.0
+
+
+def m9(run: Runner, enc: Path) -> None:
+    """The M9 model encoders (SAM ViT-Det + SigLIP) through `encoders_selftest --io`.
+
+    Three things are checked, in this order:
+
+    1. the two **host references** are bit-identical (`sam_ref` / `siglip_ref` against the
+       C `fd < 0` path, output and every intermediate block). This is the primary gate:
+       it pins the whole datapath — the im2col ordering, the patch matmul's precision
+       (f32-accumulate for SAM, f64 for SigLIP), the LayerNorm/softmax/GELU rounding, the
+       windowed rel-pos bias, the neck — against the C without needing a device;
+    2. the Rust **one-shot NPU** arm against the host reference (cosine per layer);
+    3. the Rust **resident ctx** arm against the same reference (per layer, plus the
+       neck/final output), and on a device the C NPU arm against its own reference for
+       scale. A device arm is skipped (with a note) when the binary has no NPU.
+
+    The blobs and pixels come from the Rust `--write-blob` fixture, so the C loader
+    validates the format the Rust writer produces (a wrong header, order or size is a
+    `rocket_*_load` failure, not a silent mismatch).
+    """
+    print("M9 model encoders (SAM + SigLIP):")
+    m6b = run.rust
+    run.rust = enc.resolve()
+    synth = run.work / "m9"
+    r = subprocess.run([str(run.rust), "--write-blob", str(synth)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"  --write-blob failed: {r.stderr.strip()}")
+        run.fail = True
+        run.rust = m6b
+        return
+
+    for family in ("sam", "siglip"):
+        blob = synth / f"{family}.f16"
+        pix = synth / f"{family}_pixels.raw"
+        # The expected output lengths come from the blob itself.
+        sizes = m9_sizes(blob, family)
+        if sizes is None:
+            print(f"  {family}: cannot read the fixture geometry")
+            run.fail = True
+            continue
+        n_out, n_hidden, block, n_layers = sizes
+
+        # 1. the host references, bit-identical
+        c_out, r_out = run.run_files(f"m9_{family}_ref", [f"{family}_ref", str(blob), str(pix)],
+                                     [], False, n_out)
+        run.report(f"{family} host reference", c_out, r_out, strict=True)
+        c_hid = r_f16(run.work / f"m9_{family}_ref.c.hidden")
+        r_hid = r_f16(run.work / f"m9_{family}_ref.rs.hidden")
+        exact, cos, max_abs = stats(c_hid, r_hid)
+        ok = exact == len(c_hid)
+        run.fail |= not ok
+        print(f"  {family + ' host reference hidden':<34} "
+              f"{'bit-identical' if exact == len(c_hid) else f'exact={exact}/{len(c_hid)}':<18} "
+              f"cos={cos:.9f} max_abs={max_abs:.3e} -> {'PASS' if ok else 'FAIL'}")
+
+        # 2./3. the device arms against the host reference (skip without an NPU)
+        if not have_npu():
+            print(f"  {family + ' device arms':<34} skipped (no /dev/accel/accel0)")
+            continue
+        for fam in (f"{family}_npu", f"{family}_ctx"):
+            got, _ = run.run_files(f"m9_{fam}", [fam, str(blob), str(pix)], [], False, n_out,
+                                   c_args=[family, str(blob), str(pix)])
+            if not got:
+                continue
+            got_hid = r_f16(run.work / f"m9_{fam}.rs.hidden")
+            if len(got_hid) != n_hidden:
+                print(f"  {fam}: hidden size {len(got_hid)}, expected {n_hidden}")
+                run.fail = True
+                continue
+            cos = cosine(got, r_out)
+            worst = cos
+            table = []
+            for k in range(n_layers + 1):
+                c = cosine(got_hid[k * block:(k + 1) * block],
+                           r_hid[k * block:(k + 1) * block])
+                table.append(c)
+                worst = min(worst, c)
+            ok = worst >= 0.9999
+            run.fail |= not ok
+            print(f"  {fam:<34} layers " + " ".join(f"{c:.6f}" for c in table))
+            print(f"  {'':<34} out  {cos:.9f}  worst {worst:.9f} -> "
+                  f"{'PASS' if ok else 'FAIL'}")
+
+    run.rust = m6b
+
+
+def have_npu() -> bool:
+    return Path("/dev/accel/accel0").exists()
+
+
+def m9_sizes(blob: Path, family: str):
+    """`(out_len, hidden_len, block_len, n_layers)` from a blob header."""
+    raw = blob.read_bytes()
+    h = struct.unpack("<16i", raw[:64])
+    magic = h[0] & 0xFFFFFFFF
+    d, n_layers = h[2], h[3]
+    if family == "sam":
+        if magic != 0x53414D42:
+            return None
+        grid, neck_out = h[6], h[10]
+        block = grid * grid * d
+        return neck_out * grid * grid, (n_layers + 1) * block, block, n_layers
+    if magic != 0x53474C50:
+        return None
+    l = h[6]
+    block = l * d
+    return block, (n_layers + 1) * block, block, n_layers
+
+
 if __name__ == "__main__":
     sys.exit(main())
+

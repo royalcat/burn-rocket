@@ -295,6 +295,61 @@ takes a 30k-key request from OOM to a 1 GiB working set. Wall is parity to ±20 
 it wins once the key axis dominates the query block (0.88-0.95x measured) and pays
 more, smaller submits at a square 8k with a 2k tile.
 
+### The model encoders (M9): SAM ViT-Det and SigLIP
+
+`rocket-npu` also carries the two **model-level** encoders of the C library — complete
+graphs assembled from the primitives above, not new kernels. Each has a flat fp16 weight
+blob (the `tools/sam_extract.py` / `tools/siglip_extract.py` format), a **device-free
+host reference** (the C `fd < 0` datapath), a one-shot device entry and a **resident**
+context that packs the static GEMMs once and reuses them across images.
+
+| | graph | blob |
+|---|---|---|
+| **SAM ViT-Det** (`facebook/sam-vit-base`) | patch conv (k = stride = 16, with bias) → learned 2D position table → 12 pre-norm blocks (fused qkv → **windowed** attention on all but the periodic global layers → the decomposed **relative-position bias** added to the *unscaled* `QK^T` before the softmax → o-projection, then an erf-GELU MLP) → neck (1×1 conv → channels-first LayerNorm → 3×3 conv → LayerNorm) → `[1,256,64,64]` | 183.8 MB |
+| **SigLIP-B/16** (the SmolVLM-256M front-end) | patch conv (16, 16, with bias) → position table → 12 pre-norm blocks (q/k/v/o + GELU-tanh MLP) → post-LayerNorm → `[1024,768]` | 172.9 MB |
+
+The host/NPU split is the C's: the big GEMMs (patch, qkv/o, fc1/fc2, the neck convs and
+the per-head `QK^T` / `P·V`) run on the NPU, and the `O(tokens·d)` glue (im2col, the
+position add, window partition/unpartition, the LayerNorms, the erf-GELU, the softmax and
+the decomposed rel-pos matmul+add) on the host. The rel-pos add is faithful in fp16 (the
+C measures cos ≥ 0.9999991/layer), so there is no host-f32 fallback for it. SAM's window
+grid is zero-padded up to a multiple of the window size, and — as in the C — the pad
+tokens *do* participate as keys/queries in the boundary windows; the real 64×64 grid with
+14×14 windows (70×70 padded, 25 windows) is exactly that case.
+
+`SiglipModel` also carries the C's plain-ViT variant knobs, honoured by the resident
+path only (as in C): a CLIP `cls` prefix row, a pre-encoder LayerNorm, quick-GELU instead
+of GELU-tanh, and DPT-style multi-tap exits. A v1 blob leaves them at the SigLIP
+defaults.
+
+**Validation.** The primary gate is the two host references against the C's: both are
+**bit-identical** to `rocket_sam_encode(-1, …)` / `rocket_siglip_encode(-1, …)` — the
+output *and* every intermediate token block — on the synthetic fixture (x86 and the
+board) and on the real checkpoints (x86). That pins the whole datapath (im2col ordering,
+SAM's f32-accumulate vs SigLIP's f64-accumulate patch matmul, the LayerNorm/softmax/GELU
+rounding, the windowed rel-pos bias, the neck) without needing a device. On the board the
+device arms are then scored against that reference: the synthetic fixture
+(d=64, 2 layers, grid 8/window 4) gives SAM one-shot **0.99999951** / resident
+**0.99999951** worst-layer, and SigLIP one-shot **0.99999724** / resident **0.99999724**;
+SAM's one-shot and resident outputs are **bit-identical to each other**, and repeats are
+bit-identical. On the real checkpoints — the board, cores 0-3, load average ~9-11
+(the live embedding service keeps 4-7) — the same comparison gives SAM one-shot worst
+layer **0.99999848** / neck **0.99999938** (150 s) and resident worst **0.99999842** /
+neck 0.99999936 (113 s after a 1.8 s pack), SigLIP one-shot output **0.99998189**
+(18.8 s, worst layer 0.99999144) and resident output **0.99993420**
+(4.4 s after a 0.8 s pack, worst layer 0.99998237; the
+per-head fallback `ROCKET_SIGLIP_FA=0` gives 0.99992939 in 13.3 s, so the flash-attention
+fan-out is 3× the per-head path on this shape). For
+scale on the same artifacts, the C library's own `sam_rocket` gate reports mean-layer
+0.999999 / neck 0.999999 with a 153.9 s one-shot, so the Rust one-shot is at parity
+with the C's and the SigLIP resident arm is 4.3× faster than its one-shot (it skips
+the per-call weight re-pack and the per-layer `mha_self` fd churn).
+
+`siglip_rocket`, the C library's own gate, passes on the board against the HF f32
+reference with mean-layer cosine 0.999985 and post-LN 0.999884, which is what makes the
+port's target meaningful. The C's erf-GELU (device one-shot) and GELU-tanh (resident)
+differ by ~1e-3 as its header says, so the resident arm carries that delta on top.
+
 ### Missing surface
 
 `rocket-npu` is a focused matmul/attention driver, not a full replacement of every
@@ -324,7 +379,9 @@ model `conv2d_dw_int8_model` and the `requant_*` arithmetic), the PPU pooling fa
 (`pool_fp16`/`pool_int8`/`pool_uint8` and their references, `pool_fp16_plan` with the
 C's `-3`..`-10` classes, `PoolDesc`), the upsample family
 (`upsample_nearest`/`upsample_bilinear` and the references, `build_kernel`,
-`bilinear_ksize`, the plans), and
+`bilinear_ksize`, the plans), the two model encoders (`ops::sam` and `ops::siglip`:
+the blob loaders, the device-free host references, the one-shot entries and the resident
+contexts, with the CLIP/DPT variant knobs), and
 masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
@@ -342,9 +399,12 @@ the reduce/softmax families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--
 families (`--norm`, `--vision`, `--ffn`, `--encoder`, the four per-family shape
 overrides, `--reps`), `crates/rocket-npu/src/bin/conv_selftest.rs` for the convolution
 family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, `--int8`, `--int8-dw`,
-`--pool`, `--resize`, the per-family shape overrides, `--reps`), and their `--io`
-raw-file modes are the exchange format of `tools/c-oracle/ab_compare.py` for the
-C-vs-Rust A/B on the board.
+`--pool`, `--resize`, the per-family shape overrides, `--reps`), and
+`crates/rocket-npu/src/bin/encoders_selftest.rs` for the two model encoders (`--write-blob`,
+`sam`/`siglip` with `--ref`/`--npu`/`--ctx N`, `--ref-in`/`--ref-out` to move a host
+reference between machines, and a `--io` mode); their `--io` raw-file modes are the
+exchange format of `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board
+(`--enc`, or `--enc-only` for just the M9 section).
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
@@ -366,12 +426,12 @@ optimization is the remaining work), the RK3576-specific convolution and pooling
 entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
 entry with its zero point and the prepacked/cube handles), the int8 convolution's
 opt-in `ROCKET_CONV_BATCH` batched submit (bit-identical to the per-tile path this
-port runs), and the remaining op families: SAM/SigLIP and graph execution.
+port runs), and graph execution (the RK3576-only graph runner).
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
 the FFN/MLP, the encoder block, the fp16 and int8 convolution families (direct/
 depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant), the
-PPU pooling family and the upsample are implemented. See
-the `rocket-npu` crate docs for the full list.
+PPU pooling family, the upsample and the two model encoders (SAM ViT-Det and
+SigLIP-B/16) are implemented. See the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and

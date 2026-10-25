@@ -174,7 +174,7 @@ pub fn flash_attn_ref(
                 for (p, &vj) in sc.iter().zip(&vh[c * n_kv..c * n_kv + n_kv]) {
                     a += p * vj.to_f64();
                 }
-                *o = f16::from_f64(a * inv);
+                *o = crate::ops::f16_from_f64(a * inv);
             }
         }
     }
@@ -528,7 +528,7 @@ pub fn mha_self_ref(
             for (i, &cr) in ctx[t * d..(t + 1) * d].iter().enumerate() {
                 a += cr * f64::from(wo[o * d + i].to_f32());
             }
-            out[t * d + o] = f16::from_f64(a + bias(bo, o));
+            out[t * d + o] = crate::ops::f16_from_f64(a + bias(bo, o));
         }
     }
     Ok(())

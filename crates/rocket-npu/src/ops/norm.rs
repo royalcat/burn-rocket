@@ -290,7 +290,7 @@ pub fn layernorm_ref(
         for (i, o) in op.iter_mut().enumerate() {
             let g = gamma[i].to_f64();
             let b = beta.map_or(0.0, |b| b[i].to_f64());
-            *o = f16::from_f64((xp[i].to_f64() - mean) * r * g + b);
+            *o = crate::ops::f16_from_f64((xp[i].to_f64() - mean) * r * g + b);
         }
     }
 }

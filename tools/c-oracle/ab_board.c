@@ -47,6 +47,15 @@
  * int8/uint8 pools are one byte per element, `conv_int8`'s OUT is int32, and the scales
  * are f32 bit patterns in hex.)
  *
+ * M9 (the model encoders). `BLOB` is a `tools/sam_extract.py` / `tools/siglip_extract.py`
+ * blob, `PIXELS` the raw f16 `[ic][image_size][image_size]` input, `OUT` receives the
+ * neck / final output and `OUT.hidden` the `(n_layers+1)` intermediate token blocks (the
+ * same layout as `encoders_selftest --io`). `*_ref` runs the exact host reference
+ * (`fd < 0`) and needs no NPU at all:
+ *
+ *   ab_board sam|sam_ref       BLOB PIXELS OUT
+ *   ab_board siglip|siglip_ref BLOB PIXELS OUT
+ *
  * (In the encoder line any of LN1B/BQ/BK/BV/BO/LN2B/BF1/BF2 may be `-`. `mlp` is the
  * C's internal host-handoff MLP, which has no public entry point: the fused entry is
  * what this harness can call, so `mlp` is rejected with a message.)
@@ -72,6 +81,8 @@
 #include "rocket_normvision.h"
 #include "rocket_ffn.h"
 #include "rocket_encoder.h"
+#include "rocket_sam.h"
+#include "rocket_siglip.h"
 
 static void die(const char *what)
 {
@@ -123,8 +134,11 @@ int main(int argc, char **argv)
 {
     if (argc < 3) die("usage: ab_board FAMILY ... IN OUT");
     const char *family = argv[1];
-    int fd = rocket_open();
-    if (fd < 0) die("cannot open the NPU");
+    /* The `*_ref` encoder families run the C `fd < 0` host reference, so they work on a
+     * host with no NPU (the M9 self-check on x86). Every other family needs the device. */
+    const int host_only = !strcmp(family, "sam_ref") || !strcmp(family, "siglip_ref");
+    int fd = host_only ? -1 : rocket_open();
+    if (!host_only && fd < 0) die("cannot open the NPU");
 
     int rc = 0;
     if (!strcmp(family, "avg") || !strcmp(family, "max") || !strcmp(family, "min")) {
@@ -553,10 +567,56 @@ int main(int argc, char **argv)
         if (rc) die("resize op failed");
         spit(argv[8], out, on * sizeof(_Float16));
         free(in); free(out);
+    } else if (!strcmp(family, "sam") || !strcmp(family, "sam_ref")) {
+        /* sam|sam_ref BLOB PIXELS OUT   (OUT.hidden gets the (nL+1) token blocks) */
+        if (argc < 5) die("sam BLOB PIXELS OUT");
+        rocket_sam_model m;
+        int lrc = rocket_sam_load(argv[2], &m);
+        if (lrc) die("rocket_sam_load");
+        size_t pb;
+        _Float16 *pix = slurp(argv[3], &pb);
+        const size_t pix_n = (size_t)m.ic * m.image_size * m.image_size;
+        if (pb != pix_n * sizeof(_Float16)) die("pixels size");
+        const size_t Gd = (size_t)m.grid * m.grid * m.d;
+        const size_t Nn = (size_t)m.neck_out * m.grid * m.grid;
+        _Float16 *out = calloc(Nn, sizeof(_Float16));
+        _Float16 *hid = calloc((size_t)(m.n_layers + 1) * Gd, sizeof(_Float16));
+        if (!out || !hid) die("calloc");
+        rc = rocket_sam_encode(fd, &m, pix, out, hid);
+        if (rc) die("rocket_sam_encode");
+        char hpath[4096];
+        snprintf(hpath, sizeof hpath, "%s.hidden", argv[4]);
+        spit(argv[4], out, Nn * sizeof(_Float16));
+        spit(hpath, hid, (size_t)(m.n_layers + 1) * Gd * sizeof(_Float16));
+        free(pix); free(out); free(hid);
+        rocket_sam_free(&m);
+    } else if (!strcmp(family, "siglip") || !strcmp(family, "siglip_ref")) {
+        /* siglip|siglip_ref BLOB PIXELS OUT   (OUT.hidden gets the (nL+1) token blocks) */
+        if (argc < 5) die("siglip BLOB PIXELS OUT");
+        rocket_siglip_model m;
+        int lrc = rocket_siglip_load(argv[2], &m);
+        if (lrc) die("rocket_siglip_load");
+        size_t pb;
+        _Float16 *pix = slurp(argv[3], &pb);
+        const size_t pix_n = (size_t)m.ic * m.image_size * m.image_size;
+        if (pb != pix_n * sizeof(_Float16)) die("pixels size");
+        const size_t ntok = (size_t)m.L + m.n_prefix;
+        const size_t Td = ntok * (size_t)m.d;
+        _Float16 *out = calloc(m.n_taps > 0 ? (size_t)m.n_taps * Td : Td, sizeof(_Float16));
+        _Float16 *hid = calloc((size_t)(m.n_layers + 1) * Td, sizeof(_Float16));
+        if (!out || !hid) die("calloc");
+        rc = rocket_siglip_encode(fd, &m, pix, out, hid);
+        if (rc) die("rocket_siglip_encode");
+        char hpath[4096];
+        snprintf(hpath, sizeof hpath, "%s.hidden", argv[4]);
+        spit(argv[4], out, (m.n_taps > 0 ? (size_t)m.n_taps * Td : Td) * sizeof(_Float16));
+        spit(hpath, hid, (size_t)(m.n_layers + 1) * Td * sizeof(_Float16));
+        free(pix); free(out); free(hid);
+        rocket_siglip_free(&m);
     } else {
         die("unknown family");
     }
 
-    rocket_close(fd);
+    if (fd >= 0) rocket_close(fd);
     return 0;
 }

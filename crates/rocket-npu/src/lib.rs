@@ -187,6 +187,28 @@
 //!   `ROCKET_CONV_TRANSPOSE_HW=0` forcing the lowering) and
 //!   [`ops::conv_transpose::conv_transpose2d_ref`] (the route-independent
 //!   scatter-add oracle);
+//! - the two **model-level encoders** ([`ops::sam`], [`ops::siglip`] — the M9 capstone,
+//!   ports of `rocket_sam_encoder.c` and `rocket_siglip_encoder.c`). [`ops::sam`] is
+//!   the SAM ViT-Det image encoder: patch conv + learned 2D position table, pre-norm
+//!   blocks with a fused qkv, windowed attention on all but the periodic global
+//!   layers, the **decomposed relative-position bias** added to the unscaled `QK^T`
+//!   scores before the softmax, an erf-GELU MLP and the 1x1-conv / channels-first
+//!   LayerNorm / 3x3-conv / LayerNorm neck. [`ops::siglip`] is the SigLIP-B/16
+//!   plain-ViT tower: patch conv + position table, pre-norm blocks (built on
+//!   [`ops::encoder::encoder_block`]) and a post-LayerNorm, plus the C's plain-ViT
+//!   variant knobs (a CLIP prefix token and pre-LN, quick-GELU, and the DPT multi-tap
+//!   exits) in the resident path. Both expose the `*_extract.py` blob loader
+//!   ([`ops::sam::SamModel::load`] / [`ops::siglip::SiglipModel::load`] and their
+//!   `from_blob`/`from_parts` forms, with the C's `-1`..`-4` failure classes), a
+//!   **device-free host reference** ([`ops::sam::sam_encode_ref`] /
+//!   [`ops::siglip::siglip_encode_ref`], the C `fd < 0` datapath, bit-identical to it
+//!   on the host and on the board), the one-shot device entry
+//!   ([`ops::sam::sam_encode`] / [`ops::siglip::siglip_encode`]) and the resident
+//!   prepacked context ([`ops::sam::SamContext`] / [`ops::siglip::SiglipContext`]):
+//!   the static GEMMs are packed once and the per-head computed matmuls fan across the
+//!   context's worker fds. SigLIP's resident path also runs its attention through
+//!   [`attn::Attention`] (`ROCKET_SIGLIP_FA=0` keeps the per-head path), matching the
+//!   C's `use_fa`;
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
@@ -238,11 +260,11 @@
 //!   prepacked/cube handles), and the int8 convolution's batched (gapped multi-task)
 //!   submit — the C's opt-in `ROCKET_CONV_BATCH`, which is bit-identical to the per-tile
 //!   path this port runs;
-//! - the remaining op families: SAM/SigLIP and graph execution. The activation +
-//!   elementwise, the reduce + softmax, the transformer/vision norms, the FFN/MLP, the
-//!   encoder block, the fp16 and int8 convolution families (direct/depthwise/1D, the
-//!   conv→activation fusion, the transposed conv and the int8 requant), the PPU pooling
-//!   family and the upsample are implemented above.
+//! - graph execution (the RK3576-only graph runner). The activation + elementwise, the
+//!   reduce + softmax, the transformer/vision norms, the FFN/MLP, the encoder block,
+//!   the fp16 and int8 convolution families (direct/depthwise/1D, the conv→activation
+//!   fusion, the transposed conv and the int8 requant), the PPU pooling family, the
+//!   upsample and the SAM/SigLIP encoders are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.

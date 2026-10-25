@@ -771,6 +771,99 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   references (count-include-pad, int8 rounding, uint8 recentring), the resize
   kernel/plan/geometry table (scales 1..4) and the half-pixel zero-boundary
   reference.
+  **M9 SAM + SigLIP encoders** (2026-10-25, the parity capstone):
+  `src/rocket_sam_encoder.c` (769 lines) and `src/rocket_siglip_encoder.c` (765) are
+  ported as `ops/sam.rs` and `ops/siglip.rs`. `ops::sam` is the SAM ViT-Det image
+  encoder: patch conv (k = stride = `patch`, with bias) + the learned 2D position
+  table, then pre-norm blocks with a **fused qkv** (`[3d,d]`), **windowed** attention
+  on all but the periodic global layers (the grid is zero-padded to a multiple of
+  `win` and — faithfully — the pad tokens take part as keys/queries in the boundary
+  windows), the scale folded into the softmax over the *unscaled* `QK^T`, the
+  **decomposed relative-position bias** (`rel_h`/`rel_w` from the resolved
+  `[side,side,dhead]` tables, added to the scores before the softmax), an erf-GELU
+  MLP, and the neck (1x1 conv as a matmul, channels-first LayerNorm, 3x3 pad1 conv,
+  channels-first LayerNorm). `ops::siglip` is the SigLIP-B/16 plain-ViT tower: patch
+  conv + position table, pre-norm blocks built on `ops::encoder::encoder_block`, a
+  post-LayerNorm, plus the C's plain-ViT knobs (`n_prefix`/`prefix` cls row,
+  `pre_g`/`pre_b` pre-encoder LN, `act_kind` quick-GELU / exact-erf, DPT `taps`) in
+  the resident path and `patch_dim_pad` (patch 14's 588 -> 608 K align).
+  API: `sam_load`/`SamModel::{load, from_blob, from_parts, synthetic, to_blob}`,
+  `sam_encode(&Device, ...)` (the C one-shot), `sam_encode_ref` (the exact `fd < 0`
+  host reference, device-free), `SamContext::{create, encode}` + `sam_encode_ctx`
+  (resident: the patch, per-layer qkv/o/fc1/fc2 and neck conv1 weights packed once),
+  and the same six for SigLIP (`siglip_load`, `siglip_encode`, `siglip_encode_ref`,
+  `SiglipContext`); `SamGeometry`/`SamLayerWeights`/`SamNeckWeights` and
+  `SiglipGeometry`/`SiglipLayerWeights`/`SiglipVariant`/`SiglipAct` carry the model.
+  Loader errors keep the C codes (`-1` open, `-2` size, `-3` magic/version, `-4`
+  dims/blob size) and the C's exact-size check; the C mmaps, this port owns the
+  decoded tensors.
+  The host/NPU split is the C's: the big GEMMs on the NPU (`matmul::one_shot` for the
+  one-shot arms, the resident `Context` for the ctx arms), the `O(tokens·d)` glue on
+  the host — im2col (`patchify`, shared by both), the position add, window
+  partition/unpartition, the LayerNorms, the fp16-input erf-GELU / GELU-tanh /
+  quick-GELU tables (bit-exact to the C's f32 formulas through glibc `erff`/`tanhf`),
+  the biased softmax row and the decomposed rel-pos matmul+add in fp16 (no host-f32
+  fallback). SAM's reference accumulates in **f32** and SigLIP's in **f64** — the C's
+  two different `host_matmul`s, kept apart. The ctx path runs the computed QK/PV
+  matmuls through the resident `Context` (N fanned across its workers) where the C
+  uses one stream + pthreads per (window, head); SigLIP's ctx also mirrors the C's
+  `ROCKET_SIGLIP_FA` fan-out through `attn::Attention` (the per-head path when off).
+  **Host-reference bit-identity** is the primary gate and it holds: Rust
+  `*_encode_ref` == the C `*_encode(fd < 0)` for the output *and* every intermediate
+  block, on the synthetic fixture (x86 and the board, via
+  `encoders_selftest --io *_ref` against `ab_board sam_ref|siglip_ref`) and on the
+  real checkpoints (x86; the same pair at the real SAM geometry was started on the
+  board too but the naive reference takes ~1 h per side on the A55s, so it is left
+  out — the board fixture already pins the same libm calls). Finding: `half`'s
+  `f16::from_f64` is **not** correctly rounded on x86 with F16C (it detours through
+  f32, so a value just past an fp16 tie rounds down one ULP), while the C's
+  `(_Float16)(double)` is single-rounded and the
+  aarch64 `half` path is the hardware `fcvt h, d`. A new `ops::f16_from_f64` does the
+  exact RNE conversion in software (and is used by the SAM/SigLIP references,
+  `norm::layernorm_ref`, `encoder::encoder_block_ref` and `attn::mha_self_ref` /
+  `flash_attn_ref`); aarch64 results are unchanged, x86 now matches the C.
+  Synthetic fixture (`SamGeometry::fixture()` / `SiglipGeometry::fixture()`: d=64,
+  2 layers, 2 heads/dh=32, d_ff=64, grid 8 / win 4 / patch 8 / ic 3 / neck 16, and
+  SigLIP L=64 / patch 8): the board (cores 0-3) gives SAM one-shot cos
+  0.99999993 (layer 1) / 0.99999970 (global layer) / **0.99999951** (neck), resident
+  ctx the same (its output is **bit-identical** to the one-shot, and repeats are
+  bit-identical), and SigLIP one-shot 0.99999906 / 0.99999781 / **0.99999755**,
+  resident 0.99999944 / 0.99999874 / **0.99999865** (the resident arm is the
+  GELU-tanh host table, so it differs from the erf one-shot by design and lands
+  *closer* to the erf host reference here). Wall (synthetic, busy board): SAM ref
+  51.7 ms, one-shot 56.2 ms, ctx create 11.0 ms + 26.2 ms/image; SigLIP ref 41.3 ms,
+  one-shot 72.4 ms, ctx create 10.7 ms + 9.6 ms/image (the one-shot pays
+  `mha_self`'s per-call fds + a full weight re-pack).
+  Real checkpoints (`facebook/sam-vit-base` 183.8 MB, the SmolVLM-256M SigLIP-B/16
+  tower 172.9 MB, both extracted with the reference `tools/*_extract.py` in the emb2
+  venv): the C's own gates PASS on the board (`siglip_rocket`: mean-layer 0.999985,
+  post-LN 0.999884 vs the HF f32 reference; `sam_rocket`: mean-layer & neck 0.999999,
+  worst 0.999998, one-shot 153.9 s), and the
+  Rust arms are scored against it on the board (cores 0-3, load average 9-11):
+  SAM one-shot worst-layer 0.99999848 / neck 0.99999938 in 149.9 s, resident worst
+  0.99999842 / neck 0.99999936 in 113.5 s (+1.8 s create); SigLIP one-shot worst
+  0.99998189 in 18.8 s, resident worst 0.99993420 in 4.4 s (+0.8 s create, the
+  GELU-tanh vs erf delta included; `ROCKET_SIGLIP_FA=0`'s per-head path gives
+  0.99992939 in 13.3 s, so the FA fan-out is 3x on this shape). The C's one-shot on
+  the same artifacts takes 153.9 s, so the Rust one-shot is at parity; SigLIP's
+  resident arm is 4.3x its one-shot. The real-geometry host reference is ~21 min of
+  naive host matmul (Rust, ~20 min), and the C's is ~68 min because baseline x86-64
+  has no F16C, so its per-element `(_Float16)` reads become libgcc `__extendhfsf2`
+  calls; it is therefore computed once on the dev host and loaded with `--ref-in`
+  (`encoders_selftest` grew `--ref-in`/`--ref-out` for exactly that) after the
+  bit-identity check above (which holds for both real checkpoints on x86).
+  `cargo test -p rocket-npu` pins the blob round trip and the `-1`..`-4` loader
+  classes for both formats, the windowed partition/unpartition (including a padded
+  grid's pad tokens), the rel-pos block indexing, the biased softmax definition, the
+  erf-GELU / GELU-tanh / quick-GELU tables against their float formulas, the row
+  softmax, the reference determinism and the variant validation (CLIP prefix / pre-LN
+  / quick-GELU, ascending in-range taps, `patch_dim_pad` agreement), and
+  `ops::f16_from_f64` against every fp16 round trip plus the double-rounding
+  regression.
+  Not covered: the CLIP/DPT variant knobs are implemented but only exercised
+  structurally (no CLIP or DPT checkpoint was available; the C's own gate covers only
+  the SigLIP shape too), and the resident path has no SAM worker-pool analogue of the
+  C's per-(window, head) stream threads (same arithmetic, different task split).
 
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
@@ -787,11 +880,11 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   `rocket_conv2d_dw_int8_rk3576`, `rocket_pool_int8_rk3576*`,
   `rocket_conv2d_int8_pack_rk3576`), the int8 conv's opt-in `ROCKET_CONV_BATCH`
   batched (gapped multi-task) submit — bit-identical to the per-tile path this port
-  runs — and the other op families: SAM/SigLIP, graph execution. (The tiled
+  runs — and graph execution (the RK3576-only graph runner). (The tiled
   long-context attention path *is* implemented — M5b above; the activation family is
   M6a, the reduce + softmax family M6b, the norms/vision norms/FFN/encoder M7, the
-  fp16 convolution family M8a, and the int8 convolution + PPU pooling + upsample
-  families M8b.)
+  fp16 convolution family M8a, the int8 convolution + PPU pooling + upsample families
+  M8b, and the SAM + SigLIP model encoders M9.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -806,12 +899,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references) and `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose and int8-conv/pool/resize raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales) |
+| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1376,8 +1469,8 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   direct conv's tiles (one submit/fence per job slice instead of per tile). The port
   runs the per-tile path, which is bit-identical; wiring it needs
   `matmul::chain::pack` plus a gapped batched submit in the conv tiler.
-- **SAM/SigLIP encoders and graph execution** are the remaining op families of the C
-  library.
+- **Graph execution** (the RK3576-only graph runner) is the remaining op family of the
+  C library.
 - **int8 GEMM on the flex CPU path** is the only lever that would close the qwen3
   speed gap with production. flex has none; the candidates are the `burn-cpu`
   (CubeCL/LLVM) backend (CPU quantized matmul unverified, cannot cross-compile — would
@@ -1529,6 +1622,46 @@ cmake --build ref/build --target conv2d_fp16_rocket conv1d_rocket conv_transpose
 for t in conv2d_fp16_rocket conv1d_rocket conv_transpose_rocket conv_act_rocket; do
     taskset -c 0-3 ./ref/build/$t || echo "C gate $t FAILED"
 done
+# M9 model encoders (SAM ViT-Det + SigLIP). The synthetic fixture drives the 3-way gate:
+# the Rust host reference vs the C host reference (bit-identical, no NPU needed), then
+# the one-shot and resident arms vs it (cosine >= 0.9999 per layer + the neck/final).
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin encoders_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/encoders_selftest \
+    tools/c-oracle/ab_board.c tools/c-oracle/ab_compare.py root@rock-5b-plus.lan:/root/rocket-m9/
+# the C side links librocketnpu built NATIVELY on the board (a cross-built one cannot
+# open the device; `sam_ref`/`siglip_ref` alone work on x86 too)
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && gcc -O2 -ffp-contract=off \
+    -I /root/rocket-m6a/ref/include -I /root/rocket-m6a/ref ab_board.c \
+    /root/rocket-m6a/ref/build/librocketnpu.a -lm -lpthread -o ab_board'
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 ./encoders_selftest --write-blob .'
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 python3 ab_compare.py --enc-only \
+    --rust ./encoders_selftest --enc ./encoders_selftest --c ./ab_board --work /tmp/m9ab'
+# the same fixture blobs drive the C `fd < 0` reference on the DEV HOST (the host
+# librocketnpu needs no device for sam_ref/siglip_ref):
+gcc -O2 -ffp-contract=off -I /tmp/opencode/ref-rocket-userspace/include \
+    -I /tmp/opencode/ref-rocket-userspace tools/c-oracle/ab_board.c \
+    /tmp/opencode/ref-rocket-userspace/build-host/librocketnpu.a -lm -lpthread -o /tmp/opencode/ab_board_host
+# the per-arm cosine table (each arm is scored against the in-process host reference):
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 ./encoders_selftest sam --ref --npu --ctx 3 --reps 2'
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 ./encoders_selftest siglip --ref --npu --ctx 3 --reps 2'
+# real checkpoints: extract once on the dev host in the emb2 venv (blobs are 184/173 MB),
+# then prove the Rust and C host references agree bit for bit and load the reference on
+# the board with --ref-in (the naive host matmul is ~20 min at SAM's 1024px):
+/mnt/hub/venvs/emb2/bin/python ref/tools/sam_extract.py --model facebook/sam-vit-base --out /tmp/opencode/m9-art/sam
+/mnt/hub/venvs/emb2/bin/python ref/tools/siglip_extract.py \
+    --model HuggingFaceTB/SmolVLM-256M-Instruct --out /tmp/opencode/m9-art/siglip/siglip_weights.f16
+/mnt/hub/venvs/emb2/bin/python ref/tools/siglip_reference.py --out /tmp/opencode/m9-art/siglip
+$CARGO_TARGET_DIR/release/encoders_selftest --io sam_ref sam.f16 sam_pixels.raw rust_sam_ref.out
+/tmp/opencode/ab_board_host sam_ref sam.f16 sam_pixels.raw c_sam_ref.out
+cmp rust_sam_ref.out c_sam_ref.out && cmp rust_sam_ref.out.hidden c_sam_ref.out.hidden
+scp rust_sam_ref.out rust_sam_ref.out.hidden sam.f16 sam_pixels.raw root@rock-5b-plus.lan:/root/rocket-m9/
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 ./encoders_selftest sam \
+    --blob sam.f16 --pixels sam_pixels.raw --ref-in rust_sam_ref.out --npu --ctx 3 --reps 1'
+# the C library's own gates on the same artifacts (they must PASS for the above to mean
+# anything; sam_rocket needs {sam_weights.f16,pixels,hidden,neck}.f32 in its dir):
+cmake --build ref/build --target sam_rocket siglip_rocket -j2
+taskset -c 0-3 ref/build/sam_rocket /root/rocket-m9/sam-art
+taskset -c 0-3 ref/build/siglip_rocket /root/rocket-m9/siglip-art
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench

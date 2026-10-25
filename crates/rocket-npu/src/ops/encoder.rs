@@ -183,7 +183,7 @@ pub fn encoder_block_ref(
     )?;
     let mut xa = vec![f16::ZERO; td];
     for i in 0..td {
-        xa[i] = f16::from_f64(x[i].to_f64() + attn[i].to_f64());
+        xa[i] = crate::ops::f16_from_f64(x[i].to_f64() + attn[i].to_f64());
     }
 
     // x = x + MLP(LN2(x))
@@ -207,7 +207,7 @@ pub fn encoder_block_ref(
                 a += fv * w[j].to_f64();
             }
             let bias = p.bf2.map_or(0.0, |b| b[o].to_f64());
-            *cell = f16::from_f64(xa[row * d + o].to_f64() + a + bias);
+            *cell = crate::ops::f16_from_f64(xa[row * d + o].to_f64() + a + bias);
         }
     }
     Ok(())
@@ -433,7 +433,7 @@ mod tests {
         .unwrap();
         let mut xa = vec![f16::ZERO; t * d];
         for i in 0..t * d {
-            xa[i] = f16::from_f64(x[i].to_f64() + attn[i].to_f64());
+            xa[i] = crate::ops::f16_from_f64(x[i].to_f64() + attn[i].to_f64());
         }
         layernorm_ref(t, d, &xa, p.ln2_g, p.ln2_b, 1e-5, &mut ln);
         let mut want = vec![f16::ZERO; t * d];

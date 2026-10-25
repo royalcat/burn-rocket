@@ -33,6 +33,14 @@
 //! dilated-input lowering), [`pool`] is `rocket_pool.c` (the PPU MaxPool/AveragePool
 //! with the int8/uint8 entries) and [`resize`] is `rocket_resize.c` (the integer-factor
 //! upsample realised as a depthwise transposed conv).
+//!
+//! [`sam`] and [`siglip`] are the two model-level encoders (the M9 capstone):
+//! `rocket_sam_encoder.c` — the windowed, relative-position-biased SAM ViT-Det image
+//! encoder with its conv neck — and `rocket_siglip_encoder.c` — the plain-ViT SigLIP
+//! vision tower. Each is a graph of the primitives above plus its blob loader, a
+//! device-free host reference and a resident (prepacked) context.
+
+use half::f16;
 
 pub mod activation;
 pub mod conv;
@@ -44,6 +52,8 @@ pub mod normvision;
 pub mod pool;
 pub mod reduce;
 pub mod resize;
+pub mod sam;
+pub mod siglip;
 pub mod softmax;
 
 pub use activation::{
@@ -97,6 +107,123 @@ pub use resize::{
     bilinear_ksize, build_kernel, upsample_bilinear, upsample_bilinear_plan, upsample_bilinear_ref,
     upsample_desc, upsample_nearest, upsample_nearest_plan, upsample_nearest_ref,
 };
+pub use sam::{
+    SAM_MAGIC, SAM_MAX_LAYERS, SAM_VERSION, SamContext, SamGeometry, SamLayerWeights, SamModel,
+    SamNeckWeights, sam_encode, sam_encode_ctx, sam_encode_ref, sam_load,
+};
+pub use siglip::{
+    SIGLIP_MAGIC, SIGLIP_MAX_TAPS, SIGLIP_VERSION, SiglipAct, SiglipContext, SiglipGeometry,
+    SiglipLayerWeights, SiglipModel, SiglipVariant, siglip_encode, siglip_encode_ctx,
+    siglip_encode_ref, siglip_load,
+};
 pub use softmax::{
     cross_entropy, cross_entropy_ref, logsoftmax, logsoftmax_ref, softmax, softmax_ref,
 };
+
+/// A correctly rounded (round-to-nearest, ties-to-even) `f64 -> f16` conversion.
+///
+/// The C library's reference paths all narrow a `double` with a plain `(_Float16)` cast,
+/// which on aarch64 compiles to the single-rounding `fcvt h, d`. `half`'s
+/// [`f16::from_f64`] does **not** guarantee that: with F16C it goes through `f32`
+/// (`f as f32` then `f32 -> f16`), so a value just past an fp16 tie rounds *down* by one
+/// ULP, and the crate's own `aarch64` path uses the hardware conversion. A reference
+/// that must be bit-identical to the C on every host therefore cannot use it.
+///
+/// This is the same function everywhere: decompose the f64, keep 11 significand bits
+/// with a sticky-based ties-to-even round, and re-encode as a normal / subnormal fp16.
+pub(crate) fn f16_from_f64(v: f64) -> f16 {
+    let bits = v.to_bits();
+    let sgn = ((bits >> 48) & 0x8000) as u16;
+    let exp = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1u64 << 52) - 1);
+    if exp == 0x7ff {
+        // Infinities stay infinities; a NaN becomes a quiet NaN (the payload is never
+        // observable in this crate's arithmetic).
+        return f16::from_bits(if frac == 0 {
+            sgn | 0x7c00
+        } else {
+            sgn | 0x7e00
+        });
+    }
+    if exp == 0 {
+        // An f64 subnormal is below 2^-1022, i.e. far under the smallest fp16 subnormal.
+        return f16::from_bits(sgn);
+    }
+    let e = exp - 1023;
+    if e > 15 {
+        // |v| >= 2^16 > the 65520 overflow threshold.
+        return f16::from_bits(sgn | 0x7c00);
+    }
+    let sig = (1u64 << 52) | frac;
+    // A normal fp16 keeps 11 significand bits (implicit + 10 stored); below 2^-14 the
+    // significand shifts into the subnormal range (fp16 min subnormal 2^-24).
+    let shift = (-14 - e).max(0) as u32;
+    let drop = 42 + shift;
+    if drop >= 64 {
+        return f16::from_bits(sgn);
+    }
+    let keep = sig >> drop;
+    let rest = sig & ((1u64 << drop) - 1);
+    let half = 1u64 << (drop - 1);
+    let mut k = keep;
+    if rest > half || (rest == half && (keep & 1) == 1) {
+        k += 1;
+    }
+    if e >= -14 {
+        let mut et = e;
+        if k == 2048 {
+            k = 1024;
+            et += 1;
+        }
+        if et > 15 {
+            return f16::from_bits(sgn | 0x7c00);
+        }
+        return f16::from_bits(sgn | (((et + 15) as u16) << 10) | (k as u16 & 0x3ff));
+    }
+    // Subnormal — or the smallest normal when `k` rounded up to 1024, whose encoding is
+    // exactly that bit pattern.
+    f16::from_bits(sgn | k as u16)
+}
+
+#[cfg(test)]
+mod f16_convert_tests {
+    use super::f16_from_f64;
+    use half::f16;
+
+    #[test]
+    fn every_fp16_value_round_trips() {
+        for u in 0..=0xffffu16 {
+            let v = f16::from_bits(u);
+            if v.is_nan() {
+                continue;
+            }
+            assert_eq!(f16_from_f64(v.to_f64()), v, "bits {u:#06x}");
+        }
+    }
+
+    #[test]
+    fn it_rounds_like_a_single_rounding_cast() {
+        // The case that exposed the f32 detour: just past an fp16 tie at 2.0, so the
+        // correctly rounded result is the next value up.
+        let v = -2.012_695_386_074f64;
+        assert_eq!(f16_from_f64(v), f16::from_f32(-2.013_671_9));
+        // Exactly on the tie: ties-to-even keeps the even significand.
+        assert_eq!(
+            f16_from_f64(-2.012_695_312_5f64),
+            f16::from_f32(-2.011_718_8)
+        );
+        // The normal/subnormal boundary and the overflow threshold.
+        assert_eq!(f16_from_f64(2f64.powi(-24)), f16::from_bits(0x0001));
+        assert_eq!(f16_from_f64(2f64.powi(-25)), f16::ZERO);
+        assert_eq!(f16_from_f64(2f64.powi(-14)), f16::from_bits(0x0400));
+        assert_eq!(f16_from_f64(65504.0), f16::MAX);
+        assert_eq!(f16_from_f64(65519.0), f16::MAX);
+        assert_eq!(f16_from_f64(65520.0), f16::INFINITY);
+        assert_eq!(f16_from_f64(f64::INFINITY), f16::INFINITY);
+        assert_eq!(f16_from_f64(-0.0).to_bits(), 0x8000);
+        // ... and it agrees with the hardware path on plain values.
+        for x in [0.5f64, 1.0, -1.5, 1e-5, -3e4, 3.0e-8, 12345.678] {
+            assert_eq!(f16_from_f64(x), f16::from_f64(x), "x = {x}");
+        }
+    }
+}
