@@ -119,7 +119,7 @@ same planners, register programs and numerics. The per-milestone write-up is in
   board even though every op fits.
 - **Still out** (deliberate; see `lib.rs`): RK3576 entries and the RK3576 graph
   runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants,
-  non-fp16 batch wrappers, tiled MLA, the fused-FFN cube-residency mechanism,
+  non-fp16 batch wrappers, the fused-FFN cube-residency mechanism,
   `ROCKET_CONV_BATCH`, and resident bf16 (the C library has none).
 
 ## Status (2026-10-06, extended 2026-10-07/08)
@@ -491,7 +491,8 @@ same planners, register programs and numerics. The per-milestone write-up is in
   (host only when bigger than one tiled score matrix, so a mixed sliding/full model
   keeps its short buffers; per-head BOs any scratch whose `n`/`k` reaches `Kn`; the
   chained group scratch once its key axis reaches `Kn`); `Worker::run`
-  dispatches it before the chained and per-head paths when `dv == dk`, and
+  dispatches it before the chained and per-head paths, at any `dk`/`dv` (the original
+  port limited it to `dv == dk`; **M5c** below lifts that), and
   `ROCKET_FA_CHAIN` never applies. Board (`attn_selftest --tile`, cores 0-3, busy board
   at load 10-13, 600 MHz NPU): tiled vs the f64 `flash_attn_ref` cosine **0.99999994**
   at 30,016 keys (T=512, GQA 8/2, d=64, causal; materialized 0.99999996) and 0.99999993
@@ -520,6 +521,35 @@ same planners, register programs and numerics. The per-milestone write-up is in
   `fa_heads_range` skips the batched path for MLA and now so do we (per-head path;
   verified at 3,008 keys with dk/dv 64/32 and 32/64, cosine 1.0 vs the materialized
   arm, and `mha_self` unchanged).
+  **M5c tiled MLA** (2026-10-25): M5b's `dv == dk` gate is gone, so a value dim that
+  differs from the head dim tiles too. The tiled path was already parameterized by both
+  dims (`TileScratch`'s `kh [wp,dk]` / `vh [dv,wp]` / `ctx [Tp,dv]`, `attn::Online`'s
+  `acc [Tp,dv]`, `gather_v_tile`'s `dv*kv` stride and the per-tile AV `Tp x wp x dv`), so
+  the whole round is two guards — `Worker::prepare`'s `if dk == dv { tile_kv_width(kn) }
+  else { 0 }` becomes `tile_kv_width(kn)`, and `Worker::run`'s `tile_w > 0 && head_dim
+  == dv` becomes `tile_w > 0`. The **chained** path keeps its MLA exclusion (`head_dim
+  == dv` in the group-size condition): its `GroupBufs` still carry one stride per head
+  for both operands, which only holds while the value dim is the head dim (as in C's
+  `fa_heads_range`). This is a Rust extension — the C `fa_heads_range_tiled` takes one
+  `d` and has no MLA variant, so there is no C byte parity; the gate is
+  `flash_attn_ref` plus the materialized arm. Host test
+  `attn::tests::an_mla_geometry_tiles_like_one_pass` runs the same fold at 576/512,
+  64/32 and 32/64 against one-pass tile widths. Board (`attn_selftest --tile`, cores
+  0-3, busy board at load ~11-12, 600 MHz NPU): T=64 kv=2048 GQA 8/2 dk=576 dv=512
+  causal, tile 512 — tiled cosine **0.99999994** vs the f64 ref (materialized
+  0.99999996), tiled vs materialized 0.99999992/max_abs 4.9e-4, chain-A/B
+  bit-identical, scratch 23.6+20.1 -> 8.6+6.3 MiB; the same shape unmasked (all 2048
+  keys live) 0.99999993 both arms, 0.99999989 between them; dk/dv 64/32 and 32/64 the
+  same pattern (0.99999994/0.99999993 vs the ref). 512x8,192 dk 576 dv 512 tile 2048:
+  170.8+140.4 -> 58.8+45.4 MiB (2.9x) at wall 1.09x / cpu 1.15x, tiled-vs-materialized
+  0.99999992; 512x16,384 keeps the *same* 58.8+45.3 MiB (flat in `Kn`) at 617.7 ms vs
+  322.4 ms at 8k, chain-A/B bit-identical; a 3-token request then trims it to 1.8 MiB bo
+  / 0.4 MiB host. Below the crossover the tiles still lose on wall (T=64 kv=2048 tile
+  512: 1.71x causal / 1.08x unmasked — 20-40 ms is dispatch-bound), which is why
+  `ROCKET_FA_TILE_MIN_KV` stays 8,192. `dv == dk` is unchanged: base `181f94f` and this
+  build print identical cosines, max_abs, footprints and chain verdicts on
+  1024x1024 dk 64 tile 256 (0.99999995 ref / 0.99999993 tiled / 0.99999991 between
+  arms, 64.4+55.0 -> 10.8+7.3 MiB); only wall moves (+-20 % board noise).
   **P2a causal block attention** (2026-10-25): `burn_rocket::attention_causal_block` and
   `attention_causal_block_window` (`MaskMode::CausalBlock`) plus
   `masks::build_causal_mask_block` / `build_causal_window_mask_block`. A query chunk at
@@ -1039,7 +1069,7 @@ same planners, register programs and numerics. The per-milestone write-up is in
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, tiled MLA (a `dv != dk` geometry), the cube-resident *mechanism* of the
+  wrappers, the cube-resident *mechanism* of the
   fused FFN/MLP (the pinned tiling, the matched-tiling
   gate and the KACC routing are bit-identical to the C; the intermediates still come
   back to row-major between ops, so the C's `RESIDENT-FUSION NOTE` round-trip
@@ -1693,7 +1723,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   attention (log-gemma §15), fixing the 8k memory blow-up (full layers were the
   remaining `[s, s]` case). The driver-side `[Tp, Kn]` score matrix is no longer
   required either: the M5b tiled path (`ROCKET_FA_TILE_KV`, opt-in, default off)
-  walks the key axis in tiles at a flat footprint (see "Port status"). The
+  walks the key axis in tiles at a flat footprint (see "Port status"), and since **M5c**
+  it also covers MLA (`dv != dk`) geometries, which no longer fall back to the
+  materialized path. The
   **caller's** additive mask is now bounded too: P2a's causal block op + the
   example's `util/causal.rs` chunk causal prefill (qwen3 `--npu`, Gemma 4 prefill) at
   `ROCKET_CAUSAL_CHUNK` (default 1024) with per-chunk `[C, q1]` masks and prefix keys,
@@ -2054,6 +2086,16 @@ taskset -c 0-3 python3 ab_compare.py --attn-only --rust ./attn_selftest \
 taskset -c 0-3 ./attn_selftest 1024 1024 8 2 --dk 64 --dv 64 --mask causal --ref 1 --tile 256 --tile-min 0
 taskset -c 0-3 ./attn_selftest 4096 4096 8 2 --mask causal --tile 2048 --tile-min 0 --reps 3
 taskset -c 0-3 ./attn_selftest 512 16384 8 2 --dk 64 --mask causal --tile 2048 --tile-only
+# ... and the MLA (dv != dk) geometries: numerics vs the f64 ref at a small shape
+# (the default 8,192 crossover keeps 2048 keys materialized, so --tile-min 0 forces
+# the tiled arm; the literal `--tile 512` alone only reports that it stays
+# materialized), then the footprint and its flatness in Kn
+taskset -c 0-3 ./attn_selftest 64 2048 8 2 --dk 576 --dv 512 --mask causal --tile 512 --tile-min 0 --ref 1 --reps 1
+taskset -c 0-3 ./attn_selftest 64 2048 8 2 --dk 576 --dv 512 --mask none --tile 512 --tile-min 0 --ref 1 --reps 1
+taskset -c 0-3 ./attn_selftest 64 2048 8 2 --dk 64 --dv 32 --mask causal --tile 512 --tile-min 0 --ref 1 --reps 1
+taskset -c 0-3 ./attn_selftest 64 2048 8 2 --dk 32 --dv 64 --mask causal --tile 512 --tile-min 0 --ref 1 --reps 1
+taskset -c 0-3 ./attn_selftest 512 8192 8 2 --dk 576 --dv 512 --mask causal --tile 2048 --tile-min 0 --reps 2 --mem
+taskset -c 0-3 ./attn_selftest 512 16384 8 2 --dk 576 --dv 512 --mask causal --tile 2048 --tile-only --reps 2
 taskset -c 0-3 ./int8_selftest --dense 264 320 288
 taskset -c 0-3 ./int8_selftest --gw-one-shot 512 1024 512 32
 taskset -c 0-3 ./int4_selftest 64 256 128

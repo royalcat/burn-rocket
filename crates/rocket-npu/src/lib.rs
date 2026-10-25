@@ -236,7 +236,9 @@
 //!   carries the online softmax ([`attn::Online`]) instead of materializing the
 //!   `[Tp, Kn]` score matrix, so the attention scratch stops growing with the key
 //!   count; it is opt-in (default 0 = off) and engages only above
-//!   `ROCKET_FA_TILE_MIN_KV` (default 8192 padded keys) and for `dv == dk`;
+//!   `ROCKET_FA_TILE_MIN_KV` (default 8192 padded keys). It carries `dk` and `dv`
+//!   separately, so an MLA (`dv != dk`) geometry tiles too — a Rust extension, since
+//!   the C tiled range has a single `d`;
 //!
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):
@@ -254,8 +256,6 @@
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
 //!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
-//! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
-//!   the head dim (`mha_self` is the only user) stays on the materialized path;
 //! - the cube-resident *mechanism* of the fused FFN/MLP: [`ops::ffn::ffn_fused`] and
 //!   [`ops::ffn::mlp_fused`] reproduce the pinned tiling, the matched-tiling gate and
 //!   the KACC routing bit for bit (verified against the C on the board), but the

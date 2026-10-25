@@ -974,21 +974,17 @@ fn tile_block(
         std::env::set_var("ROCKET_FA_TILE_MIN_KV", opts.min_kv.to_string());
     }
     let kn = case.kv.div_ceil(32) * 32;
-    // The worker resolves tiling from the padded key count AND refuses it for MLA
-    // (`dv != dk`), so report what the path will actually do.
-    let kbp = if case.dv == case.dk {
-        tile_kv_width(kn)
-    } else {
-        0
-    };
+    // The worker resolves tiling from the padded key count alone (any `dk`/`dv`), so
+    // report what the path will actually do.
+    let kbp = tile_kv_width(kn);
     println!(
         "tile: ROCKET_FA_TILE_KV={} ROCKET_FA_TILE_MIN_KV={} -> tile_kv_width(Kn={kn}) = {kbp}{}",
         opts.kbp,
         opts.min_kv,
         if case.dv != case.dk {
             format!(
-                " (dv {} != dk {}: MLA stays materialized)",
-                case.dv, case.dk
+                " (MLA: dk {} dv {} — the tiled path carries the two separately)",
+                case.dk, case.dv
             )
         } else {
             String::new()

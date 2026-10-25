@@ -58,7 +58,10 @@
 //! context shrinks toward one head and `G == 1` runs the per-head path outright.
 //! `ROCKET_FA_CHAIN=0` forces the per-head path for every call (the A/B switch). MLA
 //! (`dv != dk`) never chains — the group buffers carry one stride per head for both
-//! operands, which only holds while the value dim is the head dim (as in C).
+//! operands, which only holds while the value dim is the head dim (as in C). The tiled
+//! long-context path below does not share that limit (its tiles carry `dk` and `dv`
+//! separately), so an MLA geometry still gets an online-softmax long-context form from
+//! `ROCKET_FA_TILE_KV`, with the materialized per-head path as its alternative.
 //!
 //! Numerics: the batched path is bit-identical to the per-head one only while both
 //! accumulate the same way. [`MmBatch`] always accumulates the K-tiles in fp32 on the
@@ -81,8 +84,13 @@
 //! unnormalized output `acc[Tp, dv]`, all fp32), so the working score tile is only
 //! `[Tp, Kbp]` and the resident footprint stops growing with `Kn`.
 //!
-//! It engages only when `dv == dk` (MLA stays materialized), the padded key count is
-//! above `ROCKET_FA_TILE_MIN_KV` (default 8192) and the tile is a real subdivision.
+//! It engages at any head/value geometry: the value dim `dv` is carried separately from
+//! the head dim `dk` everywhere (`TileScratch`'s `kh`/`vh`/`ctx`, [`Online::acc`], the
+//! gathered value tile and both per-tile matmuls), so a `dv != dk` (MLA) shape tiles
+//! too. That is a Rust extension — the C `fa_heads_range_tiled` takes one `d` and has no
+//! MLA variant, so there is no C byte parity for it and the gate is
+//! [`flash_attn_ref`] plus the materialized arm. The path needs the padded key count
+//! above `ROCKET_FA_TILE_MIN_KV` (default 8192) and the tile to be a real subdivision.
 //! It is checked BEFORE the chained path and never chains (`ROCKET_FA_CHAIN` does not
 //! apply): the per-tile GEMMs are small and the submit floor is not what limits a long
 //! context, and the path owns its own scratch — `sc/P/kh/vh` are one tile wide, which
@@ -649,9 +657,11 @@ impl Worker {
         if self.kn == 0 || self.tp == 0 {
             return Err(Error::shape("flash_attn/empty"));
         }
-        // C `fa_scratch_ensure`: MLA (`dv != dk`) never tiles, so the scratch sizing
-        // here and the dispatch in `run` can never disagree.
-        self.tile_w = if dk == dv { tile_kv_width(self.kn) } else { 0 };
+        // C `fa_scratch_ensure`, without the C's MLA exclusion: the tiles carry `dk` and
+        // `dv` as separate fields, so a `dv != dk` geometry sizes here too and the
+        // dispatch in `run` and this sizing can never disagree. The C helper refuses
+        // MLA only because its tiled range has a single `d`.
+        self.tile_w = tile_kv_width(self.kn);
         if self.tile_w > 0 {
             // One tile of key/value/score, never `[Tp, Kn]` (the C rule): that is the
             // whole point of the path.
@@ -777,15 +787,16 @@ impl Worker {
         self.out.resize(heads.len() * t * dv, f16::ZERO);
         // Long context: the tiled path owns the scratch sizing (`prepare` resolved it
         // from the same padded Kn) and never chains or batches, so it is dispatched
-        // before either. MLA (`dv != dk`) always resolved `tile_w == 0`.
-        if self.tile_w > 0 && self.head_dim == dv {
+        // before either — at any `dk`/`dv` (MLA included; see `prepare`).
+        if self.tile_w > 0 {
             return self.run_tiled(t, kv, heads, gqa, scale, softcap, q, k, v, mask);
         }
         // A group of one chains nothing, so it takes the per-head path — and so does a
         // worker whose two shapes both need their own fp16 K-accumulation. MLA
         // (`dv != dk`) never chains: the group buffers carry one stride per head for
         // both operands, which only holds while the value dim is the head dim (the C
-        // `fa_heads_range` skips the batched path on the same condition).
+        // `fa_heads_range` skips the batched path on the same condition). Only the
+        // materialized path is affected — the tiled path above returned already.
         let g = if self.head_dim == dv && chain_enabled() && (self.qk_batch || self.av_batch) {
             group_size(chain_elems(), self.tp, self.kn, heads.len())
         } else {
@@ -806,9 +817,10 @@ impl Worker {
     /// with an f16 unnormalized `P`, AV matmul `Tp x wp x dv`, then `acc += ctx`. Per
     /// head: `out = acc / l`. Host softmax only (the running rescale is sequential
     /// across tiles, so `ROCKET_ATTN_HOST_SOFTMAX` cannot apply — the C tiled range takes
-    /// no `host_sm` either), `dv == dk` only, and never chained: the per-tile GEMMs are
-    /// already small, so the submit floor the chained path attacks is not what limits a
-    /// long context; the score traffic is.
+    /// no `host_sm` either), any `dk`/`dv` pair (the two dims never share a stride here:
+    /// `kh` is `[wp, dk]`, `vh` is `[dv, wp]`, `ctx`/`acc` are `[Tp, dv]`), and never
+    /// chained: the per-tile GEMMs are already small, so the submit floor the chained
+    /// path attacks is not what limits a long context; the score traffic is.
     #[allow(clippy::too_many_arguments)]
     fn run_tiled(
         &mut self,
@@ -1470,7 +1482,8 @@ mod tests {
 
     /// One head's tiled attention over host f32 `acc`, using the same fold the worker
     /// runs, so the online state can be checked against a materialized reference with
-    /// no device involved.
+    /// no device involved. `dv` is carried separately from `dk` on purpose: an MLA
+    /// (`dv != dk`) geometry must tile through exactly the same fold.
     #[allow(clippy::too_many_arguments)]
     fn tiled_host(
         scores: &[f16],
@@ -1478,21 +1491,25 @@ mod tests {
         t: usize,
         kv: usize,
         dk: usize,
+        dv: usize,
         tp: usize,
         scale: f32,
         softcap: f32,
         kbp: usize,
     ) -> Vec<f16> {
         // The values are the score matrix's own second operand stand-in: a deterministic
-        // [dk, kv] matrix so a wrong tile offset shows up as a wrong output.
-        let v: Vec<f16> = (0..dk * kv)
+        // [dv, kv] matrix so a wrong tile offset shows up as a wrong output.
+        // `check_flash`'s geometry contract: the head dim pads to 32, the value dim to 16.
+        assert_eq!(dk % 32, 0);
+        assert_eq!(dv % 16, 0);
+        let v: Vec<f16> = (0..dv * kv)
             .map(|i| f16::from_f32(((i * 37) % 101) as f32 / 101.0 - 0.5))
             .collect();
-        let mut out = vec![f16::ZERO; t * dk];
+        let mut out = vec![f16::ZERO; t * dv];
         let mut online = Online::with_mode(SoftmaxMode::Fast);
         let mut p = vec![f16::ZERO; tp * (kbp + 32)];
-        let mut ctx = vec![f16::ZERO; tp * dk];
-        online.begin(tp, kbp, dk);
+        let mut ctx = vec![f16::ZERO; tp * dv];
+        online.begin(tp, kbp, dv);
         let mut j0 = 0;
         while j0 < kv {
             let w = (kv - j0).min(kbp);
@@ -1515,25 +1532,25 @@ mod tests {
                 w,
                 tp,
                 wp,
-                dk,
+                dv,
                 scale,
                 softcap,
             );
-            // P.T · V for this tile, in f32, into the [tp, dk] AV stand-in (the pad
+            // P.T · V for this tile, in f32, into the [tp, dv] AV stand-in (the pad
             // columns' values are zero, so only the real `w` columns can contribute).
             for i in 0..tp {
-                for c in 0..dk {
+                for c in 0..dv {
                     let mut sum = 0.0f32;
                     for j in 0..w {
                         sum += p[i * wp + j].to_f32() * v[c * kv + j0 + j].to_f32();
                     }
-                    ctx[i * dk + c] = f16::from_f32(sum);
+                    ctx[i * dv + c] = f16::from_f32(sum);
                 }
             }
-            online.add(&ctx[..tp * dk], tp, dk);
+            online.add(&ctx[..tp * dv], tp, dv);
             j0 += kbp;
         }
-        online.finish(&mut out, t, dk);
+        online.finish(&mut out, t, dv);
         out
     }
 
@@ -1560,9 +1577,9 @@ mod tests {
 
         // Reference for the same host pipeline: one tile over the whole key axis (the
         // tile width is a multiple of 32, so 320 covers all 300 keys in one fold).
-        let one = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 320);
+        let one = tiled_host(&scores, Some(&mask), t, kv, dk, dk, tp, scale, 0.0, 320);
         for kbp in [32usize, 128, 288, 512] {
-            let many = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, kbp);
+            let many = tiled_host(&scores, Some(&mask), t, kv, dk, dk, tp, scale, 0.0, kbp);
             let (mut cos, mut na, mut nb, mut max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for (&a, &b) in one.iter().zip(&many) {
                 let (a, b) = (a.to_f64(), b.to_f64());
@@ -1587,15 +1604,62 @@ mod tests {
         let scores: Vec<f16> = (0..tp * kv).map(|_| f16::from_f32(0.25)).collect();
         let mut mask = vec![f16::NEG_INFINITY; t * kv];
         mask[0] = f16::ZERO;
-        let got = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 32);
+        let got = tiled_host(&scores, Some(&mask), t, kv, dk, dk, tp, scale, 0.0, 32);
         // Only key 0 is visible, and every visible score is equal, so its probability
         // is 1 whatever the tile layout: the output is V's column 0.
-        let want = tiled_host(&scores, Some(&mask), t, kv, dk, tp, scale, 0.0, 320);
+        let want = tiled_host(&scores, Some(&mask), t, kv, dk, dk, tp, scale, 0.0, 320);
         assert_eq!(got, want, "tile layout must not change a one-key row");
 
         // And a row with no visible key at all (a padding row) is zero, not uniform.
         let empty = vec![f16::NEG_INFINITY; t * kv];
-        let zeros = tiled_host(&scores, Some(&empty), t, kv, dk, tp, scale, 0.0, 32);
+        let zeros = tiled_host(&scores, Some(&empty), t, kv, dk, dk, tp, scale, 0.0, 32);
         assert!(zeros.iter().all(|v| *v == f16::ZERO));
+    }
+
+    /// MLA (`dv != dk`): the fold carries the value dim separately, so the tiled result
+    /// must not depend on the tile layout there either — and a `dv` that is neither the
+    /// head dim nor its multiple is the shape a wrong shared stride would break.
+    #[test]
+    fn an_mla_geometry_tiles_like_one_pass() {
+        let (t, tp, kv) = (6usize, 8usize, 300usize);
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let scores: Vec<f16> = (0..tp * kv)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                f16::from_f32(((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+            })
+            .collect();
+        let mut mask = vec![f16::ZERO; t * kv];
+        for row in 0..t {
+            for j in (row + 1)..kv {
+                mask[row * kv + j] = f16::NEG_INFINITY;
+            }
+        }
+        // The model geometries: DeepSeek-style 576/512, and both sides of a small MLA.
+        for (dk, dv) in [(576usize, 512usize), (64, 32), (32, 64)] {
+            let scale = 1.0 / (dk as f32).sqrt();
+            let one = tiled_host(&scores, Some(&mask), t, kv, dk, dv, tp, scale, 0.0, 320);
+            assert_eq!(one.len(), t * dv, "the output follows dv, not dk");
+            for kbp in [32usize, 128, 288] {
+                let many = tiled_host(&scores, Some(&mask), t, kv, dk, dv, tp, scale, 0.0, kbp);
+                assert_eq!(many.len(), t * dv);
+                let (mut cos, mut na, mut nb, mut max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                for (&a, &b) in one.iter().zip(&many) {
+                    let (a, b) = (a.to_f64(), b.to_f64());
+                    cos += a * b;
+                    na += a * a;
+                    nb += b * b;
+                    max = max.max((a - b).abs());
+                }
+                let cos = cos / (na.sqrt() * nb.sqrt());
+                assert!(
+                    cos > 0.9999,
+                    "dk={dk} dv={dv} kbp={kbp}: cosine {cos:.8} vs one tile"
+                );
+                assert!(max < 1e-3, "dk={dk} dv={dv} kbp={kbp}: max_abs {max:.6}");
+            }
+        }
     }
 }

@@ -314,6 +314,18 @@ takes a 30k-key request from OOM to a 1 GiB working set. Wall is parity to ±20 
 it wins once the key axis dominates the query block (0.88-0.95x measured) and pays
 more, smaller submits at a square 8k with a 2k tile.
 
+It also covers an MLA head geometry, where the value dim differs from the head dim
+(`dv != dk`): the tiles carry `dk` and `dv` separately (`kh [wp,dk]`, `vh [dv,wp]`,
+the AV matmul `Tp x wp x dv` and the fp32 `acc [Tp,dv]`), so a 576/512 geometry tiles
+like any other. That is a Rust extension — the C `fa_heads_range_tiled` takes a single
+`d` and has no MLA variant, so there is no C byte parity there; the gate is the device-free
+`flash_attn_ref` plus the materialized arm. Board (T=64 kv=2048 GQA 8/2 dk 576 dv 512,
+tile 512, causal): tiled cosine 0.99999994 vs the f64 reference (materialized
+0.99999996), 0.99999992 between the arms, and 23.6+20.1 → 8.6+6.3 MiB of scratch; at
+512x8,192 170.8+140.4 → 58.8+45.4 MiB (2.9x) at wall 1.09x, i.e. the same trade as the
+`dv == dk` path (memory for submits, never faster below the crossover). A `dv == dk`
+geometry is bit-for-bit unaffected by the change.
+
 ### Softmax placement: host vs on-NPU (`ROCKET_ATTN_HOST_SOFTMAX`)
 
 The C library's attention entries can run their row softmax either host-side or through
@@ -447,7 +459,8 @@ masked GQA attention (the persistent
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching, the
 selectable host / on-NPU softmax placement (`ROCKET_ATTN_HOST_SOFTMAX`) and
 the tiled long-context path (`ROCKET_FA_TILE_KV`: online softmax over key tiles, no
-`[Tp, Kn]` score matrix), the two f64 host oracles (`flash_attn_ref`,
+`[Tp, Kn]` score matrix, at any `dk`/`dv` — MLA included), the two f64 host oracles
+(`flash_attn_ref`,
 `mha_self_ref`), the device/BO/submit primitives (including multi-job submit and the
 opt-in chained layout), and the dtype parity harness (`tools/c-oracle` + `parity.py`).
 
@@ -468,23 +481,23 @@ exchange format of `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the b
 (`--enc`, or `--enc-only` for just the M9 section). `attn_selftest` covers the attention
 side: the chained A/B by default, `--oneshot` for the stateless entries against the f64
 oracle, `--mha` for the encoder sublayer, `--host-sm 0|1` to pick the softmax placement,
-`--sm-ab` to run both placements and report the wall/CPU and the deviation, and an
-`--io flash|mha` raw-file mode (`ab_compare.py --attn-only`).
+`--sm-ab` to run both placements and report the wall/CPU and the deviation, `--tile KBP`
+(`--tile-min`, `--tile-only`) for the tiled long-context A/B at any `dk`/`dv` — MLA
+included — and an `--io flash|mha` raw-file mode (`ab_compare.py --attn-only`).
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
-rather than the score matrix dominates), needs `dv == dk`, and never chains. Set it to
-the tile width you want (`2048` is the tuned value) and the attention scratch stops
-growing with the key count; it trades more, smaller NPU submits for the flat footprint
-and the cache-resident score tile.
+rather than the score matrix dominates), tiles at any `dk`/`dv` (MLA included), and
+never chains. Set it to the tile width you want (`2048` is the tuned value) and the
+attention scratch stops growing with the key count; it trades more, smaller NPU
+submits for the flat footprint and the cache-resident score tile.
 
 Not exposed yet: resident bf16 (the C library has no variant either, and it has none
 for tf32 either — that surface is complete), the `*_ref_fp16` host references of the
 remaining non-matmul families, the
 `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
-aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stays
-materialized), the cube-resident *mechanism* of the fused
+aliases, the non-fp16 batch wrappers, the cube-resident *mechanism* of the fused
 FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
 bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
 optimization is the remaining work), the RK3576-specific convolution and pooling
