@@ -357,6 +357,40 @@ pub fn wt_scatter_tile_i8(
     }
 }
 
+/// Accumulate one int32 output cube into the i64 accumulator (the dense int8 path).
+///
+/// The int32 cube is C2=4 — the same 16 B per 4-channel group as the fp32 cube — so
+/// the de-tile index is [`out_idx_i8`]. The dense `rocket_matmul_int8` sums its
+/// per-K-tile int32 partials on the host in int64, which is integer-exact; this is the
+/// gather half of that.
+pub fn detile_accum_i32(
+    acc: &mut [i64],
+    n: usize,
+    slot: &[i32],
+    m0: usize,
+    n0: usize,
+    mtile: usize,
+    ntile: usize,
+) {
+    let h = mtile;
+    for row in 0..mtile {
+        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
+        let mut col = 0;
+        while col + 4 <= ntile {
+            let g = col / 4;
+            let src = &slot[g * h * 4 + 4 * row..][..4];
+            for (dv, sv) in d[col..col + 4].iter_mut().zip(src) {
+                *dv += *sv as i64;
+            }
+            col += 4;
+        }
+        while col < ntile {
+            d[col] += slot[out_idx_i8(h, col + 1, row + 1)] as i64;
+            col += 1;
+        }
+    }
+}
+
 /// Accumulate one int32 output cube into `acc`, adding `scale * value`.
 #[allow(clippy::too_many_arguments)]
 pub fn detile_accum_i8_scaled(
@@ -513,6 +547,35 @@ mod int8_bf16_tests {
                 assert_eq!(slot[wt_idx_i8(kt, k + 1, c + 1)], b[k * kt + c]);
             }
         }
+    }
+
+    #[test]
+    fn int32_cube_detiles_in_four_channel_groups() {
+        // Ragged (mtile % 4, ntile % 4) int32 cube at a non-zero origin: the gather
+        // walks 4-channel groups of the int8 output cube (C2=4), so element (row, col)
+        // sits at out_idx_i8(mtile, col + 1, row + 1), and a pre-existing partial in
+        // the i64 accumulator (an earlier K-tile) must be added to, not replaced.
+        let (mt, nt): (usize, usize) = (3, 6);
+        let (alloc_m, alloc_n) = (mt.div_ceil(4) * 4, nt.div_ceil(4) * 4);
+        let slot: Vec<i32> = (0..alloc_m * alloc_n).map(|i| i as i32 * 7 - 40).collect();
+        let (n, m0, n0) = (20, 4, 4);
+        let mut acc = vec![0i64; (m0 + mt + 1) * n];
+        acc[(m0 + 2) * n + n0 + 1] = -1_000_000;
+        detile_accum_i32(&mut acc, n, &slot, m0, n0, mt, nt);
+        for row in 0..mt {
+            for col in 0..nt {
+                let want = slot[out_idx_i8(mt, col + 1, row + 1)] as i64;
+                let want = if (row, col) == (2, 1) {
+                    want - 1_000_000
+                } else {
+                    want
+                };
+                assert_eq!(acc[(m0 + row) * n + n0 + col], want, "row={row} col={col}");
+            }
+        }
+        assert_eq!(acc[0], 0);
+        assert_eq!(acc[(m0 + mt) * n + n0], 0);
+        assert_eq!(acc[m0 * n + n0 + nt], 0);
     }
 
     #[test]

@@ -1,10 +1,19 @@
-//! Resident group-wise int8 matmul (W8A8), the path behind `--npu-int8`.
+//! Resident int8 matmul (W8A8), the path behind `--npu-int8`.
 //!
 //! Port of `rocket_prepacked_int8.c`: N is split across worker fds in 32-column
 //! slices, a scratch is cached per `(M,K,N,group)`, and a resident weight holds the
 //! int8 codes only. The NPU writes int32 partials; this layer applies the per-row /
 //! per-channel per-group scales and accumulates in f32, exactly like the C path.
 //! There is no NPU-side int8 K-accumulation.
+//!
+//! Two modes share one compute core, selected by the weight's group
+//! (`rocket_i8_weights_pack` / `_pack_gw`):
+//!
+//! - `group == 0` — **per-channel**: raw int32 `C[M,N]`, host int64 K-accumulation
+//!   (integer-exact). The W8A8 in-model path; the caller owns the dequant.
+//! - `group > 0` — **group-wise**: every K-tile stays inside one quant group, so its
+//!   int32 partial takes that group's `a_scale[m,g]*b_scale[n,g]` on readback and is
+//!   accumulated in f32. The natively-quantized-weight path.
 
 use std::collections::{HashMap, VecDeque};
 use std::thread;
@@ -18,8 +27,10 @@ use crate::regcmd::desc::{BATCH, CBUF_BANK_SIZE, RC_STRIDE};
 use crate::regcmd::fp16::MatmulParams;
 use crate::regcmd::int8::emit;
 
+use super::bos::i8_words;
+use super::int8_dense::int8_plan;
 use super::layout;
-use super::plan::{INT8_GW, Plan, plan_geom};
+use super::plan::{INT8, INT8_GW, Plan, plan_geom};
 use super::run::wait_ns;
 
 const MAX_WORKERS: usize = 8;
@@ -35,10 +46,15 @@ struct Worker {
     in_all: Bo,
     out_all: Bo,
     facc: Vec<f32>,
+    iacc: Vec<i64>,
     in_zeroed: bool,
 }
 
-/// A weight resident in per-worker NPU buffers (int8 codes only).
+/// A weight resident in per-worker NPU buffers (int8 codes only, no scales).
+///
+/// `group == 0` is the per-channel (dense) layout, `group > 0` the group-wise one.
+/// The codes are scattered `(N/32, K/32, 32, 32)` per K-tile either way; only the tile
+/// boundaries differ, so a weight's bytes are the int8 codes and nothing else.
 pub struct I8Weight {
     m: usize,
     k: usize,
@@ -71,7 +87,7 @@ struct Sig {
     wt_bytes: usize,
 }
 
-/// A persistent group-wise int8 context.
+/// A persistent int8 context (per-channel and group-wise resident weights).
 pub struct I8Context {
     devs: Vec<Device>,
     threads: usize,
@@ -101,7 +117,7 @@ impl I8Context {
         if !k.is_multiple_of(32) || !n.is_multiple_of(32) {
             return Err(Error::shape("int8/k-n"));
         }
-        if group < 32 || !group.is_multiple_of(32) || !k.is_multiple_of(group) {
+        if group != 0 && (group < 32 || !group.is_multiple_of(32) || !k.is_multiple_of(group)) {
             return Err(Error::shape("int8/group"));
         }
         let nstep = fanout_step(n, self.threads, 32);
@@ -113,8 +129,8 @@ impl I8Context {
             }
             let nsub = (n - n0).min(nstep);
             let plan = plan_for(m, k, nsub, group)?;
-            let kt_per_group = group / plan.kt;
-            debug_assert_eq!(kt_per_group * plan.kt, group);
+            let kt_per_group = if group == 0 { 0 } else { group / plan.kt };
+            debug_assert!(group == 0 || kt_per_group * plan.kt == group);
             let tiles = plan.nmt * plan.nnt * plan.nkt;
             let slots = tiles.clamp(1, BATCH);
             let guard = self.devs[t].alloc_bo(4096)?;
@@ -133,6 +149,7 @@ impl I8Context {
                 in_all,
                 out_all,
                 facc: Vec::new(),
+                iacc: Vec::new(),
                 in_zeroed: false,
             });
         }
@@ -158,7 +175,13 @@ impl I8Context {
     }
 
     /// Pack a pre-quantized `[N,K]` int8 weight into resident per-worker BOs.
-    pub fn pack_weight_gw(
+    ///
+    /// Shared by both modes: the codes are scattered `(N/32, K/32, 32, 32)` per K-tile,
+    /// and only the tile boundaries (fixed by the mode's tiling) move — group-wise is a
+    /// re-tiling, not a requantization. No scales are stored: the output is raw int32 or
+    /// caller-scaled f32, so the scales stay caller-side (the C
+    /// `rki_scatter_weights`).
+    fn pack_codes(
         &mut self,
         m: usize,
         k: usize,
@@ -176,12 +199,9 @@ impl I8Context {
             let wt_sz = w.plan.nnt * w.plan.nkt * w.plan.wt_slot + CBUF_BANK_SIZE;
             let mut bo = w.dev.alloc_bo(wt_sz)?;
             bo.prep(0)?;
-            bo.as_mut_slice().fill(0);
             {
-                let bytes = bo.as_mut_slice();
-                let words = unsafe {
-                    std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<i8>(), bytes.len())
-                };
+                let words = i8_words(&mut bo);
+                words.fill(0);
                 for ni in 0..w.plan.nnt {
                     let n0 = ni * w.plan.nt;
                     let ntile = w.plan.n_tile(ni);
@@ -224,30 +244,44 @@ impl I8Context {
         })
     }
 
-    /// `C[M,N] = sum_g a_scale[m,g] * b_scale[n,g] * (A_g * B_g^T)`, f32 output.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_gw(
+    /// Pack a pre-quantized `[N,K]` int8 weight for the **per-channel** (dense) path
+    /// (the C `rocket_i8_weights_pack`). The returned weight's group is 0.
+    pub fn pack_weight(&mut self, m: usize, k: usize, n: usize, b: &[i8]) -> Result<I8Weight> {
+        self.pack_codes(m, k, n, b, 0)
+    }
+
+    /// Pack a pre-quantized `[N,K]` int8 weight for the **group-wise** path (the C
+    /// `rocket_i8_weights_pack_gw`). `group >= 32`, `group % 32 == 0`, `group | K`.
+    pub fn pack_weight_gw(
         &mut self,
         m: usize,
         k: usize,
         n: usize,
+        b: &[i8],
+        group: usize,
+    ) -> Result<I8Weight> {
+        if group == 0 {
+            return Err(Error::shape("int8/pack/group"));
+        }
+        self.pack_codes(m, k, n, b, group)
+    }
+
+    /// Run every worker over its N-slice of `a`, accumulating into the worker's
+    /// `iacc` (dense) or `facc` (group-wise, `ng = K/group`).
+    #[allow(clippy::too_many_arguments)]
+    fn run_workers(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        group: usize,
         a: &[i8],
+        ng: usize,
         a_scale: &[f32],
         b_scale: &[f32],
-        cf: &mut [f32],
         w: &I8Weight,
     ) -> Result<()> {
-        if k != w.k || n != w.n || w.group == 0 {
-            return Err(Error::shape("int8/matmul/shape"));
-        }
-        if a.len() != m * k || cf.len() != m * n {
-            return Err(Error::shape("int8/matmul/buffers"));
-        }
-        let ng = k / w.group;
-        if a_scale.len() != m * ng || b_scale.len() != n * ng {
-            return Err(Error::shape("int8/matmul/scales"));
-        }
-        let workers = self.scratch(m, k, n, w.group)?;
+        let workers = self.scratch(m, k, n, group)?;
         if workers.len() != w.bos.len() {
             return Err(Error::tiling("int8/weight-workers"));
         }
@@ -274,7 +308,7 @@ impl I8Context {
                 let wt = &w.bos[i];
                 handles.push(scope.spawn(move || -> Result<()> {
                     crate::device::affinity::pin_current(i, base);
-                    worker.pack_input(m, k, a)?;
+                    worker.pack_input(k, a)?;
                     worker.compute(m, k, n, ng, a_scale, b_scale, wt)
                 }));
             }
@@ -289,7 +323,70 @@ impl I8Context {
         if let Some(e) = results.into_iter().find_map(|r| r.err()) {
             return Err(e);
         }
-        for worker in workers.iter() {
+        Ok(())
+    }
+
+    /// `C[M,N] = A[M,K] * B[N,K]^T`, raw int32 (the C `rocket_matmul_int8_prepacked`).
+    ///
+    /// `w` must be a per-channel weight ([`I8Context::pack_weight`]); the group-wise
+    /// form is [`I8Context::matmul_gw`]. `M % 4` is required — an unaligned `M`
+    /// miscomputes on HW and the resident path cannot pad rows (a padded row would need
+    /// a matching `a_scale`), so ragged row counts are padded caller-side; the pack's
+    /// `M` is informational (canonical tiling makes the weight valid for every `M`).
+    pub fn matmul(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[i8],
+        c: &mut [i32],
+        w: &I8Weight,
+    ) -> Result<()> {
+        if k != w.k || n != w.n || w.group != 0 {
+            return Err(Error::shape("int8/matmul/shape"));
+        }
+        if a.len() != m * k || c.len() != m * n {
+            return Err(Error::shape("int8/matmul/buffers"));
+        }
+        self.run_workers(m, k, n, 0, a, 0, &[], &[], w)?;
+        for worker in self.scratch(m, k, n, 0)?.iter() {
+            for row in 0..m {
+                let dst = &mut c[row * n + worker.n0..][..worker.nsub];
+                let src = &worker.iacc[row * worker.nsub..][..worker.nsub];
+                for (d, s) in dst.iter_mut().zip(src) {
+                    *d = *s as i32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `C[M,N] = sum_g a_scale[m,g] * b_scale[n,g] * (A_g * B_g^T)`, f32 output (the C
+    /// `rocket_matmul_int8_prepacked_gw`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_gw(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[i8],
+        a_scale: &[f32],
+        b_scale: &[f32],
+        cf: &mut [f32],
+        w: &I8Weight,
+    ) -> Result<()> {
+        if k != w.k || n != w.n || w.group == 0 {
+            return Err(Error::shape("int8/matmul/shape"));
+        }
+        if a.len() != m * k || cf.len() != m * n {
+            return Err(Error::shape("int8/matmul/buffers"));
+        }
+        let ng = k / w.group;
+        if a_scale.len() != m * ng || b_scale.len() != n * ng {
+            return Err(Error::shape("int8/matmul/scales"));
+        }
+        self.run_workers(m, k, n, w.group, a, ng, a_scale, b_scale, w)?;
+        for worker in self.scratch(m, k, n, w.group)?.iter() {
             for row in 0..m {
                 cf[row * n + worker.n0..][..worker.nsub]
                     .copy_from_slice(&worker.facc[row * worker.nsub..][..worker.nsub]);
@@ -300,13 +397,10 @@ impl I8Context {
 }
 
 impl Worker {
-    fn pack_input(&mut self, _m: usize, k: usize, a: &[i8]) -> Result<()> {
+    fn pack_input(&mut self, k: usize, a: &[i8]) -> Result<()> {
         self.in_all.prep(0)?;
         {
-            let bytes = self.in_all.as_mut_slice();
-            let words = unsafe {
-                std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<i8>(), bytes.len())
-            };
+            let words = i8_words(&mut self.in_all);
             if !self.in_zeroed {
                 words.fill(0);
                 self.in_zeroed = true;
@@ -345,8 +439,14 @@ impl Worker {
         wt: &Bo,
     ) -> Result<()> {
         let plan = &self.plan;
-        self.facc.clear();
-        self.facc.resize(m * self.nsub, 0.0);
+        let dense = ng == 0;
+        if dense {
+            self.iacc.clear();
+            self.iacc.resize(m * self.nsub, 0);
+        } else {
+            self.facc.clear();
+            self.facc.resize(m * self.nsub, 0.0);
+        }
         let mut tasks: Vec<DrmRocketTask> = Vec::with_capacity(BATCH);
         let mut meta: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(BATCH);
         let mut ops = Vec::with_capacity(160);
@@ -397,7 +497,7 @@ impl Worker {
                         regcmd,
                         regcmd_count: count as u32,
                     });
-                    let group_idx = ki / self.kt_per_group;
+                    let group_idx = ki / self.kt_per_group.max(1);
                     meta.push((m0, n0, mtile, ntile, group_idx));
                     nb += 1;
                     done += 1;
@@ -413,29 +513,36 @@ impl Worker {
                         self.dev.submit(&tasks, &in_h, &out_h, 0)?;
                         self.out_all.prep(wait_ns())?;
                         {
-                            let bytes = self.out_all.as_slice();
-                            let words = unsafe {
-                                std::slice::from_raw_parts(
-                                    bytes.as_ptr().cast::<i32>(),
-                                    bytes.len() / 4,
-                                )
-                            };
+                            let words = super::bos::i32_words_ref(&self.out_all);
                             let n0_base = self.n0;
                             for (j, &(m0, n0, mtile, ntile, g)) in meta.iter().enumerate() {
                                 let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
-                                let facc = &mut self.facc;
-                                layout::detile_accum_i8_scaled(
-                                    facc,
-                                    self.nsub,
-                                    slot,
-                                    m0,
-                                    n0,
-                                    mtile,
-                                    ntile,
-                                    |row, col| {
-                                        a_scale[row * ng + g] * b_scale[(n0_base + col) * ng + g]
-                                    },
-                                );
+                                if dense {
+                                    layout::detile_accum_i32(
+                                        &mut self.iacc,
+                                        self.nsub,
+                                        slot,
+                                        m0,
+                                        n0,
+                                        mtile,
+                                        ntile,
+                                    );
+                                } else {
+                                    let facc = &mut self.facc;
+                                    layout::detile_accum_i8_scaled(
+                                        facc,
+                                        self.nsub,
+                                        slot,
+                                        m0,
+                                        n0,
+                                        mtile,
+                                        ntile,
+                                        |row, col| {
+                                            a_scale[row * ng + g]
+                                                * b_scale[(n0_base + col) * ng + g]
+                                        },
+                                    );
+                                }
                             }
                         }
                         self.out_all.fini()?;
@@ -451,34 +558,22 @@ impl Worker {
     }
 }
 
+/// The per-worker plan for a shape. The tiling is resolved at the **canonical** tile
+/// height (`max_tile`), not the call's `M`, so a resident weight's scatter layout is
+/// M-independent and one pack serves every `M` — the C `rki_worker_alloc`. Only the
+/// live `Mt` and `nMt` follow the call.
 fn plan_for(m: usize, k: usize, n: usize, group: usize) -> Result<Plan> {
     let max_tile = hw::current().max_tile as usize;
-    let (cmt, kt, nt) = plan_geom(&INT8_GW, max_tile.max(4), k, n, group)?;
-    if !group.is_multiple_of(kt) {
+    let geom = if group == 0 { &INT8 } else { &INT8_GW };
+    let (cmt, kt, nt) = plan_geom(geom, max_tile.max(4), k, n, group)?;
+    if group > 0 && !group.is_multiple_of(kt) {
         return Err(Error::shape("int8/group-kt"));
     }
-    Ok(Plan {
-        m,
-        k,
-        n,
-        mt: cmt.min(m),
-        kt,
-        nt,
-        nmt: m.div_ceil(cmt.min(m)),
-        nnt: n.div_ceil(nt),
-        nkt: k.div_ceil(kt),
-        in_slot: rup(cmt.min(m), 4) * rup(kt, 32),
-        wt_slot: rup(nt, 32) * rup(kt, 32),
-        out_slot: rup(cmt.min(m), 4) * rup(nt, 16),
-    })
+    Ok(int8_plan(m, k, n, cmt.min(m), kt, nt))
 }
 
 fn fanout_step(n: usize, threads: usize, align: usize) -> usize {
     let threads = threads.max(1);
     let align = align.max(1);
     n.div_ceil(threads).div_ceil(align) * align
-}
-
-fn rup(x: usize, a: usize) -> usize {
-    x.div_ceil(a) * a
 }

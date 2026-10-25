@@ -6,8 +6,9 @@ pub mod bos;
 pub(crate) mod chain;
 pub mod context;
 pub mod f32out;
-pub mod geom;
+pub mod int16;
 pub mod int8;
+pub mod int8_dense;
 pub mod layout;
 pub mod plan;
 pub mod run;
@@ -22,6 +23,8 @@ pub use chain::enabled as chain_enabled;
 pub use context::{Context, MemStats, SlotMem, Weight};
 pub use f32out::one_shot as one_shot_f32out;
 pub use int8::{I8Context, I8Weight};
+pub use int8_dense::{one_shot_int8, one_shot_int8_groupwise, plan_int8};
+pub use int16::one_shot_int16_exact;
 pub use plan::{Plan, plan_geom};
 pub use run::{
     compute_cpu, compute_kacc, i8_weights_bytes, one_shot, one_shot_bf16, one_shot_bf16_mt,

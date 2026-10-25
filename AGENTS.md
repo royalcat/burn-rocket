@@ -348,8 +348,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   image had no decoder, so `input_video`/`/embed` video and non-WAV audio
   requests failed in the deployed container (log-gemma §21).
 - **Port status**: fp16 one-shot/streaming/resident/segmented/multi-fd/fp32-out and
-  batched matmul, group-wise int8, the native bf16 stream and masked GQA attention are
-  ported. Planner and regcmd output are byte-equal to the C library (dtype parity
+  batched matmul, dense *and* group-wise int8 (one-shot plus resident per-channel /
+  group-wise weights), `int16_exact`, the native bf16 stream and masked GQA attention
+  are ported (`int8_selftest --dense|--gw-one-shot|--prepacked-dense|--prepacked-gw`
+  and `int16_selftest` are the board checks: int32/i64-exact vs the CPU reference on
+  ragged shapes, one-shot gw bit-identical to the resident gw at group 32-512).
+  Planner and regcmd output are byte-equal to the C library (dtype parity
   harness: `tools/c-oracle` + `parity.py`); fp16/bf16 cosine >= 0.99999 and int8
   matches its dequantized reference. Board microbenchmarks: int8 512x3072x1024
   62-70 ms vs C 59-66, bf16 stream 24-27 ms vs C 22-26. Attention uses a per-worker
@@ -360,8 +364,8 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   cut the score pass 4.3× (log-gemma §19); EmbeddingGemma 2's vision tower runs its
   attention on the NPU by default under `--npu` (S2, §20). End-to-end: qwen3
   3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
-  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): dense/per-channel
-  int8, one-shot int8 group-wise, int4/int16/tf32, resident bf16 (the C library has no
+  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): int4 and tf32
+  (one-shot, resident, group-wise, plans), resident bf16 (the C library has no
   variant either), `mha_self`, `*_ref` host references, `_planes`/transposed variants,
   RK3576 entries, the public `rocket_stream_*` aliases, tiled long-context attention,
   on-NPU softmax, and all non-matmul op families.
@@ -384,7 +388,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype), the `parity.py` dtype parity harness, and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest`, `bf16_selftest` |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int16_selftest`, `bf16_selftest` |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1069,6 +1073,13 @@ On the board (after the cross-build + scp above; the NPU-enabled binary):
 ```sh
 ssh root@rock-5b-plus.lan
 cd /root/rocket-inference
+# driver dtype selftests (bare binaries, no model; any spare cores)
+#   int8: --dense / --prepacked-dense are int32-exact, the gw pair matches the
+#   dequantized reference (and each other bit-for-bit at a group-pinned Kt);
+#   int16_exact is i64-exact.  Shape args are M K N [GROUP].
+taskset -c 0-3 ./int8_selftest --dense 264 320 288
+taskset -c 0-3 ./int8_selftest --gw-one-shot 512 1024 512 32
+taskset -c 0-3 ./int16_selftest 64 256 128
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
 taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1

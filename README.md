@@ -146,7 +146,8 @@ The example app builds with `--no-default-features --features npu` (aarch64) or
 `--no-default-features` (flex CPU on any target).
 
 Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
-group-wise int8, the native bf16 stream and masked GQA attention are ported and
+dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weights),
+`int16_exact`, the native bf16 stream and masked GQA attention are ported and
 validated on the board. Planner and regcmd output are byte-equal to the C library;
 fp16/bf16 cosine >= 0.99999, int8 matches its dequantized reference. Qwen3
 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16 microbenchmarks
@@ -156,17 +157,18 @@ are at or above the C library's speed.
 
 `rocket-npu` is a focused matmul/attention driver, not a full replacement of every
 `librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
-fp32-out and batched matmul, resident group-wise int8, the native bf16 stream, masked
+fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
+and resident group-wise), `int16_exact`, the native bf16 stream, masked
 GQA attention with chained per-head QK/AV batching, the device/BO/submit primitives
 (including multi-job submit and the opt-in chained layout), and the dtype parity
 harness (`tools/c-oracle` + `parity.py`).
 
-Not exposed yet: dense/per-channel int8, one-shot int8 group-wise, int4/int16/tf32,
-resident bf16 (the C library has no variant either), `mha_self`, the `*_ref` host
-references, the `_planes`/transposed variants, RK3576 entries, the public
-`rocket_stream_*` aliases, the long-context tiled attention path, on-NPU softmax, and
-every non-matmul op family (conv, pool, activation, norm, FFN, softmax, reduce,
-resize, encoders, graph). See the `rocket-npu` crate docs for the full list.
+Not exposed yet: int4 and tf32 (one-shot, resident, group-wise, plans), resident bf16
+(the C library has no variant either), `mha_self`, the `*_ref` host references, the
+`_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
+the long-context tiled attention path, on-NPU softmax, and every non-matmul op family
+(conv, pool, activation, norm, FFN, softmax, reduce, resize, encoders, graph). See the
+`rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and

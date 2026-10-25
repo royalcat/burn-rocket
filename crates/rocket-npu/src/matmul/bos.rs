@@ -223,6 +223,21 @@ pub(crate) fn u64_words(bo: &mut Bo) -> &mut [u64] {
     unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u64>(), bytes.len() / 8) }
 }
 
+/// The BO as int8 codes (the int8 in/wt pack target).
+pub(crate) fn i8_words(bo: &mut Bo) -> &mut [i8] {
+    let bytes = bo.as_mut_slice();
+    // SAFETY: every byte is a valid `i8`, and the mapping is page-aligned.
+    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<i8>(), bytes.len()) }
+}
+
+/// The BO as int32 words (the int8 output cube).
+pub(crate) fn i32_words_ref(bo: &Bo) -> &[i32] {
+    let bytes = bo.as_slice();
+    assert_eq!(bytes.len() % 4, 0);
+    // SAFETY: the int8 output BO is a whole number of 4-byte int32 elements.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i32>(), bytes.len() / 4) }
+}
+
 pub fn zero_bo(bo: &mut Bo) -> Result<()> {
     bo.prep(0)?;
     bo.as_mut_slice().fill(0);

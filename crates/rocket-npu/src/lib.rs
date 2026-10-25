@@ -2,9 +2,9 @@
 //!
 //! This crate replaces the C `librocketnpu` with a native Rust implementation of the
 //! same algorithms: DRM-accel device handling, register-command generation, the
-//! tiled matmul engine (fp16, int8, int4, int16, bf16, tf32), resident weights,
-//! multi-threaded fan-out, and flash attention. It is an independent crate: no Burn
-//! dependency, no C toolchain, no kernel headers.
+//! tiled matmul engine (fp16, int8, int16, bf16), resident weights, multi-threaded
+//! fan-out, and flash attention. It is an independent crate: no Burn dependency, no C
+//! toolchain, no kernel headers.
 //!
 //! The layout follows the upstream C library closely enough that a function can be
 //! read side by side with its original (`rocket_matmul.c`, `npu_regcmd.c`, …):
@@ -42,7 +42,14 @@
 //! - fp16 batching: [`matmul::MmBatch`] (the persistent `rocket_mm_batch_*` context,
 //!   pack-once/resident BOs) and the one-shot [`matmul::batch()`]
 //!   (`rocket_matmul_fp16_batch`);
-//! - int8: resident **group-wise** W8A8 only ([`matmul::I8Context`]);
+//! - int8: dense `int8 x int8 -> int32` one-shot ([`matmul::one_shot_int8`], host
+//!   int64 K-accumulation), the one-shot group-wise
+//!   [`matmul::one_shot_int8_groupwise`], the int8 planner ([`matmul::plan_int8`]), and
+//!   the resident W8A8 weights in both modes ([`matmul::I8Context`]: per-channel
+//!   `pack_weight`/`matmul` returning raw int32, group-wise
+//!   `pack_weight_gw`/`matmul_gw` scaling each K-tile's partial in f32);
+//! - int16: [`matmul::one_shot_int16_exact`], the bit-exact `int16 x int16 -> int64`
+//!   decomposition into four int8 products (inputs clamped to `[-32768, 32639]`);
 //! - bf16: the native streaming path ([`matmul::Bf16Stream`]) plus the one-shot
 //!   `_bf16`/`_mt` wrappers over it;
 //! - the `rocket_weights_bytes`/`rocket_i8_weights_bytes` footprint helpers and
@@ -61,9 +68,7 @@
 //!
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
-//! - dense/per-channel int8 (`rocket_matmul_int8*` without `_gw`), one-shot
-//!   `rocket_matmul_int8_groupwise`, and the int8 planner's dense variant;
-//! - all int4, int16 and tf32 entries (one-shot, resident, group-wise, plans);
+//! - all int4 and tf32 entries (one-shot, resident, group-wise, plans);
 //! - a resident bf16 weight (the C library has none either);
 //! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
 //!   transposed-output variants, and the RK3576-specific entries;
