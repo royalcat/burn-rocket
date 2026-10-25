@@ -60,6 +60,17 @@
  * C's internal host-handoff MLP, which has no public entry point: the fused entry is
  * what this harness can call, so `mlp` is rejected with a message.)
  *
+ * M10 (attention, the softmax placement A/B). Same argument layout as
+ * `attn_selftest --io`; `-` is a NULL tensor and the two floats travel as f32 bit
+ * patterns in hex, so neither side parses a decimal:
+ *
+ *   ab_board flash T KV DK DV HEADS HKV SCALE_BITS SOFTCAP_BITS Q K V MASK OUT
+ *   ab_board mha   T D HEADS X WQ BQ WK BK WV BV WO BO OUT
+ *
+ * `ROCKET_ATTN_HOST_SOFTMAX` is read by the C library itself, with its own per-entry
+ * defaults: `flash` parses the value (`0` = on-NPU) while `mha` only tests presence
+ * (`=1` host, unset on-NPU). `ab_compare.py --attn` sets each side accordingly.
+ *
  * The CE target rule matches the port: target[row] = (row*7919 + 13) % N, with row 0
  * set to -1 so the out-of-range guard is exercised on both sides.
  *
@@ -72,6 +83,7 @@
 #include <stdint.h>
 
 #include "rocket_npu.h"
+#include "rocket_attn.h"
 #include "rocket_conv.h"
 #include "rocket_pool.h"
 #include "rocket_reduce.h"
@@ -128,6 +140,16 @@ static _Float16 *slurp_f16(const char *path, size_t n)
 static _Float16 *slurp_f16_opt(const char *path, size_t n)
 {
     return !strcmp(path, "-") ? NULL : slurp_f16(path, n);
+}
+
+/* An f32 argument given as a hex bit pattern (`0x3db504f3`), so the two sides cannot
+ * disagree about a decimal's rounding. */
+static float arg_f32(const char *s)
+{
+    uint32_t bits = (uint32_t)strtoul(s, NULL, 0);
+    float v;
+    memcpy(&v, &bits, sizeof v);
+    return v;
 }
 
 int main(int argc, char **argv)
@@ -567,6 +589,45 @@ int main(int argc, char **argv)
         if (rc) die("resize op failed");
         spit(argv[8], out, on * sizeof(_Float16));
         free(in); free(out);
+    } else if (!strcmp(family, "flash")) {
+        /* flash T KV DK DV HEADS HKV SCALE_BITS SOFTCAP_BITS Q K V MASK OUT */
+        if (argc < 15) die("flash T KV DK DV HEADS HKV SCALE_BITS SOFTCAP_BITS Q K V MASK OUT");
+        int T = atoi(argv[2]), KV = atoi(argv[3]), DK = atoi(argv[4]), DV = atoi(argv[5]);
+        int NH = atoi(argv[6]), NKVH = atoi(argv[7]);
+        float scale = arg_f32(argv[8]), softcap = arg_f32(argv[9]);
+        size_t qn = (size_t)NH * T * DK, kn = (size_t)NKVH * KV * DK;
+        size_t vn = (size_t)NKVH * DV * KV, on = (size_t)NH * T * DV;
+        _Float16 *Q = slurp_f16(argv[10], qn);
+        _Float16 *K = slurp_f16(argv[11], kn);
+        _Float16 *V = slurp_f16(argv[12], vn);
+        _Float16 *M = slurp_f16_opt(argv[13], (size_t)T * KV);
+        _Float16 *out = calloc(on, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = rocket_flash_attn_fp16(fd, T, KV, DK, DV, NH, NKVH, scale, softcap, Q, K, V, M, out);
+        if (rc) die("flash attention op failed");
+        spit(argv[14], out, on * sizeof(_Float16));
+        free(Q); free(K); free(V); free(M); free(out);
+    } else if (!strcmp(family, "mha")) {
+        /* mha T D HEADS X WQ BQ WK BK WV BV WO BO OUT */
+        if (argc < 15) die("mha T D HEADS X WQ BQ WK BK WV BV WO BO OUT");
+        int T = atoi(argv[2]), D = atoi(argv[3]), NH = atoi(argv[4]);
+        size_t dd = (size_t)D * D;
+        _Float16 *x = slurp_f16(argv[5], (size_t)T * D);
+        _Float16 *wq = slurp_f16(argv[6], dd);
+        _Float16 *bq = slurp_f16_opt(argv[7], (size_t)D);
+        _Float16 *wk = slurp_f16(argv[8], dd);
+        _Float16 *bk = slurp_f16_opt(argv[9], (size_t)D);
+        _Float16 *wv = slurp_f16(argv[10], dd);
+        _Float16 *bv = slurp_f16_opt(argv[11], (size_t)D);
+        _Float16 *wo = slurp_f16(argv[12], dd);
+        _Float16 *bo = slurp_f16_opt(argv[13], (size_t)D);
+        _Float16 *out = calloc((size_t)T * D, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = rocket_mha_self_fp16(fd, T, D, NH, x, wq, bq, wk, bk, wv, bv, wo, bo, out);
+        if (rc) die("mha_self op failed");
+        spit(argv[14], out, (size_t)T * D * sizeof(_Float16));
+        free(x); free(wq); free(bq); free(wk); free(bk);
+        free(wv); free(bv); free(wo); free(bo); free(out);
     } else if (!strcmp(family, "sam") || !strcmp(family, "sam_ref")) {
         /* sam|sam_ref BLOB PIXELS OUT   (OUT.hidden gets the (nL+1) token blocks) */
         if (argc < 5) die("sam BLOB PIXELS OUT");

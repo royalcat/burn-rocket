@@ -241,7 +241,8 @@ fused entries' host-handoff fallback — `M = 1` and the `M = 260` KACC EW-strid
 refusal — so both sides have to make the same fallback decision). The encoder block is
 the only case that is not bit-identical (198/512 and 2040/8192 elements exact): its
 attention sublayer is `attn::mha_self`, whose host fast softmax is the documented
-deviation from the C's on-NPU softmax. Against the device-free fp64 references:
+deviation from the C's on-NPU softmax (set `ROCKET_ATTN_HOST_SOFTMAX=0` for the on-NPU
+arm, which is bit-identical to the C — see the placement section below). Against the device-free fp64 references:
 RMSNorm/LayerNorm cosine
 0.99999992-0.99999994 with <= 2.9e-3 absolute and <= 2.1e-3 relative error on the
 significant elements, the vision norms 0.9999999 with <= 2.1e-3 relative, GeGLU
@@ -312,6 +313,45 @@ at cosine 0.9999999 (30,016 keys, causal, GQA 8/2) and cuts the attention scratc
 takes a 30k-key request from OOM to a 1 GiB working set. Wall is parity to ±20 %:
 it wins once the key axis dominates the query block (0.88-0.95x measured) and pays
 more, smaller submits at a square 8k with a 2k tile.
+
+### Softmax placement: host vs on-NPU (`ROCKET_ATTN_HOST_SOFTMAX`)
+
+The C library's attention entries can run their row softmax either host-side or through
+`rocket_softmax_fp16`, the composition of host row-max plus the DPU `EXP` LUT, the
+feature-axis row sum and the per-row scale. Both arms are ported: `attn::RowSoftmax`
+owns the host pass (`attn::Softmax`, the default) and the on-NPU arm, which writes the
+same f16 masked scores the C does (`fa_score` in f32, one f16 narrowing, pad columns at
+the `-30000` clamp) and hands them to `ops::softmax::softmax` — the same composition the
+M6b gate already found bit-identical to C. `ROCKET_ATTN_HOST_SOFTMAX=0` selects the
+on-NPU arm, `1`/unset the host one (the port's default everywhere; the C's `mha_self`
+defaults to on-NPU, so `=0` is what reproduces it). The **materialized** paths honor
+the knob — `Attention::flash`'s per-head and chained group paths, and `mha_self` — while
+the tiled `ROCKET_FA_TILE_KV` path stays host-only by construction (its online
+running max/rescale is sequential across key tiles, and the C tiled range takes no
+`host_sm` either). `ROCKET_FA_CHAIN=0/1` and the `mha_self` thread fan-out stay
+bit-identical under either placement.
+
+The knob is global — `burn_rocket`'s attention ops ride the same `Attention::flash`, so
+setting it also switches the app's NPU attention — and the on-NPU arm is a
+parity/comparison knob, not a default; the measurements say why
+(board, cores 0-3, busy board at load ~10; `attn_selftest --sm-ab`): at T=257 kv=257 with
+8 heads / 2 kv heads and dk 64 it costs **1.8-2.2x the host wall** (128.1 vs 59.7 ms in
+one run, 100.5 vs 56.3 in another — the board scatters ±20 %) with a single fd and
+**1.2-1.3x** through the 4-worker fan-out, and at kv=1024 **2.55x / 1.76x**: the gap grows
+with the key count, as the C's own comment predicts, but it is far wider here because the
+C compares against a scalar `expf` pass and this port has the S1 fast host softmax.
+`mha_self` reads 1.1-1.25x (T=257) and 1.75x at the kv=1024 run's T=256. Numerics against
+the device-free f64 references: cosine 0.99999990 (flash) and 0.99999887-0.99999989
+(`mha_self`) — the `EXP` LUT's approximation, as documented for `rocket_softmax_fp16`.
+
+The C-vs-Rust A/B closes the surface (`ab_board` grew `flash`/`mha` families with the
+`attn_selftest --io` layout; `ab_compare.py --attn-only`): the **on-NPU arms are
+bit-identical on every case** — flash causal, unmasked, soft-cap 8, MLA (`dv != dk`) and
+a one-hot `n_kv > T` prefix, plus `mha_self` at T=8/5/33 with the `Tp`/`Tn` padding —
+while the host arms differ by at most ~2.4 f16 ULP at the output peak (cosine
+0.9999992-1.0), which is exactly the documented f32-vs-f16 score write. The C's
+single-fd entry chains its heads by default (`ROCKET_FA_CHAIN`), and so does the Rust
+one, so those cases pin the chained path's placement too.
 
 ### The model encoders (M9): SAM ViT-Det and SigLIP
 
@@ -402,7 +442,8 @@ the blob loaders, the device-free host references, the one-shot entries and the 
 contexts, with the CLIP/DPT variant knobs), and
 masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
-the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
+the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching, the
+selectable host / on-NPU softmax placement (`ROCKET_ATTN_HOST_SOFTMAX`) and
 the tiled long-context path (`ROCKET_FA_TILE_KV`: online softmax over key tiles, no
 `[Tp, Kn]` score matrix), the two f64 host oracles (`flash_attn_ref`,
 `mha_self_ref`), the device/BO/submit primitives (including multi-job submit and the
@@ -422,7 +463,11 @@ family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, `--int8`, `--int8-
 `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`, `--ref-in`/`--ref-out` to move a host
 reference between machines, and a `--io` mode); their `--io` raw-file modes are the
 exchange format of `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board
-(`--enc`, or `--enc-only` for just the M9 section).
+(`--enc`, or `--enc-only` for just the M9 section). `attn_selftest` covers the attention
+side: the chained A/B by default, `--oneshot` for the stateless entries against the f64
+oracle, `--mha` for the encoder sublayer, `--host-sm 0|1` to pick the softmax placement,
+`--sm-ab` to run both placements and report the wall/CPU and the deviation, and an
+`--io flash|mha` raw-file mode (`ab_compare.py --attn-only`).
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
@@ -437,7 +482,7 @@ remaining non-matmul families, the
 `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stays
-materialized), on-NPU **attention** softmax, the cube-resident *mechanism* of the fused
+materialized), the cube-resident *mechanism* of the fused
 FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
 bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
 optimization is the remaining work), the RK3576-specific convolution and pooling

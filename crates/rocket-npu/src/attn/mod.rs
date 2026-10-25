@@ -20,12 +20,34 @@
 //! [`softmax::Softmax`] (fast polynomial `exp` by default, `SOFTMAX_EXACT=1` for
 //! the original scalar path).
 //!
+//! # Softmax placement (`ROCKET_ATTN_HOST_SOFTMAX`, default host)
+//!
+//! [`softmax::RowSoftmax`] also owns the C library's **on-NPU** softmax arm: with
+//! `ROCKET_ATTN_HOST_SOFTMAX=0`, the masked scores narrow to f16 and
+//! [`crate::ops::softmax::softmax`] (the `rocket_softmax_fp16` port) runs the DPU `EXP`
+//! LUT, the feature-axis row sum and the per-row scale on the device, with the row max
+//! and `1/sum` on the host. The **materialized** paths honor it — the per-head path, the
+//! chained group path (its mask + softmax is also per head over the full key axis, as in
+//! the C `fa_heads_range_batched`, so `ROCKET_FA_CHAIN=0/1` stays bit-identical under
+//! either placement) and the encoder's [`mha_self`] — while the kernel choices are the
+//! C's: `mha_self` defaults to on-NPU in C and to host here, and the flash entries
+//! default to host in both. The knobs are `0` = on-NPU and `1`/unset = host, so
+//! `ROCKET_ATTN_HOST_SOFTMAX=0` is the parity arm for the C's `mha_self`.
+//!
+//! The tiled long-context path below has no such choice: its running max/rescale is
+//! sequential across key tiles and inherently host-side, so it always runs the host
+//! pass (as the C `fa_heads_range_tiled` does — it takes no `host_sm` argument). The C
+//! library's own comment calls the on-NPU softmax transfer-bound (~5-10 % slower than a
+//! host pass on flash attention, the gap growing with `n_kv`, because the scores are
+//! already host-resident for the mask), and this port's fast host pass widens that gap,
+//! so the on-NPU arm is a parity/comparison knob, not the default.
+//!
 //! # Chained per-head batching (`ROCKET_FA_CHAIN`, default ON)
 //!
 //! Port of the C `fa_heads_range_batched` (`ROCKET_FA_CHAIN`): every per-head QK matmul
 //! of a worker shares one `(Tp, dk, Kn)` shape and its per-head AV matmuls one
 //! `(Tp, Kn, dv)`, so a worker's head range runs in GROUPS — gather the group's
-//! operands, ONE [`MmBatch`] run for its QK, the host mask + softmax per head, one
+//! operands, ONE [`MmBatch`] run for its QK, the mask + softmax per head, one
 //! [`MmBatch`] run for its AV — instead of one submit + fence wait per matmul. Per-head
 //! attention GEMMs are tiny and dispatch-bound, so this attacks the submit floor rather
 //! than the MAC count. The mask and softmax sit BETWEEN the two batched jobs (never
@@ -53,7 +75,7 @@
 //!
 //! Port of the C `fa_heads_range_tiled`. The materialized path computes scores over the
 //! FULL key axis in one QK matmul, so its `[Tp, Kn]` score matrix grows with the key
-//! count (and streams to DRAM and back for the host mask + softmax). The tiled path
+//! count (and streams to DRAM and back for the mask + softmax). The tiled path
 //! walks the key axis in tiles of [`tile_kv_width`] keys and carries the
 //! FlashAttention-2 running softmax ([`Online`]: max `m[Tp]`, denominator `l[Tp]`,
 //! unnormalized output `acc[Tp, dv]`, all fp32), so the working score tile is only
@@ -90,7 +112,7 @@ mod softmax;
 pub use oneshot::{
     flash_attn, flash_attn_mt, flash_attn_ref, fully_masked_rows, mha_self, mha_self_ref,
 };
-pub use softmax::{Online, Softmax, SoftmaxMode};
+pub use softmax::{Online, RowSoftmax, Softmax, SoftmaxMode, SoftmaxPlacement, host_softmax};
 
 const MAX_WORKERS: usize = 8;
 
@@ -556,8 +578,9 @@ struct Worker {
     scores: Vec<f16>,
     ctx: Vec<f16>,
     out: Vec<f16>,
-    /// Reused row buffer + kernel mode for the host softmax.
-    sm: Softmax,
+    /// Reused row buffer + kernel mode for the host softmax, and the f16 masked score
+    /// matrix the on-NPU arm (`ROCKET_ATTN_HOST_SOFTMAX=0`) feeds to it.
+    sm: RowSoftmax,
     head_dim: usize,
     dv: usize,
     tp: usize,
@@ -580,7 +603,7 @@ impl Worker {
             + self.tav.as_ref().map_or(0, ScratchCache::bo_bytes);
         ScratchMem {
             bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes() + batch + tiled,
-            host_bytes: host * size_of::<f16>() + self.tiles.host_bytes(),
+            host_bytes: host * size_of::<f16>() + self.tiles.host_bytes() + self.sm.bytes(),
             shape: (self.tp, self.kn),
             tile: self.tile_w,
         }
@@ -610,7 +633,7 @@ impl Worker {
             scores: Vec::new(),
             ctx: Vec::new(),
             out: Vec::new(),
-            sm: Softmax::new(),
+            sm: RowSoftmax::new(),
             head_dim: 0,
             dv: 0,
             tp: 0,
@@ -730,6 +753,9 @@ impl Worker {
             self.p.shrink_to_fit();
             self.ctx.shrink_to_fit();
         }
+        // The on-NPU arm's masked score matrix follows the same rule (the host arm's row
+        // buffer is `O(Kn)` and `Softmax` keeps it; it is not a per-head matrix).
+        self.sm.trim(self.tp * self.kn);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -778,9 +804,11 @@ impl Worker {
     /// Per tile: gather the key/value tile, QK matmul `Tp x dk x wp`, scale and
     /// soft-cap and mask the tile (pad columns to the clamp), fold it into `m`/`l`/`acc`
     /// with an f16 unnormalized `P`, AV matmul `Tp x wp x dv`, then `acc += ctx`. Per
-    /// head: `out = acc / l`. Host softmax only, `dv == dk` only, and never chained —
-    /// the per-tile GEMMs are already small, so the submit floor the chained path
-    /// attacks is not what limits a long context; the score traffic is.
+    /// head: `out = acc / l`. Host softmax only (the running rescale is sequential
+    /// across tiles, so `ROCKET_ATTN_HOST_SOFTMAX` cannot apply — the C tiled range takes
+    /// no `host_sm` either), `dv == dk` only, and never chained: the per-tile GEMMs are
+    /// already small, so the submit floor the chained path attacks is not what limits a
+    /// long context; the score traffic is.
     #[allow(clippy::too_many_arguments)]
     fn run_tiled(
         &mut self,
@@ -888,6 +916,7 @@ impl Worker {
                 .current_mut()
                 .matmul(&self.qh, &self.kh, &mut self.scores)?;
             self.sm.run(
+                &self.dev,
                 &self.scores,
                 &mut self.p,
                 mask,
@@ -897,7 +926,7 @@ impl Worker {
                 kn,
                 scale,
                 softcap,
-            );
+            )?;
             self.av
                 .current_mut()
                 .matmul(&self.p, &self.vh, &mut self.ctx)?;
@@ -974,9 +1003,13 @@ impl Worker {
                 }
             }
 
-            // The mask + softmax sit between the two batched jobs, per head.
+            // The mask + softmax sit between the two batched jobs, per head. This is a
+            // full-key-axis row softmax per head (exactly like the per-head path), so
+            // the on-NPU placement applies here too — the C `fa_heads_range_batched`
+            // passes its `host_sm` through the same loop.
             for i in 0..g {
                 sm.run(
+                    dev,
                     &grp.sc[i * tk..][..tk],
                     &mut grp.p[i * tk..][..tk],
                     mask,
@@ -986,7 +1019,7 @@ impl Worker {
                     kn,
                     scale,
                     softcap,
-                );
+                )?;
             }
 
             for (i, &h) in range.iter().enumerate() {

@@ -60,12 +60,22 @@ on the int8 direct path and the same OUT_CVT requant on the depthwise one):
 The fused conv->activation path adds the DPU LUT interpolation, which the C header says
 to gate with a tolerance, so it is gated relatively (cosine + max-abs); the exact count
 is printed either way.
+
+M10 (attention, `--attn`) compares the two softmax placements of `flash_attn` and
+`mha_self` on the same raw inputs (`ab_board flash|mha` against `attn_selftest --io`).
+The host arms are NOT expected to be bit-identical: the Rust host pass keeps the masked
+scores in f32, while the C writes them back through the f16 `sc` buffer the on-NPU arm
+needs. The on-NPU arms run the same masked-score write, the same `rocket_softmax_fp16`
+composition and the same fp16 matmuls, so those are gated strictly (bit-identical);
+`ROCKET_ATTN_HOST_SOFTMAX` is set per side, with the C's presence-based `mha_self`
+default taken into account.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import os
 import struct
 import subprocess
 import sys
@@ -144,6 +154,14 @@ def lcg(n: int, lo: float, hi: float, seed: int) -> list[float]:
     return out
 
 
+def f16_ulp(x: float) -> float:
+    """The f16 spacing at |x| (2^-10 of its binade; f16 has 10 explicit mantissa bits)."""
+    a = abs(x)
+    if a == 0.0 or not math.isfinite(a):
+        return 0.0
+    return math.ldexp(1.0, max(math.floor(math.log2(a)) - 10, -24))
+
+
 def stats(want: list[float], got: list[float]) -> tuple[int, float, float]:
     exact = sum(1 for a, b in zip(want, got) if a == b)
     dot = sum(a * b for a, b in zip(want, got))
@@ -171,7 +189,9 @@ class Runner:
 
     def run_files(self, name: str, args: list[str], inputs: list[Path], out_f32: bool,
                   n_out: int, c_args: list[str] | None = None,
-                  kind: str | None = None) -> tuple[list[float], list[float]]:
+                  kind: str | None = None, r_env: dict[str, str | None] | None = None,
+                  c_env: dict[str, str | None] | None = None,
+                  r_bin: Path | None = None) -> tuple[list[float], list[float]]:
         """Run both binaries on `inputs` (the trailing files of the `--io` layout).
 
         `args` carries the family and its scalar/optional-file arguments; the binary
@@ -184,14 +204,27 @@ class Runner:
             if out.exists():
                 out.unlink()
         ins = [str(p) for p in inputs]
-        r = subprocess.run([str(self.rust), "--io", *args, *ins, str(r_out)],
-                           capture_output=True, text=True)
+
+        def env_of(extra: dict[str, str | None] | None) -> dict[str, str] | None:
+            if extra is None:
+                return None
+            e = dict(os.environ)
+            for k, v in extra.items():
+                if v is None:
+                    e.pop(k, None)
+                else:
+                    e[k] = v
+            return e
+
+        r = subprocess.run([str(r_bin or self.rust), "--io", *args, *ins, str(r_out)],
+                           capture_output=True, text=True, env=env_of(r_env))
         if r.returncode != 0:
             print(f"  {name}: rust exited {r.returncode}: {r.stderr.strip()}")
             self.fail = True
             return [], []
         c = subprocess.run([str(self.cbin), *(c_args if c_args is not None else args),
-                            *ins, str(c_out)], capture_output=True, text=True)
+                            *ins, str(c_out)], capture_output=True, text=True,
+                           env=env_of(c_env))
         if c.returncode != 0:
             print(f"  {name}: C exited {c.returncode}: {c.stderr.strip()}")
             self.fail = True
@@ -203,6 +236,26 @@ class Runner:
             print(f"  {name}: output size {len(c_vals)}/{len(r_vals)}, expected {n_out}")
             self.fail = True
         return c_vals, r_vals
+
+    def report_ulp(self, name: str, c_vals: list[float], r_vals: list[float],
+                   ulps: float = 2.0) -> None:
+        """Gate a pair that differs only by f16 rounding of an f16-width intermediate.
+
+        The bound is `ulps` f16 ULPs at the output peak, which is what a f16 score
+        write-back can move an element by (an element near zero is a cancellation of
+        peak-sized terms, so the absolute bound is taken at the peak).
+        """
+        if not c_vals or not r_vals:
+            return
+        exact, cos, max_abs = stats(c_vals, r_vals)
+        n = len(c_vals)
+        peak = max((abs(v) for v in c_vals), default=0.0)
+        bound = ulps * f16_ulp(peak)
+        ok = exact == n or (cos >= 0.999999 and max_abs <= bound)
+        self.fail |= not ok
+        tag = "bit-identical" if exact == n else f"exact={exact}/{n}"
+        print(f"  {name:<34} {tag:<18} cos={cos:.9f} max_abs={max_abs:.3e} "
+              f"(<= {bound:.2e}) -> {'PASS' if ok else 'FAIL'}")
 
     def report(self, name: str, c_vals: list[float], r_vals: list[float],
                strict: bool = False, tol: tuple[float, float] = (0.9999, 1e-3)) -> None:
@@ -233,21 +286,32 @@ def main() -> int:
                     help="the conv_selftest binary (M8a/M8b families; skipped when missing)")
     ap.add_argument("--enc", type=Path,
                     help="the encoders_selftest binary (M9 SAM/SigLIP; skipped when missing)")
+    ap.add_argument("--attn", type=Path,
+                    help="the attn_selftest binary (M10 attention softmax placement; "
+                         "skipped when missing)")
     ap.add_argument("--c", required=True, type=Path)
     ap.add_argument("--work", default=Path("/tmp/ab_m6b"), type=Path)
     ap.add_argument("--no-wide", action="store_true",
                     help="skip the 257x1000 softmax case")
     ap.add_argument("--enc-only", action="store_true",
                     help="run only the M9 encoder section (needs --enc)")
+    ap.add_argument("--attn-only", action="store_true",
+                    help="run only the M10 attention section (needs --attn)")
     args = ap.parse_args()
 
     run = Runner(args.rust, args.c, args.work)
 
-    if args.enc_only:
-        if args.enc is None:
+    if args.enc_only or args.attn_only:
+        if args.enc_only and args.enc is None:
             print("--enc-only needs --enc")
             return 2
-        m9(run, args.enc)
+        if args.attn_only and args.attn is None:
+            print("--attn-only needs --attn")
+            return 2
+        if args.enc_only:
+            m9(run, args.enc)
+        if args.attn_only:
+            m10(run, args.attn)
         print()
         print("ab_compare:", "FAIL" if run.fail else "PASS")
         return 1 if run.fail else 0
@@ -329,6 +393,9 @@ def main() -> int:
 
     if args.enc is not None:
         m9(run, args.enc)
+
+    if args.attn is not None:
+        m10(run, args.attn)
 
     print()
     print("ab_compare:", "FAIL" if run.fail else "PASS")
@@ -830,6 +897,113 @@ def m9_sizes(blob: Path, family: str):
     return block, (n_layers + 1) * block, block, n_layers
 
 
+def m10(run: Runner, attn: Path) -> None:
+    """The M10 attention softmax placement A/B (`ab_board flash|mha` vs `attn_selftest --io`).
+
+    Two arms per case, both sides on the same raw inputs:
+
+    * **host** — `ROCKET_ATTN_HOST_SOFTMAX=1` for both binaries. NOT gated at
+      bit-identity: the Rust host pass keeps the masked scores in f32 between the matmul
+      and the softmax, while the C writes them back through its f16 `sc` buffer. The gate
+      is cosine >= 0.999999 plus a max-abs bound of 8 f16 ULPs at the output peak, because
+      the score ULP propagates through the softmax and both matmuls (the measured worst
+      case is ~2.4 ULP); the exact count is printed too, and a one-hot row (the `prefix`
+      case) is expected to land bit-identical.
+    * **on-NPU** — Rust `=0`; the C flash entry takes `=0` too, but its `mha_self` only
+      tests *presence* (`g_attn_host_sm`), so that side runs with the variable unset.
+      Both then write the same f16 masked scores, run the same `rocket_softmax_fp16`
+      composition and the same fp16 matmuls, so this pair is gated strictly
+      (bit-identical) — that is the claim the port makes for the on-NPU path.
+
+    The device must be free: one side (the C `ab_board`) opens it and so does each Rust
+    stateless entry.
+    """
+    print("M10 attention softmax placement (host vs on-NPU):")
+    m6b = run.rust
+    run.rust = attn.resolve()
+    work = run.work
+
+    # flash cases: (tag, T, KV, DK, DV, heads, kv_heads, softcap, mask-kind)
+    flash_cases = [
+        ("causal64", 64, 64, 64, 64, 4, 2, 0.0, "causal"),
+        ("nocap", 32, 96, 64, 64, 4, 1, 0.0, "none"),
+        ("softcap8", 64, 64, 64, 64, 4, 2, 8.0, "causal"),
+        ("mla", 32, 48, 64, 32, 4, 1, 0.0, "causal"),
+        ("prefix", 8, 40, 64, 64, 2, 2, 0.0, "window"),
+    ]
+    for (tag, T, KV, DK, DV, NH, NKVH, softcap, kind) in flash_cases:
+        scale = 1.0 / math.sqrt(DK)
+        q = lcg(NH * T * DK, -1.0, 1.0, 0x1A + T)
+        k = lcg(NKVH * KV * DK, -1.0, 1.0, 0x1B + KV)
+        v = lcg(NKVH * DV * KV, -1.0, 1.0, 0x1C + DV)
+        mask: list[float] = []
+        if kind != "none":
+            w = max(1, T // 8)
+            for i in range(T):
+                for j in range(KV):
+                    pos = KV - T + i  # causal: key j is visible iff j <= this position
+                    keep = j <= pos and (kind != "window" or j > pos - w)
+                    mask.append(0.0 if keep else -math.inf)
+        qp, kp, vp = work / f"a10_{tag}.q", work / f"a10_{tag}.k", work / f"a10_{tag}.v"
+        mp = work / f"a10_{tag}.mask"
+        w_f16(qp, q)
+        w_f16(kp, k)
+        w_f16(vp, v)
+        if kind == "none":
+            mp = Path("-")
+        else:
+            w_f16(mp, mask)
+        args = ["flash", str(T), str(KV), str(DK), str(DV), str(NH), str(NKVH),
+                scale_bits(scale), scale_bits(softcap)]
+        ins = [qp, kp, vp, mp]
+        n_out = NH * T * DV
+        for (arm, r_env, c_env, strict) in (
+            ("host", {"ROCKET_ATTN_HOST_SOFTMAX": "1"}, {"ROCKET_ATTN_HOST_SOFTMAX": "1"}, False),
+            ("npu", {"ROCKET_ATTN_HOST_SOFTMAX": "0"}, {"ROCKET_ATTN_HOST_SOFTMAX": "0"}, True),
+        ):
+            c_vals, r_vals = run.run_files(
+                f"a10_flash_{tag}_{arm}", args, ins, False, n_out,
+                r_env=r_env, c_env=c_env)
+            if strict:
+                run.report(f"flash {tag} softmax={arm}", c_vals, r_vals, strict=True)
+            else:
+                run.report_ulp(f"flash {tag} softmax={arm}", c_vals, r_vals, ulps=8.0)
+
+    # mha_self cases: (tag, T, D, heads)
+    # dh = D / heads must be a multiple of 32 (the fp16 QK contraction), so no 64/4.
+    mha_cases = [("t8d64h2", 8, 64, 2), ("t5d128h2", 5, 128, 2), ("t33d64h2", 33, 64, 2)]
+    for (tag, T, D, NH) in mha_cases:
+        x = lcg(T * D, -1.0, 1.0, 0x2A + T)
+        ws = {n: lcg(D * D, -1.0, 1.0, 0x2B + i) for i, n in enumerate("qkvo")}
+        bs = {n: lcg(D, -0.5, 0.5, 0x3B + i) for i, n in enumerate("qvo")}
+        paths = {}
+        for n, vals in ws.items():
+            paths[n] = work / f"a10_mha_{tag}.w{n}"
+            w_f16(paths[n], vals)
+        for n, vals in bs.items():
+            paths[f"b{n}"] = work / f"a10_mha_{tag}.b{n}"
+            w_f16(paths[f"b{n}"], vals)
+        xp = work / f"a10_mha_{tag}.x"
+        w_f16(xp, x)
+        args = ["mha", str(T), str(D), str(NH)]
+        ins = [xp, paths["q"], paths["bq"], paths["k"], Path("-"),
+               paths["v"], paths["bv"], paths["o"], paths["bo"]]
+        n_out = T * D
+        for (arm, r_env, c_env, strict) in (
+            ("host", {"ROCKET_ATTN_HOST_SOFTMAX": "1"}, {"ROCKET_ATTN_HOST_SOFTMAX": "1"}, False),
+            # The C `mha_self` treats the variable's PRESENCE as "host", so its on-NPU
+            # arm is the unset one; the Rust side takes the value (0 = on-NPU).
+            ("npu", {"ROCKET_ATTN_HOST_SOFTMAX": "0"}, {"ROCKET_ATTN_HOST_SOFTMAX": None}, True),
+        ):
+            c_vals, r_vals = run.run_files(
+                f"a10_mha_{tag}_{arm}", args, ins, False, n_out,
+                r_env=r_env, c_env=c_env)
+            if strict:
+                run.report(f"mha_self {tag} softmax={arm}", c_vals, r_vals, strict=True)
+            else:
+                run.report_ulp(f"mha_self {tag} softmax={arm}", c_vals, r_vals, ulps=8.0)
+
+    run.rust = m6b
+
 if __name__ == "__main__":
     sys.exit(main())
-

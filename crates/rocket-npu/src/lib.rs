@@ -209,14 +209,22 @@
 //!   context's worker fds. SigLIP's resident path also runs its attention through
 //!   [`attn::Attention`] (`ROCKET_SIGLIP_FA=0` keeps the per-head path), matching the
 //!   C's `use_fa`;
-//! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
+//! - attention: masked GQA with host mask/soft-cap, a per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
 //!   [`attn::flash_attn_mt`] (the `_mt` head fan-out); the device-free f64 oracles
 //!   [`attn::flash_attn_ref`] and [`attn::mha_self_ref`]; and the encoder sublayer
-//!   [`attn::mha_self`] (`rocket_mha_self_fp16`). The host softmax has a fast
-//!   branch-free `exp` path ([`attn::Softmax`]) and keeps the original scalar one
-//!   behind `SOFTMAX_EXACT=1`. Each worker batches its per-head QK and AV matmuls into
+//!   [`attn::mha_self`] (`rocket_mha_self_fp16`). The row softmax runs either on the
+//!   host ([`attn::Softmax`]: a fast branch-free `exp` path, the original scalar one
+//!   behind `SOFTMAX_EXACT=1`, and the default) or, with
+//!   [`ROCKET_ATTN_HOST_SOFTMAX=0`](attn::host_softmax), through the library's on-NPU
+//!   composition ([`attn::RowSoftmax`] over [`ops::softmax::softmax`]: the DPU `EXP`
+//!   LUT, the feature-axis row sum and the per-row scale, with the row max and `1/sum`
+//!   on the host). The C library's `mha_self` defaults to the on-NPU arm and its flash
+//!   entries to the host one; this crate defaults to host everywhere and takes the
+//!   value (`0` = on-NPU), so `=0` is the parity switch for the C's `mha_self`. The
+//!   materialized paths honor the knob (per-head, the chained group path and
+//!   `mha_self`); the tiled path below is host-softmax by construction. Each worker batches its per-head QK and AV matmuls into
 //!   one [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of
 //!   the C `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a
 //!   shape that needs more than one fp16 K-accumulation tile stays on the per-head path
@@ -243,10 +251,6 @@
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
 //!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
-//! - the on-NPU attention softmax (the FA path always brings the scores host-side for
-//!   the additive mask, where the C library measures the round-trip as slower; the
-//!   tiled path is host-softmax by construction, since its running rescale is
-//!   sequential across tiles);
 //! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
 //!   the head dim (`mha_self` is the only user) stays on the materialized path;
 //! - the cube-resident *mechanism* of the fused FFN/MLP: [`ops::ffn::ffn_fused`] and

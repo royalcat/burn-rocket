@@ -23,11 +23,18 @@
 //!
 //! `--oneshot` instead runs the stateless entries (`rocket_flash_attn_fp16` and its
 //! `_mt` fan-out, one context per call) and compares both with
-//! [`flash_attn_ref`](rocket_npu::attn::flash_attn_ref), asserting the fan-out is
+//! [`flash_attn_ref`], asserting the fan-out is
 //! bit-identical to the single-fd call. `--mha` runs the encoder composition
 //! (`rocket_mha_self_fp16`, with `d = dk * heads`) against its f64 reference and
 //! asserts the `nthreads` projection fan-out changes no bits. Both flags may be given
 //! together; either one replaces the chained-batch bench.
+//!
+//! `--host-sm 0|1` sets `ROCKET_ATTN_HOST_SOFTMAX` (`0` = the on-NPU softmax,
+//! `1`/unset = the host pass, the port's default) for every mode below. `--sm-ab`
+//! instead runs BOTH placements of `flash_attn` and `mha_self` on one case, interleaved,
+//! and reports each arm's wall/CPU and its cosine/max-abs against the f64 reference plus
+//! the two arms against each other — the on-NPU `EXP` LUT is approximate, so that pair
+//! is expected to differ by ~1e-3 in max-abs, not bit-wise.
 //!
 //! `--dk`/`--dv` pick the head geometry (default 128/128; the embedding model's vision
 //! tower is 64/64 at 2394 patches). `--softcap` and `--mask` pick the score post-
@@ -37,7 +44,8 @@ use std::time::Instant;
 
 use half::f16;
 use rocket_npu::attn::{
-    Attention, flash_attn, flash_attn_mt, flash_attn_ref, mha_self, mha_self_ref, tile_kv_width,
+    Attention, flash_attn, flash_attn_mt, flash_attn_ref, host_softmax, mha_self, mha_self_ref,
+    tile_kv_width,
 };
 
 fn rnd(seed: &mut u64) -> f16 {
@@ -265,6 +273,98 @@ fn oneshot_block(
     Ok(())
 }
 
+/// The `mha_self` fixture: `x`, the four `[d, d]` projections and the C's Whisper biases
+/// (`bq`, `bv`, `bo` present, `bk` NULL).
+struct MhaCase {
+    t: usize,
+    d: usize,
+    dh: usize,
+    heads: usize,
+    x: Vec<f16>,
+    wq: Vec<f16>,
+    wk: Vec<f16>,
+    wv: Vec<f16>,
+    wo: Vec<f16>,
+    bq: Vec<f16>,
+    bv: Vec<f16>,
+    bo: Vec<f16>,
+}
+
+impl MhaCase {
+    fn new(t: usize, dh: usize, heads: usize) -> Self {
+        let d = dh * heads;
+        let mut seed = 0x005e_ed0f_0a7e_5713_u64;
+        let x: Vec<f16> = (0..t * d).map(|_| rnd(&mut seed)).collect();
+        let mat = |n: usize, seed: &mut u64| -> Vec<f16> { (0..n).map(|_| rnd(seed)).collect() };
+        let (wq, wk, wv, wo) = (
+            mat(d * d, &mut seed),
+            mat(d * d, &mut seed),
+            mat(d * d, &mut seed),
+            mat(d * d, &mut seed),
+        );
+        let (bq, bv, bo) = (mat(d, &mut seed), mat(d, &mut seed), mat(d, &mut seed));
+        MhaCase {
+            t,
+            d,
+            dh,
+            heads,
+            x,
+            wq,
+            wk,
+            wv,
+            wo,
+            bq,
+            bv,
+            bo,
+        }
+    }
+
+    fn run(&self, out: &mut [f16], threads: usize) -> rocket_npu::Result<()> {
+        mha_self(
+            self.t,
+            self.d,
+            self.heads,
+            &self.x,
+            &self.wq,
+            Some(&self.bq),
+            &self.wk,
+            None,
+            &self.wv,
+            Some(&self.bv),
+            &self.wo,
+            Some(&self.bo),
+            out,
+            threads,
+        )
+    }
+
+    fn reference(&self) -> rocket_npu::Result<Vec<f16>> {
+        let mut want = vec![f16::ZERO; self.t * self.d];
+        mha_self_ref(
+            self.t,
+            self.d,
+            self.heads,
+            &self.x,
+            &self.wq,
+            Some(&self.bq),
+            &self.wk,
+            None,
+            &self.wv,
+            Some(&self.bv),
+            &self.wo,
+            Some(&self.bo),
+            &mut want,
+        )?;
+        Ok(want)
+    }
+
+    /// The f64 oracle's MAC count, for the skip decision.
+    fn ref_work(&self) -> f64 {
+        4.0 * self.t as f64 * (self.d * self.d) as f64
+            + 2.0 * self.heads as f64 * (self.t * self.t * self.dh) as f64
+    }
+}
+
 /// The encoder composition: `mha_self` with one and with `threads` projection workers,
 /// both against the f64 reference.
 fn mha_block(
@@ -275,41 +375,16 @@ fn mha_block(
     reps: usize,
     force_ref: Option<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let d = dh * heads;
+    let case = MhaCase::new(t, dh, heads);
+    let (d, t) = (case.d, case.t);
     println!("mha_self T={t} d={d} n_head={heads} dh={dh} threads={threads}");
-    let mut seed = 0x005e_ed0f_0a7e_5713_u64;
-    let x: Vec<f16> = (0..t * d).map(|_| rnd(&mut seed)).collect();
-    let mat = |n: usize, seed: &mut u64| -> Vec<f16> { (0..n).map(|_| rnd(seed)).collect() };
-    let (wq, wk, wv, wo) = (
-        mat(d * d, &mut seed),
-        mat(d * d, &mut seed),
-        mat(d * d, &mut seed),
-        mat(d * d, &mut seed),
-    );
-    // The C's Whisper case: bq, bv and bo present, bk NULL.
-    let (bq, bv, bo) = (mat(d, &mut seed), mat(d, &mut seed), mat(d, &mut seed));
 
     // The f64 oracle is O(4·T·d² + 2·n_head·T²·dh); skip it when it would dominate.
-    let work = 4.0 * t as f64 * (d * d) as f64 + 2.0 * heads as f64 * (t * t * dh) as f64;
+    let work = case.ref_work();
     let do_ref = force_ref.unwrap_or(work <= 2e9);
     let want = if do_ref {
         let t0 = Instant::now();
-        let mut want = vec![f16::ZERO; t * d];
-        mha_self_ref(
-            t,
-            d,
-            heads,
-            &x,
-            &wq,
-            Some(&bq),
-            &wk,
-            None,
-            &wv,
-            Some(&bv),
-            &wo,
-            Some(&bo),
-            &mut want,
-        )?;
+        let want = case.reference()?;
         println!(
             "mha_self_ref     : wall {:9.2} ms",
             t0.elapsed().as_secs_f64() * 1e3
@@ -324,43 +399,13 @@ fn mha_block(
     let threads_of = [1usize, threads];
     // Warm both (packs the projections once, sizes the scratch).
     for (o, &n) in outs.iter_mut().zip(&threads_of) {
-        mha_self(
-            t,
-            d,
-            heads,
-            &x,
-            &wq,
-            Some(&bq),
-            &wk,
-            None,
-            &wv,
-            Some(&bv),
-            &wo,
-            Some(&bo),
-            o,
-            n,
-        )?;
+        case.run(o, n)?;
     }
     let mut walls = vec![Vec::new(); 2];
     for _ in 0..reps {
         for (i, (o, &n)) in outs.iter_mut().zip(&threads_of).enumerate() {
             let t0 = Instant::now();
-            mha_self(
-                t,
-                d,
-                heads,
-                &x,
-                &wq,
-                Some(&bq),
-                &wk,
-                None,
-                &wv,
-                Some(&bv),
-                &wo,
-                Some(&bo),
-                o,
-                n,
-            )?;
+            case.run(o, n)?;
             walls[i].push(t0.elapsed().as_secs_f64() * 1e3);
         }
     }
@@ -385,7 +430,265 @@ fn mha_block(
     Ok(())
 }
 
+/// One arm of the placement A/B: what it produced and what it cost.
+struct SmArm {
+    out: Vec<f16>,
+    walls: Vec<f64>,
+    cpus: Vec<f64>,
+}
+
+/// Run one closure under both softmax placements, interleaved, and report each arm.
+///
+/// `ROCKET_ATTN_HOST_SOFTMAX` is set in the environment before every call (`1` = host,
+/// `0` = on-NPU; the knobs are resolved per call), and the warm-up call per arm sizes each
+/// arm's scratch. Interleaved reps keep a drifting board from biasing one arm.
+fn placement_ab<F>(
+    tag: &str,
+    out_len: usize,
+    want: Option<&[f16]>,
+    reps: usize,
+    run: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(&mut [f16]) -> rocket_npu::Result<()>,
+{
+    let placements = [("host", "1"), ("npu", "0")];
+    let mut outs: [Vec<f16>; 2] = std::array::from_fn(|_| vec![f16::ZERO; out_len]);
+    let mut walls: [Vec<f64>; 2] = Default::default();
+    let mut cpus: [Vec<f64>; 2] = Default::default();
+    // Warm both (opens the fds, sizes the scratch, allocates the on-NPU arm's matrix).
+    for (i, (_, v)) in placements.iter().enumerate() {
+        unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", v) };
+        run(&mut outs[i])?;
+    }
+    for _ in 0..reps {
+        for (i, (_, v)) in placements.iter().enumerate() {
+            unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", v) };
+            let cpu = cpu_s();
+            let t0 = Instant::now();
+            run(&mut outs[i])?;
+            walls[i].push(t0.elapsed().as_secs_f64() * 1e3);
+            cpus[i].push((cpu_s() - cpu) * 1e3);
+        }
+    }
+    let labels = ["host", "npu"];
+    let mut arms: Vec<SmArm> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let arm = SmArm {
+            out: std::mem::take(&mut outs[i]),
+            walls: std::mem::take(&mut walls[i]),
+            cpus: std::mem::take(&mut cpus[i]),
+        };
+        println!(
+            "{tag} softmax={label:<4}: wall {:9.2} ms  cpu {:9.2} ms  (median of {reps})",
+            median(arm.walls.clone()),
+            median(arm.cpus.clone())
+        );
+        if let Some(want) = want {
+            let (cos, max) = compare(&arm.out, want);
+            println!("                         cosine {cos:.8} max_abs {max:.6}  (vs f64 ref)");
+        }
+        arms.push(arm);
+    }
+    let (cos, max) = compare(&arms[1].out, &arms[0].out);
+    let (diff, _) = bit_diff(&arms[1].out, &arms[0].out);
+    println!("{tag} npu vs host: cosine {cos:.8} max_abs {max:.6} ({diff} differing bits)");
+    let ratio = |a: &[f64], b: &[f64]| {
+        let (a, b) = (median(a.to_vec()), median(b.to_vec()));
+        if b > 0.0 { a / b } else { 0.0 }
+    };
+    println!(
+        "{tag} npu/host: wall {:.2}x  cpu {:.2}x",
+        ratio(&arms[1].walls, &arms[0].walls),
+        ratio(&arms[1].cpus, &arms[0].cpus)
+    );
+    Ok(())
+}
+
+/// `--sm-ab`: the host pass against the on-NPU composition for both the flash primitive
+/// and the encoder sublayer. The on-NPU `EXP` LUT is approximate, so this reports the
+/// deviation instead of gating it: the C library's own gate accepts cosine >= 0.9995.
+fn sm_ab_block(
+    case: &Case,
+    want: Option<&[f16]>,
+    threads: usize,
+    reps: usize,
+    mha_dh: usize,
+    mha_heads: usize,
+    force_ref: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "softmax placement A/B: flash T={} kv={} dk={} dv={} heads={} (ref {})",
+        case.t,
+        case.kv,
+        case.dk,
+        case.dv,
+        case.heads,
+        if want.is_some() { "on" } else { "off" }
+    );
+    // Single fd: the stateless entry, one context per call (the C's shape).
+    placement_ab("flash single-fd", case.out_len(), want, reps, |o| {
+        case.run_oneshot(o)
+    })?;
+    placement_ab(
+        &format!("flash mt({threads})"),
+        case.out_len(),
+        want,
+        reps,
+        |o| case.run_mt(o, threads),
+    )?;
+
+    // The encoder sublayer, whose C default is the on-NPU arm.
+    let mha = MhaCase::new(case.t, mha_dh, mha_heads);
+    let work = mha.ref_work();
+    let do_ref = force_ref.unwrap_or(work <= 2e9);
+    let want_mha = if do_ref {
+        let t0 = Instant::now();
+        let want = mha.reference()?;
+        println!(
+            "mha_self_ref     : wall {:9.2} ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Some(want)
+    } else {
+        println!("mha_self_ref     : skipped ({work:.1e} MACs; --ref 1 forces it)");
+        None
+    };
+    placement_ab("mha_self", mha.t * mha.d, want_mha.as_deref(), reps, |o| {
+        mha.run(o, threads)
+    })?;
+    Ok(())
+}
+
+// ── Raw-file mode (`--io`), the C A/B layout ────────────────────────────────
+//
+// Shared with `tools/c-oracle/ab_board.c` (the same argument layout on both sides),
+// driven by `tools/c-oracle/ab_compare.py --attn`. Floats travel as f32 bit patterns in
+// hex so neither side parses a decimal differently; `-` is a NULL tensor.
+
+fn read_f16(path: &str, n: usize) -> Result<Vec<f16>, Box<dyn std::error::Error>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() != n * 2 {
+        return Err(format!("{path}: {} bytes, want {}", bytes.len(), n * 2).into());
+    }
+    Ok(bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| f16::from_bits(u16::from_le_bytes(*c)))
+        .collect())
+}
+
+fn read_f16_opt(path: &str, n: usize) -> Result<Option<Vec<f16>>, Box<dyn std::error::Error>> {
+    if path == "-" {
+        Ok(None)
+    } else {
+        Ok(Some(read_f16(path, n)?))
+    }
+}
+
+fn write_f16(path: &str, v: &[f16]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        bytes.extend_from_slice(&x.to_bits().to_le_bytes());
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+/// An f32 argument as a hex bit pattern (`0x3db504f3`), so both sides read the same bits.
+fn arg_f32(s: &str) -> Result<f32, Box<dyn std::error::Error>> {
+    let t = s.trim();
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    Ok(f32::from_bits(u32::from_str_radix(t, 16)?))
+}
+
+/// `--io flash ...` / `--io mha ...`: one op on raw files, the C A/B layout.
+fn io_mode(a: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let num = |i: usize| -> Result<usize, Box<dyn std::error::Error>> {
+        a.get(i)
+            .ok_or_else(|| "missing argument".into())
+            .and_then(|s| Ok(s.parse::<usize>()?))
+    };
+    let file = |i: usize| -> Result<&str, Box<dyn std::error::Error>> {
+        a.get(i)
+            .map(String::as_str)
+            .ok_or_else(|| "missing file".into())
+    };
+    match a.first().map(String::as_str) {
+        Some("flash") => {
+            // flash T KV DK DV HEADS HKV SCALE_BITS SOFTCAP_BITS Q K V MASK OUT
+            let (t, kv, dk, dv, heads, hkv) =
+                (num(1)?, num(2)?, num(3)?, num(4)?, num(5)?, num(6)?);
+            let (scale, softcap) = (arg_f32(file(7)?)?, arg_f32(file(8)?)?);
+            let q = read_f16(file(9)?, heads * t * dk)?;
+            let k = read_f16(file(10)?, hkv * kv * dk)?;
+            let v = read_f16(file(11)?, hkv * dv * kv)?;
+            let mask = read_f16_opt(file(12)?, t * kv)?;
+            let mut out = vec![f16::ZERO; heads * t * dv];
+            flash_attn(
+                t,
+                kv,
+                dk,
+                dv,
+                heads,
+                hkv,
+                scale,
+                softcap,
+                &q,
+                &k,
+                &v,
+                mask.as_deref(),
+                &mut out,
+            )?;
+            write_f16(file(13)?, &out)?;
+        }
+        Some("mha") => {
+            // mha T D HEADS X WQ BQ WK BK WV BV WO BO OUT
+            let (t, d, heads) = (num(1)?, num(2)?, num(3)?);
+            let x = read_f16(file(4)?, t * d)?;
+            let wq = read_f16(file(5)?, d * d)?;
+            let bq = read_f16_opt(file(6)?, d)?;
+            let wk = read_f16(file(7)?, d * d)?;
+            let bk = read_f16_opt(file(8)?, d)?;
+            let wv = read_f16(file(9)?, d * d)?;
+            let bv = read_f16_opt(file(10)?, d)?;
+            let wo = read_f16(file(11)?, d * d)?;
+            let bo = read_f16_opt(file(12)?, d)?;
+            let mut out = vec![f16::ZERO; t * d];
+            mha_self(
+                t,
+                d,
+                heads,
+                &x,
+                &wq,
+                bq.as_deref(),
+                &wk,
+                bk.as_deref(),
+                &wv,
+                bv.as_deref(),
+                &wo,
+                bo.as_deref(),
+                &mut out,
+                1,
+            )?;
+            write_f16(file(13)?, &out)?;
+        }
+        other => {
+            return Err(format!("--io needs flash|mha (got {})", other.unwrap_or("<none>")).into());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--io") {
+        return io_mode(&argv[1..]);
+    }
     // Positional `tokens kv heads kv_heads`, then the flags.
     let mut pos = Vec::new();
     let mut chain: Option<bool> = None;
@@ -402,7 +705,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tile = 0usize;
     let mut tile_min = 8192i64;
     let mut tile_only = false;
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut host_sm: Option<bool> = None;
+    let mut sm_ab = false;
     let mut i = 0;
     while i < argv.len() {
         let arg = argv[i].as_str();
@@ -427,12 +731,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--tile" => tile = value()?.parse()?,
             "--tile-min" => tile_min = value()?.parse()?,
             "--tile-only" => tile_only = true,
+            "--host-sm" => host_sm = Some(value()?.trim() != "0"),
+            "--sm-ab" => sm_ab = true,
             "--help" | "-h" => {
                 println!(
                     "usage: attn_selftest [tokens] [kv] [heads] [kv_heads] \
                      [--dk N] [--dv N] [--chain 0|1] [--reps N] [--ref 0|1] [--mem] \
                      [--oneshot] [--mt N] [--mha] [--softcap F] [--mask none|causal|window] \
-                     [--tile KBP] [--tile-min KV] [--tile-only]"
+                     [--tile KBP] [--tile-min KV] [--tile-only] [--host-sm 0|1] [--sm-ab]"
                 );
                 return Ok(());
             }
@@ -516,6 +822,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::set_var("ROCKET_FA_TILE_MIN_KV", tile_min.to_string());
         }
     }
+    // `--host-sm` selects the materialized paths' softmax placement process-wide (the
+    // knob is resolved per call); `--sm-ab` sets it per arm itself.
+    if let Some(host) = host_sm {
+        unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", if host { "1" } else { "0" }) };
+    }
+    println!(
+        "softmax placement: {} (ROCKET_ATTN_HOST_SOFTMAX={})",
+        if host_softmax() { "host" } else { "on-NPU" },
+        if host_softmax() { "1" } else { "0" }
+    );
 
     // The f64 oracle is O(heads * t * kv * dk); skip it when it would dominate the run
     // (the chained A/B does not need it).
@@ -534,7 +850,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mha {
         mha_block(t, dk, heads, threads, reps, want_ref)?;
     }
-    if oneshot || mha {
+    if sm_ab {
+        sm_ab_block(&case, want.as_deref(), threads, reps, dk, heads, want_ref)?;
+    }
+    if oneshot || mha || sm_ab {
         return Ok(());
     }
 

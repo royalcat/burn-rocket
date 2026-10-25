@@ -35,10 +35,25 @@
 //! (a fully masked query, or a padded row) yields a uniform distribution, and
 //! padded columns are clamped like masked-out keys — the old path's behaviour,
 //! preserved so A/B runs differ only in rounding.
+//!
+//! # Host vs on-NPU placement (`ROCKET_ATTN_HOST_SOFTMAX`)
+//!
+//! The C library's attention entries can run their row softmax either on the host (its
+//! flash default) or through `rocket_softmax_fp16`, the on-NPU composition this crate
+//! ports as [`crate::ops::softmax::softmax`] (its `mha_self` default). [`RowSoftmax`]
+//! owns both arms for one caller: the host pass and the f16 masked-score matrix the
+//! on-NPU arm feeds to that composition, plus the [`host_softmax`] knob resolution
+//! (`0` = on-NPU). The tiled long-context path ([`Online`]) has no such choice — its
+//! running max/rescale is sequential across key tiles and inherently host-side — so it
+//! always runs the host pass.
 
 use half::f16;
 
+use crate::Device;
+use crate::error::Result;
 use crate::knobs;
+
+use super::oneshot::fa_score;
 
 /// Scores at or below this clamp to it (the C library's `-30000` padding key).
 pub(crate) const PAD_KEY_SCORE: f32 = -30000.0;
@@ -258,6 +273,191 @@ impl Softmax {
             let sum = kern::row_exp(row, mx);
             let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
             kern::row_write(row, &mut p[i * kn..(i + 1) * kn], inv);
+        }
+    }
+
+    /// Live bytes of the reusable row buffer.
+    pub fn bytes(&self) -> usize {
+        self.row.capacity() * size_of::<f32>()
+    }
+}
+
+// ── Softmax placement: host pass vs the on-NPU composition ────────────────────
+
+/// Where the materialized attention paths run their row softmax
+/// (C `ROCKET_ATTN_HOST_SOFTMAX`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftmaxPlacement {
+    /// The host pass ([`Softmax`]): scale, soft-cap, mask and `exp` in f32, one f16
+    /// narrowing at the end (the C `host_softmax_rows` semantics).
+    Host,
+    /// The library's on-NPU composition ([`crate::ops::softmax::softmax`]): the masked
+    /// scores narrow to f16, then the DPU `EXP` LUT, the feature-axis row sum (fp32)
+    /// and the per-row scale run on the NPU, with the row max and `1/sum` on the host.
+    Npu,
+}
+
+impl SoftmaxPlacement {
+    /// Whether this placement is the host pass (for reporting).
+    pub fn is_host(self) -> bool {
+        matches!(self, SoftmaxPlacement::Host)
+    }
+}
+
+/// Whether the materialized attention entries softmax on the host:
+/// `ROCKET_ATTN_HOST_SOFTMAX=0` selects the on-NPU path, anything else (or unset) the
+/// host one. Resolved per call, like the crate's other attention knobs, so one process
+/// can A/B the two arms.
+///
+/// The C library reads this knob with *opposite defaults* per entry — its `mha_self`
+/// (`g_attn_host_sm`) is on-NPU unless the variable is set at all, its flash entries
+/// (`fa_host_softmax`) are host unless it parses to 0. **This port keeps the host pass
+/// as the default everywhere** (the behaviour of every Rust attention entry before the
+/// knob existed) and takes the value: `ROCKET_ATTN_HOST_SOFTMAX=0` reproduces the C's
+/// on-NPU `mha_self` arm, `=1` its host arm.
+pub fn host_softmax() -> bool {
+    knobs::int("ROCKET_ATTN_HOST_SOFTMAX") != Some(0)
+}
+
+/// [`host_softmax`] as a [`SoftmaxPlacement`].
+pub fn placement() -> SoftmaxPlacement {
+    if host_softmax() {
+        SoftmaxPlacement::Host
+    } else {
+        SoftmaxPlacement::Npu
+    }
+}
+
+/// `out[0..tp][0..kn] = f16(fa_score(sc, scale, softcap, mask))`, the C
+/// `fa_mask_scores` write: the real key columns take the additive mask (rows at or past
+/// `n_tokens` take none, as in C) and the pad columns clamp to `-30000`, which then
+/// underflows to ~0 in the softmax.
+///
+/// The arithmetic is the C's `fa_score`, in f32 with one f16 narrowing at the end — no
+/// fused multiply-add, so the masked score is exactly the value the C library's f16 `sc`
+/// buffer holds. (The host arm of [`RowSoftmax`] deliberately keeps f32 scores instead;
+/// this is the arm that matches the C on the NPU.)
+#[allow(clippy::too_many_arguments)]
+fn masked_scores(
+    sc: &[f16],
+    out: &mut [f16],
+    mask: Option<&[f16]>,
+    n_tokens: usize,
+    n_kv: usize,
+    tp: usize,
+    kn: usize,
+    scale: f32,
+    softcap: f32,
+) {
+    debug_assert!(sc.len() >= tp * kn && out.len() >= tp * kn && n_kv <= kn);
+    let pad = f16::from_f32(PAD_KEY_SCORE);
+    for i in 0..tp {
+        let srow = &sc[i * kn..(i + 1) * kn];
+        let mrow = mask
+            .filter(|_| i < n_tokens)
+            .map(|m| &m[i * n_kv..i * n_kv + n_kv]);
+        let row = &mut out[i * kn..(i + 1) * kn];
+        for j in 0..n_kv {
+            let m = mrow.map_or(0.0, |m| m[j].to_f32());
+            row[j] = f16::from_f32(fa_score(srow[j].to_f32(), scale, softcap, m));
+        }
+        row[n_kv..].fill(pad);
+    }
+}
+
+/// One materialized attention call's row softmax, in either placement.
+///
+/// Holds the host pass ([`Softmax`]: its f32 row buffer and kernel mode) and the f16
+/// masked-score matrix the on-NPU arm needs, so a steady request stream (one call per
+/// head per layer) reallocates neither. [`RowSoftmax::run`] resolves
+/// [`ROCKET_ATTN_HOST_SOFTMAX`](host_softmax) per call.
+#[derive(Debug, Clone)]
+pub struct RowSoftmax {
+    /// The host pass (`SOFTMAX_EXACT=1` still selects its scalar kernel).
+    host: Softmax,
+    /// The on-NPU arm's masked f16 scores, the C `fa_mask_scores` write before the
+    /// softmax. Only the on-NPU arm sizes it.
+    masked: Vec<f16>,
+}
+
+impl Default for RowSoftmax {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RowSoftmax {
+    pub fn new() -> Self {
+        RowSoftmax {
+            host: Softmax::new(),
+            masked: Vec::new(),
+        }
+    }
+
+    /// Softmax the `n_tokens` real rows of a padded `[tp, kn]` f16 score matrix into
+    /// `p`, on the host or on the NPU.
+    ///
+    /// The mask, scale and soft-cap are applied to the scores first and the semantics
+    /// match [`Softmax::run`] exactly — including the `-30000` clamp and the uniform
+    /// fallback of a fully masked row — so the two arms differ only in where the
+    /// `exp`/sum/scale run and in the rounding of the masked scores (f32 on the host,
+    /// one f16 narrowing before the NPU, exactly as the C writes its `sc` buffer).
+    ///
+    /// The on-NPU arm reports the composition's own refusals (the `INT_MAX` element
+    /// guard, a zero dimension); the host arm cannot fail.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &mut self,
+        dev: &Device,
+        scores: &[f16],
+        p: &mut [f16],
+        mask: Option<&[f16]>,
+        n_tokens: usize,
+        n_kv: usize,
+        tp: usize,
+        kn: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> Result<SoftmaxPlacement> {
+        if tp == 0 || kn == 0 {
+            return Ok(placement());
+        }
+        debug_assert!(n_tokens <= tp && n_kv <= kn);
+        debug_assert!(scores.len() >= tp * kn && p.len() >= tp * kn);
+        if host_softmax() {
+            self.host
+                .run(scores, p, mask, n_tokens, n_kv, tp, kn, scale, softcap);
+            return Ok(SoftmaxPlacement::Host);
+        }
+        self.masked.resize(tp * kn, f16::ZERO);
+        masked_scores(
+            scores,
+            &mut self.masked,
+            mask,
+            n_tokens,
+            n_kv,
+            tp,
+            kn,
+            scale,
+            softcap,
+        );
+        crate::ops::softmax::softmax(dev, tp, kn, &self.masked, p)?;
+        Ok(SoftmaxPlacement::Npu)
+    }
+
+    /// Live host bytes of both arms.
+    pub fn bytes(&self) -> usize {
+        self.host.bytes() + self.masked.capacity() * size_of::<f16>()
+    }
+
+    /// Release the on-NPU arm's matrix when the working shape has shrunk well below it
+    /// (the 4x rule the attention scratch uses); `need` is the current `tp * kn`.
+    pub fn trim(&mut self, need: usize) {
+        if need == 0 {
+            return;
+        }
+        if self.masked.len() > 4 * need {
+            self.masked = Vec::new();
         }
     }
 }
@@ -1093,5 +1293,78 @@ mod tests {
             scalar::row_write(&b, &mut pb, 1.0 / sb);
             assert!(max_abs(&pa, &pb) < 1e-6, "row {i}");
         }
+    }
+
+    // ── Softmax placement ──────────────────────────────────────────────────────
+
+    /// The block has no device, so this covers the knob resolution and the masked-score
+    /// write (the C `fa_mask_scores`), which is the whole on-NPU arm except the
+    /// composition itself (that one is `ops::softmax::softmax`, gated on the board).
+    #[test]
+    fn host_softmax_knob_takes_the_value() {
+        let _g = crate::knobs::TEST_ENV.lock().unwrap();
+        unsafe { std::env::remove_var("ROCKET_ATTN_HOST_SOFTMAX") };
+        assert!(host_softmax(), "unset is the host pass (the Rust default)");
+        assert_eq!(placement(), SoftmaxPlacement::Host);
+        unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", "1") };
+        assert!(host_softmax());
+        unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", "0") };
+        assert!(!host_softmax(), "0 selects the on-NPU arm");
+        assert_eq!(placement(), SoftmaxPlacement::Npu);
+        assert!(!placement().is_host());
+        // Anything else parses as "host", like the C `atoi(...) != 0`.
+        unsafe { std::env::set_var("ROCKET_ATTN_HOST_SOFTMAX", "2") };
+        assert!(host_softmax());
+        unsafe { std::env::remove_var("ROCKET_ATTN_HOST_SOFTMAX") };
+    }
+
+    #[test]
+    fn masked_scores_scales_masks_and_clamps_like_the_c() {
+        // 2 padded rows x 4 padded columns, 2 real keys.
+        let (tp, kn, n_kv, n_tokens) = (2usize, 4usize, 2usize, 1usize);
+        let sc: Vec<f16> = [1.0f32, -2.0, 99.0, 99.0, 3.0, 4.0, 99.0, 99.0]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let mask: Vec<f16> = [-1.0f32, 0.0].into_iter().map(f16::from_f32).collect();
+        let mut out = vec![f16::ONE; tp * kn];
+        masked_scores(&sc, &mut out, Some(&mask), n_tokens, n_kv, tp, kn, 0.5, 0.0);
+        let pad = f16::from_f32(PAD_KEY_SCORE);
+        // Row 0 (real): scale, add the mask, then one f16 narrowing.
+        assert_eq!(out[0], f16::from_f32(1.0 * 0.5 - 1.0));
+        assert_eq!(out[1], f16::from_f32(-2.0 * 0.5 + 0.0));
+        assert_eq!(&out[2..4], &[pad, pad], "pad columns clamp");
+        // Row 1 (past n_tokens): no mask, its scores are never read.
+        assert_eq!(out[4], f16::from_f32(3.0 * 0.5));
+        assert_eq!(out[5], f16::from_f32(4.0 * 0.5));
+        assert_eq!(&out[6..8], &[pad, pad]);
+        // No mask at all, and the clamp pulls a deep negative score up to the floor.
+        let sc2: Vec<f16> = [-1.0e5f32, 2.0, 0.0, 0.0]
+            .into_iter()
+            .map(f16::from_f32)
+            .collect();
+        let mut out2 = vec![f16::ZERO; kn];
+        masked_scores(&sc2, &mut out2, None, 1, n_kv, 1, kn, 1.0, 0.0);
+        assert_eq!(out2[0], pad);
+        assert_eq!(out2[1], f16::from_f32(2.0));
+        // A soft-cap bounds the score: 30*tanh(100/30) approaches 30 but never reaches it.
+        let sc3 = vec![f16::from_f32(100.0); 2];
+        let mut out3 = vec![f16::ZERO; 2];
+        masked_scores(&sc3, &mut out3, None, 1, 2, 1, 2, 1.0, 30.0);
+        let capped = out3[0].to_f32();
+        assert!(capped < 30.0 && capped > 29.9, "{capped}");
+    }
+
+    #[test]
+    fn row_softmax_trim_releases_a_stale_matrix() {
+        let mut sm = RowSoftmax::new();
+        sm.masked = vec![f16::ZERO; 4096];
+        assert!(sm.bytes() > 0);
+        sm.trim(4096);
+        assert_eq!(sm.masked.len(), 4096, "the working shape stays");
+        sm.trim(16);
+        assert!(sm.masked.is_empty(), "a 256x smaller request releases it");
+        sm.trim(0);
+        assert!(sm.masked.is_empty());
     }
 }

@@ -3,7 +3,7 @@
 //! `rocket_attn.c` exposes the same two compositions in several forms. The persistent
 //! [`Attention`] context covers `rocket_fa_ctx_*`; everything else lives here, as
 //! compositions of the validated pieces (`matmul::one_shot`, [`Attention::flash`],
-//! [`Softmax`]) rather than a second attention implementation:
+//! [`Softmax`](super::Softmax)) rather than a second attention implementation:
 //!
 //! - [`flash_attn`] (`rocket_flash_attn_fp16`, one worker fd) and [`flash_attn_mt`]
 //!   (`_mt`, the head fan-out across worker fds). Both build a context per call, so a
@@ -24,13 +24,17 @@
 //! Where the device entries differ from the C library, it is because they ride the
 //! crate's existing attention kernel, and the differences are the documented ones:
 //!
-//! - the softmax is always the **host** pass ([`Softmax`]): the fast polynomial `exp`
-//!   by default (`SOFTMAX_EXACT=1` for the scalar one) instead of the C's on-NPU
-//!   softmax for `mha_self` (`ROCKET_ATTN_HOST_SOFTMAX`, default off there) and its
-//!   `expf` loop for the flash path;
-//! - the scores stay f32 between the matmul and the softmax, so the `scale` and the
-//!   pad-key clamp are not rounded back through f16 (the C writes the masked scores
-//!   into its f16 `sc` buffer before softmaxing).
+//! - the softmax is the **host** pass ([`Softmax`]) by default, where the C's
+//!   `mha_self` defaults to its on-NPU softmax. `ROCKET_ATTN_HOST_SOFTMAX=0` selects
+//!   the on-NPU arm too ([`RowSoftmax`] over [`crate::ops::softmax::softmax`], the
+//!   port of `rocket_softmax_fp16`), which is the placement-parity switch; both arms
+//!   share the C's mask/soft-cap application and the `-30000` clamp, and the on-NPU
+//!   one also shares its f16 narrowing of the masked scores;
+//! - the host arm's scores stay f32 between the matmul and the softmax, so the `scale`
+//!   and the pad-key clamp are not rounded back through f16 (the C writes the masked
+//!   scores into its f16 `sc` buffer before softmaxing). The on-NPU arm *does* narrow
+//!   through f16, because that is the NPU operand type — so it is the arm that matches
+//!   the C bit for bit.
 
 use std::thread;
 
@@ -42,7 +46,7 @@ use crate::error::{Error, Result};
 use crate::matmul::one_shot;
 
 use super::softmax::PAD_KEY_SCORE;
-use super::{Attention, Softmax, check_flash};
+use super::{Attention, RowSoftmax, check_flash};
 
 /// `rocket_flash_attn_fp16`: masked GQA attention on one worker fd.
 ///
@@ -183,7 +187,10 @@ pub fn flash_attn_ref(
 
 /// One pre-softmax score, the C `fa_score`: scale, optional soft-cap, additive mask and
 /// the clamp that lets a masked / padded key underflow to ~0 in f16.
-fn fa_score(qk: f32, scale: f32, softcap: f32, mask: f32) -> f32 {
+///
+/// Shared with the on-NPU softmax arm (`attn::softmax::RowSoftmax`), which must write the
+/// same f16 masked score matrix the C `fa_mask_scores` builds before its softmax.
+pub(crate) fn fa_score(qk: f32, scale: f32, softcap: f32, mask: f32) -> f32 {
     let mut s = qk * scale;
     if softcap != 0.0 {
         s = softcap * (s / softcap).tanh();
@@ -229,9 +236,10 @@ pub fn fully_masked_rows(mask: &[f16], n_tokens: usize, n_kv: usize) -> usize {
 /// bit-identical to `nthreads = 1`; the self-test asserts it.
 ///
 /// Deviations from the C, both from reusing the crate's attention kernel: the softmax
-/// is the host [`Softmax`] (fast polynomial `exp`, single f16 rounding) where the C
-/// defaults to its on-NPU softmax, and the scores stay f32 between the matmul and the
-/// softmax instead of being written back through f16. See the module docs.
+/// is the host pass ([`RowSoftmax`]) unless `ROCKET_ATTN_HOST_SOFTMAX=0` selects the
+/// on-NPU composition — the C defaults to on-NPU here — and the host arm keeps the
+/// scores in f32 instead of writing them back through f16 (the on-NPU arm narrows, as
+/// the C does). See the module docs.
 ///
 /// The shape contract is the C one plus the fp16 matmul's own alignment, which the C
 /// also inherits: `d % n_head == 0` here, then `d % 32 == 0` for the projections and
@@ -388,7 +396,7 @@ struct HeadScratch {
     sc: Vec<f16>,
     p: Vec<f16>,
     ctx: Vec<f16>,
-    sm: Softmax,
+    sm: RowSoftmax,
 }
 
 impl HeadScratch {
@@ -404,12 +412,13 @@ impl HeadScratch {
             // (`one_shot` sizes its output exactly); only its first `n_tokens` rows are
             // the head's context.
             ctx: vec![f16::ZERO; tp * dh],
-            sm: Softmax::new(),
+            sm: RowSoftmax::new(),
         }
     }
 
-    /// Gather head `h`, run its QK matmul, host softmax and AV matmul, and return the
-    /// head's `[n_tokens, dh]` context.
+    /// Gather head `h`, run its QK matmul, softmax (host or on-NPU per
+    /// `ROCKET_ATTN_HOST_SOFTMAX`) and AV matmul, and return the head's
+    /// `[n_tokens, dh]` context.
     #[allow(clippy::too_many_arguments)]
     fn head<'a>(
         &'a mut self,
@@ -431,6 +440,7 @@ impl HeadScratch {
         gather_head_t_cols(&mut self.vh, v, n_tokens, d, off, dh, tn);
         one_shot(dev, tp, dh, tn, &self.qh, &self.kh, &mut self.sc)?;
         self.sm.run(
+            dev,
             &self.sc,
             &mut self.p,
             None,
@@ -440,7 +450,7 @@ impl HeadScratch {
             tn,
             scale,
             0.0,
-        );
+        )?;
         one_shot(dev, tp, tn, dh, &self.p, &self.vh, &mut self.ctx)?;
         Ok(&self.ctx[..n_tokens * dh])
     }

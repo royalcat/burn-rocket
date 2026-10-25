@@ -432,8 +432,9 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   0.99999989-0.99999996 vs the ref (vision 2394/64d, T=257 GQA 8/2 causal+causal-cross+
   band, softcap 0-50, T=64), zero differing bits single-fd vs mt everywhere; mha_self
   0.99999927 (d=512, T=82) / 0.99999812 (d=1024, T=257) vs its f64 ref. Deviations
-  from C: host (fast) softmax both places, and the scores stay f32 between matmul and
-  softmax instead of round-tripping f16.
+  from C: host (fast) softmax by default in both places, and the host arm's scores
+  stay f32 between matmul and softmax instead of round-tripping f16 (the on-NPU arm,
+  `ROCKET_ATTN_HOST_SOFTMAX=0`, is the one that matches C bit for bit — see M10 below).
   **M5b tiled long-context attention** (`ROCKET_FA_TILE_KV`, 2026-10-25): the port of
   `fa_heads_range_tiled`. `attn::tile_kv_width(kn)` resolves the knob per call exactly
   as C (`0` = off by default, width rounded up to 32 with a 32 floor, engages only while
@@ -945,13 +946,55 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   the SigLIP shape too), and the resident path has no SAM worker-pool analogue of the
   C's per-(window, head) stream threads (same arithmetic, different task split).
 
+  **M10 on-NPU attention softmax** (2026-10-25, the last attention surface): the C
+  library's optional on-NPU softmax (`ROCKET_ATTN_HOST_SOFTMAX=0`) is ported as
+  `attn::RowSoftmax` (`crates/rocket-npu/src/attn/softmax.rs`): it owns the host pass
+  (`attn::Softmax`, unchanged and still the default) and, for the on-NPU arm, the f16
+  masked-score write (the C `fa_mask_scores`, `fa_score` in f32 then one f16 narrowing,
+  pad columns at the `-30000` clamp) that feeds `ops::softmax::softmax` — the M6b
+  `rocket_softmax_fp16` composition already verified bit-identical to C. `host_softmax()`
+  resolves the knob per call (`0` = on-NPU, `1`/unset = host), and the **materialized**
+  paths honor it: `Attention::flash`'s per-head path, its chained group path (that mask +
+  softmax is also a full-key-axis row softmax per head, and the C
+  `fa_heads_range_batched` passes its `host_sm` through the same loop, so
+  `ROCKET_FA_CHAIN=0/1` stays bit-identical under either placement — verified) and
+  `mha_self` (whose C default is on-NPU). The tiled `ROCKET_FA_TILE_KV` path stays
+  host-only by construction (the online running max/rescale is sequential across tiles;
+  the C tiled range takes no `host_sm` either). Defaults are unchanged (host
+  everywhere), i.e. the C's `mha_self` default is NOT reproduced unless asked for:
+  `ROCKET_ATTN_HOST_SOFTMAX=0` is the parity switch, `1` the host arm.
+  **C-vs-Rust A/B** (`ab_board` grew `flash`/`mha` families with `attn_selftest --io`'s
+  layout, driven by `ab_compare.py --attn-only`, board cores 0-3): the on-NPU arms are
+  **bit-identical for every case** — flash causal/no-mask/soft-cap 8/MLA `dv != dk`/
+  n_kv > T one-hot at 64 keys, and `mha_self` at T=8 d=64 h=2, T=5 d=128 h=2 and
+  T=33 d=64 h=2 (Tp/Tn padding; the C single-fd entry chains its heads by default and so
+  does the Rust one, so the chained placement is pinned by the same cases) — while the
+  host arms differ by <= 2.4 f16 ULP at the output peak (cos 0.9999992-1.0), which is the
+  documented f32-vs-f16 score path.
+  **Board wall/CPU** (busy board, load ~10, cores 0-3; `attn_selftest --sm-ab`): the
+  on-NPU arm is 1.8-2.2x the single-fd host arm at T=257 kv=257 (two runs: 2.15x and
+  1.79x, the board scatters +-20 %) and 2.55x at kv=1024, with 1.2-1.3x (kv=257) and
+  1.76x (kv=1024) through the mt(4) fan-out; `mha_self` 1.1-1.25x at T=257 and 1.75x at
+  the kv=1024 run's T=256. That is the expected direction and larger than the C's own
+  ~5-10 %: the C compares against a scalar `expf` host pass, this port against the S1
+  fast pass, so the on-NPU arm is a parity/comparison knob, not a default. Against the
+  f64 references the on-NPU arm reads cos 0.99999990 (flash) /
+  0.99999887-0.99999989 (`mha_self`) — the EXP LUT's approximation, as documented.
+  `attn_selftest` grew `--host-sm 0|1`, `--sm-ab` and the `--io flash|mha` raw-file
+  mode; the chain A/B and the `mha_self` fan-out stay
+  bit-identical under `--host-sm 0` (0 differing of 131,584 / 5,248). The knob is
+  **global**: it also reaches `burn_rocket`'s attention ops (they call
+  `Attention::flash`), i.e. every app NPU attention path, so it is a comparison switch
+  and must not leak into a deployment environment by accident (unset = the host pass,
+  the shipped behaviour, which is unchanged).
+
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU **attention** softmax, the
-  cube-resident *mechanism* of the fused FFN/MLP (the pinned tiling, the matched-tiling
+  wrappers, tiled MLA (a `dv != dk` geometry), the cube-resident *mechanism* of the
+  fused FFN/MLP (the pinned tiling, the matched-tiling
   gate and the KACC routing are bit-identical to the C; the intermediates still come
   back to row-major between ops, so the C's `RESIDENT-FUSION NOTE` round-trip
   optimization is what remains), the RK3576-specific convolution/pooling entries (the
@@ -984,7 +1027,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1924,7 +1967,13 @@ ssh root@rock-5b-plus.lan 'cd /root/rocket-m6a && tar xzf ref-src.tgz -C ref &&
 #   flash_attn_ref and asserts single-fd == mt; --mha does the same for
 #   mha_self vs mha_self_ref at d = --dk * heads. --mask none|causal|window,
 #   --softcap F, --mt N and --ref 0|1 pick the case (the f64 oracle auto-skips
-#   above 2e9 MACs). --tile KBP switches to the tiled long-context A/B
+#   above 2e9 MACs). --host-sm 0|1 sets ROCKET_ATTN_HOST_SOFTMAX for every mode
+#   (0 = the on-NPU softmax, the C's mha_self default); --sm-ab instead runs BOTH
+#   placements of flash_attn (single-fd and mt) and mha_self and prints each arm's
+#   wall/CPU, its cosine/max-abs vs the f64 ref and the two arms against each other
+#   (the on-NPU EXP LUT is approximate: expect cos ~0.9999999, max_abs ~1e-3, and
+#   on the board ~2x the host wall, not bit-identity). --tile KBP switches to the
+#   tiled long-context A/B
 #   (ROCKET_FA_TILE_KV=KBP, --tile-min KV, default 8192): it runs the case
 #   materialized and tiled, reports each arm's cosine/max-abs vs the f64 ref and
 #   vs the other, its wall/CPU, the mem_stats footprint each leaves (Tp/Kn/tile,
@@ -1934,6 +1983,23 @@ ssh root@rock-5b-plus.lan 'cd /root/rocket-m6a && tar xzf ref-src.tgz -C ref &&
 taskset -c 0-3 ./attn_selftest 257 257 8 2 --oneshot --mt 4 --mask causal --softcap 30
 taskset -c 0-3 ./attn_selftest 2394 2394 12 12 --dk 64 --dv 64 --mask none --oneshot --ref 1
 taskset -c 0-3 ./attn_selftest 82 82 8 8 --dk 64 --mha --mt 2
+# the softmax placement: host (default) vs on-NPU, for the flash primitive and mha_self
+taskset -c 0-3 ./attn_selftest 257 257 8 2 --dk 64 --sm-ab --mt 4 --mask causal --reps 3
+taskset -c 0-3 ./attn_selftest 256 1024 8 2 --dk 64 --sm-ab --mt 4 --mask causal --reps 2
+#   ... and both placements individually (the chain A/B and the mha fan-out must stay
+#   bit-identical under either)
+taskset -c 0-3 ./attn_selftest 257 257 8 2 --dk 64 --host-sm 0 --mask causal --reps 2
+taskset -c 0-3 ./attn_selftest 82 82 2 2 --dk 32 --mha --host-sm 0 --reps 2
+# C-vs-Rust A/B for the on-NPU softmax: ab_board grew `flash` / `mha` families with the
+# same argument layout as `attn_selftest --io` (floats as f32 hex bit patterns, `-` =
+# NULL). The script sets ROCKET_ATTN_HOST_SOFTMAX per side: the C `mha_self` treats the
+# variable's PRESENCE as host, so its on-NPU arm is the unset one while the Rust side
+# takes the value (0 = on-NPU). The on-NPU arms must be bit-identical; the host arms
+# differ by ~1-2 f16 ULP (the Rust host pass keeps f32 scores, the C writes f16).
+gcc -O2 -ffp-contract=off -I /root/rocket-m6a/ref/include -I /root/rocket-m6a/ref \
+    ab_board.c /root/rocket-m6a/ref/build/librocketnpu.a -lm -lpthread -o ab_board
+taskset -c 0-3 python3 ab_compare.py --attn-only --rust ./attn_selftest \
+    --attn ./attn_selftest --c ./ab_board --work /tmp/a10
 # tiled long-context A/B: small case with the f64 ref (tiling forced on), then the
 # long cases (ref skipped, materialized arm skipped where it would not fit)
 taskset -c 0-3 ./attn_selftest 1024 1024 8 2 --dk 64 --dv 64 --mask causal --ref 1 --tile 256 --tile-min 0
