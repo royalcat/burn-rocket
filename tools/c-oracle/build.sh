@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the host-side C oracle (planner + fp16 regcmd emitter).
+# Build the host-side C oracle (planners + regcmd emitters for every matmul dtype).
 #
 #   tools/c-oracle/build.sh <rocket-userspace-src> <host-install-dir> [out]
 #

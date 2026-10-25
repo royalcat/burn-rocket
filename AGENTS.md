@@ -380,7 +380,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + fp16 regcmd dump) and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
+| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype), the `parity.py` dtype parity harness, and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
 | `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest`, `bf16_selftest` |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
