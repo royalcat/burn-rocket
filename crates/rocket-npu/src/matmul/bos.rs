@@ -238,6 +238,14 @@ pub(crate) fn i32_words_ref(bo: &Bo) -> &[i32] {
     unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i32>(), bytes.len() / 4) }
 }
 
+/// The BO as int16 words (the int4 output cube).
+pub(crate) fn i16_words_ref(bo: &Bo) -> &[i16] {
+    let bytes = bo.as_slice();
+    assert_eq!(bytes.len() % 2, 0);
+    // SAFETY: the int4 output BO is a whole number of 2-byte int16 elements.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i16>(), bytes.len() / 2) }
+}
+
 pub fn zero_bo(bo: &mut Bo) -> Result<()> {
     bo.prep(0)?;
     bo.as_mut_slice().fill(0);

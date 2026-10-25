@@ -45,28 +45,11 @@ pub fn plan_int8(m: usize, k: usize, n: usize) -> Result<(usize, usize, usize)> 
 ///
 /// [`Plan`]'s fp16 constructor rounds the weight slot's N to 16; int8's weight cube
 /// groups N and K in 32s (its feature cube groups K in 16s) and its output cube is
-/// int32 with C2=4, so the slot sizes are derived here rather than inherited. `mt` is
-/// the live tile height the caller resolved (`plan_geom`'s `Mt`, or the canonical clamp
-/// of it).
+/// int32 with C2=4, so the slot sizes come from the [`INT8`] geometry rather than
+/// from fp16's. `mt` is the live tile height the caller resolved (`plan_geom`'s `Mt`,
+/// or the canonical clamp of it).
 pub(crate) fn int8_plan(m: usize, k: usize, n: usize, mt: usize, kt: usize, nt: usize) -> Plan {
-    Plan {
-        m,
-        k,
-        n,
-        mt,
-        kt,
-        nt,
-        nmt: m.div_ceil(mt),
-        nnt: n.div_ceil(nt),
-        nkt: k.div_ceil(kt),
-        in_slot: rup(mt, 4) * rup(kt, 32),
-        wt_slot: rup(nt, 32) * rup(kt, 32),
-        out_slot: rup(mt, 4) * rup(nt, 16),
-    }
-}
-
-pub(crate) fn rup(x: usize, a: usize) -> usize {
-    x.div_ceil(a) * a
+    Plan::derive_geom(&INT8, m, k, n, mt, kt, nt)
 }
 
 /// The transient BO set one int8 one-shot call drives — the C locals in
@@ -386,6 +369,7 @@ pub fn one_shot_int8_groupwise(
 
 #[cfg(test)]
 mod tests {
+    use super::super::plan::rup;
     use super::*;
 
     #[test]

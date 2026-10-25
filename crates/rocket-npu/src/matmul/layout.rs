@@ -422,6 +422,146 @@ pub fn detile_accum_i8_scaled(
     }
 }
 
+// ── int4 cubes: feature C2=32 nibbles, weight (N/64,K/32,64,32) nibbles,
+//    int16 output C2=8 ──────────────────────────────────────────────────────────
+//
+// The int4 operands are NIBBLE-packed, so the indices below count nibbles, not bytes:
+// byte `n >> 1`, low nibble when `n` is even and high when odd. Every group base
+// carries a factor of 32 (feature/weight K-group, output granule 8 vs 2/4/8) and is
+// therefore even, which is what lets the blocked scatters pack 16 whole bytes
+// (`i4_pack16`) instead of touching nibbles one at a time.
+
+/// Feature-cube nibble index (1-based row/channel, as in the C helpers).
+#[inline]
+pub fn feat_idx_i4(h: usize, ch: usize, row: usize) -> usize {
+    ((ch - 1) / 32) * h * 32 + 32 * (row - 1) + (ch - 1) % 32
+}
+
+/// Weight-cube nibble index (1-based output channel `k` / K `c`).
+#[inline]
+pub fn wt_idx_i4(c: usize, k: usize, ch: usize) -> usize {
+    let n_kgrp = c.div_ceil(32);
+    let n_grp = (k - 1) / 64;
+    let n_within = (k - 1) % 64;
+    let k_grp = (ch - 1) / 32;
+    let k_within = (ch - 1) % 32;
+    n_grp * n_kgrp * 64 * 32 + k_grp * 64 * 32 + n_within * 32 + k_within
+}
+
+/// Output-cube int16 element index (1-based), C2=8.
+#[inline]
+pub fn out_idx_i4(h: usize, ch: usize, row: usize) -> usize {
+    ((ch - 1) / 8) * h * 8 + 8 * (row - 1) + (ch - 1) % 8
+}
+
+/// Set nibble `idx` of a packed buffer (even = low half, odd = high half).
+#[inline]
+fn put_nib(buf: &mut [u8], idx: usize, v: i8) {
+    let nib = (v & 0xF) as u8;
+    if idx & 1 != 0 {
+        buf[idx >> 1] = (buf[idx >> 1] & 0x0F) | (nib << 4);
+    } else {
+        buf[idx >> 1] = (buf[idx >> 1] & 0xF0) | nib;
+    }
+}
+
+/// Pack 32 int4 codes (one per `i8`, two per byte) into 16 bytes.
+#[inline]
+fn pack16_i4(d: &mut [u8], s: &[i8]) {
+    for j in 0..16 {
+        d[j] = ((s[2 * j] & 0xF) as u8) | (((s[2 * j + 1] & 0xF) as u8) << 4);
+    }
+}
+
+/// Scatter one `A[m0.., k0..]` tile into the `(K/32, Mt, 32)`-nibble int4 feature cube.
+pub fn feat_scatter_i4(
+    slot: &mut [u8],
+    a: &[i8],
+    astride: usize,
+    m0: usize,
+    k0: usize,
+    mtile: usize,
+    ktile: usize,
+) {
+    let h = mtile;
+    let ng = ktile / 32;
+    for row in 0..mtile {
+        let arow = &a[(m0 + row) * astride + k0..][..ktile];
+        for g in 0..ng {
+            // feat_idx_i4(H, 32g+1, h) = g*H*32 + 32*(h-1), and that base is even.
+            let base = g * h * 32 + 32 * row;
+            pack16_i4(&mut slot[base >> 1..], &arow[g * 32..]);
+        }
+        for (col, &v) in arow.iter().enumerate().skip(ng * 32) {
+            put_nib(slot, feat_idx_i4(h, col + 1, row + 1), v);
+        }
+    }
+}
+
+/// Scatter one weight row `brow[k0..k0+ktile]` for output channel `kk` (0-based).
+pub fn wt_scatter_row_i4(slot: &mut [u8], brow: &[i8], kk: usize, ktile: usize) {
+    let n_kgrp = ktile.div_ceil(32);
+    let ng = ktile / 32;
+    let nbase = (kk / 64) * n_kgrp * 64 * 32 + (kk % 64) * 32;
+    for g in 0..ng {
+        let base = nbase + g * 64 * 32;
+        pack16_i4(&mut slot[base >> 1..], &brow[g * 32..]);
+    }
+    for (col, &v) in brow.iter().enumerate().skip(ng * 32) {
+        put_nib(slot, wt_idx_i4(ktile, kk + 1, col + 1), v);
+    }
+}
+
+/// Scatter a contiguous `B[n0.., k0..]` weight tile into an int4 weight cube slot.
+pub fn wt_scatter_tile_i4(
+    slot: &mut [u8],
+    b: &[i8],
+    bstride: usize,
+    n0: usize,
+    k0: usize,
+    ntile: usize,
+    ktile: usize,
+) {
+    for kk in 0..ntile {
+        let brow = &b[(n0 + kk) * bstride + k0..][..ktile];
+        wt_scatter_row_i4(slot, brow, kk, ktile);
+    }
+}
+
+/// Accumulate one int16 output cube into the i64 accumulator.
+///
+/// int4 x int4 accumulates in the conv's CACC and is written back as **int16**
+/// (`out_precision = 1`), so each K-tile's partial saturates above 32767 — the caller
+/// must keep `Kt` small enough (or the data low enough) for a bit-exact comparison.
+/// The int16 cube is C2=8, so it gathers at [`out_idx_i4`].
+pub fn detile_accum_i16(
+    acc: &mut [i64],
+    n: usize,
+    slot: &[i16],
+    m0: usize,
+    n0: usize,
+    mtile: usize,
+    ntile: usize,
+) {
+    let h = mtile;
+    for row in 0..mtile {
+        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
+        let mut col = 0;
+        while col + 8 <= ntile {
+            let g = col / 8;
+            let src = &slot[g * h * 8 + 8 * row..][..8];
+            for (dv, sv) in d[col..col + 8].iter_mut().zip(src) {
+                *dv += *sv as i64;
+            }
+            col += 8;
+        }
+        while col < ntile {
+            d[col] += slot[out_idx_i4(h, col + 1, row + 1)] as i64;
+            col += 1;
+        }
+    }
+}
+
 // ── bf16 cubes: feature/weight == int16, fp32 output C2=4 ─────────────────────
 
 #[inline]
@@ -517,6 +657,155 @@ pub fn detile_accum_bf16(
     ntile: usize,
 ) {
     detile_accum_f32(acc, n, slot, m0, n0, mtile, ntile);
+}
+
+#[cfg(test)]
+mod int4_tests {
+    use super::*;
+
+    /// Read nibble `idx` back as a sign-extended int4 code.
+    fn get_nib(buf: &[u8], idx: usize) -> i8 {
+        let b = buf[idx >> 1];
+        let nib = if idx & 1 != 0 {
+            (b >> 4) & 0xF
+        } else {
+            b & 0xF
+        };
+        ((nib as i8) << 4) >> 4
+    }
+
+    fn code(i: usize) -> i8 {
+        (i % 16) as i8 - 8
+    }
+
+    #[test]
+    fn int4_feature_round_trip() {
+        let (mt, kt): (usize, usize) = (12, 64);
+        let a: Vec<i8> = (0..mt * kt).map(code).collect();
+        let mut slot = vec![0u8; mt.div_ceil(4) * 4 * kt / 2];
+        feat_scatter_i4(&mut slot, &a, kt, 0, 0, mt, kt);
+        for row in 0..mt {
+            for col in 0..kt {
+                assert_eq!(
+                    get_nib(&slot, feat_idx_i4(mt, col + 1, row + 1)),
+                    a[row * kt + col],
+                    "row={row} col={col}"
+                );
+            }
+        }
+        // A tile with a non-zero origin reads the right window of the source.
+        let mut slice = vec![0u8; 8 * 32 / 2];
+        feat_scatter_i4(&mut slice, &a, kt, 4, 32, 4, 32);
+        for row in 0..4 {
+            for col in 0..32 {
+                assert_eq!(
+                    get_nib(&slice, feat_idx_i4(4, col + 1, row + 1)),
+                    a[(4 + row) * kt + 32 + col]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int4_feature_scatter_ignores_the_ktile_tail() {
+        // The planner always hands a K%32==0 Ktile, but the C loop keeps a tail branch;
+        // it must write the tail nibbles and nothing else (a ragged 40-wide tile).
+        let (mt, kt): (usize, usize) = (5, 40);
+        let a: Vec<i8> = (0..mt * kt).map(code).collect();
+        let mut slot = vec![0u8; 8 * 64 / 2];
+        feat_scatter_i4(&mut slot, &a, kt, 0, 0, mt, kt);
+        for row in 0..mt {
+            for col in 0..kt {
+                assert_eq!(
+                    get_nib(&slot, feat_idx_i4(mt, col + 1, row + 1)),
+                    a[row * kt + col],
+                    "row={row} col={col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int4_weight_round_trip() {
+        let (nt, kt): (usize, usize) = (80, 96);
+        let b: Vec<i8> = (0..nt * kt).map(code).collect();
+        let mut slot = vec![0u8; nt.div_ceil(64) * 64 * kt / 2];
+        wt_scatter_tile_i4(&mut slot, &b, kt, 0, 0, nt, kt);
+        for k in 0..nt {
+            for c in 0..kt {
+                assert_eq!(
+                    get_nib(&slot, wt_idx_i4(kt, k + 1, c + 1)),
+                    b[k * kt + c],
+                    "k={k} c={c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int4_weight_slice_offsets() {
+        let (n, k) = (128, 64);
+        let b: Vec<i8> = (0..n * k).map(code).collect();
+        let mut slot = vec![0u8; 64 * 64 / 2];
+        wt_scatter_tile_i4(&mut slot, &b, k, 64, 32, 64, 32);
+        for kk in 0..64 {
+            for cc in 0..32 {
+                assert_eq!(
+                    get_nib(&slot, wt_idx_i4(32, kk + 1, cc + 1)),
+                    b[(64 + kk) * k + 32 + cc]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int4_int16_cube_detiles_in_eight_channel_groups() {
+        // Ragged (mtile, ntile) int16 cube at a non-zero origin: the gather walks
+        // 8-channel groups (C2=8) at out_idx_i4, and a pre-existing partial in the i64
+        // accumulator (an earlier K-tile) must be added to, not replaced.
+        let (mt, nt): (usize, usize) = (5, 6);
+        let (alloc_m, alloc_n) = (mt.div_ceil(4) * 4, nt.div_ceil(8) * 8);
+        let slot: Vec<i16> = (0..alloc_m * alloc_n).map(|i| i as i16 * 7 - 40).collect();
+        let (n, m0, n0) = (20, 4, 4);
+        let mut acc = vec![0i64; (m0 + mt + 1) * n];
+        acc[(m0 + 2) * n + n0 + 1] = -1_000_000;
+        detile_accum_i16(&mut acc, n, &slot, m0, n0, mt, nt);
+        for row in 0..mt {
+            for col in 0..nt {
+                let want = slot[out_idx_i4(mt, col + 1, row + 1)] as i64;
+                let want = if (row, col) == (2, 1) {
+                    want - 1_000_000
+                } else {
+                    want
+                };
+                assert_eq!(acc[(m0 + row) * n + n0 + col], want, "row={row} col={col}");
+            }
+        }
+        assert_eq!(acc[0], 0);
+        assert_eq!(acc[(m0 + mt) * n + n0], 0);
+        assert_eq!(acc[m0 * n + n0 + nt], 0);
+    }
+
+    #[test]
+    fn int4_nibble_layout_matches_the_c_index_math() {
+        // wt_idx_i4's shape: (N/64, K/32, 64, 32) nibbles, with the stride of the
+        // N-group counting ceil(Kt/32) K-groups.
+        assert_eq!(wt_idx_i4(32, 1, 1), 0);
+        assert_eq!(wt_idx_i4(32, 2, 1), 32);
+        assert_eq!(wt_idx_i4(32, 1, 33), 64 * 32);
+        // The next N group starts one K-group plane later, and that plane's stride is
+        // 64*32 * ceil(Kt/32) — two K groups double it.
+        assert_eq!(wt_idx_i4(32, 65, 1), 64 * 32);
+        assert_eq!(wt_idx_i4(64, 65, 1), 2 * 64 * 32);
+        // feat_idx_i4 is C2=32: 32 rows of a K-group, then the next K-group.
+        assert_eq!(feat_idx_i4(4, 1, 1), 0);
+        assert_eq!(feat_idx_i4(4, 2, 1), 1);
+        assert_eq!(feat_idx_i4(4, 1, 2), 32);
+        assert_eq!(feat_idx_i4(4, 33, 1), 4 * 32);
+        // out_idx_i4 is C2=8.
+        assert_eq!(out_idx_i4(4, 9, 1), 4 * 8);
+        assert_eq!(out_idx_i4(4, 1, 2), 8);
+    }
 }
 
 #[cfg(test)]

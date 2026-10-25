@@ -4,25 +4,29 @@
 //!   regcmd_dump plan         M K N
 //!   regcmd_dump plan-int8    M K N
 //!   regcmd_dump plan-int8-gw M K N [GROUP]
+//!   regcmd_dump plan-int4    M K N
 //!   regcmd_dump plan-bf16    M K N
 //!   regcmd_dump emit         M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!   regcmd_dump emit-int8    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
+//!   regcmd_dump emit-int4    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!   regcmd_dump emit-bf16    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!
 //! The emitters take the TILE dims (Mt Kt Nt), not the full problem dims, and a
 //! plan prints `Mt Kt Nt jobs` or `-1`, matching `tools/c-oracle/oracle`.
 //!
-//! int4 and tf32 have no Rust planner/emitter yet (M3/M4). Their subcommands
-//! exist only so the parity harness can report them as PENDING; they exit
-//! nonzero without writing a plan/program.
+//! tf32 has no Rust planner/emitter yet (M4). Its subcommands exist only so the
+//! parity harness can report them as PENDING; they exit nonzero without writing a
+//! plan/program.
 //!
 //! `emit-int8` with ACCUMULATE=1 is not ported: the C int8 emitter has an
 //! EW-add path there, but the C library itself documents that encoding as
 //! non-bit-exact and never used in production, so the Rust port leaves it out.
+//! `emit-int4` ignores FP32TOFP16/ACCUMULATE/ADD_DMA, as the C's plain-conv int4
+//! generator does.
 
 use std::process::ExitCode;
 
-use rocket_npu::matmul::plan::{self, BF16, INT8, INT8_GW, Plan};
+use rocket_npu::matmul::plan::{self, BF16, INT4, INT8, INT8_GW, Plan};
 use rocket_npu::regcmd::fp16::{MatmulParams, emit};
 
 fn dma(arg: &str) -> u32 {
@@ -59,6 +63,7 @@ fn emit_program(kind: &str, params: &MatmulParams) -> ExitCode {
     let r = match kind {
         "emit" => emit(params, &mut ops),
         "emit-int8" => rocket_npu::regcmd::int8::emit(params, &mut ops),
+        "emit-int4" => rocket_npu::regcmd::int4::emit(params, &mut ops),
         "emit-bf16" => rocket_npu::regcmd::bf16::emit(params, &mut ops),
         _ => unreachable!(),
     };
@@ -85,9 +90,11 @@ fn not_implemented(mode: &str, milestone: &str) -> ExitCode {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
-        eprintln!("usage: regcmd_dump plan|plan-int8|plan-int8-gw|plan-bf16 M K N [GROUP]");
         eprintln!(
-            "       regcmd_dump emit|emit-int8|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]"
+            "usage: regcmd_dump plan|plan-int8|plan-int8-gw|plan-int4|plan-bf16 M K N [GROUP]"
+        );
+        eprintln!(
+            "       regcmd_dump emit|emit-int8|emit-int4|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]"
         );
         return ExitCode::FAILURE;
     }
@@ -121,7 +128,10 @@ fn main() -> ExitCode {
             print_plan(&BF16, 0, m, k, n);
             ExitCode::SUCCESS
         }
-        "plan-int4" => not_implemented(mode, "M3"),
+        "plan-int4" => {
+            print_plan(&INT4, 0, m, k, n);
+            ExitCode::SUCCESS
+        }
         "plan-tf32" => not_implemented(mode, "M4"),
         "emit" | "emit-int8" | "emit-bf16" => {
             if args.len() < 8 {
@@ -147,7 +157,22 @@ fn main() -> ExitCode {
             }
             emit_program(mode, &p)
         }
-        "emit-int4" => not_implemented(mode, "M3"),
+        "emit-int4" => {
+            if args.len() < 8 {
+                eprintln!("emit needs M K N IN WT OUT");
+                return ExitCode::FAILURE;
+            }
+            // The int4 generator takes no fp32-out/accumulate/add args.
+            let p = MatmulParams::new(
+                m as u32,
+                k as u32,
+                n as u32,
+                dma(&args[5]),
+                dma(&args[6]),
+                dma(&args[7]),
+            );
+            emit_program(mode, &p)
+        }
         "emit-tf32" => not_implemented(mode, "M4"),
         other => {
             eprintln!("unknown mode {other}");

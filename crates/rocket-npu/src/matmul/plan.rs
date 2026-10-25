@@ -1,7 +1,7 @@
-//! Tiling plans for the fp16 geometry.
+//! Tiling plans for the RK3588 matmul geometries.
 //!
-//! The planner is a translation of `mm_plan_geom` with the fp16 geometry
-//! (`2 B`, N-align 16, K-align 32, Kt ceiling 16384, asymmetric-Nt heuristic on).
+//! The planner is a translation of `mm_plan_geom` with one [`Geometry`] per dtype
+//! (fp16's `2 B`, N-align 16, asymmetric-Nt heuristic is the default of [`Plan::new`]).
 //! Plans are pure: no device access.
 
 use crate::error::{Error, Result};
@@ -12,15 +12,22 @@ use crate::regcmd::desc::CBUF_BANK_SIZE;
 
 const DIM_MAX: usize = 1 << 24;
 
-/// The fp16 geometry constants.
+/// One dtype's tiling constants (`struct mm_geom` in the C library).
+///
+/// The element size is a fraction because int4 is half a byte: `mm_banks` computes
+/// `rows*Kt*ebytes_num/ebytes_den` in integer arithmetic, so 1/2 must stay exact.
 #[derive(Debug, Clone, Copy)]
 pub struct Geometry {
     pub name: &'static str,
-    pub elem_bytes: usize,
+    /// Bytes per element = `elem_num / elem_den` (int4 = 1/2).
+    pub elem_num: usize,
+    pub elem_den: usize,
     pub n_align: usize,
     pub k_align: usize,
     pub kt_ceil: usize,
     pub bank_slack: usize,
+    /// The weight slot's N granularity (`weight_int8` groups 32, `weight_int4` 64).
+    pub wt_n_align: usize,
     pub asym_nt: bool,
     pub pick_nt: bool,
     pub grouped: bool,
@@ -28,11 +35,13 @@ pub struct Geometry {
 
 pub const FP16: Geometry = Geometry {
     name: "fp16",
-    elem_bytes: 2,
+    elem_num: 2,
+    elem_den: 1,
     n_align: 16,
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 0,
+    wt_n_align: 16,
     asym_nt: true,
     pick_nt: false,
     grouped: false,
@@ -42,11 +51,13 @@ pub const FP16: Geometry = Geometry {
 /// feature-DMA slack.
 pub const INT8: Geometry = Geometry {
     name: "int8",
-    elem_bytes: 1,
+    elem_num: 1,
+    elem_den: 1,
     n_align: 32,
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 1,
+    wt_n_align: 32,
     asym_nt: false,
     pick_nt: false,
     grouped: false,
@@ -56,11 +67,13 @@ pub const INT8: Geometry = Geometry {
 /// reaches the fewest tiles.
 pub const INT8_GW: Geometry = Geometry {
     name: "int8 group-wise",
-    elem_bytes: 1,
+    elem_num: 1,
+    elem_den: 1,
     n_align: 32,
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 1,
+    wt_n_align: 32,
     asym_nt: false,
     pick_nt: true,
     grouped: true,
@@ -69,11 +82,29 @@ pub const INT8_GW: Geometry = Geometry {
 /// bf16 shares the int16/fp16 2-byte geometry (N16, K32) and the fp32 output cube.
 pub const BF16: Geometry = Geometry {
     name: "bf16",
-    elem_bytes: 2,
+    elem_num: 2,
+    elem_den: 1,
     n_align: 16,
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 0,
+    wt_n_align: 16,
+    asym_nt: false,
+    pick_nt: false,
+    grouped: false,
+};
+
+/// int4 dense geometry (`gen_matmul_int4`): half a byte per element, N align 64
+/// (`weight_int4` groups output channels in 64s), K align 32, no bank slack.
+pub const INT4: Geometry = Geometry {
+    name: "int4",
+    elem_num: 1,
+    elem_den: 2,
+    n_align: 64,
+    k_align: 32,
+    kt_ceil: 16384,
+    bank_slack: 0,
+    wt_n_align: 64,
     asym_nt: false,
     pick_nt: false,
     grouped: false,
@@ -111,6 +142,21 @@ impl Plan {
     }
 
     pub fn derive(m: usize, k: usize, n: usize, mt: usize, kt: usize, nt: usize) -> Plan {
+        Plan::derive_geom(&FP16, m, k, n, mt, kt, nt)
+    }
+
+    /// [`Plan::derive`] for an explicit geometry: the slot sizes are the dtype's
+    /// (weight-N granularity differs — 16 fp16/bf16, 32 int8, 64 int4 — while the
+    /// feature and output cubes keep their 4/32/16 element groups).
+    pub fn derive_geom(
+        geom: &Geometry,
+        m: usize,
+        k: usize,
+        n: usize,
+        mt: usize,
+        kt: usize,
+        nt: usize,
+    ) -> Plan {
         Plan {
             m,
             k,
@@ -122,7 +168,7 @@ impl Plan {
             nnt: n.div_ceil(nt),
             nkt: k.div_ceil(kt),
             in_slot: rup(mt, 4) * rup(kt, 32),
-            wt_slot: rup(nt, 16) * rup(kt, 32),
+            wt_slot: rup(nt, geom.wt_n_align) * rup(kt, 32),
             out_slot: rup(mt, 4) * rup(nt, 16),
         }
     }
@@ -169,12 +215,16 @@ impl Plan {
     }
 }
 
-fn rup(x: usize, a: usize) -> usize {
+pub(crate) fn rup(x: usize, a: usize) -> usize {
     x.div_ceil(a) * a
 }
 
+/// CBUF banks a `rows` x `kt` operand tile of this dtype occupies.
+///
+/// The C truncates the byte count (`long bytes = rows*Kt*num/den`) before rounding up
+/// to banks, which is what keeps the half-byte int4 geometry exact.
 fn banks(geom: &Geometry, rows: usize, kt: usize) -> usize {
-    (rows * kt * geom.elem_bytes).div_ceil(CBUF_BANK_SIZE)
+    (rows * kt * geom.elem_num / geom.elem_den).div_ceil(CBUF_BANK_SIZE)
 }
 
 fn fits(geom: &Geometry, mt: usize, nt: usize, kt: usize, budget: usize) -> bool {
