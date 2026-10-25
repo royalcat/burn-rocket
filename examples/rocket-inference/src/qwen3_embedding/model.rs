@@ -349,8 +349,17 @@ impl Qwen3Attention {
             let v = qkv
                 .slice(s![.., .., qw + kw..qw + kw + vw])
                 .reshape([b, s, kv, d]);
-            let q = rope.apply(self.q_norm.forward(q), 0);
-            let k = rope.apply(self.k_norm.forward(k), 0);
+            let q = self.q_norm.forward(q);
+            let k = self.k_norm.forward(k);
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            if crate::util::glue::glue() {
+                // Fused one-pass RoPE (bit-identical to the composite below).
+                let q = burn_rocket::rope_apply(q, rope.cos_rows(0, s), rope.sin_rows(0, s));
+                let k = burn_rocket::rope_apply(k, rope.cos_rows(0, s), rope.sin_rows(0, s));
+                return (q, k, v);
+            }
+            let q = rope.apply(q, 0);
+            let k = rope.apply(k, 0);
             return (q, k, v);
         }
 

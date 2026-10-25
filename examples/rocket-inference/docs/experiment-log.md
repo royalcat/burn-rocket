@@ -1103,13 +1103,14 @@ measured case). A resident-EW
 context in the driver would remove the 5-BO churn per call but not the
 `22,092`-submit tiling, so it would not change this verdict either.
 
-**Side finding (not changed here, model path out of P2c's scope).** The `--npu`
-model path does not use the fused kernel today: `Qwen3Attention::project`
-returns early on the `qkv_fused` handle (`let q = rope.apply(...)`), and that
-handle is set for every layer by the `--npu` loader, so RoPE there is the
-composite at 1.88-1.91x the fused kernel (a 1.63 s/forward cost at 2777 tokens,
-bf16 or f32). Both are bit-identical, so wiring `rope_apply` into that branch is
-a free win worth a follow-up; it is deliberately not part of this probe.
+**Side finding, fixed in the same round.** The `--npu` model path did not use
+the fused kernel: `Qwen3Attention::project` returned early on the `qkv_fused`
+handle (`let q = rope.apply(...)`), and that handle is set for every layer by
+the `--npu` loader, so RoPE there was the composite. It now calls the fused
+`rope_apply` in that branch too. The two are bit-identical, and the model A/B
+(qwen3 f32 `--npu`, 2777 tokens, cores 0-3) is **64.8 -> 58.8 s wall, 42.9 ->
+47.2 tok/s, cosine 1.0, max|d| 0.0** — a larger win than the probe's 1.6 s
+because the composite also pays tensor-op overhead outside the RoPE math.
 
 Reproduce (board, cores 0-3; the full run is ~7 min, mostly the NPU arm):
 

@@ -1583,10 +1583,10 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   numerics were fine at cos 0.999999935, and the arm's host half alone is 1.8x the
   fused arm). No app path, no flag — do not retry without a resident-EW context *and*
   a broadcast operand, and even then the host round-trip dominates. The probe stays as
-  `examples/rocket-inference/src/bin/rope_bench.rs`. Side finding worth acting on
-  separately: `--npu`'s `qkv_fused` branch calls the composite `RopeCache::apply`, not
-  the fused `rope_apply` (1.88-1.91x = ~1.6 s/forward at 2777 tokens), and the two are
-  bit-identical, so wiring the fused kernel in is free (not done here).
+  `examples/rocket-inference/src/bin/rope_bench.rs`. Side finding, fixed in the same
+  round: `--npu`'s `qkv_fused` branch called the composite `RopeCache::apply`, not the
+  fused `rope_apply`; it now uses the fused kernel (bit-identical to the previous
+  binary, **64.8 -> 58.8 s at 2777 tokens, 42.9 -> 47.2 tok/s, cosine 1.0**).
 - **On-NPU softmax in `rocket-npu`** is no longer on the critical path: the S1
   host pass (log-gemma §19) cut the host softmax to 0.05 s/layer, so
   `attention_window` now beats flex's fused kernel 1.99× at the tower geometry
@@ -1626,9 +1626,9 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   host half alone (3.29 s) exceeds the whole fused arm. No app path, no flag; the
   permanent probe is `examples/rocket-inference/src/bin/rope_bench.rs` (the P2c gate
   matrix: 82/2777 tokens x f32/bf16, `--skip-npu` for the host arms, `--layers/--reps`).
-  Side finding: `--npu`'s `qkv_fused` branch uses the composite `rope.apply`
-  (1.88-1.91x the fused kernel = ~1.6 s/forward at 2777 tokens), and the two are
-  bit-identical — a free follow-up, not changed here.
+  Side finding, fixed: `--npu`'s `qkv_fused` branch used the composite `rope.apply`
+  (1.88-1.91x the fused kernel); it now calls `rope_apply`, bit-identical and
+  **64.8 -> 58.8 s at 2777 tokens** (42.9 -> 47.2 tok/s).
 - Board service: redeploy `home-llm-gateway-embed-1` from `main` to pick up the
   S1 fast host softmax, the S2 NPU vision default and the ffmpeg runtime (the
   deployed `:latest` is `94f99bd`, pre-S1/S2 and pre-ffmpeg), then re-measure the
