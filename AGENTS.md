@@ -355,8 +355,11 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   one-shot (raw-f32 operands, 4-byte cube, fp32 out and f64 host K-accumulation; the
   MAC *truncates* each mantissa to 10 bits toward zero, so the parity reference is the
   C's `tf32rt` (zero the low 13 bits), not a round-to-nearest tf32; planner + emitter
-  byte-equal, `tf32_selftest` is the board check) and masked GQA
-  attention are ported
+  byte-equal, `tf32_selftest` is the board check), masked GQA
+  attention and the **reduce + softmax** family (the PPU global average/max/min pools
+  with `reduce_factor_axis`/`global_avgpool_plan`, the feature-axis ones-matmul reduce,
+  the triangular-ones cumsum, row softmax/log-softmax/cross-entropy and
+  `rocket_scale_rows_fp16`; M6b below) are ported
   (`int8_selftest --dense|--gw-one-shot|--prepacked-dense|--prepacked-gw`,
   `int4_selftest --dense|--gw-one-shot G|--prepacked|--prepacked-gw G`,
   `int16_selftest` and `tf32_selftest` are the board checks: int32/i64-exact vs the
@@ -466,15 +469,63 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   exactly 0; the self-test counts those as `glitch=` and leaves them out of the gate).
   `cargo test -p rocket-npu` pins the LUT words/epilogue fields, the program hash, the
   refs' identities, the knob overrides and the table domains.
+  **M6b reduce + softmax** (2026-10-25): `src/rocket_reduce.c` (538 lines),
+  `src/rocket_softmax.c`, `gen_pool_fp16` from `src/npu_regcmd.c` and
+  `rocket_scale_rows_fp16` from `src/rocket_norm.c` are ported as
+  `ops/reduce.rs`, `ops/softmax.rs`, `regcmd/pool.rs` and `ops/norm.rs` (the last one
+  says in its module docs that the rest of `rocket_norm.h` — RMSNorm/LayerNorm and the
+  fp16-square prescale — is M7). API: `ops::reduce::{global_avgpool_plan,
+  global_avgpool, global_avgpool_ref, global_maxpool, global_minpool,
+  global_maxpool_ref, global_minpool_ref, reduce_factor_axis, reduce_feature,
+  reduce_feature_ref, cumsum, cumsum_ref, feature_data, recip_pair}`,
+  `ops::softmax::{softmax, softmax_ref, logsoftmax, logsoftmax_ref, cross_entropy,
+  cross_entropy_ref}` (CE takes `target: &[i32]` and writes `&mut [f32]`),
+  `ops::norm::{scale_rows, scale_rows_ref}` and
+  `regcmd::pool::{gen_pool_fp16, PoolParams, PoolMethod, ppu_recip_kernel_fp16}`.
+  There is **no "no device" variant**: the device entry points always take `&Device`,
+  the `*_ref` functions are the host path, and a **non-decomposable** shape falls back
+  to `*_ref` *inside* the device function (that is what the C does for `fd >= 0` too).
+  Decomposition rules kept exactly: `reduce_factor_axis` is 16-smooth-only and
+  ascending (largest divisor first, then sorted, so the running quotient never drops
+  below 4 — a PPU-written sub-4 cube is not read back by the next chained pass), the
+  plan needs `H`/`W` the same factor count (`Shape` for not-16-smooth / unequal,
+  `NoMem` past `REDUCE_MAX_DIM` 8192, `Unsupported` past 8192 channels), the passes
+  ping-pong NC1HWC2 cubes (`feature_data`, C2=8) with exact tiling, the average
+  reciprocals are `fp16(65536/k)` per axis with the geometric sqrt split for an
+  asymmetric kernel (`recip_pair`), and the submit carries
+  `DRM_ROCKET_JOB_PPU_DONE` when `ppu_done_supported()`. The feature reduce and cumsum
+  are `matmul::one_shot_f32out` calls (N padded to 16, column 0 read; triangular ones
+  weight for cumsum), so they inherit the genuine fp32 K-accumulation; the softmax
+  family is host row-max + f32 subtract → `activation(Exp)` → `reduce_feature` → host
+  `1/s` (or `log`) → `scale_rows` (or `ew_sub`; CE is logsumexp + the host gather), with
+  the C's `s <= 0` guards and the `INT_MAX` element-count ceiling. Program parity: the
+  PPU program is **byte-identical** (30 words), and so are the decomposition
+  (`pool C H W`: the plan reason code plus both factor lists, 20 shapes) and
+  `ppu_recip_kernel_fp16` (19 kernel extents), over the new `pool` section of
+  `parity.py`; the six matmul dtypes still PASS. Board (cores 0-3, busy board
+  load ~9.5): `reduce_selftest` PASS for every family — pools 7x7/14x14/56x56/49x49/
+  17x13-fallback/1x1 (avg cosine 0.9999999, max/min exact), feature 4x32..512x1024
+  (max_rel 2.3e-7), cumsum 4x16..128x256 all four variants (bit-exact after the fp16
+  read-back), softmax/logsoftmax/CE at 4x8/64x1000/257x4096 **and 257x151936**
+  (softmax cosine 0.9999999, logsoftmax abs <= 7.8e-3, CE abs <= 4.2e-5; the LM-head
+  shape is 3.7 s softmax / 1.8 s CE). A C-vs-Rust A/B (`tools/c-oracle/ab_compare.py`
+  with `ab_board.c` built natively on the board) is **bit-identical for every family**,
+  including the average pools and softmax — both sides run the same program and the same
+  host glue, so even the reciprocal quantization cancels. `cargo test -p rocket-npu`
+  pins the factor/plan decisions, the cube round trip, the four cumsum references, the
+  softmax/logsoftmax/CE references, `scale_rows_ref`, the pool program word list
+  (including the MAX `0xFC00` pad fill) and the reciprocal convention.
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU softmax, and the other op
-  families: conv (2d/1d/transpose/depthwise), pool, norm/FFN/encoder, softmax/reduce,
-  resize/upsample, SAM/SigLIP, graph execution. (The tiled long-context attention path
-  *is* implemented — M5b above; the activation family is M6a.)
+  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU **attention** softmax, and the
+  other op families: the `rocket_pool.c` MaxPool/AveragePool API (only the PPU
+  global-pool decomposition is ported), conv (2d/1d/transpose/depthwise), the rest of
+  `rocket_norm.h` (RMSNorm/LayerNorm — M7), FFN/encoder, resize/upsample, SAM/SigLIP,
+  graph execution. (The tiled long-context attention path *is* implemented — M5b above;
+  the activation family is M6a and the reduce + softmax family is M6b.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -489,12 +540,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters and `activation` (the LUT flying-mode program)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program) and `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale; RMSNorm/LayerNorm are M7)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype), the `parity.py` dtype parity harness, and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference) |
+| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal), the `parity.py` dtype+pool parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax raw-file A/B), and `build.sh` for the oracle itself |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1113,9 +1164,12 @@ cargo check -p burn-rocket --no-default-features
 cargo check -p burn-rocket --no-default-features --features flex
 # driver unit tests (planner, capacity classes, emitters, layout)
 cargo test -p rocket-npu
-# dtype parity vs the C oracle: plan + every regcmd word, all six dtypes
+# dtype parity vs the C oracle: plan + every regcmd word, all six dtypes, plus the
+# PPU pool section (20 decomposition plans + 19 reciprocals + 18 pool programs)
 cargo build -p rocket-npu --bin regcmd_dump
 python3 tools/c-oracle/parity.py
+# ... or just the pool half:
+python3 tools/c-oracle/parity.py --kind pool
 # activation/elementwise: LUT + epilogue and program byte-parity vs the C builder
 # (a throwaway C dumper in /tmp links build-host/librocketnpu.a and prints
 # `rocket_lut_epilogue_build` for kinds 0..=18 plus `gen_lut_activation_fp16` for a
@@ -1127,6 +1181,25 @@ diff /tmp/opencode/c-gen.txt /tmp/opencode/rust-gen.txt     # BYTE-IDENTICAL (10
 # clippy must be clean on both targets (the driver has aarch64-only device paths)
 cargo clippy -p rocket-npu --all-targets -- -D warnings
 cargo clippy -p rocket-npu --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
+# reduce + softmax on the board (cores 0-3): pools, feature reduce, cumsum and the
+# softmax family vs the fp64 references; the wide LM-head shape runs only with headroom
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin reduce_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/reduce_selftest \
+    root@rock-5b-plus.lan:/root/rocket-m6b/
+taskset -c 0-3 ./reduce_selftest --all --reps 2
+taskset -c 0-3 ./reduce_selftest --pool --shape 5 17 13      # the host-fallback shape
+# C-vs-Rust A/B for the same families: ab_board.c links librocketnpu natively on the
+# board (a cross-built C binary reads an empty driver name and cannot open the device),
+# and both sides consume the same raw files via `reduce_selftest --io`.
+#   scp ref-src.tgz (include src cmake graph tests CMakeLists.txt) + ab_board.c + ab_compare.py
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m6b && tar xzf ref-src.tgz -C ref &&
+  cmake -S ref -B ref/build -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build ref/build --target rocketnpu -j4 &&
+  gcc -O2 -I ref/include -I ref ab_board.c ref/build/librocketnpu.a -lm -lpthread -o ab_board'
+taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --c ./ab_board
+# the C library's own gates on the same board (they must PASS for the A/B to mean anything)
+cmake --build ref/build --target reduce_mean_rocket softmax_rocket -j4
+taskset -c 0-3 ref/build/reduce_mean_rocket && taskset -c 0-3 ref/build/softmax_rocket
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench

@@ -9,6 +9,13 @@ their stdout is compared byte for byte:
   plan  -> "Mt Kt Nt jobs", or "-1"
   emit  -> task_count, then one %016llx word per NPUOP (at the planned tile dims)
 
+A final `pool` section covers the spatial-reduce machinery: the decomposition
+(`pool C H W`: the `rocket_global_avgpool_plan` reason code and the per-axis
+`rocket_reduce_factor_axis` factors) over a shape matrix, the PPU pool generator
+(`emit-pool`, a pure function of `pool_params_t`) over a shape/method/pad/stride
+matrix, and the fp16 average-pool reciprocal (`recip`,
+`ppu_recip_kernel_fp16`) for every kernel extent.
+
 Dtypes whose Rust planner/emitter is not ported yet report a visible PENDING
 line instead of failing. Any mismatch exits nonzero and prints the first
 differing line with both values.
@@ -17,12 +24,15 @@ Usage:
   python3 tools/c-oracle/parity.py
   python3 tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
   python3 tools/c-oracle/parity.py --kind fp16,int8
+  python3 tools/c-oracle/parity.py --kind pool
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -87,6 +97,83 @@ INVALID_SHAPES: tuple[tuple[int, int, int], ...] = (
     (4, 64, 8),    # N % 16
     (0, 64, 16),   # non-positive
 )
+
+
+# ── PPU pool matrix ───────────────────────────────────────────────────────────
+#
+# (name, c, ih, iw, oh, ow, kh, kw, sy, sx, pt, pl, pb, pr, method, expect_ok)
+#
+# The geometry follows the reduce decomposition: exact tiling (stride == kernel,
+# no pad) for every pass of a global pool, plus the padded/overlapping shapes the
+# generator must also encode. `expect_ok=False` pins an identical refusal.
+POOL_CASES: tuple[tuple, ...] = (
+    # Global-pool passes: 7x7 (one pass), 14x14 (one pass), 56x56 = 14 then 4,
+    # 49x49 = 7 then 7, and the asymmetric 28x20 = (14x10) then (2x2).
+    ("7x7",     8,  7,  7, 1,  1,  7,  7,  7,  7, 0, 0, 0, 0, "avg", True),
+    ("14x14",  16, 14, 14, 1,  1, 14, 14, 14, 14, 0, 0, 0, 0, "avg", True),
+    ("56x56/1", 3, 56, 56, 4,  4, 14, 14, 14, 14, 0, 0, 0, 0, "avg", True),
+    ("56x56/2", 3,  4,  4, 1,  1,  4,  4,  4,  4, 0, 0, 0, 0, "avg", True),
+    ("49x49/1", 4, 49, 49, 7,  7,  7,  7,  7,  7, 0, 0, 0, 0, "avg", True),
+    ("49x49/2", 4,  7,  7, 1,  1,  7,  7,  7,  7, 0, 0, 0, 0, "avg", True),
+    ("28x20/1", 16, 28, 20, 2, 2, 14, 10, 14, 10, 0, 0, 0, 0, "avg", True),
+    ("28x20/2", 16,  2,  2, 1, 1,  2,  2,  2,  2, 0, 0, 0, 0, "avg", True),
+    # Extrema: idempotent, so no reciprocal; padded MAX fills -inf, MIN fills 0.
+    ("max pad", 8,  5,  5, 3,  3,  3,  3,  3,  3, 1, 1, 1, 1, "max", True),
+    ("min pad", 8,  5,  5, 3,  3,  3,  3,  3,  3, 1, 1, 1, 1, "min", True),
+    ("max",     4, 49, 49, 7,  7,  7,  7,  7,  7, 0, 0, 0, 0, "max", True),
+    ("min",    64, 14, 14, 1,  1, 14, 14, 14, 14, 0, 0, 0, 0, "min", True),
+    # A padded, overlapping average (stride 1, kernel 3, symmetric pad 1).
+    ("avg pad", 8,  5,  5, 5,  5,  3,  3,  1,  1, 1, 1, 1, 1, "avg", True),
+    # Last encodable cube channel (field = 8191) and a 13-bit width.
+    ("field max", 8192, 4, 8192, 1, 1024, 4, 8, 4, 8, 0, 0, 0, 0, "avg", True),
+    # Kernel 1: legal for the generator (avg would need an infinite reciprocal).
+    ("k1 max",  2,  4,  4, 4,  4,  1,  1,  1,  1, 0, 0, 0, 0, "max", True),
+    # Refusals: 4-bit kernel field, 13-bit channel field, zero extent.
+    ("kw17",    8,  4,  4, 2,  2,  2, 17,  2,  2, 0, 0, 0, 0, "avg", False),
+    ("c8193", 8193, 4,  4, 2,  2,  2,  2,  2,  2, 0, 0, 0, 0, "avg", False),
+    ("iw0",     8,  4,  0, 2,  2,  2,  2,  2,  2, 0, 0, 0, 0, "avg", False),
+)
+
+POOL_METHODS = {"avg": 0, "max": 1, "min": 2}
+
+# (C, H, W) for the decomposition (`pool C H W`): the plan reason code plus the per-axis
+# factor lists. Covers every branch of `rocket_global_avgpool_plan` — square, equal-count
+# rectangle, unequal count (-6), not 16-smooth on H (-4) and on W (-5), the 1x1 identity,
+# the dim bound (-3), the channel-field bound (-5) and a non-positive dim (-1).
+POOL_PLAN_SHAPES: tuple[tuple[int, int, int], ...] = (
+    (8, 7, 7),
+    (8, 14, 14),
+    (64, 28, 28),
+    (16, 28, 20),
+    (8, 16, 8),
+    (16, 56, 8),
+    (512, 7, 7),
+    (130, 7, 7),
+    (12, 98, 98),
+    (4, 224, 224),
+    (8, 17, 17),
+    (12, 19, 19),
+    (8, 7, 19),
+    (8, 1, 1),
+    (1, 4096, 4096),
+    (8, 8192, 8192),
+    (8, 8193, 8),
+    (8192, 8, 8),
+    (8193, 8, 8),
+    (0, 8, 8),
+)
+
+
+def fp16_bits(value: float) -> int:
+    """The fp16 bit pattern of `value` (RNE), as the C `_Float16` cast."""
+    return int.from_bytes(struct.pack("<e", value), "little")
+
+
+def pool_recip(kh: int, kw: int) -> int:
+    """The reduce `recip_pair` convention: exact per-axis, sqrt split when asymmetric."""
+    if kh == kw:
+        return fp16_bits(65536.0 / kh)
+    return fp16_bits(65536.0 / math.sqrt(kh * kw))
 
 
 def round_up(value: int, align: int) -> int:
@@ -325,6 +412,70 @@ def check_dtype(
     return status, plan_checks, len(emit_programs)
 
 
+def check_pool(
+    oracle: Path,
+    dump: Path,
+    failures: list[Failure],
+    verbose: bool,
+) -> tuple[int, int]:
+    """Returns (recip checks, plan checks, program checks) over the pool matrix."""
+    kind = Dtype("pool", "recip", "emit-pool", n_align=1, k_align=1)
+    recip_checks = 0
+    for k in list(range(1, 17)) + [32, 100, 1000]:
+        args = ["recip", str(k)]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        recip_checks += 1
+        ok = compare(failures, kind, " ".join(args), c_proc, r_proc)
+        if verbose and ok:
+            print(f"  {' '.join(args):<24} -> {c_proc.stdout.strip()}")
+
+    plan_checks = 0
+    for (c, h, w) in POOL_PLAN_SHAPES:
+        args = ["pool", str(c), str(h), str(w)]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        plan_checks += 1
+        if compare(failures, kind, " ".join(args), c_proc, r_proc) and verbose:
+            print(f"  {' '.join(args):<24} -> {c_proc.stdout.split()!r}")
+
+    prog_checks = 0
+    for (name, c, ih, iw, oh, ow, kh, kw, sy, sx, pt, pl, pb, pr, method,
+         expect_ok) in POOL_CASES:
+        rw = rh = 0
+        if method == "avg" and kh >= 2 and kw >= 2:
+            r = pool_recip(kh, kw)
+            rw = rh = r
+        args = [
+            "emit-pool",
+            str(c), str(ih), str(iw), str(oh), str(ow),
+            str(kh), str(kw), str(sy), str(sx),
+            str(pt), str(pl), str(pb), str(pr),
+            str(POOL_METHODS[method]), str(rw), str(rh), IN_DMA, OUT_DMA,
+        ]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        prog_checks += 1
+        ok = compare(failures, kind, f"{name}: {' '.join(args[1:])}", c_proc, r_proc)
+        if not ok:
+            continue
+        refused = c_proc.stdout.strip() == "-1"
+        if refused == expect_ok:
+            failures.append(
+                Failure(
+                    kind.name,
+                    name,
+                    f"expected {'a program' if expect_ok else 'a refusal'}, "
+                    f"got {c_proc.stdout.strip()!r}",
+                )
+            )
+        elif verbose:
+            words = c_proc.stdout.splitlines()
+            what = "refused" if refused else f"{words[0]} words"
+            print(f"  {name:<10} {' '.join(args[1:])[:60]:<60} -> {what}")
+    return recip_checks, plan_checks, prog_checks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare the Rust rocket-npu planner/emitters against the C oracle.",
@@ -355,7 +506,7 @@ def main() -> int:
         wanted: list[str] = []
         for chunk in args.kind:
             wanted.extend(part.strip() for part in chunk.split(",") if part.strip())
-        known = {d.name for d in DTYPES}
+        known = {d.name for d in DTYPES} | {"pool"}
         unknown = [k for k in wanted if k not in known]
         if unknown:
             print(f"error: unknown --kind {', '.join(unknown)}; known: {', '.join(sorted(known))}",
@@ -365,8 +516,10 @@ def main() -> int:
             print("error: --kind selected no dtypes", file=sys.stderr)
             return 2
         selected = tuple(d for d in DTYPES if d.name in wanted)
+        pool_selected = "pool" in wanted
     else:
         selected = DTYPES
+        pool_selected = True
 
     print(f"oracle: {oracle}")
     print(f"dump:   {dump}")
@@ -378,13 +531,25 @@ def main() -> int:
         status, plan_checks, emit_checks = check_dtype(dtype, oracle, dump, failures, args.verbose)
         results.append((dtype, status, plan_checks, emit_checks))
 
+    pool_counts: tuple[int, int, int] | None = None
+    if pool_selected:
+        pool_counts = check_pool(oracle, dump, failures, args.verbose)
+
     print()
-    width = max(len(d.name) for d in selected)
+    names = [len(d.name) for d in selected]
+    if pool_counts is not None:
+        names.append(len("pool"))
+    width = max(names)
     for dtype, status, plan_checks, emit_checks in results:
         if status == "pending":
             continue
         counts = f"plan {plan_checks}, emit {emit_checks}"
         print(f"{dtype.name:<{width}}  {status.upper():<5}  {counts}")
+    if pool_counts is not None:
+        recip_checks, plan_checks, prog_checks = pool_counts
+        status = "fail" if any(f.dtype == "pool" for f in failures) else "pass"
+        print(f"{'pool':<{width}}  {status.upper():<5}  "
+              f"recip {recip_checks}, plan {plan_checks}, program {prog_checks}")
 
     if failures:
         print()
@@ -399,7 +564,13 @@ def main() -> int:
     passed = sum(1 for _, status, _, _ in results if status == "pass")
     pending = sum(1 for _, status, _, _ in results if status == "pending")
     print()
-    print(f"{len(results)} dtype(s): {passed} pass, {pending} pending, 0 fail")
+    if results:
+        print(f"{len(results)} dtype(s): {passed} pass, {pending} pending, 0 fail")
+    if pool_counts is not None:
+        print(
+            f"pool: {pool_counts[0]} reciprocal(s) + {pool_counts[1]} plan(s) + "
+            f"{pool_counts[2]} program(s) compared, all byte-identical"
+        )
     print("RESULT: PASS")
     return 0
 

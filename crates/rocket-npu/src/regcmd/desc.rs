@@ -32,6 +32,10 @@ pub const CNA: u64 = 0x0201;
 pub const CORE: u64 = 0x0801;
 pub const DPU: u64 = 0x1001;
 pub const DPU_RDMA: u64 = 0x2001;
+/// The pooling engine (`BLOCK_PPU | PC_OP_01` = `0x4000 | 0x01`).
+pub const PPU: u64 = 0x4001;
+/// The pooling engine's read-DMA (`BLOCK_PPU_RDMA | PC_OP_01` = `0x8000 | 0x01`).
+pub const PPU_RDMA: u64 = 0x8001;
 pub const OP_40: u64 = 0x0041;
 pub const OP_ENABLE: u64 = 0x0081;
 
@@ -159,6 +163,50 @@ pub const DPU_RDMA_SURF_NOTCH: u32 = 0x504C;
 pub const DPU_RDMA_PAD_CFG: u32 = 0x5064;
 pub const DPU_RDMA_WEIGHT: u32 = 0x5068;
 pub const DPU_RDMA_EW_SURF_NOTCH: u32 = 0x506C;
+
+// ── PPU (the pooling engine) ──────────────────────────────────────────────────
+//
+// The PPU is the NPU's pooling block (the NVDLA PDP analog), page 0x6000; it reads
+// its input cube through its own read-DMA on page 0x7000. It has kernel/stride/
+// padding + an average-pool reciprocal but no reshape/transpose register (there is
+// no Rubin/NVDLA-RUBIK block on the RK3588), so it cannot de-tile to row-major.
+pub const PPU_S_POINTER: u32 = 0x6004;
+pub const PPU_OPERATION_ENABLE: u32 = 0x6008;
+pub const PPU_DATA_CUBE_IN_WIDTH: u32 = 0x600C;
+pub const PPU_DATA_CUBE_IN_HEIGHT: u32 = 0x6010;
+pub const PPU_DATA_CUBE_IN_CHANNEL: u32 = 0x6014;
+pub const PPU_DATA_CUBE_OUT_WIDTH: u32 = 0x6018;
+pub const PPU_DATA_CUBE_OUT_HEIGHT: u32 = 0x601C;
+pub const PPU_DATA_CUBE_OUT_CHANNEL: u32 = 0x6020;
+pub const PPU_OPERATION_MODE_CFG: u32 = 0x6024;
+pub const PPU_POOLING_KERNEL_CFG: u32 = 0x6034;
+pub const PPU_RECIP_KERNEL_WIDTH: u32 = 0x6038;
+pub const PPU_RECIP_KERNEL_HEIGHT: u32 = 0x603C;
+pub const PPU_POOLING_PADDING_CFG: u32 = 0x6040;
+pub const PPU_PADDING_VALUE_1_CFG: u32 = 0x6044;
+pub const PPU_PADDING_VALUE_2_CFG: u32 = 0x6048;
+pub const PPU_DST_BASE_ADDR: u32 = 0x6070;
+pub const PPU_DST_SURF_STRIDE: u32 = 0x607C;
+pub const PPU_DATA_FORMAT: u32 = 0x6084;
+pub const PPU_MISC_CTRL: u32 = 0x60DC;
+
+pub const PPU_RDMA_S_POINTER: u32 = 0x7004;
+pub const PPU_RDMA_OPERATION_ENABLE: u32 = 0x7008;
+pub const PPU_RDMA_CUBE_IN_WIDTH: u32 = 0x700C;
+pub const PPU_RDMA_CUBE_IN_HEIGHT: u32 = 0x7010;
+pub const PPU_RDMA_CUBE_IN_CHANNEL: u32 = 0x7014;
+pub const PPU_RDMA_SRC_BASE_ADDR: u32 = 0x701C;
+pub const PPU_RDMA_SRC_LINE_STRIDE: u32 = 0x7024;
+pub const PPU_RDMA_SRC_SURF_STRIDE: u32 = 0x7028;
+pub const PPU_RDMA_DATA_FORMAT: u32 = 0x7030;
+
+/// `PC_OPERATION_ENABLE` mask that brings PPU + PPU_RDMA into `op_en`
+/// (`PPU_OP_EN` bit 5 | `PPU_RDMA_OP_EN` bit 6 — the global participation mask).
+pub const PC_ENABLE_PPU_PPU_RDMA: u32 = 0x60;
+/// `PPU_OPERATION_MODE_CFG.FLYING_MODE` (bit 4): standalone RDMA-fed, no DPU flyin.
+pub const PPU_FLYING_MODE: u32 = 1 << 4;
+/// The fp16 `-inf` pad fill (`PPU_PADDING_VALUE_1_CFG`) so a padded cell never wins a max.
+pub const PPU_PAD_VALUE_NEG_INF: u32 = 0x0000_FC00;
 
 // ── Field builders ─────────────────────────────────────────────────────────────
 pub const fn rdma_fmc_burst_len(x: u32) -> u32 {

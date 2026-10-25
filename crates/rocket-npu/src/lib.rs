@@ -16,7 +16,9 @@
 //! - [`attn`] — flash attention on top of the matmul engine.
 //! - [`ops`] — the elementwise families: the DPU LUT activation block, the
 //!   conv-main EW binary ops and the composites on top of them (clip, PReLU,
-//!   LeakyReLU/ELU/SELU, divide).
+//!   LeakyReLU/ELU/SELU, divide); the PPU spatial pools with the telescoping
+//!   global-mean decomposition, the matmul-backed feature reduce and cumsum;
+//!   row softmax / log-softmax / cross-entropy; the per-row broadcast scale.
 //! - [`knobs`], [`hw`], [`error`] — diagnostics, the RK3588 profile, typed failures.
 //!
 //! The crate is inference-only and targets the RK3588 only. Failure payloads carry
@@ -90,6 +92,22 @@
 //!   EW multiply, `ROCKET_ACT_WIDE_LUT` for the single-pass table); the register
 //!   program ([`regcmd::activation`]) is word-for-word the C generator's 1070-word
 //!   flying-mode DPU/DPU_RDMA layout;
+//! - the reduce + softmax family ([`ops::reduce`], [`ops::softmax`],
+//!   [`ops::norm`], the ports of `rocket_reduce.c`, `rocket_softmax.c` and
+//!   `rocket_scale_rows_fp16`): the PPU global average/max/min pools
+//!   ([`ops::reduce::global_avgpool`] and friends) with the 16-smooth /
+//!   equal-factor-count decomposition ([`ops::reduce::reduce_factor_axis`],
+//!   [`ops::reduce::global_avgpool_plan`]), smallest-first factors, the
+//!   ping-pong NC1HWC2 cube passes, the per-axis fp16 reciprocals
+//!   ([`crate::regcmd::pool::ppu_recip_kernel_fp16`] with the asymmetric sqrt
+//!   split) and the exact host fallback; the feature-axis ones-matmul reduce
+//!   ([`ops::reduce::reduce_feature`], fp32 out with f64 host K-accumulation);
+//!   the triangular-ones [`ops::reduce::cumsum`]; row
+//!   [`ops::softmax::softmax`] / [`ops::softmax::logsoftmax`] /
+//!   [`ops::softmax::cross_entropy`] (host row-max and `1/s`/`log`/gather, EXP
+//!   LUT + feature reduce + per-row scale on the device) and
+//!   [`ops::norm::scale_rows`]; the PPU program ([`regcmd::pool::gen_pool_fp16`],
+//!   word-for-word the C generator) and every host reference (`*_ref`);
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
@@ -115,9 +133,9 @@
 //!   streaming forms);
 //! - a resident bf16 weight (the C library has none either);
 //! - the `*_ref_fp16` host references of the remaining non-matmul op families (matmul,
-//!   attention and activation/elementwise are ported), the `_planes` and
-//!   transposed-output variants, and the RK3576-specific entries (including
-//!   `rocket_act_int8_rk3576`);
+//!   attention, activation/elementwise and reduce/softmax/norm-scale are ported), the
+//!   `_planes` and transposed-output variants, and the RK3576-specific entries
+//!   (including `rocket_act_int8_rk3576`);
 //! - the non-fp16 batch wrappers (`rocket_mm_batch_*` for int8/int4);
 //! - chaining outside the fp16 CPU-accumulation and batched paths: the KACC submit loop
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
@@ -129,9 +147,11 @@
 //!   sequential across tiles);
 //! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
 //!   the head dim (`mha_self` is the only user) stays on the materialized path;
-//! - every remaining op family: conv (2d/1d/transpose/depthwise), pool,
-//!   norm/FFN/encoder, softmax and reduce, resize/upsample, SAM/SigLIP and graph
-//!   execution. The activation + elementwise family is implemented above.
+//! - every remaining op family: the `rocket_pool.c` MaxPool/AveragePool API (only the
+//!   PPU global-pool decomposition is ported here), conv (2d/1d/transpose/depthwise),
+//!   the rest of `rocket_norm.h` (RMSNorm and LayerNorm — M7), FFN/encoder,
+//!   resize/upsample, SAM/SigLIP and graph execution. The activation + elementwise and
+//!   the reduce + softmax families are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.

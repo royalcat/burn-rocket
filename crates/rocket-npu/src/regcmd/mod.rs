@@ -10,4 +10,5 @@ pub mod desc;
 pub mod fp16;
 pub mod int4;
 pub mod int8;
+pub mod pool;
 pub mod tf32;

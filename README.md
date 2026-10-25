@@ -151,15 +151,21 @@ dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weight
 dense and group-wise int4 (one-shot with the C's int16-saturation `kt_cap`, plus the
 resident `I4Context` in both modes and its planner), `int16_exact`, the native bf16
 stream, the tf32 one-shot (raw-f32 operands; the MAC truncates to a 10-bit mantissa,
-fp32 out with f64 host K-accumulation), masked GQA attention and the activation +
+fp32 out with f64 host K-accumulation), masked GQA attention, the activation +
 elementwise family (`rocket_activation.c`: every `ROCKET_ACTIVATION_*` kind, the
 parametric LeakyReLU/ELU/SELU/PReLU, the conv-main EW mul/add/sub/max/min, clip and
-divide) are ported and validated on the board. Planner and regcmd output are
-byte-equal to the C library for every matmul dtype (fp16/int8/int8-group-wise/int4/
-tf32/bf16) and for the activation program (1070 words, word-for-word); the LUT tables
-and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
->= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against the
-int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
+divide) and the reduce + softmax family (`rocket_reduce.c`, `rocket_softmax.c` and
+`rocket_scale_rows_fp16`: the PPU global average/max/min pools with the telescoping
+decomposition, the feature-axis ones-matmul reduce, the triangular-ones cumsum, row
+softmax/log-softmax/cross-entropy and the per-row broadcast scale) are ported and
+validated on the board. Planner and regcmd output are byte-equal to the C library for
+every matmul dtype (fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation
+program (1070 words, word-for-word) and for the PPU pool program (30 words, over an
+18-case shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the
+plan reason code and both factor lists) and the fp16 average-reciprocal convention;
+the LUT tables and epilogue constants are byte-identical to the C builder. fp16/bf16
+cosine >= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
+the int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
 
 The activation/elementwise device output is **bit-identical to the C library on the
 board for all 19 activation kinds and the six EW ops** (same table, same program, same
@@ -168,6 +174,18 @@ BO layout); the EW add/mul/sub/max/min are exact against the host arithmetic, an
 unsigned table clamp, OUT_CVT decode) tracks the device to within a fraction of an
 fp16 ULP. Qwen3 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16
 microbenchmarks are at or above the C library's speed.
+
+The reduce/softmax device output is **bit-identical to the C library on the board for
+every family** (`tools/c-oracle/ab_compare.py`: average/max/min pools including the
+host-fallback shape, the feature reduce in sum and mean modes, all four cumsum
+variants, softmax/log-softmax/cross-entropy up to 257x1000 and the per-row scale) —
+both sides run the same program and the same host glue, so even the fp16 reciprocal
+quantization cancels. Against the device-free fp64 references: max/min pools are
+exact, the feature reduce is within 2.3e-7 relative (fp32 accumulator), cumsum is
+bit-exact after its fp16 read-back, softmax sits at cosine 0.99999992, log-softmax's
+absolute error is <= 7.8e-3 and cross-entropy's <= 4.2e-5. Board wall for the families
+at 257 rows: a 4096-wide softmax 97 ms, the 151936-wide LM-head softmax 3.4 s, the
+same log-softmax 3.7 s and cross-entropy 1.8 s (busy board, load ~8.4).
 
 Attention also has its long-context form, the opt-in tiled path
 (`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
@@ -188,7 +206,11 @@ and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Conte
 both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
 the tf32 one-shot and its planner, the activation + elementwise family (all 19
 `ROCKET_ACTIVATION_*` kinds, LeakyReLU/ELU/SELU/PReLU, EW mul/add/sub/max/min, clip,
-divide, the LUT builder and the `*_ref` host references), masked GQA attention (the persistent
+divide, the LUT builder and the `*_ref` host references), the reduce + softmax family
+(the PPU global average/max/min pools with `global_avgpool_plan`/`reduce_factor_axis`
+and the exact host fallback, the feature-axis ones-matmul reduce, cumsum, row
+softmax/log-softmax/cross-entropy and the per-row scale, each with its `*_ref`), and
+masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
 the tiled long-context path (`ROCKET_FA_TILE_KV`: online softmax over key tiles, no
@@ -199,7 +221,10 @@ opt-in chained layout), and the dtype parity harness (`tools/c-oracle` + `parity
 The activation family's own self-test (`crates/rocket-npu/src/bin/activation_selftest.rs`)
 runs every kind and EW op on the board against that model, and its `--dump-lut` /
 `--dump-gen` modes reproduce the C `rocket_lut_epilogue_build` dump and the generated
-program byte for byte.
+program byte for byte. `crates/rocket-npu/src/bin/reduce_selftest.rs` does the same for
+this milestone's families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape`,
+`--reps`), and its `--io` raw-file mode is the exchange format of
+`tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board.
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
@@ -214,11 +239,12 @@ remaining non-matmul families, the
 `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stays
-materialized), on-NPU
-softmax, and the remaining op families (conv 2d/1d/transpose, pool,
-norm/FFN/encoder, softmax/reduce, resize/upsample, SAM/SigLIP, graph execution).
-The activation + elementwise family is implemented. See the `rocket-npu` crate docs
-for the full list.
+materialized), on-NPU **attention** softmax, and the remaining op families: the
+`rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool decomposition is
+ported), conv (2d/1d/transpose/depthwise), the rest of `rocket_norm.h` (RMSNorm,
+LayerNorm — M7), FFN/encoder, resize/upsample, SAM/SigLIP and graph execution.
+The activation + elementwise and the reduce + softmax families are implemented. See
+the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and
