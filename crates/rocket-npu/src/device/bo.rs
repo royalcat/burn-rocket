@@ -120,6 +120,23 @@ impl Bo {
         self.handle
     }
 
+    /// Ensure the object holds at least `need` bytes, reallocating into the low 4 GiB
+    /// when it does not (C `rocket_bo_ensure32`).
+    ///
+    /// `Ok(false)` — the object already held `need` bytes and is returned untouched, its
+    /// contents and zero padding intact. `Ok(true)` — it was replaced by a fresh
+    /// low-IOVA object of exactly `need` bytes, so the previous contents (including any
+    /// zero padding the caller relied on) are gone.
+    pub fn ensure32(&mut self, need: usize) -> Result<bool> {
+        if self.size >= need {
+            return Ok(false);
+        }
+        // Grow: the replacement is allocated first, then the old object is dropped
+        // (munmap + GEM_CLOSE), so a failed allocation leaves `self` intact.
+        *self = Bo::new_32(&self.dev, need)?;
+        Ok(true)
+    }
+
     /// The owning device (cloned handle) for submits issued while borrowing this BO.
     pub(crate) fn device(&self) -> super::Device {
         super::Device {

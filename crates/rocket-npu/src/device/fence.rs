@@ -13,6 +13,10 @@ static WAITS: AtomicU64 = AtomicU64::new(0);
 static SLOW_WAITS: AtomicU64 = AtomicU64::new(0);
 static MAX_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Sentinel for "the busy-poll budget has not been resolved yet" (C's `-1`).
+const UNRESOLVED: u64 = u64::MAX;
+static BUSY_POLL_US: AtomicU64 = AtomicU64::new(UNRESOLVED);
+
 fn slow_mark_ms() -> u64 {
     static MARK: OnceLock<u64> = OnceLock::new();
     *MARK.get_or_init(|| {
@@ -62,14 +66,33 @@ pub fn reset_counters() {
 }
 
 /// `ROCKET_BUSY_POLL` in microseconds, resolved once, or 0 when off.
+///
+/// A caller may override it at any time with [`set_busy_poll_us`]; the sentinel says
+/// "not resolved yet", so the override works before or after the first read.
 pub(crate) fn busy_poll_us() -> u64 {
-    static US: OnceLock<u64> = OnceLock::new();
-    *US.get_or_init(|| {
-        crate::knobs::int("ROCKET_BUSY_POLL")
-            .filter(|v| *v > 0)
-            .map(|v| v as u64)
-            .unwrap_or(0)
-    })
+    let v = BUSY_POLL_US.load(Ordering::Relaxed);
+    if v != UNRESOLVED {
+        return v;
+    }
+    let resolved = crate::knobs::int("ROCKET_BUSY_POLL")
+        .filter(|v| *v > 0)
+        .map(|v| v as u64)
+        .unwrap_or(0);
+    match BUSY_POLL_US.compare_exchange(UNRESOLVED, resolved, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        Ok(_) => resolved,
+        // Another thread resolved it first (or a setter did); its value wins.
+        Err(v) => v,
+    }
+}
+
+/// Override the completion-wait spin budget (C `rocket_busy_poll_set_us`).
+///
+/// Negative values clamp to 0 (spin off). Takes effect immediately, whether or not
+/// `ROCKET_BUSY_POLL` was already resolved, and applies to every wait that starts
+/// afterwards.
+pub fn set_busy_poll_us(us: i64) {
+    BUSY_POLL_US.store(us.max(0) as u64, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -86,5 +109,18 @@ mod tests {
         assert_eq!(slow, 0);
         assert_eq!(max_us, 3);
         reset_counters();
+    }
+
+    #[test]
+    fn busy_poll_override() {
+        // Process-wide, so save and restore: other tests may rely on the env value.
+        let before = busy_poll_us();
+        set_busy_poll_us(-5);
+        assert_eq!(busy_poll_us(), 0, "negative clamps to off");
+        set_busy_poll_us(250);
+        assert_eq!(busy_poll_us(), 250, "the setter overrides a resolved value");
+        set_busy_poll_us(0);
+        assert_eq!(busy_poll_us(), 0);
+        set_busy_poll_us(before as i64);
     }
 }

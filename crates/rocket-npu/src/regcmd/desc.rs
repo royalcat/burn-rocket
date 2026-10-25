@@ -35,6 +35,15 @@ pub const DPU_RDMA: u64 = 0x2001;
 pub const OP_40: u64 = 0x0041;
 pub const OP_ENABLE: u64 = 0x0081;
 
+/// The C header's `OP_REG_PC`: a register write to the PC block. The block target and
+/// the opcode share the value `0x0101`, so this is [`PC`] under the C name.
+pub const OP_REG_PC: u64 = PC;
+/// The inert filler op. Every emitted program ends with the trailer
+/// `[OP_NONE, PC_REGISTER_AMOUNTS, OP_40, OP_ENABLE]`; the chained (batched-submit)
+/// layout repurposes this slot as a `PC_BASE_ADDRESS` write, which keeps the op count
+/// — and so the chained stride — unchanged.
+pub const OP_NONE: u64 = 0x0000;
+
 // ── PC ─────────────────────────────────────────────────────────────────────────
 pub const PC_OPERATION_ENABLE: u32 = 0x0008;
 pub const PC_BASE_ADDRESS: u32 = 0x0010;
@@ -212,5 +221,14 @@ mod tests {
     fn fetches_are_constant_builders() {
         assert_eq!(rdma_fmc_burst_len(15), 0xF << 11);
         assert_eq!(rdma_fmc_comb_use(5), 5 << 8);
+    }
+
+    #[test]
+    fn chain_opcodes() {
+        // The C header's OP_REG_PC is the PC block target under its opcode name, and
+        // OP_NONE is the all-zero word the emitter puts in the trailer's filler slot.
+        assert_eq!(OP_REG_PC, PC);
+        assert_eq!(OP_NONE, 0);
+        assert_eq!(NpuOp(OP_NONE).target(), OP_NONE);
     }
 }

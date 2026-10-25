@@ -19,12 +19,13 @@ pub mod uapi;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::log::log_debug;
 
 pub use bo::{Bo, BoRange, MemRef};
+pub use submit::Job;
 pub use uapi::Handle;
 
 /// Device permissions and driver capabilities, resolved at open time.
@@ -175,6 +176,94 @@ impl Device {
         submit::submit(&self.inner, tasks, in_handles, out_handles, flags)
     }
 
+    /// One job carrying `tasks`, with no `DRM_ROCKET_JOB_*` flags — the named alias of
+    /// [`Device::submit`] (C `rocket_submit_tasks`).
+    pub fn submit_tasks(
+        &self,
+        tasks: &[uapi::DrmRocketTask],
+        in_handles: &[Handle],
+        out_handles: &[Handle],
+    ) -> Result<()> {
+        submit::submit_tasks(&self.inner, tasks, in_handles, out_handles)
+    }
+
+    /// As [`Device::submit_tasks`], but copying the descriptors into a caller-owned
+    /// `scratch` buffer first (C `rocket_submit_tasks_pre`). Rust's slice-based submit
+    /// already builds the descriptor array on the stack, so this form exists for API
+    /// parity rather than for speed.
+    pub fn submit_tasks_pre(
+        &self,
+        scratch: &mut Vec<uapi::DrmRocketTask>,
+        tasks: &[uapi::DrmRocketTask],
+        in_handles: &[Handle],
+        out_handles: &[Handle],
+        flags: u32,
+    ) -> Result<()> {
+        submit::submit_tasks_pre(&self.inner, scratch, tasks, in_handles, out_handles, flags)
+    }
+
+    /// Submit one job per element of `jobs` in a single ioctl (C `rocket_submit_jobs`).
+    ///
+    /// A job's tasks run sequentially on one NPU core; several jobs in one submit are
+    /// scheduled across the three cores, so real concurrency needs each job to write a
+    /// separate output BO (a shared output BO serialises on the write-after-write
+    /// dependency). Waits are per output BO, as with any other async submit.
+    pub fn submit_jobs(&self, jobs: &[Job<'_>]) -> Result<()> {
+        submit::submit_jobs(&self.inner, jobs)
+    }
+
+    /// Whether the running kernel honors `DRM_ROCKET_JOB_BATCHED`
+    /// (C `rocket_batched_submit_supported`).
+    pub fn batched_submit_supported(&self) -> bool {
+        self.inner.caps.batched
+    }
+
+    /// Whether chained submit is this provider's *native* mode
+    /// (C `rocket_batched_submit_native`).
+    ///
+    /// Always false here: the stock driver runs a job's tasks one per IRQ, so the
+    /// contiguous self-chained layout stays an opt-in extension
+    /// (`ROCKET_BATCH_SUBMIT=1`, see `matmul::chain`).
+    pub fn batched_submit_native(&self) -> bool {
+        false
+    }
+
+    /// Whether one submit is one job, i.e. the kernel keeps a core on a job's whole task
+    /// sequence (C `rocket_submit_batch_atomic`).
+    ///
+    /// Structural on this driver, not versioned: `core->in_flight_job` is held across the
+    /// tasks and the done fence is only signalled once the last task retires, so CBUF
+    /// operand reuse holds across a batch without the caller doing anything.
+    pub fn submit_batch_atomic(&self) -> bool {
+        true
+    }
+
+    /// Whether a batched job's completion wait is armed on the task counter rather than
+    /// on a per-task `PC_DONE` deadline (interface 1.4+, C
+    /// `rocket_batch_completion_tracked`).
+    pub fn batch_completion_tracked(&self) -> bool {
+        self.inner.caps.batch_completion_tracked
+    }
+
+    /// Whether `DRM_ROCKET_JOB_NO_DPU_DONE` may be sent (RK3576 only; false here,
+    /// C `rocket_no_dpu_done_supported`). The submit ioctl rejects unknown flags, so
+    /// this is a safety gate, not advice.
+    pub fn no_dpu_done_supported(&self) -> bool {
+        self.inner.caps.no_dpu_done
+    }
+
+    /// Whether `DRM_ROCKET_JOB_PPU_DONE` may be sent (interface 1.3+,
+    /// C `rocket_ppu_done_supported`).
+    pub fn ppu_done_supported(&self) -> bool {
+        self.inner.caps.ppu_done
+    }
+
+    /// Whether the ranged cache-maintenance ioctls exist (interface 1.5+,
+    /// C `rocket_bo_ranges_supported`).
+    pub fn bo_ranges_supported(&self) -> bool {
+        self.inner.caps.ranges
+    }
+
     #[allow(dead_code)] // used by the matmul context
     pub(crate) fn inner(&self) -> &Arc<DeviceInner> {
         &self.inner
@@ -182,12 +271,52 @@ impl Device {
 }
 
 fn batched_supported(version: Version) -> bool {
-    if let Ok(s) = std::fs::read_to_string("/sys/module/rocket/parameters/rocket_batch_submit") {
-        // The parameter exists only on a kernel carrying the batched-submit patch;
-        // its value is the master switch.
-        return s.trim().parse::<i64>().map(|v| v != 0).unwrap_or(false);
+    match batch_submit_param() {
+        Some(v) => v,
+        // The parameter exists only on a kernel carrying the batched-submit patch; a
+        // kernel that implements the flag without the kill switch still reports >= 1.1.
+        None => version.at_least_minor(1),
     }
-    version.at_least_minor(1)
+}
+
+/// The kernel's `rocket_batch_submit` module parameter, if the patch is present.
+///
+/// Its mere existence proves `DRM_ROCKET_JOB_BATCHED` is understood; its value is the
+/// master switch (`0` forces every job down the per-task path, which is exactly the mix
+/// userspace must not self-chain into).
+fn batch_submit_param() -> Option<bool> {
+    let s = std::fs::read_to_string("/sys/module/rocket/parameters/rocket_batch_submit").ok()?;
+    Some(s.trim().parse::<i64>().map(|v| v != 0).unwrap_or(false))
+}
+
+/// Whether the running kernel honors `DRM_ROCKET_JOB_BATCHED`, probed without an open
+/// [`Device`] (C `rocket_batched_submit_supported`).
+///
+/// Reads `/sys/module/rocket/parameters/rocket_batch_submit` first and otherwise falls
+/// back to the advertised DRM interface version (`>= 1.1`), which needs a device node.
+/// Probed once and cached, like the C code, so it is safe to call from a hot path —
+/// `matmul::chain::enabled` does, because it must answer without a device.
+pub fn batched_submit_supported_global() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if let Some(forced) = batch_submit_param() {
+            if !forced {
+                log_debug!(
+                    "rocket_batch_submit=0: the kernel forces every job to the per-task \
+                     path, so chained submit stays off"
+                );
+            }
+            return forced;
+        }
+        probe_version().is_some_and(|v| v.at_least_minor(1))
+    })
+}
+
+/// The interface version the running kernel advertises, without keeping a [`Device`]
+/// open (C `rocket_iface_minor`). `None` when no `rocket` device can be opened.
+fn probe_version() -> Option<Version> {
+    static VERSION: OnceLock<Option<Version>> = OnceLock::new();
+    *VERSION.get_or_init(|| Device::open().ok().map(|d| d.caps().version))
 }
 
 /// `CLOCK_MONOTONIC` in nanoseconds.

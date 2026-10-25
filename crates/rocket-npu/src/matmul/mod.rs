@@ -2,6 +2,7 @@
 
 pub mod bf16;
 pub mod bos;
+pub(crate) mod chain;
 pub mod context;
 pub mod geom;
 pub mod int8;

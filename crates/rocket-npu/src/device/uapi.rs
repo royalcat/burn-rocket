@@ -119,7 +119,7 @@ pub struct DrmRocketCreateBo {
 
 /// `struct drm_rocket_task`.
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct DrmRocketTask {
     pub regcmd: u32,
     pub regcmd_count: u32,

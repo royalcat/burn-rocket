@@ -25,8 +25,16 @@
 //! function-for-function replacement of the full 367-entry API. Implemented:
 //!
 //! - device/uAPI: open/caps, BO allocation (32-bit IOVA checked), prep/fini
-//!   (whole-object and ranged), one-job submit, submit/fence counters, sysfs core
-//!   enumeration, big-core detection and worker pinning;
+//!   (whole-object and ranged), one-job and multi-job submit (`submit`,
+//!   `submit_tasks`, `submit_tasks_pre`, `submit_jobs`), the capability probes
+//!   (`batched_submit_supported`, `submit_batch_atomic`, `batch_completion_tracked`,
+//!   `no_dpu_done_supported`, `ppu_done_supported`, `bo_ranges_supported`, and the
+//!   device-less `batched_submit_supported_global`), `Bo::ensure32`, submit/fence
+//!   counters and the post-init `fence::set_busy_poll_us`, sysfs core enumeration,
+//!   big-core detection and worker pinning;
+//! - the contiguous self-chaining regcmd layout (`matmul::chain`, the port of
+//!   `rocket_chain.c`) as host-testable slice helpers: `enabled`, `words`,
+//!   `amount_encode`, `pack`, `pack_at`, `verify`;
 //! - fp16: one-shot, streaming, resident and segmented-resident matmul, canonical
 //!   and legacy tiling, KACC and CPU-accumulation, per-shape scratch cache;
 //! - int8: resident **group-wise** W8A8 only ([`matmul::I8Context`]);
@@ -49,10 +57,12 @@
 //!   stream exists, matching the C library);
 //! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
 //!   transposed-output variants, and the RK3576-specific entries;
-//! - batched/chained submit (`ROCKET_BATCH_SUBMIT`, `rocket_chain_*`), multi-job
-//!   submit, and the public `rocket_submit_*` convenience wrappers;
-//! - the `rocket_bo_ensure32`, `rocket_weights_bytes`/`rocket_i8_weights_bytes`,
-//!   `rocket_ctx_nthreads` and post-init `rocket_busy_poll_set_us` helpers;
+//! - the matmul batch wrappers (`rocket_matmul_fp16_batch`, `rocket_mm_batch_*`) and
+//!   the Context/attention paths that would *use* the chained layout — `matmul::chain`
+//!   provides the layout and the submit seam it needs, but no engine batches yet, so
+//!   `ROCKET_BATCH_SUBMIT` currently changes nothing;
+//! - the `rocket_weights_bytes`/`rocket_i8_weights_bytes` and `rocket_ctx_nthreads`
+//!   helpers;
 //! - the long-context tiled attention path (`ROCKET_FA_TILE_KV`), on-NPU softmax,
 //!   and chained per-head attention batching;
 //! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
