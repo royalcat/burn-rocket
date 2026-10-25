@@ -77,7 +77,11 @@
 //! - int16: [`matmul::one_shot_int16_exact`], the bit-exact `int16 x int16 -> int64`
 //!   decomposition into four int8 products (inputs clamped to `[-32768, 32639]`);
 //! - bf16: the native streaming path ([`matmul::Bf16Stream`]) plus the one-shot
-//!   `_bf16`/`_mt` wrappers over it;
+//!   `_bf16`/`_mt` wrappers over it, and the **resident weight** extension
+//!   ([`matmul::Bf16Context`] + [`matmul::Bf16Weight`], [`matmul::resident_plan`]):
+//!   the weight is packed once per `(K,N)` with the canonical (M-independent) tiling
+//!   and reused across `M`, where the C-shaped stream re-scatters it every call. The
+//!   C library has no resident bf16 variant, so this half is a Rust extension;
 //! - tf32: [`matmul::one_shot_tf32`] and its 4-byte planner ([`matmul::plan_tf32`]).
 //!   The caller feeds raw fp32 and the MAC truncates the mantissa to 10 bits (toward
 //!   zero, the C `tf32rt` rounding); the output
@@ -257,7 +261,6 @@
 //!
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
-//! - a resident bf16 weight (the C library has none either);
 //! - the `*_ref_fp16` host references of the remaining non-matmul op families (matmul,
 //!   attention, activation/elementwise, reduce/softmax/norm, the transformer and vision
 //!   norms, the FFN/MLP and the encoder block are ported), the
@@ -277,7 +280,11 @@
 //!   matmul directly, exactly as the C's `RESIDENT-FUSION NOTE` describes), the encoder
 //!   block, the fp16 and int8 convolution families (direct/depthwise/1D, the
 //!   conv→activation fusion, the transposed conv and the int8 requant), the PPU pooling
-//!   family, the upsample and the SAM/SigLIP encoders are implemented above.
+//!   family, the upsample and the SAM/SigLIP encoders are implemented above. Resident
+//!   bf16 is implemented too, as a Rust extension ([`matmul::Bf16Context`] /
+//!   [`matmul::Bf16Weight`] over [`matmul::resident_plan`]'s pinned tiling): the C
+//!   library has no variant — `rocket_bf16_stream.c` re-scatters both operands on every
+//!   call — so nothing there is a parity reference for it.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.

@@ -693,7 +693,8 @@ fn to_host_bf16(t: FlexTensor, what: &str) -> (usize, usize, Vec<bf16>) {
 /// Whether bf16 weights use the library's bf16 streaming path (`ROCKET_BF16_STREAM=1`)
 /// instead of packing into the resident fp16 path.
 ///
-/// The library has no resident bf16 weight, and its bf16 stream re-packs A and B
+/// The C library has no resident bf16 weight (the driver's `Bf16Context` extension is
+/// not wired into this Burn extension yet), and its bf16 stream re-packs A and B
 /// on every call (measured 26-30% slower end-to-end on the board), while bf16's
 /// device math ties fp16. Packing bf16 -> f16 is exact for in-range values and
 /// keeps the resident weights, so it is the default; the env var selects the

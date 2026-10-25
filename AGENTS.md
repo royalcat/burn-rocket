@@ -78,11 +78,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 
 ## C-library parity port (2026-10-25)
 
-`main` contains the C-library parity port (fast-forward from the `npu-parity` branch):
-the RK3588 surface of `librocketnpu` is implemented in `crates/rocket-npu` with the
-same planners, register programs and numerics. The per-milestone write-up is in
-"Port status" below (M0-M10); the app measurements are in
-`examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
+`main` contains the C-library parity port (fast-forward from `npu-parity`, then the
+four `npu-parity-2` follow-ups): the RK3588 surface of `librocketnpu` is implemented in
+`crates/rocket-npu` with the same planners, register programs and numerics. The
+per-milestone write-up is in "Port status" below (M0-M12, including M5c tiled MLA, M11
+cube-resident FFN/MLP, M12 resident bf16 and `ROCKET_CONV_BATCH`); the app measurements
+are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 `crates/rocket-npu/src/lib.rs` ("Surface covered and deliberately missing") and
 `README.md` ("Missing surface") rather than re-deriving the surface.
 
@@ -118,8 +119,12 @@ same planners, register programs and numerics. The per-milestone write-up is in
   30k-token f32 qwen3 forward peaks at ~4.08 GiB anon and did not complete on the busy
   board even though every op fits.
 - **Still out** (deliberate; see `lib.rs`): RK3576 entries and the RK3576 graph
-  runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants,
-  non-fp16 batch wrappers, and resident bf16 (the C library has none).
+  runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants and
+  the non-fp16 batch wrappers. Resident bf16 is **not** out: it exists as a Rust
+  extension (`Bf16Context`/`Bf16Weight`, `matmul::resident_plan`) even though the C
+  library has no variant (its `rocket_bf16_stream.c` re-scatters both operands per
+  call) — so there is no C A/B for it, only the f64 reference, the C-shaped stream and
+  the canonical-tiling stream (`bf16_selftest`).
 
 ## Status (2026-10-06, extended 2026-10-07/08)
 
@@ -1112,9 +1117,70 @@ same planners, register programs and numerics. The per-milestone write-up is in
   `... not cube-matchable -> host-handoff` / `kacc-cube ... refused`), the C's knob.
   New `log_info!` macro in `log.rs` for it.
 
-  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
-  (the C library has no variant either — and neither has it for tf32, whose surface is
-  therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
+  **M12 resident bf16 (Rust extension, 2026-10-25)**: `matmul/bf16.rs` gained
+  `Bf16Context` + `Bf16Weight` + `resident_plan(k, n)`, and `Plan::canonical_geom(geom,
+  m, k, n)` (in `plan.rs`) generalizes the fp16 `Plan::canonical` to any geometry so the
+  bf16 weight can use the same M-independent pinning. **The C library has no resident
+  bf16 variant** (`rocket_bf16_stream.c` re-scatters A *and* B every call — its comment
+  argues bf16 weights are used once per prefill), so this half is a Rust extension with
+  no parity reference; `Bf16Stream`'s own behaviour is unchanged (it still re-packs both
+  operands per call, and `one_shot_bf16`/`_mt` still route through it).
+  API: `Bf16Context::new(nthreads)` (fds clamped to 1..=8), `pack_weight(k, n, b) ->
+  Bf16Weight` (let the caller pick the `(k, n)` N-split by the context's thread count,
+  so a weight packed by one context is refused — `Tiling` error — by another),
+  `matmul(m, k, n, a, &w, c)`, `Bf16Weight::{shape, bytes}`, `Bf16Context::threads`,
+  `resident_plan(k, n)`, and `Bf16Stream::new_canonical(nthreads)` (the same stream over
+  the canonical tiling — the arm that isolates the resident weight from the tiling
+  choice; `new` is the C behaviour). `Scratch` now keeps the streaming weight BOs in
+  their own `Vec<Bo>` (zeroed once at build, as before, but no longer lazily on the first
+  pack) so the resident arm can pass another owner's BOs into the same compute; the
+  weight scatter (`scatter_weights`, the worker's N slice of the whole `[N,K]` at a
+  non-zero `n0`) is shared by both arms.
+  **The pin is load-bearing**: the C planner derives `Kt` from the call's `M`, so at
+  `K=1024 N=768` the stream plans `Kt=704 / 576 / 384` for `M=4 / 64 / 256` while the
+  canonical plan keeps `Kt=384, Nt=256, nNt=3, nKt=3, wt_slot=98304` for every `M`
+  (`cargo test`'s `the_canonical_plan_pins_the_weight_layout_across_m` +
+  `the_streaming_planner_derives_kt_from_m` prove both halves on the host; the same
+  holds at `K=4096 N=1024`, `nNt=4 nKt=11`). Consequently the resident weight is
+  bit-identical to the *canonical* stream at every `M`, and to the *C-tiling* stream
+  only where the plans coincide — `M >= max_tile` (256) — below which the pinned `Kt`
+  re-partitions the K sum (the same float-accum reassociation the C's own comment
+  documents for `nthreads > 1`): board `max_abs <= 3.1e-6`, cosine 1.000000000, and both
+  arms are 1.00000000 against the f64 reference. The job count at small `M` is the
+  price: at `M=4 K=1024` the pinned `Kt=384` gives 3 K-tiles where the full-width stream
+  plan (`Kt=704`) gives 2, and per 160-column worker slice the stream fits all 1024
+  columns in one tile where the pin needs 3 (so the resident arm submits 3x the jobs
+  there — which is why its M=4 win comes only from skipping the re-pack).
+  Board (`bf16_selftest`, cores 0-3, busy board at load 10-11.6; medians of 5-7
+  interleaved ABBA samples per arm, four runs — the run-to-run spread is +-20 % even
+  interleaved, so read the ranges): `K=1024 N=768` **10.16-11.19 -> 7.80-9.62 ms/call
+  (0.72-0.87x)**, `K=4096 N=1024` **27.47-30.87 -> 18.57-21.69 ms/call (0.64-0.79x)**,
+  i.e. the per-call weight re-scatter is what the resident arm removes. The `canon` arm
+  (the same programs as the stream, on the pinned tiling) still re-packs and therefore
+  tracks the stream's wall; the measured resident-vs-canon ratio is 0.71-0.79x, which is
+  the re-pack alone where the two tilings coincide. Pack
+  once: 7.5-13.7 ms / 2.047 MiB BO at `K=1024 N=768` (host f32 weight 3.000 MiB) and
+  40.3-54.8 ms / 8.383 MiB at `K=4096 N=1024` (16 MiB), so the break-even is **2.8-8.4**
+  and **4.4-7.6** calls — a 4-call ladder of 836 rows does *not* pay for itself yet
+  (pack-included total 1.02-1.18x), which is the honest reading: the win is per request
+  of a long-lived process, not per short-lived bench. Memory follows the same story: the
+  stream caches one weight BO set **per `(M,K,N)`** (8.11 MiB over the ladder at
+  `K=1024 N=768`, 34.02 MiB at `K=4096 N=1024`), the resident weight is one set for every
+  `M` (2.047 / 8.383 MiB), and at `M=4` the stream's set is the *smaller* one of the two
+  (1.66 vs 2.05 MiB: its one-tile `Kt=1024` pads less than the pinned 3x384).
+  The pack includes what the C's `rkw_weights_pack` does (fresh BO + prep + `memset` +
+  scatter, `bos::check_iova` added), and its cost is dominated by the BO alloc/first
+  touch, not the scatter. fp16 `Context` at the same shapes is cosine 0.9999974 vs the
+  bf16 arms (11-bit vs 8-bit mantissa: reported, never bit-compared).
+  `bf16_selftest` grew `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/
+  `--reps` and an `M = 4, 64, 256, 512` ladder (default: both `K,N` groups, all arms),
+  reporting per-arm wall/CPU, cosine+max_abs vs an f64 reference, the two identity
+  gates, the weight's bytes and the per-call ratio + break-even; its exit code is the
+  gate (cosine >= 0.99999 and resident == canon bit-identical), so
+  `taskset -c 0-3 ./bf16_selftest --reps 5` prints `RESULT: PASS`.
+
+  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): the
+  `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
   wrappers, the RK3576-specific convolution/pooling entries (the
@@ -1122,7 +1188,10 @@ same planners, register programs and numerics. The per-milestone write-up is in
   zero point and the prepacked/cube handles; `rocket_conv2d_int8_rk3576`,
   `rocket_conv2d_dw_int8_rk3576`, `rocket_pool_int8_rk3576*`,
   `rocket_conv2d_int8_pack_rk3576`) and graph execution (the RK3576-only graph
-  runner). (The tiled
+  runner). Resident bf16 is **implemented as a Rust extension**
+  (`Bf16Context`/`Bf16Weight` over `matmul::resident_plan`) although the C library has
+  no variant, and tf32's surface is complete (the C has no resident or group-wise tf32
+  either). (The tiled
   long-context attention path *is* implemented — M5b above; the activation family is
   M6a, the reduce + softmax family M6b, the norms/vision norms/FFN/encoder M7, the
   fp16 convolution family M8a, the int8 convolution + PPU pooling + upsample families
@@ -1142,12 +1211,12 @@ same planners, register programs and numerics. The per-milestone write-up is in
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need, and `run`'s `alloc_cube`/`compute_kacc_cube`/`compute_kacc_from`/`compute_cpu_from` + `layout::scatter_bias_cube` are the cross-op cube path those entries drive), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the cube-resident fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan — including `Plan::canonical_geom`, the M-independent pin the resident bf16 weight uses —, layout, bos, run, context + the int8/int4/tf32 one-shots, the resident int4 `I4Context`, the native bf16 stream (`bf16.rs`) *and* its resident-weight extension (`Bf16Context`/`Bf16Weight`/`resident_plan`); `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need, and `run`'s `alloc_cube`/`compute_kacc_cube`/`compute_kacc_from`/`compute_cpu_from` + `layout::scatter_bias_cube` are the cross-op cube path those entries drive), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the cube-resident fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`, `attention_window`/`_block`, `attention_causal_window`, `attention_causal_block`/`_window`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -2199,6 +2268,15 @@ taskset -c 0-3 ./int4_selftest --prepacked-gw 64 264 320 320
 taskset -c 0-3 ./int16_selftest 64 256 128
 taskset -c 0-3 ./tf32_selftest
 taskset -c 0-3 ./tf32_selftest 512 1024 512
+# resident bf16 (M12, Rust extension — no C counterpart): the streaming engine vs the
+# resident weight vs an f64 reference over the M ladder, the resident-vs-canonical
+# bit-identity gate, the weight's bytes and the pack break-even; exit code is the gate
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin bf16_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/bf16_selftest root@rock-5b-plus.lan:/root/rocket-bf16/
+taskset -c 0-3 ./bf16_selftest --reps 5               # both K,N groups, all arms
+taskset -c 0-3 ./bf16_selftest --resident --no-ref 512 4096 1024 --reps 7  # one shape, one arm
+taskset -c 0-3 ./bf16_selftest --stream 64 1024 768 --reps 3   # the C-shaped stream alone
+cargo test -p rocket-npu matmul::bf16               # the canonical-plan pin, on the host
 # Q8_0-native projection probe (P2b, log §20): resident f16 vs group-wise int8 at
 # qwen3's shapes, activation quantize included; the int8/f16 ratio is the verdict
 cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin q8_bench

@@ -172,7 +172,10 @@ Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
 dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weights),
 dense and group-wise int4 (one-shot with the C's int16-saturation `kt_cap`, plus the
 resident `I4Context` in both modes and its planner), `int16_exact`, the native bf16
-stream, the tf32 one-shot (raw-f32 operands; the MAC truncates to a 10-bit mantissa,
+stream **and its resident-weight extension** (`Bf16Context`/`Bf16Weight`: pack once per
+`(K,N)` under the canonical M-independent tiling, reuse across `M` — the C library has
+no resident bf16 variant), the tf32 one-shot (raw-f32 operands; the MAC truncates to a
+10-bit mantissa,
 fp32 out with f64 host K-accumulation), masked GQA attention, the activation +
 elementwise family (`rocket_activation.c`: every `ROCKET_ACTIVATION_*` kind, the
 parametric LeakyReLU/ELU/SELU/PReLU, the conv-main EW mul/add/sub/max/min, clip and
@@ -220,6 +223,19 @@ BO layout); the EW add/mul/sub/max/min are exact against the host arithmetic, an
 unsigned table clamp, OUT_CVT decode) tracks the device to within a fraction of an
 fp16 ULP. Qwen3 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16
 microbenchmarks are at or above the C library's speed.
+
+The bf16 resident weight (`Bf16Context`/`Bf16Weight`) has no C counterpart, so its gate
+is the f64 reference plus the C-shaped stream: on the board (cores 0-3, busy) it is
+**bit-identical to the same stream over the canonical tiling at every `M`**, and to the
+plain stream at `M >= max_tile` (below that the canonical pin's `Kt` re-partitions the K
+sum: `max_abs <= 3.1e-6`, cosine 1.000000000, both arms 1.00000000 against an f64
+reference). Per call it is 0.72-0.87x the stream's wall at `K=1024 N=768` (7.8-9.6 vs
+10.2-11.2 ms) and 0.64-0.79x at `K=4096 N=1024` (18.6-21.7 vs 27.5-30.9 ms), the
+difference being the per-call weight re-scatter the stream pays; the one-time pack
+(8-14 / 40-55 ms for 2.0 / 8.4 MiB of resident BOs) breaks even after 3-8 / 4-8 calls,
+so a long-lived process wins and a one-shot benchmark does not. Memory follows the same
+shape: the stream caches one weight BO set per `(M,K,N)`, the resident weight is one set
+for every `M`.
 
 The reduce/softmax device output is **bit-identical to the C library on the board for
 every family** (`tools/c-oracle/ab_compare.py`: average/max/min pools including the
@@ -446,7 +462,8 @@ plane variants, performance mechanisms and every RK3576 entry are not reproduced
 Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
 fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
 and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
-both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
+both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream (and
+the resident `Bf16Context`/`Bf16Weight` extension, which the C library does not have),
 the tf32 one-shot and its planner, the activation + elementwise family (all 19
 `ROCKET_ACTIVATION_*` kinds, LeakyReLU/ELU/SELU/PReLU, EW mul/add/sub/max/min, clip,
 divide, the LUT builder and the `*_ref` host references), the reduce + softmax family
@@ -502,6 +519,14 @@ oracle, `--mha` for the encoder sublayer, `--host-sm 0|1` to pick the softmax pl
 `--sm-ab` to run both placements and report the wall/CPU and the deviation, `--tile KBP`
 (`--tile-min`, `--tile-only`) for the tiled long-context A/B at any `dk`/`dv` — MLA
 included — and an `--io flash|mha` raw-file mode (`ab_compare.py --attn-only`).
+`crates/rocket-npu/src/bin/bf16_selftest.rs` is the bf16 matmul A/B: the streaming
+engine (`--stream`, the C shape), the same stream over the canonical tiling (`--canon`)
+and the resident-weight context (`--resident`) over an `M = 4, 64, 256, 512` ladder at
+the `K = 1024, N = 768` and `K = 4096, N = 1024` projection shapes, each scored against
+an f64 reference and against each other (the resident weight must be bit-identical to
+the canonical stream at every `M`; against the C-tiling stream it is only guaranteed to
+be, and is measured to be, bit-identical at `M >= max_tile` — below that the pinned
+`Kt` re-partitions the K sum), plus the fp16 resident context's cosine for scale.
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
@@ -510,15 +535,17 @@ never chains. Set it to the tile width you want (`2048` is the tuned value) and 
 attention scratch stops growing with the key count; it trades more, smaller NPU
 submits for the flat footprint and the cache-resident score tile.
 
-Not exposed yet: resident bf16 (the C library has no variant either, and it has none
-for tf32 either — that surface is complete), the `*_ref_fp16` host references of the
-remaining non-matmul families, the
-`_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
+Not exposed yet: the `*_ref_fp16` host references of the remaining non-matmul families,
+the `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, the RK3576-specific convolution and pooling
 entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
 entry with its zero point and the prepacked/cube handles), and graph execution (the
 RK3576-only graph runner).
+The dtype surfaces themselves are complete: fp16, int8 and int4 have resident weights,
+bf16 has the stream *and* a resident-weight extension (which the C library does not
+have — its bf16 path only streams), tf32 is one-shot with no resident variant in C
+either, and `int16_exact` is one-shot in both libraries.
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
 the FFN/MLP (the fused entries are cube-resident: the projections leave their full
 output cubes, the bias/activation run over the cube bytes and the down/fc2 matmul reads

@@ -17,7 +17,7 @@ pub mod run;
 pub mod tf32;
 
 pub use batch::{MmBatch, batch};
-pub use bf16::Bf16Stream;
+pub use bf16::{Bf16Context, Bf16Stream, Bf16Weight, resident_plan};
 pub use bos::{Bos, Config};
 /// Whether the contiguous self-chaining submit layout is active for this process
 /// (`ROCKET_BATCH_SUBMIT=1` on a kernel that honors `DRM_ROCKET_JOB_BATCHED`). Resolved

@@ -189,9 +189,20 @@ impl Plan {
     /// A plan for the canonical tiling: plan at the full tile height and shrink Mt to
     /// the call's M, which only frees CBUF and keeps the M-independent K/N layout.
     pub fn canonical(m: usize, k: usize, n: usize) -> Result<Plan> {
+        Plan::canonical_geom(&FP16, m, k, n)
+    }
+
+    /// [`Plan::canonical`] for an explicit geometry: the same M-independent `Kt`/`Nt`
+    /// pinning with that dtype's slot sizes (the resident bf16 weight,
+    /// [`super::bf16::resident_plan`], is the second caller).
+    ///
+    /// The planner runs at `max_tile` rows — so `Kt` is the one a full-height call gets,
+    /// which is what keeps the resident weight layout valid for every `M` — and only
+    /// `Mt` shrinks to `m`, which frees CBUF and never grows a tile.
+    pub fn canonical_geom(geom: &Geometry, m: usize, k: usize, n: usize) -> Result<Plan> {
         let max_tile = hw::current().max_tile as usize;
-        let (cmt, kt, nt) = plan_geom(&FP16, max_tile.max(4), k, n, 0)?;
-        Ok(Plan::derive(m, k, n, cmt.min(m), kt, nt))
+        let (cmt, kt, nt) = plan_geom(geom, max_tile.max(4), k, n, 0)?;
+        Ok(Plan::derive_geom(geom, m, k, n, cmt.min(m), kt, nt))
     }
 
     pub fn derive(m: usize, k: usize, n: usize, mt: usize, kt: usize, nt: usize) -> Plan {
@@ -546,6 +557,18 @@ mod tests {
         assert_eq!(full.kt, small.kt);
         assert_eq!(full.nt, small.nt);
         assert_eq!(small.mt, 4);
+    }
+
+    #[test]
+    fn canonical_geom_is_canonical_for_the_fp16_geometry() {
+        // The bf16 resident weight's planner is the general form; `Plan::canonical` is
+        // its fp16 instantiation and must not drift from it.
+        for (m, k, n) in [(4, 1024, 768), (64, 512, 2048), (256, 4096, 1024)] {
+            assert_eq!(
+                Plan::canonical(m, k, n).unwrap(),
+                Plan::canonical_geom(&FP16, m, k, n).unwrap()
+            );
+        }
     }
 
     #[test]
