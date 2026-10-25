@@ -331,7 +331,7 @@ unsafe extern "C" {
     fn erf(x: f64) -> f64;
 }
 
-fn erf64(x: f64) -> f64 {
+pub(crate) fn erf64(x: f64) -> f64 {
     // SAFETY: the C `erf` is pure, takes one f64 and returns one f64.
     unsafe { erf(x) }
 }

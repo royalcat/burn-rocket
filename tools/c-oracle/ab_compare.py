@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""M6b C-vs-Rust A/B: the same raw inputs through librocketnpu and the Rust port.
+"""C-vs-Rust A/B: the same raw inputs through librocketnpu and the Rust port.
 
 Run it on the board (the C side must be built natively there, because a cross-built
 librocketnpu reads an empty driver name and cannot open the device). Both binaries use
 the same `--io` argument layout, so this script only has to produce inputs, run each
-side and compare the raw outputs:
+side and compare the raw outputs. It covers the M6b reduce/softmax family through
+`reduce_selftest` and the M7 norm/vision/FFN/encoder family through `ops_selftest`:
 
-    python3 ab_compare.py --rust ./reduce_selftest --c ./ab_board [--work DIR]
+    python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest --c ./ab_board \
+        [--work DIR] [--no-wide]
 
 For every case it prints the bit-identical element count, the cosine and the max-abs of
 the C output against the Rust output, then PASS/FAIL. A mismatch exits nonzero.
@@ -24,6 +26,19 @@ What is expected to match exactly, and why:
                                                      calls libm exp/log (only the host
                                                      reference does)
   scale_rows      fp16 broadcast EW multiply      -> bit-identical
+
+The M7 families are gated STRICTLY where nothing but EW/reduce/LUT arithmetic is
+involved — the two sides then run the same program and the same host glue:
+
+  rmsnorm/layernorm, batchnorm/groupnorm/instancenorm/l2norm   -> bit-identical
+  geglu (activation LUT + EW multiply)                        -> bit-identical
+
+and RELATIVELY where the fp16 matmul decides the last bits (the C and the Rust port run
+the same planner and the same regcmd, but a K-accumulation regrouping is one ULP; the
+gate is cosine >= 0.9999 and max-abs <= 5e-2, and the exact count is printed so a
+regression to "not even close" is visible):
+
+  ffn / ffn_fused / mlp_fused / encoder_block
 """
 
 from __future__ import annotations
@@ -86,19 +101,30 @@ class Runner:
 
     def run(self, name: str, args: list[str], src: Path, out_f32: bool,
             n_out: int) -> tuple[list[float], list[float]]:
-        """Run both binaries on `src` and return (c_out, rust_out)."""
+        """Run both binaries on one input file and return (c_out, rust_out)."""
+        return self.run_files(name, args, [src], out_f32, n_out)
+
+    def run_files(self, name: str, args: list[str], inputs: list[Path], out_f32: bool,
+                  n_out: int) -> tuple[list[float], list[float]]:
+        """Run both binaries on `inputs` (the trailing files of the `--io` layout).
+
+        `args` carries the family and its scalar/optional-file arguments; the binary
+        appends the input file(s) and then its own output path, which is why the raw
+        files go last in both `reduce_selftest --io` and `ops_selftest --io`.
+        """
         c_out = self.work / f"{name}.c"
         r_out = self.work / f"{name}.rs"
         for out in (c_out, r_out):
             if out.exists():
                 out.unlink()
-        r = subprocess.run([str(self.rust), "--io", *args, str(src), str(r_out)],
+        ins = [str(p) for p in inputs]
+        r = subprocess.run([str(self.rust), "--io", *args, *ins, str(r_out)],
                            capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  {name}: rust exited {r.returncode}: {r.stderr.strip()}")
             self.fail = True
             return [], []
-        c = subprocess.run([str(self.cbin), *args, str(src), str(c_out)],
+        c = subprocess.run([str(self.cbin), *args, *ins, str(c_out)],
                            capture_output=True, text=True)
         if c.returncode != 0:
             print(f"  {name}: C exited {c.returncode}: {c.stderr.strip()}")
@@ -111,22 +137,31 @@ class Runner:
             self.fail = True
         return c_vals, r_vals
 
-    def report(self, name: str, c_vals: list[float], r_vals: list[float]) -> None:
-        """Print the A/B for one case; PASS = identical or within 1e-3 at cos>=0.9999."""
+    def report(self, name: str, c_vals: list[float], r_vals: list[float],
+               strict: bool = False, tol: tuple[float, float] = (0.9999, 1e-3)) -> None:
+        """Print the A/B for one case.
+
+        PASS is bit-identity for the strict families (pure EW/reduce/LUT arithmetic) and
+        `cos >= tol[0] and max_abs <= tol[1]` for the ones whose fp16 K-accumulation
+        grouping can differ. The exact count is always printed.
+        """
         if not c_vals or not r_vals:
             return
         exact, cos, max_abs = stats(c_vals, r_vals)
         n = len(c_vals)
-        ok = exact == n or (cos >= 0.9999 and max_abs <= 1e-3)
+        ok = exact == n if strict else (exact == n or (cos >= tol[0] and max_abs <= tol[1]))
         self.fail |= not ok
         tag = "bit-identical" if exact == n else f"exact={exact}/{n}"
-        print(f"  {name:<26} {tag:<18} cos={cos:.9f} max_abs={max_abs:.3e} -> "
+        print(f"  {name:<34} {tag:<18} cos={cos:.9f} max_abs={max_abs:.3e} -> "
               f"{'PASS' if ok else 'FAIL'}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rust", required=True, type=Path)
+    ap.add_argument("--rust", required=True, type=Path,
+                    help="the reduce_selftest binary (M6b families)")
+    ap.add_argument("--ops", type=Path,
+                    help="the ops_selftest binary (M7 families; skipped when missing)")
     ap.add_argument("--c", required=True, type=Path)
     ap.add_argument("--work", default=Path("/tmp/ab_m6b"), type=Path)
     ap.add_argument("--no-wide", action="store_true",
@@ -203,9 +238,175 @@ def main() -> int:
                                  src, False, m * n)
         run.report(f"scale_rows {m}x{n}", c_vals, r_vals)
 
+    if args.ops is not None:
+        m7(run, args.ops)
+
     print()
     print("ab_compare:", "FAIL" if run.fail else "PASS")
     return 1 if run.fail else 0
+
+
+def m7(run: Runner, ops: Path) -> None:
+    """The M7 families through `ops_selftest --io`."""
+    # The M7 binary is a second Rust binary; swap it in and back out so the M6b cases
+    # above stay on reduce_selftest.
+    m6b = run.rust
+    run.rust = ops.resolve()
+
+    def f16(path: Path, vals: list[float]) -> str:
+        w_f16(path, vals)
+        return str(path)
+
+    # ── Norms ──────────────────────────────────────────────────────────────────
+    print("norms (rmsnorm / layernorm):")
+    for (m, h) in [(4, 256), (64, 512), (257, 1024)]:
+        x = run.work / f"norm_{m}x{h}.in"
+        w_f16(x, lcg(m * h, -2.5, 2.5, 0x71 + m * 31 + h))
+        wpath = f16(run.work / f"norm_{m}x{h}.w", lcg(h, 0.5, 1.5, 0x72 + h))
+        ones = f16(run.work / f"norm_{m}x{h}.one", [1.0] * h)
+        for tag, wp in (("w", wpath), ("w=1", ones)):
+            c_vals, r_vals = run.run(f"rmsnorm_{m}x{h}_{tag}",
+                                     ["rmsnorm", str(m), str(h), "1e-6", wp],
+                                     x, False, m * h)
+            run.report(f"rmsnorm {m}x{h} {tag}", c_vals, r_vals, strict=True)
+        gamma = f16(run.work / f"norm_{m}x{h}.g", lcg(h, 0.5, 1.5, 0x73 + h))
+        beta = f16(run.work / f"norm_{m}x{h}.b", lcg(h, -0.5, 0.5, 0x74 + h))
+        for tag, bp in (("g+b", beta), ("g", "-")):
+            c_vals, r_vals = run.run(f"layernorm_{m}x{h}_{tag}",
+                                     ["layernorm", str(m), str(h), "1e-5", gamma, bp],
+                                     x, False, m * h)
+            run.report(f"layernorm {m}x{h} {tag}", c_vals, r_vals, strict=True)
+
+    # ── Vision norms ───────────────────────────────────────────────────────────
+    print("vision norms (batchnorm / groupnorm / instancenorm / l2norm):")
+    for (n, c, p) in [(2, 8, 49), (2, 16, 196)]:
+        total = n * c * p
+        x = run.work / f"vis_{n}x{c}x{p}.in"
+        w_f16(x, lcg(total, -2.0, 2.0, 0x81 + n * 17 + c * 31 + p))
+        gamma = f16(run.work / f"vis_{n}x{c}x{p}.g", lcg(c, 0.5, 1.5, 0x82 + c))
+        beta = f16(run.work / f"vis_{n}x{c}x{p}.b", lcg(c, -0.5, 0.5, 0x83 + c))
+        mean = f16(run.work / f"vis_{n}x{c}x{p}.m", lcg(c, -0.2, 0.2, 0x84 + c))
+        var = f16(run.work / f"vis_{n}x{c}x{p}.v", lcg(c, 0.5, 1.5, 0x85 + c))
+        c_vals, r_vals = run.run(
+            f"bn_{n}x{c}x{p}",
+            ["batchnorm", str(n), str(c), str(p), "1e-5", gamma, beta, mean, var],
+            x, False, total)
+        run.report(f"batchnorm {n}x{c}x{p}", c_vals, r_vals, strict=True)
+
+        g = c // 2 if c >= 4 else 1
+        c_vals, r_vals = run.run(
+            f"gn_{n}x{c}x{p}",
+            ["groupnorm", str(n), str(c), str(g), str(p), "1e-5", gamma, beta],
+            x, False, total)
+        run.report(f"groupnorm {n}x{c}x{p} G={g}", c_vals, r_vals, strict=True)
+
+        c_vals, r_vals = run.run(
+            f"in_{n}x{c}x{p}",
+            ["instancenorm", str(n), str(c), str(p), "1e-5", gamma, beta],
+            x, False, total)
+        run.report(f"instancenorm {n}x{c}x{p}", c_vals, r_vals, strict=True)
+
+        c_vals, r_vals = run.run(f"l2_{n}x{c}x{p}",
+                                 ["l2norm", str(n * c), str(p), "1e-12"],
+                                 x, False, total)
+        run.report(f"l2norm {n * c}x{p}", c_vals, r_vals, strict=True)
+
+    # ── GEGLU / FFN / MLP ──────────────────────────────────────────────────────
+    print("geglu / ffn / mlp:")
+    ffn_tol = (0.9999, 5e-2)
+    for (m, h, i) in [(4, 256, 1024), (64, 512, 2048)]:
+        x = run.work / f"ffn_{m}x{h}x{i}.x"
+        w_f16(x, lcg(m * h, -1.5, 1.5, 0x91 + m * 31 + h))
+        wg = f16(run.work / f"ffn_{m}x{h}x{i}.wg", lcg(i * h, -0.5, 0.5, 0x92 + h * 31 + i))
+        wu = f16(run.work / f"ffn_{m}x{h}x{i}.wu", lcg(i * h, -0.5, 0.5, 0x93 + h * 31 + i))
+        wd = f16(run.work / f"ffn_{m}x{h}x{i}.wd", lcg(h * i, -0.5, 0.5, 0x94 + i * 31 + h))
+        b1 = f16(run.work / f"ffn_{m}x{h}x{i}.b1", lcg(i, -0.1, 0.1, 0x95 + i))
+
+        # GEGLU on the gated pair (GELU = 5 and SiLU = 3, the two the block uses).
+        gate = run.work / f"ffn_{m}x{h}x{i}.gate"
+        up = run.work / f"ffn_{m}x{h}x{i}.up"
+        w_f16(gate, lcg(m * i, -3.0, 3.0, 0x96 + m * 31 + i))
+        w_f16(up, lcg(m * i, -2.0, 2.0, 0x97 + m * 31 + i))
+        for kind, kname in ((5, "gelu"), (3, "silu")):
+            c_vals, r_vals = run.run_files(f"geglu_{m}x{i}_{kname}",
+                                           ["geglu", str(m * i), str(kind)],
+                                           [gate, up], False, m * i)
+            run.report(f"geglu {m}x{i} {kname}", c_vals, r_vals, strict=True)
+
+        # The binary appends the input file(s) and its output path, so the weights go
+        # through run_files: args = the scalars, inputs = X WG WU WD.
+        for fam in ("ffn", "ffn_fused"):
+            c_vals, r_vals = run.run_files(f"{fam}_{m}x{h}x{i}",
+                                           [fam, str(m), str(h), str(i), "5"],
+                                           [x, Path(wg), Path(wu), Path(wd)],
+                                           False, m * h)
+            run.report(f"{fam} {m}x{h}x{i}", c_vals, r_vals, tol=ffn_tol)
+
+        for b1p in (b1, "-"):
+            tag = "b1" if b1p != "-" else "nob1"
+            c_vals, r_vals = run.run_files(
+                f"mlp_{m}x{h}x{i}_{tag}",
+                ["mlp_fused", str(m), str(h), str(i), str(h), "5", b1p],
+                [x, Path(wg), Path(wd)],
+                False, m * h)
+            run.report(f"mlp_fused {m}x{h}x{i} {tag}", c_vals, r_vals, tol=ffn_tol)
+
+    # The fused entries' fallbacks. Two shapes make the C's `goto fb` fire and both
+    # sides must make the same decision (a fallback is a *different* plan set, so a
+    # mismatch here would show up as a large difference, not as last-bit noise):
+    #   M = 1      -> `mm_plan_init_pin` refuses M % 4; the one-shot entry's height-1
+    #                 shim then serves it (M = 2 would be refused by *both* sides, so it
+    #                 is not a case the APIs accept at all)
+    #   M = 260    -> the KACC EW-stride floor: Mt = 256 leaves a 4-row last tile
+    # (I = 128 < 256 additionally fails the Nt pin's `pin_Nt <= N`.)
+    print("fused-entry fallbacks (host handoff):")
+    for (m, h, i) in [(1, 64, 128), (260, 64, 256)]:
+        x = run.work / f"fb_{m}x{h}x{i}.x"
+        w_f16(x, lcg(m * h, -1.0, 1.0, 0xB1 + m * 31 + h))
+        wg = f16(run.work / f"fb_{m}x{h}x{i}.wg", lcg(i * h, -0.4, 0.4, 0xB2 + h + i))
+        wd = f16(run.work / f"fb_{m}x{h}x{i}.wd", lcg(h * i, -0.4, 0.4, 0xB3 + i + h))
+        for fam in ("ffn", "ffn_fused"):
+            c_vals, r_vals = run.run_files(f"fb_{fam}_{m}x{h}x{i}",
+                                           [fam, str(m), str(h), str(i), "5"],
+                                           [x, Path(wg), Path(wg), Path(wd)],
+                                           False, m * h)
+            run.report(f"{fam} fallback {m}x{h}x{i}", c_vals, r_vals, tol=ffn_tol)
+        c_vals, r_vals = run.run_files(
+            f"fb_mlp_{m}x{h}x{i}",
+            ["mlp_fused", str(m), str(h), str(i), str(h), "5", "-"],
+            [x, Path(wg), Path(wd)],
+            False, m * h)
+        run.report(f"mlp_fused fallback {m}x{h}x{i}", c_vals, r_vals, tol=ffn_tol)
+
+    # ── Encoder block ──────────────────────────────────────────────────────────
+    print("encoder block:")
+    enc_tol = (0.9999, 5e-2)
+    for (t, d, nh, dff) in [(8, 64, 2, 128), (64, 128, 4, 256)]:
+        x = run.work / f"enc_{t}x{d}x{dff}.x"
+        w_f16(x, lcg(t * d, -1.0, 1.0, 0xA1 + t * 31 + d))
+        ln1_g = f16(run.work / f"enc_{t}x{d}x{dff}.ln1g", lcg(d, 0.5, 1.5, 0xA2 + d))
+        ln1_b = f16(run.work / f"enc_{t}x{d}x{dff}.ln1b", lcg(d, -0.5, 0.5, 0xA3 + d))
+        ln2_g = f16(run.work / f"enc_{t}x{d}x{dff}.ln2g", lcg(d, 0.5, 1.5, 0xA4 + d))
+        ln2_b = f16(run.work / f"enc_{t}x{d}x{dff}.ln2b", lcg(d, -0.5, 0.5, 0xA5 + d))
+        wq = f16(run.work / f"enc_{t}x{d}x{dff}.wq", lcg(d * d, -0.3, 0.3, 0xA6 + d))
+        wk = f16(run.work / f"enc_{t}x{d}x{dff}.wk", lcg(d * d, -0.3, 0.3, 0xA7 + d))
+        wv = f16(run.work / f"enc_{t}x{d}x{dff}.wv", lcg(d * d, -0.3, 0.3, 0xA8 + d))
+        wo = f16(run.work / f"enc_{t}x{d}x{dff}.wo", lcg(d * d, -0.3, 0.3, 0xA9 + d))
+        bq = f16(run.work / f"enc_{t}x{d}x{dff}.bq", lcg(d, -0.1, 0.1, 0xAA + d))
+        bv = f16(run.work / f"enc_{t}x{d}x{dff}.bv", lcg(d, -0.1, 0.1, 0xAB + d))
+        bo = f16(run.work / f"enc_{t}x{d}x{dff}.bo", lcg(d, -0.1, 0.1, 0xAC + d))
+        wf1 = f16(run.work / f"enc_{t}x{d}x{dff}.wf1", lcg(dff * d, -0.3, 0.3, 0xAD + dff))
+        wf2 = f16(run.work / f"enc_{t}x{d}x{dff}.wf2", lcg(d * dff, -0.3, 0.3, 0xAE + dff))
+        bf1 = f16(run.work / f"enc_{t}x{d}x{dff}.bf1", lcg(dff, -0.1, 0.1, 0xAF + dff))
+        bf2 = f16(run.work / f"enc_{t}x{d}x{dff}.bf2", lcg(d, -0.1, 0.1, 0xB0 + d))
+        args = ["encoder", str(t), str(d), str(nh), str(dff), "1e-5",
+                ln1_g, ln1_b, wq, bq, wk, "-", wv, bv, wo, bo,
+                ln2_g, ln2_b, wf1, bf1, wf2, bf2]
+        c_vals, r_vals = run.run(f"enc_{t}x{d}x{nh}x{dff}", args, x, False, t * d)
+        run.report(f"encoder T={t} d={d} h={nh} ff={dff}", c_vals, r_vals, tol=enc_tol)
+
+    run.rust = m6b
+
 
 
 if __name__ == "__main__":

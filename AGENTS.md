@@ -356,10 +356,20 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   MAC *truncates* each mantissa to 10 bits toward zero, so the parity reference is the
   C's `tf32rt` (zero the low 13 bits), not a round-to-nearest tf32; planner + emitter
   byte-equal, `tf32_selftest` is the board check), masked GQA
-  attention and the **reduce + softmax** family (the PPU global average/max/min pools
+  attention, the **reduce + softmax** family (the PPU global average/max/min pools
   with `reduce_factor_axis`/`global_avgpool_plan`, the feature-axis ones-matmul reduce,
   the triangular-ones cumsum, row softmax/log-softmax/cross-entropy and
-  `rocket_scale_rows_fp16`; M6b below) are ported
+  `rocket_scale_rows_fp16`; M6b below), the **transformer norms** (RMSNorm with the
+  fp16 square under `square_prescale_k`, the fp32-accumulated mean-square, the host
+  rsqrt and one folded fp16 scale; LayerNorm with the C's stacked `[x ; x²]`
+  single-reduce job and the `x·A + B` affine fold), the **vision norms** (inference
+  BatchNorm from running stats, GroupNorm, InstanceNorm, L2-Normalize over the
+  `[N,C,P]` channels-major layout), the **FFN family** (`geglu`, the three-matmul
+  `ffn` over the C's `NT = 3` `_mt` projections, the pinned-tile `ffn_fused` and
+  `mlp_fused`, the host-handoff `mlp`) and the **encoder block** (one pre-norm Whisper
+  layer over two LayerNorms, `mha_self`, the EW residual adds and the fused MLP over
+  `Tp = (T+3) & ~3` rows, `ROCKET_ENCODER_NOFUSE` for the C's host-handoff A/B route;
+  M7 below) are ported
   (`int8_selftest --dense|--gw-one-shot|--prepacked-dense|--prepacked-gw`,
   `int4_selftest --dense|--gw-one-shot G|--prepacked|--prepacked-gw G`,
   `int16_selftest` and `tf32_selftest` are the board checks: int32/i64-exact vs the
@@ -515,17 +525,114 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   pins the factor/plan decisions, the cube round trip, the four cumsum references, the
   softmax/logsoftmax/CE references, `scale_rows_ref`, the pool program word list
   (including the MAX `0xFC00` pad fill) and the reciprocal convention.
+- **M7 norms, vision norms, FFN and encoder** (2026-10-25): the rest of
+  `rocket_norm.h` (`src/rocket_norm.c`, 241 lines), `src/rocket_normvision.c`,
+  `src/rocket_ffn.c` and `src/rocket_encoder.c` are ported as
+  `ops/norm.rs` (extended), `ops/normvision.rs`, `ops/ffn.rs` and `ops/encoder.rs`.
+  API: `ops::norm::{square_prescale_k, rmsnorm, rmsnorm_ref, layernorm, layernorm_ref}`
+  (plus the existing `scale_rows`), `ops::normvision::{batchnorm, batchnorm_ref,
+  groupnorm, groupnorm_ref, instancenorm, instancenorm_ref, l2norm, l2norm_ref}`,
+  `ops::ffn::{geglu, geglu_ref, ffn, ffn_ref, ffn_fused, mlp, mlp_ref, mlp_fused}`,
+  `ops::encoder::{EncoderParams, encoder_block, encoder_block_ref}` — all re-exported
+  flat at `ops`. The device entries take `&Device`, `*_ref` are the host fp64 forms,
+  and the `fd < 0` fallbacks are the `*_ref` functions (there is no "no device"
+  variant, as in M6b). `INT_MAX` element guards on every flat-EW count (the C only
+  guards some of the vision entries — the port guards all of them and reports
+  `Error::Shape` where C would silently under-process), and typed `Shape` errors on
+  short buffers/dims before any device access.
+  Structural details kept from the C: the **exact power-of-two fp16-square prescale**
+  (`square_prescale_k`: threshold 223, `ceil(log2)`, applied as `2^-k` and recovered
+  as `4^k`, hence bit-exact); RMSNorm = EW square → `reduce_feature(mean)` → host
+  `1/sqrt(ms·4^k + eps)` → one folded fp16 `s[m][h] = r[m]·weight[h]`; LayerNorm =
+  **one stacked `[x ; x²]` reduce job** (`2M` rows) → host mean/var/rsqrt (var clamped
+  at 0) → the `A[m][h] = r·gamma`, `B[m][h] = beta − mean·A` fold → EW mul + EW add;
+  GroupNorm = the same stacked reduce over `[N*G, (C/G)*P]` → per-**channel** A/B
+  broadcast; InstanceNorm = GroupNorm with `G = C`; L2 = square → `reduce_feature(sum)`
+  → `scale_rows`. FFN: `ffn` is the C's `rocket_matmul_fp16_mt(..., NT = 3)` fan-out +
+  `geglu` (activation LUT + EW mul) + the down projection; `ffn_fused`/`mlp_fused`
+  reproduce the C's **pinned tiling** through the new `matmul::Plan::pinned` (the
+  `mm_plan_init_pin` port: `Nt(projections) = Kt(down) = 256`, no `ROCKET_MM_*`
+  override, the free dims shrink to fit the CBUF), the matched-tiling gate
+  (`nNt == nKt && out_slot == in_slot && nM == nM && Mt == Mt && nMt*nNt <= 64`),
+  **KACC-only** for the projections (`matmul::run::one_shot_plan` with
+  `KaccPolicy::Only`: a `Tiling` refusal falls back to the whole host-handoff block,
+  as the C's `goto fb`) and **KACC-then-CPU** for the down/fc2 (`KaccPolicy::Forced`,
+  the C's `mm_compute_kacc` then `mm_compute`), the bias add in f32, and the 2-pass
+  GELU. The one thing *not* ported is the cube-residency mechanism (see the missing
+  surface below). `encoder_block` is the C's order exactly: LN1 over `T` rows →
+  `attn::mha_self` (single fd, as the C) → EW residual → LN2 → zero-pad to
+  `Tp = (T+3) & ~3` → `mlp_fused` over `Tp` (`ROCKET_ENCODER_NOFUSE` = the C's
+  `GELU_GATE` + EW-mul host-handoff route) → the bf2 add over `T` → EW residual;
+  `EncoderParams` carries the 16 tensors (C argument order, `None` for the C `NULL`).
+  A knobs/semantics note: the C's encoder MLP path ignores `ROCKET_NO_KACC` (it calls
+  the KACC primitives directly), and so does the port.
+  Host tests (`cargo test -p rocket-npu`, 183 pass): RMSNorm on hand-computed rows
+  (unit RMS, per-column gamma, eps, the 223 threshold and the exact prescale),
+  LayerNorm (zero-mean/unit-var rows, gamma/beta, negative-variance clamp, agreement
+  with RMSNorm on a symmetric row), batchnorm/groupnorm/instancenorm/l2norm on
+  hand-computed small arrays (including the per-channel affine layout trap: flat
+  element `i` belongs to channel `i / P`), `geglu`/`ffn`/`mlp` references (the C's
+  `act_exact` default-to-SiLU quirk, the f64 `ffn` intermediate vs the **fp16-narrowed**
+  `mlp` one), the pinned-tiling contract (pin alignment, `nNt == nKt`,
+  `out_slot == in_slot`), and the encoder reference (deterministic, finite, equal to the
+  hand-assembled composition of the family primitives, plus the shape/buffer refusals).
+  Board (`ops_selftest --all`, cores 0-3, busy board; `ops_selftest` is the new binary
+  with `--norm`/`--vision`/`--ffn`/`--encoder`, per-family `--*-shape` and `--io`):
+  norms 4x256..257x1024 PASS (rmsnorm cos 0.99999994, max_rel(sig) 9.8e-4; layernorm
+  0.99999992, 1.9e-3), vision 2x8x49/2x16x196 PASS (0.9999999, <= 2.1e-3), ffn
+  4x256x1024 and 64x512x2048 PASS (geglu 0.99999993; ffn/ffn_fused/mlp/mlp_fused
+  0.9999998-0.9999999 with <= 5e-3 relative at a peak of 1.2e3), encoder
+  T=8 d=64 h=2 ff=128 / T=64 d=128 h=4 ff=256 PASS (0.9999992/0.9999985, 6.9e-3/1.9e-2
+  relative on the significant elements). Wall (busy board): LayerNorm 257x1024 64 ms,
+  RMSNorm 41 ms, FFN 64x512x2048 54 ms, encoder blocks 46/53 ms. `d/n_head` must be a
+  multiple of 32 — the brief's `h=4` for `d=64` gives `dh=16`, which the fp16 matmul's
+  `K % 32` refuses **in the C too** (`rocket_mha_self_fp16` plans the same
+  `[Tp, dh, Tn]` matmul), so the self-test's defaults are `h=2`/`h=4` (Whisper's real
+  `dh` is 64). The metrics use a **relative error on the significant elements**
+  (|ref| >= 10 % of the array peak): the normalized outputs are standardized rows, so a
+  value near zero is a cancellation of two O(1) fp16 terms and its plain element-wise
+  relative error is meaningless (0.2 on an output of 0.01 at 2e-3 absolute, i.e. one
+  fp16 quarter-ULP of the pre-cancellation magnitude). The FFN/MLP relative gate is
+  2e-2; the absolute norm gate is 4e-2 and the encoder's is 1e-1 (the
+  brief's 1e-2 is *below* the fp16 pipeline's own noise at `d_ff = 256`).
+  **C-vs-Rust A/B** (`tools/c-oracle/ab_board.c` extended with `rmsnorm`, `layernorm`,
+  `batchnorm`, `groupnorm`, `instancenorm`, `l2norm`, `geglu`, `ffn`, `ffn_fused`,
+  `mlp_fused`, `encoder` — same argument layout as `ops_selftest --io`, `-` for the C
+  `NULL`, and the C side built natively on the board): **bit-identical for every norm,
+  vision norm, geglu, ffn, ffn_fused and mlp_fused case** (RMSNorm/LayerNorm with and
+  without beta and with a unit weight, BatchNorm/GroupNorm/InstanceNorm/L2 over both
+  vision shapes, GELU and SiLU, with and without b1, at 4x256x1024 and 64x512x2048).
+  That also proves `Plan::pinned` matches `mm_plan_init_pin` and that
+  `compute_kacc`-under-a-pinned-plan matches the C's `mm_compute_kacc_cube` —
+  a different `Kt` would have changed the fp16 accumulation. The encoder block is the
+  only non-bit-identical case (198/512 and 2040/8192 exact, cos 0.9999997/0.9999994):
+  its attention sublayer is `attn::mha_self`, whose host fast softmax is the documented
+  M5a deviation from the C's on-NPU softmax.
+  Two shapes also force the fused entries' **host-handoff fallback** and are
+  bit-identical as well — `M = 1` (the `M % 4` pin refusal, then the one-shot height-1
+  shim; `M = 2` is refused by *both* libraries, so it is not a state the APIs accept)
+  and `M = 260` (the KACC EW-stride floor: `Mt = 256` leaves a 4-row last tile) — which
+  is what proves the two sides make the same fallback decision, not just the same plan.
+  The encoder's two MLP routes are also bit-identical to each other on the measured
+  shapes (`ROCKET_ENCODER_NOFUSE` vs the fused default: 512/512 and 8192/8192 exact),
+  because the pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`.
+  `ab_compare.py` grew a `--ops` argument (the `ops_selftest` binary) and a per-case
+  `strict` gate: the EW/reduce/LUT families require bit-identity, the matmul-bearing
+  ones a cosine/max-abs pair (the exact count is printed for both).
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU **attention** softmax, and the
-  other op families: the `rocket_pool.c` MaxPool/AveragePool API (only the PPU
-  global-pool decomposition is ported), conv (2d/1d/transpose/depthwise), the rest of
-  `rocket_norm.h` (RMSNorm/LayerNorm — M7), FFN/encoder, resize/upsample, SAM/SigLIP,
-  graph execution. (The tiled long-context attention path *is* implemented — M5b above;
-  the activation family is M6a and the reduce + softmax family is M6b.)
+  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU **attention** softmax, the
+  cube-resident *mechanism* of the fused FFN/MLP (the pinned tiling, the matched-tiling
+  gate and the KACC routing are bit-identical to the C; the intermediates still come
+  back to row-major between ops, so the C's `RESIDENT-FUSION NOTE` round-trip
+  optimization is what remains), and the other op families: the `rocket_pool.c`
+  MaxPool/AveragePool API (only the PPU global-pool decomposition is ported), conv
+  (2d/1d/transpose/depthwise), resize/upsample, SAM/SigLIP, graph execution. (The tiled
+  long-context attention path *is* implemented — M5b above; the activation family is
+  M6a, the reduce + softmax family M6b, and the norms/vision norms/FFN/encoder M7.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -540,12 +647,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program) and `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale; RMSNorm/LayerNorm are M7)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program) and `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal), the `parity.py` dtype+pool parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode) |
+| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal), the `parity.py` dtype+pool parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax and norm/vision/FFN/encoder raw-file A/B), and `build.sh` for the oracle itself |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1200,6 +1307,24 @@ taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --c ./ab_board
 # the C library's own gates on the same board (they must PASS for the A/B to mean anything)
 cmake --build ref/build --target reduce_mean_rocket softmax_rocket -j4
 taskset -c 0-3 ref/build/reduce_mean_rocket && taskset -c 0-3 ref/build/softmax_rocket
+# norms + vision norms + FFN + encoder on the board (cores 0-3): every case vs the
+# device-free fp64 reference (--norm 4x256/64x512/257x1024, --vision 2x8x49/2x16x196,
+# --ffn 4x256x1024/64x512x2048, --encoder T=8 d=64 h=2 ff=128 and T=64 d=128 h=4 ff=256)
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin ops_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/ops_selftest \
+    root@rock-5b-plus.lan:/root/rocket-m7/
+taskset -c 0-3 ./ops_selftest --all
+taskset -c 0-3 ./ops_selftest --norm --norm-shape 4 256   # one family / one shape
+taskset -c 0-3 ./ops_selftest --encoder --encoder-shape 8 64 2 128
+# C-vs-Rust A/B for the same families: the M7 sections of ab_board.c use the same
+# argument layout as `ops_selftest --io` (`-` is the C NULL), so the same script drives
+# both binaries. --ops adds them; the norms/vision/geglu cases require BIT-IDENTITY,
+# the matmul-bearing ones a cosine/max-abs pair (the exact count is printed either way).
+# The encoder block is the one expected non-exact case: its attention sublayer is
+# attn::mha_self, whose host fast softmax is the documented M5a deviation.
+gcc -O2 -I ref/include -I ref ab_board.c ref/build/librocketnpu.a -lm -lpthread -o ab_board
+taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest \
+    --c ./ab_board --no-wide --work /tmp/ab_m7
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench

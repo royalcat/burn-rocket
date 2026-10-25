@@ -126,6 +126,72 @@ pub fn one_shot(
     Ok(())
 }
 
+/// [`one_shot`] under an explicit [`Plan`] (the cross-op FFN/MLP pinned tiling).
+///
+/// The C spellings this stands in for are `rocket_matmul_fp16` and `mm_compute_kacc` +
+/// `mm_compute`: `policy` picks the routing. `a`, `b`, `c` must be exactly
+/// `plan.m * plan.k`, `plan.n * plan.k` and `plan.m * plan.n` long (the padded cubes are
+/// built here, exactly as the packing passes do).
+pub(crate) fn one_shot_plan(
+    dev: &crate::Device,
+    plan: &Plan,
+    policy: KaccPolicy,
+    a: &[f16],
+    b: &[f16],
+    c: &mut [f16],
+) -> Result<()> {
+    if a.len() < plan.m * plan.k || b.len() < plan.n * plan.k || c.len() < plan.m * plan.n {
+        return Err(Error::shape("one_shot_plan/buffers"));
+    }
+    let config = Config::from_env();
+    let config = Config {
+        kacc: config.kacc || policy != KaccPolicy::Auto,
+        pipe: config.pipe,
+    };
+    let mut bos = Bos::new(dev, plan, config)?;
+    bos.pack_input(plan, &a[..plan.m * plan.k])?;
+    bos.pack_weights(plan, &b[..plan.n * plan.k])?;
+    let wt = bos.wt().mem_ref();
+    let mut out = vec![f16::ZERO; plan.m * plan.n];
+    if config.kacc {
+        match compute_kacc(plan, &mut bos, wt, &mut out) {
+            Ok(()) => {
+                c[..plan.m * plan.n].copy_from_slice(&out);
+                return Ok(());
+            }
+            Err(e) if e.status() == crate::Status::Tiling => {
+                if policy == KaccPolicy::Only {
+                    // The C fused entries read this refusal as "not cube-resident" and
+                    // fall back to the whole host-handoff block, not to another
+                    // accumulation order.
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // `Auto` with KACC turned off by the knob: the C's `rocket_matmul_fp16` goes straight
+    // to CPU accumulation, and `Forced`/`Only` always take the KACC branch above.
+    compute_cpu(plan, &mut bos, wt, &mut out)?;
+    c[..plan.m * plan.n].copy_from_slice(&out);
+    Ok(())
+}
+
+/// K-accumulation routing for [`one_shot_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KaccPolicy {
+    /// KACC first, CPU accumulation when the EW stride floor refuses the shape
+    /// (`rocket_matmul_fp16`); honours `ROCKET_NO_KACC`.
+    Auto,
+    /// KACC first regardless of `ROCKET_NO_KACC`, CPU accumulation on a `Tiling`
+    /// refusal — the C fused path's down projection, which calls the KACC primitive
+    /// directly and only falls back to `mm_compute` on the sentinel.
+    Forced,
+    /// KACC only; a `Tiling` refusal propagates (the C `mm_compute_kacc_cube`, whose
+    /// caller falls back to the non-cube block).
+    Only,
+}
+
 pub(crate) fn write_regcmd(
     regcmd: &mut Bo,
     slot: usize,

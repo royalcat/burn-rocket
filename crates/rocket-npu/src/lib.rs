@@ -18,7 +18,10 @@
 //!   conv-main EW binary ops and the composites on top of them (clip, PReLU,
 //!   LeakyReLU/ELU/SELU, divide); the PPU spatial pools with the telescoping
 //!   global-mean decomposition, the matmul-backed feature reduce and cumsum;
-//!   row softmax / log-softmax / cross-entropy; the per-row broadcast scale.
+//!   row softmax / log-softmax / cross-entropy; the transformer norms (the
+//!   per-row broadcast scale, RMSNorm, LayerNorm); the vision norms (BatchNorm,
+//!   GroupNorm, InstanceNorm, L2-Normalize); the gated FFN (GeGLU/SwiGLU), its
+//!   fused form and the encoder MLP; and the pre-norm encoder block.
 //! - [`knobs`], [`hw`], [`error`] — diagnostics, the RK3588 profile, typed failures.
 //!
 //! The crate is inference-only and targets the RK3588 only. Failure payloads carry
@@ -108,6 +111,31 @@
 //!   LUT + feature reduce + per-row scale on the device) and
 //!   [`ops::norm::scale_rows`]; the PPU program ([`regcmd::pool::gen_pool_fp16`],
 //!   word-for-word the C generator) and every host reference (`*_ref`);
+//! - the transformer norms ([`ops::norm`], the rest of `rocket_norm.c`):
+//!   [`ops::norm::rmsnorm`] (fp16 square under the exact power-of-two prescale
+//!   [`ops::norm::square_prescale_k`], fp32-accumulated mean-square, host
+//!   `rsqrt`, one folded fp16 scale) and [`ops::norm::layernorm`] (the C's
+//!   **stacked** `[x ; x²]` single-reduce job, the `x·A + B` affine fold and the
+//!   shared prescale), each with its fp64 `*_ref`;
+//! - the vision norms ([`ops::normvision`], the port of `rocket_normvision.c`):
+//!   [`ops::normvision::batchnorm`] (inference BN from running stats, no
+//!   reduction), [`ops::normvision::groupnorm`] (`[N*G, (C/G)*P]` stacked
+//!   reduce), [`ops::normvision::instancenorm`] (GroupNorm with `G = C`) and
+//!   [`ops::normvision::l2norm`] (per-row `x²` reduce + per-row scale), with
+//!   their fp64 `*_ref`;
+//! - the FFN family ([`ops::ffn`], the port of `rocket_ffn.c`):
+//!   [`ops::ffn::geglu`] (the gated GeGLU/SwiGLU core), [`ops::ffn::ffn`] (the
+//!   three-matmul block over the C's `NT = 3` `_mt` projections),
+//!   [`ops::ffn::ffn_fused`] and [`ops::ffn::mlp_fused`] (the pinned
+//!   `Nt = Kt = 256` cross-op tiling in [`crate::matmul::Plan::pinned`], the
+//!   matched-tiling gate, KACC-only projections with the host-handoff fallback
+//!   and KACC-then-CPU down/fc2), [`ops::ffn::mlp`] (the C's host-handoff MLP)
+//!   and the fp64 references;
+//! - the encoder block ([`ops::encoder`], the port of `rocket_encoder.c`):
+//!   [`ops::encoder::encoder_block`], one pre-norm Whisper layer assembled from
+//!   the two LayerNorms, [`attn::mha_self`], the EW residual adds and the fused
+//!   MLP over `Tp = (T+3) & ~3` rows (`ROCKET_ENCODER_NOFUSE` selects the C's
+//!   host-handoff A/B route), plus [`ops::encoder::encoder_block_ref`];
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
@@ -133,7 +161,8 @@
 //!   streaming forms);
 //! - a resident bf16 weight (the C library has none either);
 //! - the `*_ref_fp16` host references of the remaining non-matmul op families (matmul,
-//!   attention, activation/elementwise and reduce/softmax/norm-scale are ported), the
+//!   attention, activation/elementwise, reduce/softmax/norm, the transformer and vision
+//!   norms, the FFN/MLP and the encoder block are ported), the
 //!   `_planes` and transposed-output variants, and the RK3576-specific entries
 //!   (including `rocket_act_int8_rk3576`);
 //! - the non-fp16 batch wrappers (`rocket_mm_batch_*` for int8/int4);
@@ -147,11 +176,17 @@
 //!   sequential across tiles);
 //! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
 //!   the head dim (`mha_self` is the only user) stays on the materialized path;
+//! - the cube-resident *mechanism* of the fused FFN/MLP: [`ops::ffn::ffn_fused`] and
+//!   [`ops::ffn::mlp_fused`] reproduce the pinned tiling, the matched-tiling gate and
+//!   the KACC routing bit for bit (verified against the C on the board), but the
+//!   intermediates come back to row-major between ops instead of staying in the
+//!   projection's output cube — the elementwise passes commute with the cube reindex, so
+//!   only the host round-trip the C's `RESIDENT-FUSION NOTE` describes is missing;
 //! - every remaining op family: the `rocket_pool.c` MaxPool/AveragePool API (only the
 //!   PPU global-pool decomposition is ported here), conv (2d/1d/transpose/depthwise),
-//!   the rest of `rocket_norm.h` (RMSNorm and LayerNorm — M7), FFN/encoder,
-//!   resize/upsample, SAM/SigLIP and graph execution. The activation + elementwise and
-//!   the reduce + softmax families are implemented above.
+//!   resize/upsample, SAM/SigLIP and graph execution. The activation + elementwise, the
+//!   reduce + softmax, the transformer/vision norms, the FFN/MLP and the encoder block
+//!   are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.

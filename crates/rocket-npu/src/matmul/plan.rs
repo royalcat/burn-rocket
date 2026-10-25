@@ -162,6 +162,30 @@ impl Plan {
         Ok(Plan::derive(m, k, n, mt, kt, nt))
     }
 
+    /// `mm_plan_init_pin`: the cross-op-fused sibling of [`Plan::new`], with `Nt`
+    /// and/or `Kt` pinned.
+    ///
+    /// The pinned dimension is fixed (the fused FFN/MLP contract: `Nt(projections)`
+    /// must equal `Kt(down)`, a multiple of 32, so the output cube of one matmul
+    /// aliases the input cube of the next tile for tile) and the free ones shrink to
+    /// fit the CBUF. **The pin is the contract, so no `ROCKET_MM_*` env override is
+    /// read and the asymmetric-Nt heuristic does not run** — the same rule as in C.
+    ///
+    /// `pin_nt`/`pin_kt` of `None` mean "free"; the C spells this `0`. Both, when
+    /// given, must be multiples of 32 (`Nt`/`Kt` hardware granule) and no larger than
+    /// `n`/`k`. `m % 4`, `k % 32`, `n % 16` are required, as everywhere in the
+    /// planner — a caller with `m == 1` pads first.
+    pub fn pinned(
+        m: usize,
+        k: usize,
+        n: usize,
+        pin_nt: Option<usize>,
+        pin_kt: Option<usize>,
+    ) -> Result<Plan> {
+        let (mt, kt, nt) = plan_pin(&FP16, m, k, n, pin_nt, pin_kt)?;
+        Ok(Plan::derive(m, k, n, mt, kt, nt))
+    }
+
     /// A plan for the canonical tiling: plan at the full tile height and shrink Mt to
     /// the call's M, which only frees CBUF and keeps the M-independent K/N layout.
     pub fn canonical(m: usize, k: usize, n: usize) -> Result<Plan> {
@@ -296,6 +320,74 @@ fn asym_on() -> bool {
         Some(v) => v > 0,
         None => true,
     }
+}
+
+/// `matmul_plan_pin`: the pinned-tile planner behind [`Plan::pinned`].
+///
+/// `pin_nt`/`pin_kt` (`None` = free) follow the C's rules: a pinned dimension is
+/// validated (multiple of 32, within the real extent) and then never touched; the
+/// while loop shrinks only free dimensions, and a pinned pair that cannot fit is a
+/// `Shape` error (which the FFN/MLP callers turn into their host-handoff fallback,
+/// exactly as the C does).
+///
+/// Only the fp16 geometry has a caller (`mm_plan_init_pin` is fp16-only in C too), whose
+/// `bank_slack` is 0 — the budget expression below is therefore identical to the C's
+/// `CBUF_BANKS`; a future dtype with slack would need the C's no-slack form to stay
+/// parity-exact.
+fn plan_pin(
+    geom: &Geometry,
+    m: usize,
+    k: usize,
+    n: usize,
+    pin_nt: Option<usize>,
+    pin_kt: Option<usize>,
+) -> Result<(usize, usize, usize)> {
+    let profile = hw::current();
+    let max_tile = profile.max_tile as usize;
+    let budget = profile.cbuf_banks.saturating_sub(geom.bank_slack);
+    let na = geom.n_align;
+    let ka = geom.k_align;
+
+    if m == 0 || k == 0 || n == 0 || m > DIM_MAX || k > DIM_MAX || n > DIM_MAX {
+        return Err(Error::shape("plan_pin"));
+    }
+    if !k.is_multiple_of(ka) || !n.is_multiple_of(na) || !m.is_multiple_of(4) {
+        return Err(Error::shape("plan_pin"));
+    }
+    if let Some(p) = pin_nt
+        && (!p.is_multiple_of(32) || p > n)
+    {
+        return Err(Error::shape("plan_pin/nt"));
+    }
+    if let Some(p) = pin_kt
+        && (!p.is_multiple_of(32) || p > k)
+    {
+        return Err(Error::shape("plan_pin/kt"));
+    }
+
+    let mut mt = m.min(max_tile);
+    let mut nt = pin_nt.unwrap_or_else(|| n.min(max_tile));
+    let mut kt = match pin_kt {
+        Some(p) => p,
+        None => max_kt(geom, mt, nt, k, budget),
+    };
+    while !fits(geom, mt, nt, kt, budget) {
+        if pin_nt.is_none() && nt > 16 {
+            nt -= na;
+        } else if mt > 4 {
+            mt -= 4;
+        } else if pin_kt.is_none() && kt > 32 {
+            kt -= ka;
+        } else {
+            return Err(Error::shape("plan_pin/cbuf"));
+        }
+    }
+
+    let (nmt, nnt, nkt) = (m.div_ceil(mt), n.div_ceil(nt), k.div_ceil(kt));
+    if (nmt as u64) * (nnt as u64) * (nkt as u64) > i32::MAX as u64 {
+        return Err(Error::shape("plan_pin/jobs"));
+    }
+    Ok((mt, kt, nt))
 }
 
 /// The planner. Returns `(Mt, Kt, Nt)`, or a shape/tiling error.

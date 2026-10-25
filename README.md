@@ -106,6 +106,9 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
 - **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
   `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention` and its stateless
   `flash_attn`/`flash_attn_mt`/`flash_attn_ref`/`mha_self`/`mha_self_ref` siblings,
+  the `rocket_npu::ops` families — activation/elementwise, reduce/softmax, the
+  transformer and vision norms, the gated FFN and the encoder block — each with its
+  device-free `*_ref`,
   `f16` helpers, driver/counter helpers) for callers that do not want Burn tensor
   routing. The `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old
   surface. See `examples/probe.rs` for a runnable smoke test.
@@ -154,17 +157,26 @@ stream, the tf32 one-shot (raw-f32 operands; the MAC truncates to a 10-bit manti
 fp32 out with f64 host K-accumulation), masked GQA attention, the activation +
 elementwise family (`rocket_activation.c`: every `ROCKET_ACTIVATION_*` kind, the
 parametric LeakyReLU/ELU/SELU/PReLU, the conv-main EW mul/add/sub/max/min, clip and
-divide) and the reduce + softmax family (`rocket_reduce.c`, `rocket_softmax.c` and
+divide), the reduce + softmax family (`rocket_reduce.c`, `rocket_softmax.c` and
 `rocket_scale_rows_fp16`: the PPU global average/max/min pools with the telescoping
 decomposition, the feature-axis ones-matmul reduce, the triangular-ones cumsum, row
-softmax/log-softmax/cross-entropy and the per-row broadcast scale) are ported and
-validated on the board. Planner and regcmd output are byte-equal to the C library for
-every matmul dtype (fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation
-program (1070 words, word-for-word) and for the PPU pool program (30 words, over an
-18-case shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the
-plan reason code and both factor lists) and the fp16 average-reciprocal convention;
-the LUT tables and epilogue constants are byte-identical to the C builder. fp16/bf16
-cosine >= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
+softmax/log-softmax/cross-entropy and the per-row broadcast scale), the transformer
+norms (`rocket_norm.c`: RMSNorm — fp16 square under the exact power-of-two prescale,
+fp32-accumulated mean-square, host rsqrt, one folded scale — and LayerNorm with the
+C's stacked `[x ; x²]` single-reduce job and the `x·A + B` affine fold), the vision
+norms (`rocket_normvision.c`: inference BatchNorm from running stats, GroupNorm,
+InstanceNorm and L2-Normalize over the `[N,C,P]` channels-major layout), the gated FFN
+family (`rocket_ffn.c`: the GeGLU/SwiGLU core, the three-matmul block, the pinned-tile
+`ffn_fused` and `mlp_fused`, the host-handoff `mlp`) and the encoder block
+(`rocket_encoder.c`: one pre-norm Whisper layer over the two norms, `mha_self`, the
+residual adds and the fused MLP) are ported and validated on the board. Planner and
+regcmd output are byte-equal to the C library for every matmul dtype
+(fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation program (1070 words,
+word-for-word) and for the PPU pool program (30 words, over an 18-case
+shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the plan
+reason code and both factor lists) and the fp16 average-reciprocal convention; the LUT
+tables and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
+>= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
 the int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
 
 The activation/elementwise device output is **bit-identical to the C library on the
@@ -186,6 +198,28 @@ bit-exact after its fp16 read-back, softmax sits at cosine 0.99999992, log-softm
 absolute error is <= 7.8e-3 and cross-entropy's <= 4.2e-5. Board wall for the families
 at 257 rows: a 4096-wide softmax 97 ms, the 151936-wide LM-head softmax 3.4 s, the
 same log-softmax 3.7 s and cross-entropy 1.8 s (busy board, load ~8.4).
+
+The M7 norm / vision-norm / FFN family is also **bit-identical to the C library on the
+board** (`ab_compare.py` again: RMSNorm with a real and a unit weight, LayerNorm with
+and without beta, BatchNorm/GroupNorm/InstanceNorm/L2-Normalize over two `[N,C,P]`
+shapes, GeGLU in both GELU and SiLU form, `ffn`, `ffn_fused` and `mlp_fused` with and
+without the fc1 bias, at 4x256x1024 and 64x512x2048, plus two shapes that force the
+fused entries' host-handoff fallback — `M = 1` and the `M = 260` KACC EW-stride
+refusal — so both sides have to make the same fallback decision). The encoder block is
+the only case that is not bit-identical (198/512 and 2040/8192 elements exact): its
+attention sublayer is `attn::mha_self`, whose host fast softmax is the documented
+deviation from the C's on-NPU softmax. Against the device-free fp64 references:
+RMSNorm/LayerNorm cosine
+0.99999992-0.99999994 with <= 2.9e-3 absolute and <= 2.1e-3 relative error on the
+significant elements, the vision norms 0.9999999 with <= 2.1e-3 relative, GeGLU
+0.99999993 (1.5e-3), the FFN/MLP 0.9999998-0.9999999 (<= 5e-3 relative at a peak of
+1.2e3) and the encoder block 0.9999985-0.9999992 (1.9e-2 relative on the significant
+elements, 4.7e-2 absolute at a peak of 20.6) — the fp16 pipeline's own K-accumulation
+noise. Its two MLP routes are bit-identical to each other on the measured shapes
+(`ROCKET_ENCODER_NOFUSE` vs the fused default, 512/512 and 8192/8192), because the
+pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`. Board wall (cores
+0-3, busy board): a 257x1024 LayerNorm 69 ms, RMSNorm 44 ms,
+a 64x512x2048 FFN 36 ms and the encoder blocks 32 ms / 48 ms.
 
 Attention also has its long-context form, the opt-in tiled path
 (`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
@@ -209,7 +243,12 @@ the tf32 one-shot and its planner, the activation + elementwise family (all 19
 divide, the LUT builder and the `*_ref` host references), the reduce + softmax family
 (the PPU global average/max/min pools with `global_avgpool_plan`/`reduce_factor_axis`
 and the exact host fallback, the feature-axis ones-matmul reduce, cumsum, row
-softmax/log-softmax/cross-entropy and the per-row scale, each with its `*_ref`), and
+softmax/log-softmax/cross-entropy and the per-row scale, each with its `*_ref`), the
+transformer norms (`rmsnorm`/`layernorm` plus the shared `square_prescale_k` fp16-square
+guard), the vision norms (`batchnorm`/`groupnorm`/`instancenorm`/`l2norm`), the FFN
+family (`geglu`, `ffn`, the pinned-tile `ffn_fused`/`mlp_fused`, the host-handoff
+`mlp`, and `ffn_ref`/`geglu_ref`/`mlp_ref`), the encoder block
+(`encoder_block`/`encoder_block_ref`), and
 masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
@@ -222,8 +261,10 @@ The activation family's own self-test (`crates/rocket-npu/src/bin/activation_sel
 runs every kind and EW op on the board against that model, and its `--dump-lut` /
 `--dump-gen` modes reproduce the C `rocket_lut_epilogue_build` dump and the generated
 program byte for byte. `crates/rocket-npu/src/bin/reduce_selftest.rs` does the same for
-this milestone's families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape`,
-`--reps`), and its `--io` raw-file mode is the exchange format of
+the reduce/softmax families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape`,
+`--reps`), `crates/rocket-npu/src/bin/ops_selftest.rs` for the norm/vision/FFN/encoder
+families (`--norm`, `--vision`, `--ffn`, `--encoder`, the four per-family shape
+overrides, `--reps`), and their `--io` raw-file modes are the exchange format of
 `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board.
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
@@ -239,11 +280,15 @@ remaining non-matmul families, the
 `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stays
-materialized), on-NPU **attention** softmax, and the remaining op families: the
+materialized), on-NPU **attention** softmax, the cube-resident *mechanism* of the fused
+FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
+bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
+optimization is the remaining work), and the remaining op families: the
 `rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool decomposition is
-ported), conv (2d/1d/transpose/depthwise), the rest of `rocket_norm.h` (RMSNorm,
-LayerNorm — M7), FFN/encoder, resize/upsample, SAM/SigLIP and graph execution.
-The activation + elementwise and the reduce + softmax families are implemented. See
+ported), conv (2d/1d/transpose/depthwise), resize/upsample, SAM/SigLIP and graph
+execution.
+The activation + elementwise, the reduce + softmax, the transformer and vision norms,
+the FFN/MLP and the encoder block are implemented. See
 the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
