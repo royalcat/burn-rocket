@@ -49,6 +49,14 @@ sides, so it is gated STRICTLY (bit-identical):
   conv1d                                                 -> bit-identical
   conv_transpose (deconv route and the lowering)          -> bit-identical
 
+The M8b families likewise (same programs, same host packing, exact integer arithmetic
+on the int8 direct path and the same OUT_CVT requant on the depthwise one):
+
+  conv_int8 (direct, int32 out)                           -> bit-identical
+  conv_dw_int8 (int8 out, on-chip requant, bias)          -> bit-identical
+  pool / pool_int8 / pool_uint8                           -> bit-identical
+  resize_nearest / resize_bilinear                        -> bit-identical
+
 The fused conv->activation path adds the DPU LUT interpolation, which the C header says
 to gate with a tolerance, so it is gated relatively (cosine + max-abs); the exact count
 is printed either way.
@@ -80,6 +88,50 @@ def r_f16(path: Path) -> list[float]:
 def r_f32(path: Path) -> list[float]:
     raw = path.read_bytes()
     return [struct.unpack("<f", raw[i:i + 4])[0] for i in range(0, len(raw), 4)]
+
+
+def r_i32(path: Path) -> list[float]:
+    raw = path.read_bytes()
+    return [float(struct.unpack("<i", raw[i:i + 4])[0]) for i in range(0, len(raw), 4)]
+
+
+def r_i8(path: Path) -> list[float]:
+    return [float(struct.unpack("<b", bytes([b]))[0]) for b in path.read_bytes()]
+
+
+def r_u8(path: Path) -> list[float]:
+    return [float(b) for b in path.read_bytes()]
+
+
+def w_i8(path: Path, values: list[int]) -> None:
+    path.write_bytes(bytes((v & 0xFF) for v in values))
+
+
+def w_i32(path: Path, values: list[int]) -> None:
+    path.write_bytes(b"".join(struct.pack("<i", v) for v in values))
+
+
+def lcg_i8(n: int, seed: int) -> list[int]:
+    st = (0x9E3779B9 ^ seed) & 0xFFFFFFFF
+    out = []
+    for _ in range(n):
+        st = (st * 1664525 + 1013904223) & 0xFFFFFFFF
+        out.append(((st >> 16) & 0xFF) - 128)
+    return out
+
+
+def lcg_i32(n: int, lo: int, hi: int, seed: int) -> list[int]:
+    st = (0x9E3779B9 ^ seed) & 0xFFFFFFFF
+    out = []
+    for _ in range(n):
+        st = (st * 1664525 + 1013904223) & 0xFFFFFFFF
+        u = (st >> 8) & 0xFFFF
+        out.append(lo + (hi - lo) * u // 65535)
+    return out
+
+
+def scale_bits(v: float) -> str:
+    return f"0x{struct.unpack('<I', struct.pack('<f', v))[0]:08x}"
 
 
 def lcg(n: int, lo: float, hi: float, seed: int) -> list[float]:
@@ -118,7 +170,8 @@ class Runner:
         return self.run_files(name, args, [src], out_f32, n_out)
 
     def run_files(self, name: str, args: list[str], inputs: list[Path], out_f32: bool,
-                  n_out: int) -> tuple[list[float], list[float]]:
+                  n_out: int,
+                  kind: str | None = None) -> tuple[list[float], list[float]]:
         """Run both binaries on `inputs` (the trailing files of the `--io` layout).
 
         `args` carries the family and its scalar/optional-file arguments; the binary
@@ -143,7 +196,8 @@ class Runner:
             print(f"  {name}: C exited {c.returncode}: {c.stderr.strip()}")
             self.fail = True
             return [], []
-        read = r_f32 if out_f32 else r_f16
+        read = {"f16": r_f16, "f32": r_f32, "i32": r_i32, "i8": r_i8, "u8": r_u8}[
+            kind if kind is not None else ("f32" if out_f32 else "f16")]
         c_vals, r_vals = read(c_out), read(r_out)
         if len(c_vals) != n_out or len(r_vals) != n_out:
             print(f"  {name}: output size {len(c_vals)}/{len(r_vals)}, expected {n_out}")
@@ -176,7 +230,7 @@ def main() -> int:
     ap.add_argument("--ops", type=Path,
                     help="the ops_selftest binary (M7 families; skipped when missing)")
     ap.add_argument("--conv", type=Path,
-                    help="the conv_selftest binary (M8a families; skipped when missing)")
+                    help="the conv_selftest binary (M8a/M8b families; skipped when missing)")
     ap.add_argument("--c", required=True, type=Path)
     ap.add_argument("--work", default=Path("/tmp/ab_m6b"), type=Path)
     ap.add_argument("--no-wide", action="store_true",
@@ -258,6 +312,7 @@ def main() -> int:
 
     if args.conv is not None:
         m8a(run, args.conv)
+        m8b(run, args.conv)
 
     print()
     print("ab_compare:", "FAIL" if run.fail else "PASS")
@@ -522,6 +577,123 @@ def m8a(run: "Runner", conv: Path) -> None:
 
     run.rust = m6b
 
+
+
+def m8b(run: "Runner", conv: Path) -> None:
+    """The M8b int8 conv / pool / resize families through `conv_selftest --io`."""
+    m6b = run.rust
+    run.rust = conv.resolve()
+
+    def f16t(name: str, n: int, lo: float, hi: float, seed: int) -> Path:
+        path = run.work / name
+        w_f16(path, lcg(n, lo, hi, seed))
+        return path
+
+    def i8t(name: str, n: int, seed: int) -> Path:
+        path = run.work / name
+        w_i8(path, lcg_i8(n, seed))
+        return path
+
+    print("int8 direct conv (int32-raw):")
+    # (ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx)
+    i8_cases = [
+        ("k3 p1", 32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("k3 s2", 32, 16, 16, 32, 3, 3, 2, 2, 0, 0, 1, 1),
+        ("1x1", 64, 8, 8, 64, 1, 1, 1, 1, 0, 0, 1, 1),
+        ("rgb", 3, 32, 32, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("oc16", 64, 14, 14, 16, 3, 3, 1, 1, 0, 0, 1, 1),
+        ("k7 p3", 32, 16, 16, 32, 7, 7, 1, 1, 3, 3, 1, 1),
+        ("oc tile", 64, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("space tile", 32, 112, 112, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("s2 tile", 128, 28, 28, 128, 3, 3, 2, 2, 1, 1, 1, 1),
+    ]
+    for (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx) in i8_cases:
+        oh = conv_out_dim(ih, kh, sy, pt, dy)
+        ow = conv_out_dim(iw, kw, sx, pl, dx)
+        src = i8t(f"i8_{name}.in", ic * ih * iw, 0xD1 + ic * 31 + ih)
+        wt = i8t(f"i8_{name}.w", oc * ic * kh * kw, 0xD2 + oc * 31 + kh)
+        args = ["conv_int8", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(dy), str(dx)]
+        c_vals, r_vals = run.run_files(f"i8_{name}", args, [src, wt], False,
+                                       oc * oh * ow, kind="i32")
+        run.report(f"conv_int8 {name} {ic}x{ih}x{iw} oc{oc}", c_vals, r_vals, strict=True)
+
+    print("int8 depthwise conv (int8 out, on-chip requant):")
+    # (name, c, ih, iw, kh, kw, sy, sx, pt, pl, in_zp, out_zp, bias)
+    dw_cases = [
+        ("k3 zp", 64, 8, 8, 3, 3, 1, 1, 1, 1, -2, 5, True),
+        ("s2", 64, 16, 16, 3, 3, 2, 2, 1, 1, 37, -20, True),
+        ("zp ends", 64, 9, 7, 3, 3, 1, 2, 1, 1, -128, 127, True),
+        ("5x5", 64, 8, 11, 5, 5, 1, 1, 2, 2, 127, -128, False),
+        ("two groups", 128, 7, 5, 3, 3, 1, 2, 1, 1, 0, 0, True),
+        ("c32", 32, 6, 6, 3, 3, 1, 1, 1, 1, -1, 1, True),
+    ]
+    in_s, w_s, out_s = 0.0213, 0.00347, 0.0925
+    for (name, c, ih, iw, kh, kw, sy, sx, pt, pl, izp, ozp, use_bias) in dw_cases:
+        oh = conv_out_dim(ih, kh, sy, pt)
+        ow = conv_out_dim(iw, kw, sx, pl)
+        src = i8t(f"dw8_{name}.in", c * ih * iw, 0xE1 + c * 31 + ih)
+        wt = i8t(f"dw8_{name}.w", c * kh * kw, 0xE2 + c * 31 + kw)
+        if use_bias:
+            bias = run.work / f"dw8_{name}.b"
+            w_i32(bias, lcg_i32(c, -4000, 4000, 0xE3 + c))
+            bias_arg = str(bias)
+        else:
+            bias_arg = "-"
+        args = ["conv_dw_int8", str(c), str(ih), str(iw), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), "1", "1", bias_arg,
+                scale_bits(in_s), scale_bits(w_s), scale_bits(out_s),
+                str(izp), "0", str(ozp)]
+        c_vals, r_vals = run.run_files(f"dw8_{name}", args, [src, wt], False,
+                                       c * oh * ow, kind="i8")
+        run.report(f"conv_dw_int8 {name} C={c}", c_vals, r_vals, strict=True)
+
+    print("pool (fp16 / int8 / uint8):")
+    # (family, method, c, ih, iw, kh, kw, sy, sx, pt, pl, pb, pr)
+    pool_cases = [
+        ("pool", 1, 8, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0),
+        ("pool", 0, 8, 7, 7, 7, 7, 7, 7, 0, 0, 0, 0),
+        ("pool", 1, 16, 5, 5, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("pool", 0, 16, 5, 5, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("pool", 0, 16, 28, 20, 14, 10, 14, 10, 0, 0, 0, 0),
+        ("pool_int8", 1, 32, 8, 8, 2, 2, 2, 2, 0, 0, 0, 0),
+        ("pool_int8", 0, 64, 7, 7, 3, 3, 1, 1, 1, 1, 1, 1),
+        ("pool_uint8", 1, 32, 8, 8, 2, 2, 2, 2, 0, 0, 0, 0),
+        ("pool_uint8", 0, 64, 7, 7, 3, 3, 1, 1, 1, 1, 1, 1),
+    ]
+    for (fam, method, c, ih, iw, kh, kw, sy, sx, pt, pl, pb, pr) in pool_cases:
+        oh = (ih + pt + pb - kh) // sy + 1
+        ow = (iw + pl + pr - kw) // sx + 1
+        args = [fam, str(method), str(c), str(ih), str(iw), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(pb), str(pr)]
+        tag = f"{fam}_{method}_{c}x{ih}x{iw}"
+        if fam == "pool":
+            src = f16t(f"{tag}.in", c * ih * iw, -3.0, 3.0, 0xF1 + c * 17 + ih)
+            c_vals, r_vals = run.run_files(tag, args, [src], False, c * oh * ow)
+        elif fam == "pool_int8":
+            src = i8t(f"{tag}.in", c * ih * iw, 0xF2 + c * 17 + ih)
+            c_vals, r_vals = run.run_files(tag, args, [src], False, c * oh * ow,
+                                           kind="i8")
+        else:
+            src = run.work / f"{tag}.in"
+            src.write_bytes(bytes((v & 0xFF) for v in lcg_i8(c * ih * iw, 0xF3 + c)))
+            c_vals, r_vals = run.run_files(tag, args, [src], False, c * oh * ow,
+                                           kind="u8")
+        run.report(f"{fam} method={method} {c}x{ih}x{iw}", c_vals, r_vals, strict=True)
+
+    print("upsample (depthwise transposed conv):")
+    for bilinear in (False, True):
+        fam = "resize_bilinear" if bilinear else "resize_nearest"
+        for (c, ih, iw, sy, sx) in [(32, 8, 8, 2, 2), (32, 5, 7, 3, 3),
+                                    (32, 4, 4, 4, 4), (64, 6, 6, 2, 4)]:
+            src = f16t(f"rs_{c}x{ih}x{iw}_{sy}x{sx}.in", c * ih * iw, -1.5, 1.5,
+                       0xA9 + c * 31 + ih)
+            args = [fam, str(c), str(ih), str(iw), str(sy), str(sx)]
+            c_vals, r_vals = run.run_files(f"{fam}_{c}x{ih}_{sy}x{sx}", args, [src],
+                                           False, c * ih * sy * iw * sx)
+            run.report(f"{fam} {c}x{ih}x{iw} s{sy}x{sx}", c_vals, r_vals, strict=True)
+
+    run.rust = m6b
 
 
 if __name__ == "__main__":

@@ -23,7 +23,10 @@
 //!   GroupNorm, InstanceNorm, L2-Normalize); the gated FFN (GeGLU/SwiGLU), its
 //!   fused form and the encoder MLP; the pre-norm encoder block; and the fp16
 //!   convolution family (the native CNA conv — direct, depthwise, 1D and the
-//!   conv→activation fusion — plus the transposed conv).
+//!   conv→activation fusion — plus the transposed conv), the native int8 direct conv
+//!   with its multicore pool and the int8-out depthwise requant, the PPU
+//!   MaxPool/AveragePool family (int8/uint8 included) and the integer-factor
+//!   upsample.
 //! - [`knobs`], [`hw`], [`error`] — diagnostics, the RK3588 profile, typed failures.
 //!
 //! The crate is inference-only and targets the RK3588 only. Failure payloads carry
@@ -151,6 +154,31 @@
 //!   [`ops::conv::conv_out_dim`], [`ops::conv::weight_cube_index`],
 //!   [`ops::conv::feature_cube_index`], ...); [`ops::conv::conv2d_deconv`] /
 //!   [`ops::conv::conv2d_deconv_fits`] are the CNA deconvolution mode;
+//! - the native int8 convolution ([`ops::conv`], the other half of `rocket_conv.c`):
+//!   [`ops::conv::conv2d_int8`] (the direct int8 × int8 → int32 accumulator with the
+//!   int8 weight cube, the `C2 = 16` feature cube, the +1 CBUF bank slack and the
+//!   int32-output stride quirk, plus the OC/row/column tiling),
+//!   [`ops::conv::conv2d_int8_mt`] / [`ops::conv::ConvInt8Pool`] (the N-worker pool,
+//!   bit-identical to the serial path), [`ops::conv::conv2d_ref_int8`] (the
+//!   int64-accumulate oracle), and the int8-in/int8-out depthwise family
+//!   [`ops::conv::conv2d_dw_int8`] with the on-chip requant (the BS ALU bias add from
+//!   BRDMA and the three-field OUT_CVT), its host model
+//!   [`ops::conv::conv2d_dw_int8_model`] (nearest, ties to even — the DPU's measured
+//!   rule) and the `requant_*` helpers, plus [`ops::conv::ConvContext::conv2d_int8`] /
+//!   `conv2d_dw_int8` and the pure tiler ([`ops::conv::conv_int8_tile_plan`]);
+//! - the PPU pooling family ([`ops::pool`], the port of `rocket_pool.c`):
+//!   [`ops::pool::pool_fp16`] / [`ops::pool::pool_ref_fp16`] (MaxPool and
+//!   AveragePool over the `C2 = 8` cube with the `fp16(65536/k)` reciprocal and the
+//!   count-include-pad divisor), the int8/uint8 entries
+//!   ([`ops::pool::pool_int8`], [`ops::pool::pool_uint8`] and the `*_ref` oracles,
+//!   which route through the fp16 program with a cube-boundary convert exactly as the C
+//!   does), the geometry planner ([`ops::pool::pool_fp16_plan`] with the C's `-3`..`-10`
+//!   classes) and [`ops::pool::PoolDesc`];
+//! - the integer-factor upsample ([`ops::resize`], the port of `rocket_resize.c`):
+//!   [`ops::resize::upsample_nearest`] / [`ops::resize::upsample_bilinear`] as a
+//!   depthwise transposed conv with the built kernel ([`ops::resize::build_kernel`],
+//!   [`ops::resize::bilinear_ksize`]), the plans and the independent half-pixel
+//!   references;
 //! - the transposed conv ([`ops::conv_transpose`], the port of
 //!   `rocket_conv_transpose.c`): [`ops::conv_transpose::conv_transpose2d`] with
 //!   both routes ([`ops::conv_transpose::ConvTransposeRoute`] — the hardware
@@ -205,15 +233,16 @@
 //!   intermediates come back to row-major between ops instead of staying in the
 //!   projection's output cube — the elementwise passes commute with the cube reindex, so
 //!   only the host round-trip the C's `RESIDENT-FUSION NOTE` describes is missing;
-//! - the **int8** convolution entries of `rocket_conv.c` (the direct
-//!   int8 → int32 accumulator, the int8-out depthwise requant, the int8 multicore
-//!   pool and the RK3576 conv paths), which are M8b;
-//! - the remaining op families: the `rocket_pool.c` MaxPool/AveragePool API (only the
-//!   PPU global-pool decomposition is ported here), resize/upsample, SAM/SigLIP and
-//!   graph execution. The activation + elementwise, the reduce + softmax, the
-//!   transformer/vision norms, the FFN/MLP, the encoder block and the fp16 convolution
-//!   family (direct/depthwise/1D, the conv→activation fusion and the transposed conv)
-//!   are implemented above.
+//! - the RK3576-specific convolution and pooling entries (the part's own conv encoder,
+//!   the packed-image datapath, the int8 pooling entry with its own zero point and the
+//!   prepacked/cube handles), and the int8 convolution's batched (gapped multi-task)
+//!   submit — the C's opt-in `ROCKET_CONV_BATCH`, which is bit-identical to the per-tile
+//!   path this port runs;
+//! - the remaining op families: SAM/SigLIP and graph execution. The activation +
+//!   elementwise, the reduce + softmax, the transformer/vision norms, the FFN/MLP, the
+//!   encoder block, the fp16 and int8 convolution families (direct/depthwise/1D, the
+//!   conv→activation fusion, the transposed conv and the int8 requant), the PPU pooling
+//!   family and the upsample are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.

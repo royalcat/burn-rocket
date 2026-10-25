@@ -1,7 +1,8 @@
-//! On-device self-test for the M8a fp16 convolution port.
+//! On-device self-test for the M8a/M8b convolution, pool and resize port.
 //!
 //! ```text
-//! conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose] [--all]
+//! conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose]
+//!               [--int8] [--int8-dw] [--pool] [--resize] [--all]
 //!               [--reps R]
 //!               [--shape IC IH IW OC KH KW [SY SX PT PL DY DX]]
 //!               [--dw-shape C IH IW KH KW [SY SX PT PL DY DX]]
@@ -45,12 +46,21 @@ use half::f16;
 use rocket_npu::Device;
 use rocket_npu::ops::activation::Activation;
 use rocket_npu::ops::conv::{
-    Conv2dDesc, ConvContext, conv1d, conv2d, conv2d_act, conv2d_oh, conv2d_ow, conv2d_ref,
+    Conv2dDesc, ConvContext, ConvInt8Pool, conv1d, conv2d, conv2d_act, conv2d_dw_int8,
+    conv2d_dw_int8_model, conv2d_int8, conv2d_oh, conv2d_ow, conv2d_ref, conv2d_ref_int8,
 };
 use rocket_npu::ops::conv_transpose::{
     ConvTranspose2dDesc, conv_transpose2d, conv_transpose2d_oh, conv_transpose2d_ow,
     conv_transpose2d_plan_code, conv_transpose2d_ref, conv_transpose2d_route,
 };
+use rocket_npu::ops::pool::{
+    PoolDesc, pool_fp16, pool_fp16_plan, pool_int8, pool_ref_fp16, pool_ref_int8, pool_ref_uint8,
+    pool_uint8,
+};
+use rocket_npu::ops::resize::{
+    upsample_bilinear, upsample_bilinear_ref, upsample_nearest, upsample_nearest_ref,
+};
+use rocket_npu::regcmd::pool::PoolMethod;
 
 /// The C header's direct/depthwise fp16 conv gate.
 const CONV_REL: f64 = 2e-3;
@@ -451,8 +461,364 @@ fn run_transpose(dev: &Device, s: TransposeShape, reps: usize) -> bool {
     report(&name, ms, &want, &out, CONV_REL)
 }
 
-// ── Raw-file A/B mode ─────────────────────────────────────────────────────────
+// ── int8 direct conv ──────────────────────────────────────────────────────────
 
+/// A deterministic int8 fill over the full `[-128, 127]` range.
+fn fill_i8(n: usize, seed: u32) -> Vec<i8> {
+    let mut st = 0x9e37_79b9u32 ^ seed;
+    (0..n)
+        .map(|_| {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (((st >> 16) & 0xff) as i32 - 128) as i8
+        })
+        .collect()
+}
+
+/// A deterministic int32 fill in `[lo, hi]` (the bias cubes).
+fn fill_i32(n: usize, lo: i32, hi: i32, seed: u32) -> Vec<i32> {
+    let mut st = 0x9e37_79b9u32 ^ seed;
+    (0..n)
+        .map(|_| {
+            st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let u = ((st >> 8) & 0xffff) as i64;
+            (lo as i64 + (hi as i64 - lo as i64) * u / 65535) as i32
+        })
+        .collect()
+}
+
+/// Print one integer case: exact count, the worst absolute difference, PASS/FAIL.
+///
+/// `tol` is 0 for the exact gates (the int8 direct accumulator and the int8 depthwise
+/// requant model) and 1 where only a rounding step can differ.
+fn report_int(name: &str, wall_ms: f64, want: &[i64], got: &[i64], tol: i64) -> bool {
+    let exact = want.iter().zip(got).filter(|(a, b)| a == b).count();
+    let mut worst = 0i64;
+    for (a, b) in want.iter().zip(got) {
+        worst = worst.max((a - b).abs());
+    }
+    let pass = worst <= tol;
+    println!(
+        "  {name:<40} {wall_ms:9.1} ms  max_abs={worst}  exact={exact}/{}  -> {}",
+        want.len(),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
+fn run_int8(dev: &Device, s: ConvShape, reps: usize, ctx: Option<&mut ConvContext>) -> bool {
+    let d = conv_desc(s);
+    let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+    let n_in = d.ic * d.ih * d.iw;
+    let n_w = d.oc * d.ic * d.kh * d.kw;
+    let input = fill_i8(n_in, 0x61 + (n_in % 9973) as u32);
+    let w = fill_i8(n_w, 0x62 + (n_w % 9973) as u32);
+    let mut out = vec![0i32; d.oc * oh * ow];
+    let mut want = vec![0i32; d.oc * oh * ow];
+
+    let resident = ctx.is_some();
+    let (r, ms) = match ctx {
+        Some(ctx) => timed(reps, || ctx.conv2d_int8(&d, &input, &w, &mut out)),
+        None => timed(reps, || conv2d_int8(dev, &d, &input, &w, &mut out)),
+    };
+    if let Err(e) = r {
+        println!("  int8 conv {}x{}x{}: {e}", s.0, s.1, s.2);
+        return false;
+    }
+    conv2d_ref_int8(&d, &input, &w, &mut want);
+    let name = format!(
+        "{}{} {}x{}x{} k{}x{}s{} p{} oc{}",
+        if resident {
+            "int8 conv ctx"
+        } else {
+            "int8 conv"
+        },
+        "",
+        s.0,
+        s.1,
+        s.2,
+        s.4,
+        s.5,
+        s.6,
+        s.8,
+        s.3
+    );
+    let w64: Vec<i64> = want.iter().map(|&v| v as i64).collect();
+    let g64: Vec<i64> = out.iter().map(|&v| v as i64).collect();
+    report_int(&name, ms, &w64, &g64, 0)
+}
+
+/// `rocket_conv2d_int8_mt` vs the serial entry: the pool must be **bit-identical**
+/// (same tiles, same single jobs; only the scheduling differs).
+fn run_int8_mt(dev: &Device, s: ConvShape, workers: usize, reps: usize) -> bool {
+    let d = conv_desc(s);
+    let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+    let n_in = d.ic * d.ih * d.iw;
+    let n_w = d.oc * d.ic * d.kh * d.kw;
+    let n_out = d.oc * oh * ow;
+    let input = fill_i8(n_in, 0xB1 + (n_in % 9973) as u32);
+    let w = fill_i8(n_w, 0xB2 + (n_w % 9973) as u32);
+    let mut serial = vec![0i32; n_out];
+    if let Err(e) = conv2d_int8(dev, &d, &input, &w, &mut serial) {
+        println!("  int8 mt (serial) {}x{}x{}: {e}", s.0, s.1, s.2);
+        return false;
+    }
+    let mut pool = match ConvInt8Pool::new(workers) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("  int8 mt pool: {e}");
+            return false;
+        }
+    };
+    let mut par = vec![0i32; n_out];
+    let (r, ms) = timed(reps, || pool.conv2d(&d, &input, &w, &mut par));
+    if let Err(e) = r {
+        println!("  int8 mt {}x{}x{}: {e}", s.0, s.1, s.2);
+        return false;
+    }
+    let mut want = vec![0i32; n_out];
+    conv2d_ref_int8(&d, &input, &w, &mut want);
+    let exact = par.iter().zip(&serial).filter(|(a, b)| a == b).count();
+    let model_exact = par.iter().zip(&want).filter(|(a, b)| a == b).count();
+    let same = exact == n_out && model_exact == n_out;
+    println!(
+        "  {:<40} {ms:9.1} ms  workers={} exact-vs-serial={exact}/{n_out}          exact-vs-ref={model_exact}/{n_out}  -> {}",
+        format!("int8 mt {}x{}x{} oc{}", s.0, s.1, s.2, s.3),
+        pool.len(),
+        if same { "PASS" } else { "FAIL" }
+    );
+    same
+}
+
+// ── int8 depthwise (int8-out, on-chip requant) ────────────────────────────────
+
+/// The per-tensor quant of the C self-test's capture (in/w/out scales), which keeps the
+/// OUT_CVT derivation's `truncate_bits` at zero.
+const DW_IN_SCALE: f32 = 0.0213;
+const DW_W_SCALE: f32 = 0.00347;
+const DW_OUT_SCALE: f32 = 0.0925;
+
+fn run_dw_int8(
+    dev: &Device,
+    s: DwShape,
+    in_zp: i32,
+    out_zp: i32,
+    with_bias: bool,
+    reps: usize,
+) -> bool {
+    let d = dw_desc(s);
+    let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+    let c = s.0;
+    let input = fill_i8(c * d.ih * d.iw, 0x71 + (c % 9973) as u32);
+    let w = fill_i8(c * d.kh * d.kw, 0x72 + (c % 9973) as u32);
+    let bias = with_bias.then(|| fill_i32(c, -4000, 4000, 0x73 + c as u32));
+    let mut out = vec![0i8; c * oh * ow];
+    let mut want = vec![0i8; c * oh * ow];
+    let (r, ms) = timed(reps, || {
+        conv2d_dw_int8(
+            dev,
+            &d,
+            &input,
+            &w,
+            bias.as_deref(),
+            DW_IN_SCALE,
+            DW_W_SCALE,
+            DW_OUT_SCALE,
+            in_zp,
+            0,
+            out_zp,
+            &mut out,
+        )
+    });
+    if let Err(e) = r {
+        println!("  int8 dw {:?}: {e}", s);
+        return false;
+    }
+    conv2d_dw_int8_model(
+        &d,
+        &input,
+        &w,
+        bias.as_deref(),
+        DW_IN_SCALE,
+        DW_W_SCALE,
+        DW_OUT_SCALE,
+        in_zp,
+        out_zp,
+        &mut want,
+    );
+    let name = format!(
+        "int8 dw {}x{}x{} k{}x{}s{} zp {}/{} {}",
+        s.0,
+        s.1,
+        s.2,
+        s.3,
+        s.4,
+        s.5,
+        in_zp,
+        out_zp,
+        if with_bias { "bias" } else { "nobias" }
+    );
+    let w64: Vec<i64> = want.iter().map(|&v| v as i64).collect();
+    let g64: Vec<i64> = out.iter().map(|&v| v as i64).collect();
+    report_int(&name, ms, &w64, &g64, 0)
+}
+
+// ── Pooling ───────────────────────────────────────────────────────────────────
+
+/// One pooling/upsample case.
+///
+/// `tol` is 0 for the exact gates (max pooling, nearest upsample). An average carries
+/// the PPU reciprocal's fp16 quantization and the fp16 output narrowing, so its gate
+/// is an **absolute** bound scaled by the array peak: a per-element relative error is
+/// meaningless near zero, where the value is a cancellation of large window terms.
+fn report_pool(name: &str, wall_ms: f64, want: &[f16], got: &[f16], tol: f64) -> bool {
+    let (w, g) = (as_f64(want), as_f64(got));
+    let (cos, abs, rel, peak, worst) = stats(&w, &g);
+    let exact = want.iter().zip(got).filter(|(a, b)| a == b).count();
+    let pass = if tol == 0.0 {
+        exact == want.len()
+    } else {
+        cos >= COS_MIN && abs <= tol * peak.max(1e-6)
+    };
+    println!(
+        "  {name:<40} {wall_ms:9.1} ms  cos={cos:.9}  max_abs={abs:.3e}  \
+         max_rel(sig)={rel:.3e}  peak={peak:.3} (worst #{worst})  exact={exact}/{}  -> {}",
+        want.len(),
+        if pass { "PASS" } else { "FAIL" }
+    );
+    pass
+}
+
+fn run_pool(dev: &Device, d: PoolDesc, reps: usize) -> bool {
+    let (oh, ow) = (d.oh() as usize, d.ow() as usize);
+    let n_in = d.c * d.ih * d.iw;
+    let input = fill(n_in, -3.0, 3.0, 0x81 + (n_in % 9973) as u32);
+    let mut out = vec![f16::ZERO; d.c * oh * ow];
+    let mut want = vec![f16::ZERO; d.c * oh * ow];
+    let (r, ms) = timed(reps, || pool_fp16(dev, &d, &input, &mut out));
+    if let Err(e) = r {
+        println!("  pool: {e}");
+        return false;
+    }
+    pool_ref_fp16(&d, &input, &mut want);
+    let name = format!(
+        "pool {:?} {}x{}x{} k{}x{}s{}x{} p{}",
+        d.method, d.c, d.ih, d.iw, d.kh, d.kw, d.stride_y, d.stride_x, d.pad_top
+    );
+    // Max is idempotent with no reciprocal (bit-exact); an average carries the ppu
+    // reciprocal's fp16 rounding.
+    let tol = if d.method == PoolMethod::Max {
+        0.0
+    } else {
+        2e-3
+    };
+    report_pool(&name, ms, &want, &out, tol)
+}
+
+fn run_pool_int8(dev: &Device, d: PoolDesc, reps: usize, uint8: bool) -> bool {
+    let (oh, ow) = (d.oh() as usize, d.ow() as usize);
+    let n_in = d.c * d.ih * d.iw;
+    let n_out = d.c * oh * ow;
+    let input = fill_i8(n_in, 0x91 + (n_in % 9973) as u32);
+    let mut out = vec![0i8; n_out];
+    let mut want = vec![0i8; n_out];
+    let max = d.method == PoolMethod::Max;
+    let (r, ms) = timed(reps, || {
+        if uint8 {
+            // The uint8 entry takes bytes; the same bit patterns are what the int8
+            // entry sees, so one conversion pair covers both.
+            let src: Vec<u8> = input.iter().map(|&v| v as u8).collect();
+            let mut dst = vec![0u8; n_out];
+            let r = pool_uint8(dev, &d, &src, &mut dst);
+            for (o, v) in out.iter_mut().zip(&dst) {
+                *o = *v as i8;
+            }
+            r
+        } else {
+            pool_int8(dev, &d, &input, &mut out)
+        }
+    });
+    if let Err(e) = r {
+        println!("  pool int8: {e}");
+        return false;
+    }
+    if uint8 {
+        let src: Vec<u8> = input.iter().map(|&v| v as u8).collect();
+        let mut dst = vec![0u8; n_out];
+        pool_ref_uint8(&d, &src, &mut dst);
+        for (w, v) in want.iter_mut().zip(&dst) {
+            *w = *v as i8;
+        }
+    } else {
+        pool_ref_int8(&d, &input, &mut want);
+    }
+    let name = format!(
+        "pool {} {:?} {}x{}x{} k{}x{}s{}x{} p{}",
+        if uint8 { "u8" } else { "i8" },
+        d.method,
+        d.c,
+        d.ih,
+        d.iw,
+        d.kh,
+        d.kw,
+        d.stride_y,
+        d.stride_x,
+        d.pad_top
+    );
+    let w64: Vec<i64> = want.iter().map(|&v| v as i64).collect();
+    let g64: Vec<i64> = out.iter().map(|&v| v as i64).collect();
+    // Max is exact integer max; an average can differ by one where the fp16 sum times
+    // the reciprocal lands on a rounding boundary (the C gates it the same way).
+    report_int(&name, ms, &w64, &g64, if max { 0 } else { 1 })
+}
+
+// ── Resize ────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn run_resize(
+    dev: &Device,
+    c: usize,
+    ih: usize,
+    iw: usize,
+    sy: usize,
+    sx: usize,
+    bilinear: bool,
+    reps: usize,
+) -> bool {
+    let input = fill(c * ih * iw, -1.5, 1.5, 0xA1 + (c * 31 + ih) as u32);
+    let mut out = vec![f16::ZERO; c * ih * sy * iw * sx];
+    let mut want = vec![f16::ZERO; c * ih * sy * iw * sx];
+    let (r, ms) = timed(reps, || {
+        if bilinear {
+            upsample_bilinear(dev, &input, &mut out, c, ih, iw, sy, sx)
+        } else {
+            upsample_nearest(dev, &input, &mut out, c, ih, iw, sy, sx)
+        }
+    });
+    if let Err(e) = r {
+        println!("  resize: {e}");
+        return false;
+    }
+    if bilinear {
+        upsample_bilinear_ref(&input, &mut want, c, ih, iw, sy, sx);
+    } else {
+        upsample_nearest_ref(&input, &mut want, c, ih, iw, sy, sx);
+    }
+    let name = format!(
+        "{} {}x{}x{} s{}x{}",
+        if bilinear { "bilinear" } else { "nearest" },
+        c,
+        ih,
+        iw,
+        sy,
+        sx
+    );
+    // Nearest is exact block replication; bilinear carries the fp16 triangle kernel's
+    // rounding (the C header's own gate).
+    let tol = if bilinear { 2e-3 } else { 0.0 };
+    report_pool(&name, ms, &want, &out, tol)
+}
+
+// ── Raw-file A/B mode ─────────────────────────────────────────────────────────
 fn num(args: &[String], i: usize) -> Result<usize, String> {
     args.get(i)
         .ok_or_else(|| format!("missing argument #{i}"))?
@@ -486,6 +852,99 @@ fn check_len(name: &str, got: &[f16], want: usize) -> Result<(), String> {
         return Err(format!("{name}: {} elements, expected {want}", got.len()));
     }
     Ok(())
+}
+
+/// A signed integer argument (the zero points are negative).
+fn sint(args: &[String], i: usize) -> Result<i32, String> {
+    args.get(i)
+        .ok_or_else(|| format!("missing argument #{i}"))?
+        .parse::<i32>()
+        .map_err(|_| format!("argument #{i} is not an integer"))
+}
+
+/// A raw `f32` bit pattern in hex (the A/B's scale exchange, so both sides read the
+/// identical value rather than reparsing a decimal).
+fn f32_bits(args: &[String], i: usize) -> Result<f32, String> {
+    let s = args
+        .get(i)
+        .ok_or_else(|| format!("missing argument #{i}"))?;
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bits = u32::from_str_radix(s, 16).map_err(|_| format!("argument #{i} is not hex"))?;
+    Ok(f32::from_bits(bits))
+}
+
+fn read_raw(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+}
+
+fn read_i8(path: &str) -> Result<Vec<i8>, String> {
+    Ok(read_raw(path)?.into_iter().map(|b| b as i8).collect())
+}
+
+fn read_i32(path: &str) -> Result<Vec<i32>, String> {
+    let bytes = read_raw(path)?;
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!("{path}: length is not a multiple of 4"));
+    }
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| i32::from_le_bytes(*c))
+        .collect())
+}
+
+fn write_i8(path: &str, data: &[i8]) -> Result<(), String> {
+    let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
+    std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))
+}
+
+fn write_i32(path: &str, data: &[i32]) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|e| format!("{path}: {e}"))
+}
+
+fn check_len_i8(name: &str, got: &[i8], want: usize) -> Result<(), String> {
+    if got.len() != want {
+        return Err(format!("{name}: {} elements, expected {want}", got.len()));
+    }
+    Ok(())
+}
+
+fn check_len_i32(name: &str, got: &[i32], want: usize) -> Result<(), String> {
+    if got.len() != want {
+        return Err(format!("{name}: {} elements, expected {want}", got.len()));
+    }
+    Ok(())
+}
+
+/// The pool geometry arguments shared by the three pool A/B families.
+///
+/// `FAMILY METHOD C IH IW KH KW SY SX PT PL PB PR IN OUT`
+fn io_pool(args: &[String]) -> Result<PoolDesc, String> {
+    let method = match num(args, 1)? {
+        0 => PoolMethod::Avg,
+        1 => PoolMethod::Max,
+        other => return Err(format!("bad pooling method {other}")),
+    };
+    let mut d = PoolDesc::new(
+        num(args, 2)?,
+        num(args, 3)?,
+        num(args, 4)?,
+        num(args, 5)?,
+        num(args, 6)?,
+    );
+    d.stride_y = num(args, 7)?;
+    d.stride_x = num(args, 8)?;
+    d.pad_top = num(args, 9)?;
+    d.pad_left = num(args, 10)?;
+    d.pad_bottom = num(args, 11)?;
+    d.pad_right = num(args, 12)?;
+    d.method = method;
+    Ok(d)
 }
 
 fn io_mode(dev: &Device, args: &[String]) -> Result<(), String> {
@@ -581,6 +1040,125 @@ fn io_mode(dev: &Device, args: &[String]) -> Result<(), String> {
             conv_transpose2d(dev, &d, &input, &w, &mut out).map_err(|e| e.to_string())?;
             write_f16(out_path, &out)
         }
+        "conv_int8" => {
+            // conv_int8 IC IH IW OC KH KW SY SX PT PL DY DX IN W OUT
+            let (ic, ih, iw, oc) = (num(args, 1)?, num(args, 2)?, num(args, 3)?, num(args, 4)?);
+            let (kh, kw) = (num(args, 5)?, num(args, 6)?);
+            let mut d = Conv2dDesc::new(ic, ih, iw, oc, kh, kw);
+            d.stride_y = num(args, 7)?;
+            d.stride_x = num(args, 8)?;
+            d.pad_top = num(args, 9)?;
+            d.pad_left = num(args, 10)?;
+            d.dil_y = num(args, 11)?;
+            d.dil_x = num(args, 12)?;
+            let input = read_i8(args.get(13).ok_or("missing IN")?)?;
+            let w = read_i8(args.get(14).ok_or("missing W")?)?;
+            check_len_i8("IN", &input, ic * ih * iw)?;
+            check_len_i8("W", &w, oc * ic * kh * kw)?;
+            let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+            let mut out = vec![0i32; oc * oh * ow];
+            conv2d_int8(dev, &d, &input, &w, &mut out).map_err(|e| e.to_string())?;
+            write_i32(out_path, &out)
+        }
+        "conv_dw_int8" => {
+            // conv_dw_int8 IC IH IW KH KW SY SX PT PL DY DX BIAS I_SCALE W_SCALE
+            //              O_SCALE IN_ZP W_ZP OUT_ZP IN W OUT
+            let (ic, ih, iw) = (num(args, 1)?, num(args, 2)?, num(args, 3)?);
+            let (kh, kw) = (num(args, 4)?, num(args, 5)?);
+            let mut d = Conv2dDesc::new(ic, ih, iw, ic, kh, kw);
+            d.depthwise = true;
+            d.stride_y = num(args, 6)?;
+            d.stride_x = num(args, 7)?;
+            d.pad_top = num(args, 8)?;
+            d.pad_left = num(args, 9)?;
+            d.dil_y = num(args, 10)?;
+            d.dil_x = num(args, 11)?;
+            let bias_path = args.get(12).ok_or("missing BIAS")?;
+            let bias = if bias_path == "-" {
+                None
+            } else {
+                let b = read_i32(bias_path)?;
+                check_len_i32("BIAS", &b, ic)?;
+                Some(b)
+            };
+            let (in_scale, w_scale, out_scale) = (
+                f32_bits(args, 13)?,
+                f32_bits(args, 14)?,
+                f32_bits(args, 15)?,
+            );
+            let (in_zp, w_zp, out_zp) = (sint(args, 16)?, sint(args, 17)?, sint(args, 18)?);
+            let input = read_i8(args.get(19).ok_or("missing IN")?)?;
+            let w = read_i8(args.get(20).ok_or("missing W")?)?;
+            check_len_i8("IN", &input, ic * ih * iw)?;
+            check_len_i8("W", &w, ic * kh * kw)?;
+            let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+            let mut out = vec![0i8; ic * oh * ow];
+            conv2d_dw_int8(
+                dev,
+                &d,
+                &input,
+                &w,
+                bias.as_deref(),
+                in_scale,
+                w_scale,
+                out_scale,
+                in_zp,
+                w_zp,
+                out_zp,
+                &mut out,
+            )
+            .map_err(|e| e.to_string())?;
+            write_i8(out_path, &out)
+        }
+        "pool" | "pool_int8" | "pool_uint8" => {
+            // FAMILY METHOD C IH IW KH KW SY SX PT PL PB PR IN OUT
+            let d = io_pool(args)?;
+            pool_fp16_plan(&d).map_err(|e| e.to_string())?;
+            let (oh, ow) = (d.oh() as usize, d.ow() as usize);
+            let (n_in, n_out) = (d.c * d.ih * d.iw, d.c * oh * ow);
+            let in_path = args.get(13).ok_or("missing IN")?;
+            match family {
+                "pool" => {
+                    let input = read_f16(in_path)?;
+                    check_len("IN", &input, n_in)?;
+                    let mut out = vec![f16::ZERO; n_out];
+                    pool_fp16(dev, &d, &input, &mut out).map_err(|e| e.to_string())?;
+                    write_f16(out_path, &out)
+                }
+                "pool_int8" => {
+                    let input = read_i8(in_path)?;
+                    check_len_i8("IN", &input, n_in)?;
+                    let mut out = vec![0i8; n_out];
+                    pool_int8(dev, &d, &input, &mut out).map_err(|e| e.to_string())?;
+                    write_i8(out_path, &out)
+                }
+                _ => {
+                    let input = read_raw(in_path)?;
+                    if input.len() != n_in {
+                        return Err(format!("IN: {} bytes, expected {n_in}", input.len()));
+                    }
+                    let mut out = vec![0u8; n_out];
+                    pool_uint8(dev, &d, &input, &mut out).map_err(|e| e.to_string())?;
+                    std::fs::write(out_path, &out).map_err(|e| format!("{out_path}: {e}"))
+                }
+            }
+        }
+        "resize_nearest" | "resize_bilinear" => {
+            // resize_* C IH IW SY SX IN OUT
+            let (c, ih, iw) = (num(args, 1)?, num(args, 2)?, num(args, 3)?);
+            let (sy, sx) = (num(args, 4)?, num(args, 5)?);
+            let input = read_f16(args.get(6).ok_or("missing IN")?)?;
+            check_len("IN", &input, c * ih * iw)?;
+            let mut out = vec![f16::ZERO; c * ih * sy * iw * sx];
+            if family == "resize_bilinear" {
+                upsample_bilinear(dev, &input, &mut out, c, ih, iw, sy, sx)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                upsample_nearest(dev, &input, &mut out, c, ih, iw, sy, sx)
+                    .map_err(|e| e.to_string())?;
+            }
+            write_f16(out_path, &out)
+        }
         other => Err(format!("unknown --io family '{other}'")),
     }
 }
@@ -589,7 +1167,8 @@ fn io_mode(dev: &Device, args: &[String]) -> Result<(), String> {
 
 fn usage() {
     eprintln!(
-        "usage: conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose] [--all] [--reps R]\n\
+        "usage: conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose]\n\
+         \x20      [--int8] [--int8-mt] [--int8-dw] [--pool] [--resize] [--all] [--reps R]\n\
          \x20      [--shape IC IH IW OC KH KW [SY SX PT PL DY DX]]\n\
          \x20      [--dw-shape C IH IW KH KW [SY SX PT PL DY DX]]\n\
          \x20      [--conv1d-shape IC IT OC KW STRIDE PAD]\n\
@@ -603,14 +1182,26 @@ fn usage() {
          conv1d: 80x3000 k3 s1/s2 pad1, 384 outputs.\n\
          Transpose: deconv (stride 2/4), lowered (IC % 32, stride 2/4/8, opad),\n\
          depthwise, and opad 0/1.\n\
+         int8: 3x3/1x1, IC 3/32/64, OC 16/32/64, stride 1/2, pad 0/1, spatial tiling.\n\
+         int8 depthwise: C 32/64/96, 3x3, stride 1/2, zero points at both ends, bias.\n\
+         pool: fp16 max/avg at pads 0/1 plus int8/uint8 max/avg.\n\
+         resize: nearest and bilinear at scales 2/3/4.\n\
          \n\
          Raw-file A/B against the C library (run one op on IN, write OUT):\n\
          \x20 conv_selftest --io conv     IC IH IW OC KH KW SY SX PT PL DY DX DW IN W OUT\n\
          \x20 conv_selftest --io conv_act IC IH IW OC KH KW SY SX PT PL DY DX DW KIND IN W OUT\n\
          \x20 conv_selftest --io conv1d   IC IT OC KW STRIDE PAD IN W OUT\n\
          \x20 conv_selftest --io conv_t   IC IH IW OC KH KW SY SX PT PL DY DX OPADY OPADX DW IN W OUT\n\
-         Tensors are raw fp16; W is [OC][IC][KH][KW] (direct), [C][KH][KW] (depthwise)\n\
-         or [IC][OC][KH][KW] (direct transpose). This is ab_board.c's exchange format."
+         \x20 conv_selftest --io conv_int8 IC IH IW OC KH KW SY SX PT PL DY DX IN W OUT\n\
+         \x20 conv_selftest --io conv_dw_int8 IC IH IW KH KW SY SX PT PL DY DX BIAS \\\n\
+         \x20      I_SCALE W_SCALE O_SCALE IN_ZP W_ZP OUT_ZP IN W OUT\n\
+         \x20 conv_selftest --io pool|pool_int8|pool_uint8 METHOD C IH IW KH KW SY SX PT PL PB PR IN OUT\n\
+         \x20 conv_selftest --io resize_nearest|resize_bilinear C IH IW SY SX IN OUT\n\
+         Tensors are raw fp16, except conv_int8 (IN/W int8, OUT int32), conv_dw_int8\n\
+         (IN/W/OUT int8, BIAS int32 or -) and the int8/uint8 pools (one byte each).\n\
+         The quant scales are f32 bit patterns in hex. W is [OC][IC][KH][KW] (direct),\n\
+         [C][KH][KW] (depthwise) or [IC][OC][KH][KW] (direct transpose). This is\n\
+         ab_board.c's exchange format."
     );
 }
 
@@ -633,6 +1224,8 @@ fn parse_shape<const N: usize>(args: &[String], i: usize, optional: usize) -> Op
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (mut conv, mut dw, mut act, mut c1d, mut tr) = (false, false, false, false, false);
+    let (mut i8, mut i8dw, mut pool, mut resize) = (false, false, false, false);
+    let mut i8mt = false;
     let mut all = args.is_empty();
     let mut reps = 1usize;
     let mut conv_shape: Option<ConvShape> = None;
@@ -649,6 +1242,11 @@ fn main() -> ExitCode {
             "--act" => act = true,
             "--conv1d" => c1d = true,
             "--transpose" => tr = true,
+            "--int8" => i8 = true,
+            "--int8-dw" => i8dw = true,
+            "--int8-mt" => i8mt = true,
+            "--pool" => pool = true,
+            "--resize" => resize = true,
             "--all" => all = true,
             "--reps" => {
                 i += 1;
@@ -728,8 +1326,10 @@ fn main() -> ExitCode {
     }
     if io.is_none() && all {
         (conv, dw, act, c1d, tr) = (true, true, true, true, true);
+        (i8, i8dw, pool, resize) = (true, true, true, true);
+        i8mt = true;
     }
-    if io.is_none() && !(conv || dw || act || c1d || tr) {
+    if io.is_none() && !(conv || dw || act || c1d || tr || i8 || i8dw || pool || resize || i8mt) {
         usage();
         return ExitCode::FAILURE;
     }
@@ -840,6 +1440,146 @@ fn main() -> ExitCode {
         };
         for s in shapes {
             pass &= run_transpose(&dev, s, reps);
+        }
+        println!();
+    }
+
+    if i8 {
+        println!("int8 direct conv (int32-raw accumulator):");
+        let shapes = match conv_shape {
+            Some(s) => vec![s],
+            None => vec![
+                // The RGB stem (IC=3 padded to 32), 1x1, and the plain 3x3.
+                (3, 32, 32, 16, 1, 1, 1, 1, 0, 0, 1, 1),
+                (32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+                (32, 16, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1),
+                (64, 8, 8, 16, 1, 1, 1, 1, 0, 0, 1, 1),
+                // Stride 2, pad 0, and the OC%32 pad (an OC=16 head is padded to 32).
+                (32, 16, 16, 32, 3, 3, 2, 2, 0, 0, 1, 1),
+                (64, 14, 14, 16, 3, 3, 1, 1, 0, 0, 1, 1),
+                // Tiling: OC-only, then OC + row bands (112x112 k3).
+                (64, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1),
+                (128, 28, 28, 128, 3, 3, 2, 2, 1, 1, 1, 1),
+                (32, 112, 112, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+            ],
+        };
+        // The first case exercises the alloc-per-call entry; the rest share one
+        // resident context (grow-only BOs, no per-call churn).
+        let mut ctx = ConvContext::new(&dev);
+        for (idx, s) in shapes.into_iter().enumerate() {
+            pass &= if idx == 0 {
+                run_int8(&dev, s, reps, None)
+            } else {
+                run_int8(&dev, s, reps, Some(&mut ctx))
+            };
+        }
+        println!();
+    }
+    if i8mt {
+        println!("int8 direct conv, multicore pool vs serial:");
+        let shapes = match conv_shape {
+            Some(s) => vec![s],
+            None => vec![
+                (64, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1),
+                (128, 28, 28, 128, 3, 3, 2, 2, 1, 1, 1, 1),
+                (32, 112, 112, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+                // One OC group: the pool falls back to the serial path by design.
+                (64, 14, 14, 32, 3, 3, 1, 1, 0, 0, 1, 1),
+            ],
+        };
+        for s in shapes {
+            pass &= run_int8_mt(&dev, s, 3, reps);
+        }
+        println!();
+    }
+    if i8dw {
+        println!("int8 depthwise conv (int8 out, on-chip requant):");
+        let shapes: Vec<(DwShape, i32, i32, bool)> = match dw_shape {
+            Some(s) => vec![(s, -2, 5, true)],
+            None => vec![
+                // C is the int8 depthwise *group* count in effect: the CNA walks
+                // channels in G = 64 wide groups, so a C that is not a multiple of 64
+                // runs outside the writer's validated envelope (both libraries then
+                // emit identical bytes for a wrong surface — see the module docs).
+                ((64, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1), -2, 5, true),
+                ((64, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1), 37, -20, true),
+                ((64, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1), -128, 127, true),
+                ((64, 8, 11, 5, 5, 1, 1, 1, 1, 1, 1), 127, -128, false),
+                ((128, 7, 5, 3, 3, 1, 2, 1, 1, 1, 1), 0, 0, true),
+            ],
+        };
+        for (s, izp, ozp, bias) in shapes {
+            pass &= run_dw_int8(&dev, s, izp, ozp, bias, reps);
+        }
+        println!();
+    }
+    if pool {
+        println!("PPU pooling (fp16 / int8 / uint8):");
+        let mut cases: Vec<PoolDesc> = Vec::new();
+        // fp16: global max/avg, a padded max and a padded, overlapping average.
+        let mut d = PoolDesc::new(8, 7, 7, 7, 7);
+        d.stride_y = 7;
+        d.stride_x = 7;
+        d.method = PoolMethod::Max;
+        cases.push(d);
+        let mut d = PoolDesc::new(8, 7, 7, 7, 7);
+        d.stride_y = 7;
+        d.stride_x = 7;
+        cases.push(d); // avg (the default method is Max; set below)
+        // Two windows of a 7x7 kernel (the PPU's validated stepping envelope keeps the
+        // kernel at 8 or below for a multi-window pool; see the pool module docs).
+        let mut d = PoolDesc::new(16, 14, 14, 7, 7);
+        d.stride_y = 7;
+        d.stride_x = 7;
+        d.method = PoolMethod::Avg;
+        cases.push(d);
+        let mut d = PoolDesc::new(8, 5, 5, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        d.pad_bottom = 1;
+        d.pad_right = 1;
+        d.method = PoolMethod::Max;
+        cases.push(d);
+        let mut d = PoolDesc::new(8, 5, 5, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        d.pad_bottom = 1;
+        d.pad_right = 1;
+        d.method = PoolMethod::Avg;
+        cases.push(d);
+        // The second entry's method is Avg (built here so the list stays declarative).
+        cases[1].method = PoolMethod::Avg;
+        for d in &cases {
+            pass &= run_pool(&dev, *d, reps);
+        }
+        // int8 / uint8: a 2x2 stride-2 max (exact integer max) and a padded 3x3 average.
+        let mut d = PoolDesc::new(32, 8, 8, 2, 2);
+        d.stride_y = 2;
+        d.stride_x = 2;
+        d.method = PoolMethod::Max;
+        pass &= run_pool_int8(&dev, d, reps, false);
+        pass &= run_pool_int8(&dev, d, reps, true);
+        let mut d = PoolDesc::new(64, 7, 7, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        d.pad_bottom = 1;
+        d.pad_right = 1;
+        d.method = PoolMethod::Avg;
+        pass &= run_pool_int8(&dev, d, reps, false);
+        pass &= run_pool_int8(&dev, d, reps, true);
+        println!();
+    }
+    if resize {
+        println!("upsample (depthwise transposed conv):");
+        for bilinear in [false, true] {
+            for (c, ih, iw, sy, sx) in [
+                (32, 8, 8, 2, 2),
+                (32, 5, 7, 3, 3),
+                (32, 4, 4, 4, 4),
+                (64, 6, 6, 2, 4),
+            ] {
+                pass &= run_resize(&dev, c, ih, iw, sy, sx, bilinear, reps);
+            }
         }
         println!();
     }

@@ -170,11 +170,15 @@ InstanceNorm and L2-Normalize over the `[N,C,P]` channels-major layout), the gat
 family (`rocket_ffn.c`: the GeGLU/SwiGLU core, the three-matmul block, the pinned-tile
 `ffn_fused` and `mlp_fused`, the host-handoff `mlp`) and the encoder block
 (`rocket_encoder.c`: one pre-norm Whisper layer over the two norms, `mha_self`, the
-residual adds and the fused MLP) and the fp16 convolution family (`rocket_conv.c`: the
+residual adds and the fused MLP), the fp16 convolution family (`rocket_conv.c`: the
 native CNA conv — direct, depthwise, 1D and the conv→activation fusion, with the OC /
 spatial / channel tiling and the resident-BO context — and `rocket_conv_transpose.c`:
-the hardware deconvolution route and the dilated-input lowering) are ported and
-validated on the board. Planner and regcmd output are byte-equal to the C library for
+the hardware deconvolution route and the dilated-input lowering), the native int8
+convolution (`rocket_conv.c`'s other half: the direct int8→int32 accumulator with its
+multicore pool and the int8-out depthwise requant), the PPU pooling family
+(`rocket_pool.c`: MaxPool/AveragePool plus the int8/uint8 entries) and the
+integer-factor upsample (`rocket_resize.c`: nearest and bilinear as a depthwise
+transposed conv) are ported and validated on the board. Planner and regcmd output are byte-equal to the C library for
 every matmul dtype
 (fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation program (1070 words,
 word-for-word) and for the PPU pool program (30 words, over an 18-case
@@ -182,8 +186,11 @@ shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the 
 reason code and both factor lists), the fp16 average-reciprocal convention and the
 convolution family (`conv`: 23 plan cases over the direct/depthwise/dilation/stride/
 explicit-extent matrix, `emit-conv`: 18 programs including the CNA deconvolution
-strides and the refusals, `emit-conv-act`: 6 fused-activation programs); the LUT tables
-and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
+strides and the refusals, `emit-conv-act`: 6 fused-activation programs) and the int8
+convolution (`emit-conv-int8`: 11 direct programs incl. the +1 CBUF bank slack and the
+int32-output stride quirk, `emit-conv-dw-int8`: 9 depthwise programs over a
+zero-point/scale matrix, including the int32-raw diagnostic form and both refusals);
+the LUT tables and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
 >= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
 the int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
 
@@ -248,6 +255,36 @@ k3 1.3 ms through the alloc-per-call entry and 0.5 ms on a resident context, a
 depthwise 4.7 ms, the Whisper front-end conv1d (80x3000 k3 s1, 384 outputs) 80 ms and
 its stride-2 form 31 ms, and the transposed convs 1.6-3.9 ms.
 
+The M8b families are **bit-identical to the C library on the board across the whole
+measured matrix** as well (`ab_compare.py`): nine int8 direct convs (3x3/1x1/k7,
+stride 1/2, the RGB stem at `IC = 3`, an `OC = 16` head padded to 32, and the tiling
+shapes 64x56x56 k3 / 32x112x112 k3 / 128x28x28 k3 s2), six int8 depthwise convs
+(`C = 64`/`128`, strides 1/2, asymmetric strides, 5x5, zero points at both ends of the
+int8 range, with and without the bias cube), nine pools (fp16 max/avg with and without
+padding plus int8 and uint8 max/avg) and eight upsamples (nearest and bilinear at
+scales 2/3/4, non-square factors). Against the device-free references the int8 direct
+conv is **int32-exact** on every shape (int8 × int8 → int32 is exact integer
+arithmetic; a float gate would hide an accumulator bug), the int8 depthwise output is
+**bit-exact against the DPU requant model** (nearest, ties to even — the rule measured
+on the part, in `conv2d_dw_int8_model`), max pooling is exact, an average sits within
+the `fp16(65536/k)` reciprocal's tolerance (<= 1e-3 absolute at the array peak), the
+int8/uint8 averages are within one rounding step, nearest upsampling is bit-exact and
+bilinear is within the fp16 triangle kernel's rounding. Board wall (cores 0-3, busy
+board, 600 MHz module): an int8 3x3 32x16x16 0.4-1.0 ms (alloc-per-call entry 2.1 ms for
+the 3x32x32 RGB tile), 64x56x56 k3 5.6 ms, 32x112x112 k3 6.6 ms, 128x28x28 k3 s2
+4.9-23 ms depending on load; the int8 depthwise jobs 1.0-7.9 ms; fp16 pools 0.5-0.7 ms;
+the upsamples 1.4-5.8 ms.
+
+Two *encoder-level* envelopes the C library does not check showed up while measuring,
+and this port mirrors them because it emits the same programs: the PPU's pooling
+window is only reliable up to a kernel of 8 when more than one output window is
+needed (a 9x9 or larger kernel, or a stride larger than the kernel, writes zeros or
+garbage — a 14x14 kernel is fine only when the plane is exactly one window, which is
+what the global-pool decomposition uses), and the int8 depthwise writer walks channels
+in `G = 64` groups, so a `C` that is a multiple of 16 but not of 64 (32, 96) produces
+an identically-wrong surface on both sides. The self-test matrix stays inside those
+envelopes; the A/B keeps one case of each to pin the bit-identity.
+
 Attention also has its long-context form, the opt-in tiled path
 (`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
 one key tile at a time with the online softmax, instead of the `[Tp, Kn]` score
@@ -280,7 +317,14 @@ family (`geglu`, `ffn`, the pinned-tile `ffn_fused`/`mlp_fused`, the host-handof
 `conv2d_plan_code`, the `conv2d_deconv`/`conv2d_deconv_fits` deconvolution route and
 the weight/feature cube index math; `conv_transpose2d`/`conv_transpose2d_ctx`/
 `conv_transpose2d_ref` with `conv_transpose2d_plan`/`_plan_code` and the route enum),
-and
+the native int8 convolution (`conv2d_int8`/`conv2d_int8_ctx`/`conv2d_int8_mt` with
+`ConvInt8Pool`, `conv2d_ref_int8`, `conv_int8_tile_plan` and the int8 cube index
+helpers; `conv2d_dw_int8`/`conv2d_dw_int8_ctx` with the on-chip requant, its host
+model `conv2d_dw_int8_model` and the `requant_*` arithmetic), the PPU pooling family
+(`pool_fp16`/`pool_int8`/`pool_uint8` and their references, `pool_fp16_plan` with the
+C's `-3`..`-10` classes, `PoolDesc`), the upsample family
+(`upsample_nearest`/`upsample_bilinear` and the references, `build_kernel`,
+`bilinear_ksize`, the plans), and
 masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
@@ -297,9 +341,10 @@ the reduce/softmax families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--
 `--reps`), `crates/rocket-npu/src/bin/ops_selftest.rs` for the norm/vision/FFN/encoder
 families (`--norm`, `--vision`, `--ffn`, `--encoder`, the four per-family shape
 overrides, `--reps`), `crates/rocket-npu/src/bin/conv_selftest.rs` for the convolution
-family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, the four per-family shape
-overrides, `--reps`), and their `--io` raw-file modes are the exchange format of
-`tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board.
+family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, `--int8`, `--int8-dw`,
+`--pool`, `--resize`, the per-family shape overrides, `--reps`), and their `--io`
+raw-file modes are the exchange format of `tools/c-oracle/ab_compare.py` for the
+C-vs-Rust A/B on the board.
 
 `ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
 `ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
@@ -317,14 +362,15 @@ aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stay
 materialized), on-NPU **attention** softmax, the cube-resident *mechanism* of the fused
 FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
 bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
-optimization is the remaining work), the **int8 convolution** entries of
-`rocket_conv.c` (the direct int8→int32 accumulator, the int8-out depthwise requant, the
-int8 multicore pool and the RK3576 conv paths — M8b), and the remaining op families:
-the `rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool decomposition is
-ported), resize/upsample, SAM/SigLIP and graph execution.
+optimization is the remaining work), the RK3576-specific convolution and pooling
+entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
+entry with its zero point and the prepacked/cube handles), the int8 convolution's
+opt-in `ROCKET_CONV_BATCH` batched submit (bit-identical to the per-tile path this
+port runs), and the remaining op families: SAM/SigLIP and graph execution.
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
-the FFN/MLP, the encoder block and the fp16 convolution family (direct/depthwise/1D,
-the conv→activation fusion and the transposed conv) are implemented. See
+the FFN/MLP, the encoder block, the fp16 and int8 convolution families (direct/
+depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant), the
+PPU pooling family and the upsample are implemented. See
 the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module

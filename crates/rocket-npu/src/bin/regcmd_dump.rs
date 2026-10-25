@@ -18,6 +18,9 @@
 //!   regcmd_dump conv         IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]
 //!   regcmd_dump emit-conv    IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 IN WT OUT [DSY DSX]
 //!   regcmd_dump emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT
+//!   regcmd_dump emit-conv-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT [DW_GROUP]
+//!   regcmd_dump emit-conv-dw-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT BIAS \
+//!        I_SCALE_BITS W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT [DW_GROUP]
 //!
 //! The emitters take the TILE dims (Mt Kt Nt), not the full problem dims, and a
 //! plan prints `Mt Kt Nt jobs` or `-1`, matching `tools/c-oracle/oracle`.
@@ -48,7 +51,10 @@ use std::process::ExitCode;
 use rocket_npu::matmul::plan::{self, BF16, INT4, INT8, INT8_GW, Plan, TF32};
 use rocket_npu::ops::activation::{Activation, LutTable, lut_epilogue_build};
 use rocket_npu::ops::conv::{Conv2dDesc, conv2d_oh, conv2d_ow, conv2d_plan_code};
-use rocket_npu::regcmd::conv::{ConvAct, ConvParams, gen_conv2d_dw_fp16, gen_conv2d_fp16};
+use rocket_npu::regcmd::conv::{
+    ConvAct, ConvInt8Params, ConvParams, gen_conv2d_dw_fp16, gen_conv2d_dw_int8, gen_conv2d_fp16,
+    gen_conv2d_int8,
+};
 use rocket_npu::regcmd::fp16::{MatmulParams, emit};
 use rocket_npu::regcmd::pool::{PoolMethod, PoolParams, gen_pool_fp16};
 
@@ -221,6 +227,96 @@ fn conv_mode(mode: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The int8 family: `emit-conv-int8` (the direct int32-raw program) and
+/// `emit-conv-dw-int8` (the depthwise int8-out requant, or its int32-raw diagnostic
+/// form with `INT8_OUT = 0`).
+///
+/// The argument layout is `tools/c-oracle/oracle`'s: 12 geometry scalars, the three
+/// IOVAs, then the quant tail. The scales are raw `f32` bit patterns in hex.
+fn conv_int8_mode(mode: &str, args: &[String]) -> ExitCode {
+    if args.len() < 17 {
+        eprintln!("emit-conv-int8 needs IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT");
+        return ExitCode::FAILURE;
+    }
+    let n = |i: usize| args[i].parse::<usize>().unwrap_or(0);
+    let mut d = Conv2dDesc {
+        ic: n(2),
+        ih: n(3),
+        iw: n(4),
+        oc: n(5),
+        kh: n(6),
+        kw: n(7),
+        stride_y: n(8),
+        stride_x: n(9),
+        pad_top: n(10),
+        pad_left: n(11),
+        dil_y: n(12),
+        dil_x: n(13),
+        ..Default::default()
+    };
+    d.depthwise = mode == "emit-conv-dw-int8";
+    // The depthwise invariant OC == IC; a 0 in that argument means "the entry's own C"
+    // (the library passes `oc = C`).
+    if d.depthwise && d.oc == 0 {
+        d.oc = d.ic;
+    }
+    let mut p = ConvInt8Params::new(
+        d.ic as u16,
+        d.ih as u16,
+        d.iw as u16,
+        d.oc as u16,
+        conv2d_oh(&d) as u16,
+        conv2d_ow(&d) as u16,
+        d.kh as u16,
+        d.kw as u16,
+        dma(&args[14]),
+        dma(&args[15]),
+        dma(&args[16]),
+    );
+    p.stride_y = d.stride_y as u8;
+    p.stride_x = d.stride_x as u8;
+    p.dil_y = d.dil_y as u8;
+    p.dil_x = d.dil_x as u8;
+    p.pad_top = d.pad_top as u8;
+    p.pad_left = d.pad_left as u8;
+
+    let mut ops = Vec::new();
+    let r = if !d.depthwise {
+        p.dw_group = args.get(17).map(|v| v.parse().unwrap_or(0)).unwrap_or(0);
+        gen_conv2d_int8(&mut p, &mut ops)
+    } else {
+        if args.len() < 24 {
+            eprintln!("emit-conv-dw-int8 needs BIAS I W O SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT");
+            return ExitCode::FAILURE;
+        }
+        p.bias_dma = dma(&args[17]);
+        let s = |i: usize| f32::from_bits(dma(&args[i]));
+        p.in_scale = s(18);
+        p.w_scale = s(19);
+        p.out_scale = s(20);
+        let zp = |i: usize| args[i].parse::<i32>().unwrap_or(0) + 0x80;
+        p.input_zero_point = zp(21);
+        p.output_zero_point = zp(22);
+        p.weight_zero_point = zp(23);
+        p.int8_out = args.get(24).map(|v| v != "0").unwrap_or(true);
+        p.dw_group = args.get(25).map(|v| v.parse().unwrap_or(0)).unwrap_or(0);
+        gen_conv2d_dw_int8(&mut p, &mut ops)
+    };
+    match r {
+        Ok(count) => {
+            println!("{count}");
+            for op in ops {
+                println!("{:016x}", op.0);
+            }
+        }
+        Err(e) => {
+            println!("-1");
+            eprintln!("{e}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -242,12 +338,22 @@ fn main() -> ExitCode {
         eprintln!(
             "       regcmd_dump emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT"
         );
+        eprintln!(
+            "       regcmd_dump emit-conv-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT [DW_GROUP]"
+        );
+        eprintln!(
+            "       regcmd_dump emit-conv-dw-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT BIAS I_SCALE_BITS W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT [DW_GROUP]"
+        );
         return ExitCode::FAILURE;
     }
     let mode = args[1].as_str();
 
     if mode == "conv" || mode == "emit-conv" || mode == "emit-conv-act" {
         return conv_mode(mode, &args);
+    }
+
+    if mode == "emit-conv-int8" || mode == "emit-conv-dw-int8" {
+        return conv_int8_mode(mode, &args);
     }
 
     if mode == "recip" {

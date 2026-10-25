@@ -34,8 +34,18 @@
  *   ab_board conv1d   IC IT OC KW STRIDE PAD  IN W OUT
  *   ab_board conv_t   IC IH IW OC KH KW SY SX PT PL DY DX OPADY OPADX DW  IN W OUT
  *
+ * M8b (int8 convolution, pool, resize). Same argument layout as `conv_selftest --io`:
+ *
+ *   ab_board conv_int8    IC IH IW OC KH KW SY SX PT PL DY DX  IN W OUT
+ *   ab_board conv_dw_int8 IC IH IW KH KW SY SX PT PL DY DX  BIAS I_SCALE_BITS \
+ *         W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP  IN W OUT
+ *   ab_board pool|pool_int8|pool_uint8 METHOD C IH IW KH KW SY SX PT PL PB PR  IN OUT
+ *   ab_board resize_nearest|resize_bilinear C IH IW SY SX  IN OUT
+ *
  * (`W` is `[OC][IC][KH][KW]`/`[C][KH][KW]` for a conv, `[OC][IC][KW]` for conv1d and
- * `[IC][OC][KH][KW]`/`[C][KH][KW]` for a transposed conv.)
+ * `[IC][OC][KH][KW]`/`[C][KH][KW]` for a transposed conv. The int8 conv's IN/W and the
+ * int8/uint8 pools are one byte per element, `conv_int8`'s OUT is int32, and the scales
+ * are f32 bit patterns in hex.)
  *
  * (In the encoder line any of LN1B/BQ/BK/BV/BO/LN2B/BF1/BF2 may be `-`. `mlp` is the
  * C's internal host-handoff MLP, which has no public entry point: the fused entry is
@@ -54,7 +64,9 @@
 
 #include "rocket_npu.h"
 #include "rocket_conv.h"
+#include "rocket_pool.h"
 #include "rocket_reduce.h"
+#include "rocket_resize.h"
 #include "rocket_softmax.h"
 #include "rocket_norm.h"
 #include "rocket_normvision.h"
@@ -426,6 +438,121 @@ int main(int argc, char **argv)
         if (rc) die("conv_t op failed");
         spit(argv[19], out, on * sizeof(_Float16));
         free(in); free(w); free(out);
+    } else if (!strcmp(family, "conv_int8")) {
+        /* conv_int8 IC IH IW OC KH KW SY SX PT PL DY DX IN W OUT */
+        if (argc < 16) die("conv_int8 IC IH IW OC KH KW SY SX PT PL DY DX IN W OUT");
+        rocket_conv2d_desc d = {0};
+        d.ic = atoi(argv[2]); d.ih = atoi(argv[3]); d.iw = atoi(argv[4]);
+        d.oc = atoi(argv[5]); d.kh = atoi(argv[6]); d.kw = atoi(argv[7]);
+        d.stride_y = atoi(argv[8]); d.stride_x = atoi(argv[9]);
+        d.pad_top = atoi(argv[10]); d.pad_left = atoi(argv[11]);
+        d.dil_y = atoi(argv[12]);   d.dil_x = atoi(argv[13]);
+        size_t ib, wb;
+        int8_t *in = slurp(argv[14], &ib);
+        int8_t *w = slurp(argv[15], &wb);
+        if (ib != (size_t)d.ic * d.ih * d.iw) die("input size");
+        if (wb != (size_t)d.oc * d.ic * d.kh * d.kw) die("weight size");
+        size_t on = (size_t)d.oc * rocket_conv2d_oh(&d) * rocket_conv2d_ow(&d);
+        int32_t *out = calloc(on, sizeof(int32_t));
+        if (!out) die("calloc");
+        rc = rocket_conv2d_int8(fd, &d, in, w, out);
+        if (rc) die("conv_int8 op failed");
+        spit(argv[16], out, on * sizeof(int32_t));
+        free(in); free(w); free(out);
+    } else if (!strcmp(family, "conv_dw_int8")) {
+        /* conv_dw_int8 IC IH IW KH KW SY SX PT PL DY DX BIAS I_SCALE W_SCALE
+         *               O_SCALE IN_ZP W_ZP OUT_ZP IN W OUT */
+        if (argc < 22) die("conv_dw_int8 " "IC IH IW KH KW SY SX PT PL DY DX BIAS "
+                           "I_SCALE W_SCALE O_SCALE IN_ZP W_ZP OUT_ZP IN W OUT");
+        rocket_conv2d_desc d = {0};
+        d.ic = atoi(argv[2]); d.ih = atoi(argv[3]); d.iw = atoi(argv[4]);
+        d.oc = d.ic;
+        d.kh = atoi(argv[5]); d.kw = atoi(argv[6]);
+        d.stride_y = atoi(argv[7]); d.stride_x = atoi(argv[8]);
+        d.pad_top = atoi(argv[9]); d.pad_left = atoi(argv[10]);
+        d.dil_y = atoi(argv[11]);   d.dil_x = atoi(argv[12]);
+        d.depthwise = 1;
+        char **a = &argv[13];
+        int32_t *bias = NULL;
+        if (strcmp(a[0], "-")) {
+            size_t bb;
+            bias = slurp(a[0], &bb);
+            if (bb != (size_t)d.ic * sizeof(int32_t)) die("bias size");
+        }
+        union { uint32_t u; float f; } cv;
+        cv.u = (uint32_t)strtoul(a[1], NULL, 16); float in_s = cv.f;
+        cv.u = (uint32_t)strtoul(a[2], NULL, 16); float w_s = cv.f;
+        cv.u = (uint32_t)strtoul(a[3], NULL, 16); float out_s = cv.f;
+        int in_zp = atoi(a[4]), w_zp = atoi(a[5]), out_zp = atoi(a[6]);
+        size_t ib, wb;
+        int8_t *in = slurp(a[7], &ib);
+        int8_t *w = slurp(a[8], &wb);
+        if (ib != (size_t)d.ic * d.ih * d.iw) die("input size");
+        if (wb != (size_t)d.ic * d.kh * d.kw) die("weight size");
+        size_t on = (size_t)d.ic * rocket_conv2d_oh(&d) * rocket_conv2d_ow(&d);
+        int8_t *out = calloc(on, 1);
+        if (!out) die("calloc");
+        rc = rocket_conv2d_dw_int8(fd, &d, in, w, bias, in_s, w_s, out_s,
+                                   in_zp, w_zp, out_zp, out);
+        if (rc) die("conv_dw_int8 op failed");
+        spit(a[9], out, on);
+        free(in); free(w); free(out); free(bias);
+    } else if (!strcmp(family, "pool") || !strcmp(family, "pool_int8") ||
+               !strcmp(family, "pool_uint8")) {
+        /* pool* METHOD C IH IW KH KW SY SX PT PL PB PR IN OUT */
+        if (argc < 14) die("pool METHOD C IH IW KH KW SY SX PT PL PB PR IN OUT");
+        rocket_pool_desc d = {0};
+        d.method = atoi(argv[2]);
+        d.c = atoi(argv[3]);  d.ih = atoi(argv[4]);  d.iw = atoi(argv[5]);
+        d.kh = atoi(argv[6]); d.kw = atoi(argv[7]);
+        d.stride_y = atoi(argv[8]); d.stride_x = atoi(argv[9]);
+        d.pad_top = atoi(argv[10]); d.pad_left = atoi(argv[11]);
+        d.pad_bottom = atoi(argv[12]); d.pad_right = atoi(argv[13]);
+        size_t ib;
+        void *in = slurp(argv[14], &ib);
+        size_t ni = (size_t)d.c * d.ih * d.iw;
+        size_t no = (size_t)d.c * rocket_pool_oh(&d) * rocket_pool_ow(&d);
+        if (!strcmp(family, "pool")) {
+            _Float16 *out = calloc(no, sizeof(_Float16));
+            if (!out) die("calloc");
+            rc = rocket_pool_fp16(fd, &d, in, out);
+            if (rc) die("pool op failed");
+            spit(argv[15], out, no * sizeof(_Float16));
+            free(out);
+        } else if (!strcmp(family, "pool_int8")) {
+            if (ib != ni) die("input size");
+            int8_t *out = calloc(no, 1);
+            if (!out) die("calloc");
+            rc = rocket_pool_int8(fd, &d, in, out);
+            if (rc) die("pool_int8 op failed");
+            spit(argv[15], out, no);
+            free(out);
+        } else {
+            uint8_t *out = calloc(no, 1);
+            if (!out) die("calloc");
+            rc = rocket_pool_uint8(fd, &d, in, out);
+            if (rc) die("pool_uint8 op failed");
+            spit(argv[15], out, no);
+            free(out);
+        }
+        free(in);
+    } else if (!strcmp(family, "resize_nearest") || !strcmp(family, "resize_bilinear")) {
+        /* resize_* C IH IW SY SX IN OUT */
+        if (argc < 7) die("resize_* C IH IW SY SX IN OUT");
+        int C = atoi(argv[2]), IH = atoi(argv[3]), IW = atoi(argv[4]);
+        int sy = atoi(argv[5]), sx = atoi(argv[6]);
+        size_t ib;
+        _Float16 *in = slurp(argv[7], &ib);
+        if (ib != (size_t)C * IH * IW * sizeof(_Float16)) die("input size");
+        size_t on = (size_t)C * IH * sy * IW * sx;
+        _Float16 *out = calloc(on, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = !strcmp(family, "resize_bilinear")
+             ? rocket_upsample_bilinear_fp16(fd, in, out, C, IH, IW, sy, sx)
+             : rocket_upsample_nearest_fp16(fd, in, out, C, IH, IW, sy, sx);
+        if (rc) die("resize op failed");
+        spit(argv[8], out, on * sizeof(_Float16));
+        free(in); free(out);
     } else {
         die("unknown family");
     }

@@ -1,8 +1,8 @@
-//! fp16 CONV_2D on the RK3588 NPU (direct, depthwise, 1D, and the conv→activation
-//! fusion).
+//! fp16 and int8 CONV_2D on the RK3588 NPU (direct, depthwise, 1D, and the
+//! conv→activation fusion), plus the int8 multicore pool.
 //!
-//! Port of `rocket_conv.c` (the RK3588 fp16 half; the native int8 entries of that file
-//! are not part of this milestone) plus the `rocket_conv_transpose` lowering is in
+//! Port of `rocket_conv.c` (both halves: the fp16 family and the native int8
+//! direct/depthwise entries) plus `rocket_conv_transpose.c`, which lives in
 //! [`crate::ops::conv_transpose`].
 //!
 //! The NPU CNA is a native convolution engine, so a K×K / stride / pad / dilation conv
@@ -559,6 +559,8 @@ pub struct ConvContext {
     weight: Option<Bo>,
     rc: Option<Bo>,
     output: Option<Bo>,
+    /// The int8 depthwise output's per-OC int32 bias cube (BRDMA).
+    bias: Option<Bo>,
     /// Grow-only host scratch for the tilers.
     sub_in: Vec<f16>,
     sub_out: Vec<f16>,
@@ -576,6 +578,7 @@ impl ConvContext {
             weight: None,
             rc: None,
             output: None,
+            bias: None,
             sub_in: Vec::new(),
             sub_out: Vec::new(),
             rband: Vec::new(),
@@ -622,6 +625,39 @@ impl ConvContext {
         out: &mut [f16],
     ) -> Result<()> {
         crate::ops::conv_transpose::conv_transpose2d_ctx(self, d, input, w, out)
+    }
+
+    /// `rocket_conv2d_int8_ctx`: the native int8 direct conv on the resident BOs.
+    pub fn conv2d_int8(
+        &mut self,
+        d: &Conv2dDesc,
+        input: &[i8],
+        w: &[i8],
+        out: &mut [i32],
+    ) -> Result<()> {
+        conv2d_int8_ctx(self, d, input, w, out)
+    }
+
+    /// `rocket_conv2d_dw_int8_ctx`: the int8 depthwise int8-out conv on the resident
+    /// BOs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv2d_dw_int8(
+        &mut self,
+        d: &Conv2dDesc,
+        input: &[i8],
+        w: &[i8],
+        bias: Option<&[i32]>,
+        in_scale: f32,
+        w_scale: f32,
+        out_scale: f32,
+        in_zp: i32,
+        w_zp: i32,
+        out_zp: i32,
+        out: &mut [i8],
+    ) -> Result<()> {
+        conv2d_dw_int8_ctx(
+            self, d, input, w, bias, in_scale, w_scale, out_scale, in_zp, w_zp, out_zp, out,
+        )
     }
 }
 
@@ -1555,6 +1591,1358 @@ pub fn conv1d(
     conv2d(dev, &d, input, w, out)
 }
 
+// ############################################################################
+// PART 5 — native int8 CONV_2D (direct, int32-raw)
+// ############################################################################
+
+/// The C `DW_INT8_G`: the int8 depthwise weight-cube channel group (Mesa's value —
+/// feature atom 16 × 4; the fp16 group is half that at 32).
+pub const DW_INT8_G: usize = 64;
+
+/// The int8 feature-tile budget: 8 banks **minus one slack bank**. The int8 `C2 = 16`
+/// feature-cube DMA over-reads one CBUF bank past its `ceil` allocation at
+/// near-bank-full geometries (the same hardware signature `gen_matmul_int8` has), so
+/// the tiler keeps `feature_banks + 1 + weight_banks <= 12`; fp16's 2-byte cube is
+/// immune and uses the full 8 (`CONV_FEAT_BUDGET`).
+const CONV_FEAT_BUDGET_I8: usize = 7 * CBUF_BANK_SIZE;
+
+/// The C `rocket_conv2d_pool` cap (`ROCKET_CONV_POOL_MAX`).
+pub const CONV_POOL_MAX: usize = 8;
+
+/// `rocket_conv2d_ref_int8`: the int64-accumulate → int32 reference.
+///
+/// int8 × int8 reduced over `KH*KW*IC` is exact in int64 (a 7x7x512 conv sums to ~406M,
+/// past int32), and the store is the raw int32 accumulator the NPU writes — the caller
+/// applies the per-output-channel requant, exactly as it must for the device output.
+/// Depthwise (here: the int32-raw diagnostic form) reduces only each output channel's
+/// own input channel with the `[OC][1][KH][KW]` layout, as [`conv2d_ref`] does.
+pub fn conv2d_ref_int8(d: &Conv2dDesc, input: &[i8], w: &[i8], out: &mut [i32]) {
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    let (ic, ih, iw, oc, kh, kw) = (d.ic, d.ih, d.iw, d.oc, d.kh, d.kw);
+    for o in 0..oc {
+        for y in 0..oh {
+            for x in 0..ow {
+                let mut s = 0i64;
+                let (c_lo, c_hi) = if d.depthwise { (o, o + 1) } else { (0, ic) };
+                for c in c_lo..c_hi {
+                    let wic = if d.depthwise { 0 } else { c };
+                    let wspan = if d.depthwise { 1 } else { ic };
+                    for k in 0..kh {
+                        let yy = y * d.stride_y + k * d.dil_y;
+                        if yy < d.pad_top {
+                            continue;
+                        }
+                        let yy = yy - d.pad_top;
+                        if yy >= ih {
+                            continue;
+                        }
+                        for j in 0..kw {
+                            let xx = x * d.stride_x + j * d.dil_x;
+                            if xx < d.pad_left {
+                                continue;
+                            }
+                            let xx = xx - d.pad_left;
+                            if xx >= iw {
+                                continue;
+                            }
+                            let a = input[(c * ih + yy) * iw + xx] as i64;
+                            let wv = w[((o * wspan + wic) * kh + k) * kw + j] as i64;
+                            s += a * wv;
+                        }
+                    }
+                }
+                out[(o * oh + y) * ow + x] = s as i32;
+            }
+        }
+    }
+}
+
+/// The int8 conv weight-cube element index (`weight_conv_int8`): the fp16 reorder with
+/// the int8 N group of **32** instead of 16 (the K group stays 32).
+///
+/// `oc`/`ic`/`kh_i`/`kw_i` are 1-based. At `KH = KW = 1` it collapses to the int8
+/// matmul's `(N/32, K/32, 32, 32)` weight tile.
+pub fn weight_cube_index_i8(
+    ic_total: usize,
+    kh: usize,
+    kw: usize,
+    oc: usize,
+    ic: usize,
+    kh_i: usize,
+    kw_i: usize,
+) -> usize {
+    let oc1 = (oc - 1) / 32;
+    let oc2 = (oc - 1) % 32;
+    let ic1 = (ic - 1) / 32;
+    let ic2 = (ic - 1) % 32;
+    let n_ic1 = ic_total.div_ceil(32);
+    ((((oc1 * n_ic1 + ic1) * kh + (kh_i - 1)) * kw + (kw_i - 1)) * 32 + oc2) * 32 + ic2
+}
+
+/// The int8 feature-cube element index: the same NC1HWC2 math as the fp16 cube with the
+/// int8 channel atom `C2 = 16`.
+pub fn feature_cube_index_i8(
+    channels: usize,
+    pix_h: usize,
+    pix_w: usize,
+    ch: usize,
+    row: usize,
+    col: usize,
+) -> usize {
+    feature_data(channels, pix_h, pix_w, 16, ch, row, col)
+}
+
+/// Scatter a row-major int8 `[c][h][w]` feature into an NC1HWC2 cube (`C2 = 16`).
+pub fn scatter_feature_i8(cube: &mut [i8], c: usize, h: usize, w: usize, src: &[i8]) {
+    for ch in 0..c {
+        for row in 0..h {
+            for col in 0..w {
+                cube[feature_cube_index_i8(c, h, w, ch + 1, row + 1, col + 1)] =
+                    src[(ch * h + row) * w + col];
+            }
+        }
+    }
+}
+
+/// Scatter row-major int8 direct weights `[oc][ic][kh][kw]` into the int8 weight cube.
+pub fn scatter_weights_i8(cube: &mut [i8], oc: usize, ic: usize, kh: usize, kw: usize, w: &[i8]) {
+    for o in 0..oc {
+        for k in 0..kh {
+            for j in 0..kw {
+                for i in 0..ic {
+                    cube[weight_cube_index_i8(ic, kh, kw, o + 1, i + 1, k + 1, j + 1)] =
+                        w[((o * ic + i) * kh + k) * kw + j];
+                }
+            }
+        }
+    }
+}
+
+/// Scatter row-major int8 depthwise weights `[c][kh][kw]` into the `(C/G, KH, KW, G)`
+/// cube — the same element math as [`scatter_weights_dw`], only the group differs.
+pub fn scatter_weights_dw_i8(cube: &mut [i8], c: usize, kh: usize, kw: usize, g: usize, w: &[i8]) {
+    for ch in 0..c {
+        for k in 0..kh {
+            for j in 0..kw {
+                cube[weight_cube_dw_index(kh, kw, g, ch + 1, k + 1, j + 1)] =
+                    w[(ch * kh + k) * kw + j];
+            }
+        }
+    }
+}
+
+/// Gather an int32 output cube (`C2 = 4`) back to row-major `[oc][oh][ow]`.
+pub fn gather_output_i32(cube: &[i32], oc: usize, oh: usize, ow: usize, out: &mut [i32]) {
+    for ch in 0..oc {
+        for row in 0..oh {
+            for col in 0..ow {
+                out[(ch * oh + row) * ow + col] =
+                    cube[feature_data(oc, oh, ow, 4, ch + 1, row + 1, col + 1)];
+            }
+        }
+    }
+}
+
+/// Gather an int8 output cube (`C2 = 16`) back to row-major `[c][oh][ow]`.
+pub fn gather_output_i8(cube: &[i8], c: usize, oh: usize, ow: usize, out: &mut [i8]) {
+    for ch in 0..c {
+        for row in 0..oh {
+            for col in 0..ow {
+                out[(ch * oh + row) * ow + col] =
+                    cube[feature_data(c, oh, ow, 16, ch + 1, row + 1, col + 1)];
+            }
+        }
+    }
+}
+
+fn bo_i8(bo: &Bo) -> &[i8] {
+    let bytes = bo.as_slice();
+    // SAFETY: i8 has no alignment or validity requirement beyond a byte.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) }
+}
+
+fn bo_i8_mut(bo: &mut Bo) -> &mut [i8] {
+    let len = bo.len();
+    let ptr = bo.as_ptr();
+    // SAFETY: exclusive borrow of the BO, page-aligned mapping, 1-byte elements.
+    unsafe { std::slice::from_raw_parts_mut(ptr.cast::<i8>(), len) }
+}
+
+fn bo_i32(bo: &Bo) -> &[i32] {
+    let bytes = bo.as_slice();
+    // SAFETY: the mapping is page-aligned (so 4-byte aligned) and every prefix of it is
+    // initialized; the length is truncated to whole words.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i32>(), bytes.len() / 4) }
+}
+
+/// `rocket_conv2d_int8_run`'s pre-flight checks, as one pure predicate (the C folds
+/// them into the run; this port keeps them addressable for tests and callers).
+///
+/// `0` runnable, `-1` malformed, `-2` depthwise (this is the direct entry), `-3` a
+/// collapsed output extent, `-4` a tile that cannot fit the CBUF geometry.
+pub fn conv2d_int8_plan_code(d: &Conv2dDesc) -> i32 {
+    if d.depthwise {
+        return -2;
+    }
+    if d.ic == 0 || d.ih == 0 || d.iw == 0 || d.oc == 0 || d.kh == 0 || d.kw == 0 {
+        return -1;
+    }
+    if d.stride_x == 0 || d.stride_y == 0 || d.dil_x == 0 || d.dil_y == 0 {
+        return -1;
+    }
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    if oh == 0 || ow == 0 {
+        return -3;
+    }
+    let ic = d.ic.div_ceil(32) * 32;
+    if d.kw * d.kh * ic > CBUF_BANK_SIZE {
+        return -4;
+    }
+    let ih_min = (d.kh - 1) * d.dil_y + 1;
+    let iw_min = (d.kw - 1) * d.dil_x + 1;
+    if ic * ih_min * iw_min > CONV_FEAT_BUDGET_I8 {
+        return -4;
+    }
+    0
+}
+
+/// `rocket_conv2d_dw_int8_run`'s pre-flight checks.
+///
+/// `0` runnable, `-1` malformed, `-2` not depthwise / `OC != IC`, `-3` a collapsed
+/// output extent, `-4` a channel chunk that cannot fit one CBUF pass, `-5` a channel
+/// count that is not a multiple of 16 (the `C2 = 16` feature-cube grain).
+pub fn conv2d_dw_int8_plan_code(d: &Conv2dDesc) -> i32 {
+    if !d.depthwise || d.oc != d.ic {
+        return -2;
+    }
+    if d.ic == 0 || d.ih == 0 || d.iw == 0 || d.kh == 0 || d.kw == 0 {
+        return -1;
+    }
+    if d.stride_x == 0 || d.stride_y == 0 || d.dil_x == 0 || d.dil_y == 0 {
+        return -1;
+    }
+    if !d.ic.is_multiple_of(16) {
+        return -5;
+    }
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    if oh == 0 || ow == 0 {
+        return -3;
+    }
+    if d.kw * d.kh * DW_INT8_G > CBUF_BANK_SIZE {
+        return -4;
+    }
+    let cc = dw_int8_chunk(d.ic, d.ih, d.iw);
+    if cc * d.ih * d.iw > CONV_FEAT_BUDGET {
+        return -4;
+    }
+    0
+}
+
+/// The largest `G`-multiple channel chunk whose full feature fits one CBUF pass
+/// (`conv2d_dw_int8_run`'s `Cc`; there is no spatial tile on the int8 DW path).
+pub fn dw_int8_chunk(c: usize, ih: usize, iw: usize) -> usize {
+    let mut cc = c;
+    while cc > DW_INT8_G && cc * ih * iw > CONV_FEAT_BUDGET {
+        cc -= DW_INT8_G;
+    }
+    cc
+}
+
+/// One independent int8 direct-conv tile (`i8tile`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvInt8Tile {
+    /// First output channel and how many this tile writes.
+    pub oc0: usize,
+    pub oc_n: usize,
+    /// First output row / how many rows.
+    pub r0: usize,
+    pub rh: usize,
+    /// First output column / how many columns.
+    pub c0: usize,
+    pub cw: usize,
+}
+
+/// The int8 direct tiler's decomposition, as the C computes it inline before
+/// enumerating tiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvInt8Tiles {
+    /// Input channels including the 32-channel pad.
+    pub ic: usize,
+    /// Output-channel tile (a multiple of the 32-channel weight group).
+    pub oc_tile: usize,
+    /// Balanced output-row bands.
+    pub rband: Vec<usize>,
+    /// Balanced output-column bands.
+    pub cband: Vec<usize>,
+}
+
+impl ConvInt8Tiles {
+    /// The independent `(oc-group × row-band × col-band)` tiles, in the C's order
+    /// (output channel outer, then row band, then column band). Each writes a disjoint
+    /// region of the output, so they may run on several cores.
+    pub fn tiles(&self, d: &Conv2dDesc) -> Vec<ConvInt8Tile> {
+        let mut out = Vec::new();
+        let mut oc0 = 0;
+        while oc0 < d.oc {
+            let oc_n = (d.oc - oc0).min(self.oc_tile);
+            let mut r0 = 0;
+            for &rh in &self.rband {
+                let mut c0 = 0;
+                for &cw in &self.cband {
+                    out.push(ConvInt8Tile {
+                        oc0,
+                        oc_n,
+                        r0,
+                        rh,
+                        c0,
+                        cw,
+                    });
+                    c0 += cw;
+                }
+                r0 += rh;
+            }
+            oc0 += oc_n;
+        }
+        out
+    }
+
+    /// Tiles the plan produces.
+    pub fn count(&self, d: &Conv2dDesc) -> usize {
+        let nrow: usize = self.rband.len();
+        let ncol: usize = self.cband.len();
+        d.oc.div_ceil(self.oc_tile) * nrow * ncol
+    }
+}
+
+/// The int8 direct tiler's budgets (`conv2d_int8_run`'s OC/row/column decomposition).
+///
+/// OC tiles in multiples of 32 (the int8 weight oc group) and the feature budget
+/// jointly share the 12 CBUF banks: the generator gives the weight `banks - (fd+1)`, so
+/// a tile is valid only when its weight cube fits what the feature leaves. Prefer a
+/// weight within ~4 banks and shrink `OCt` toward 32; when even one 32-group needs more
+/// (a KxK conv at large IC), accept the bigger weight and shrink the feature budget.
+pub fn conv_int8_tile_plan(d: &Conv2dDesc) -> Result<ConvInt8Tiles> {
+    let ic = d.ic.div_ceil(32) * 32;
+    if d.kw * d.kh * ic > CBUF_BANK_SIZE {
+        return Err(Error::tiling("rocket_conv2d_int8/weight-bank"));
+    }
+    let banks = crate::hw::current().cbuf_banks;
+    let ocw = |oct: usize| (oct * ic * d.kh * d.kw).div_ceil(CBUF_BANK_SIZE);
+    let mut oc_tile = d.oc;
+    while oc_tile > 32 && ocw(oc_tile) > 4 {
+        oc_tile -= 32;
+    }
+    let wbanks = ocw(oc_tile);
+    // Leave >= 1 feature bank plus the C2=16 slack bank.
+    if wbanks > banks - 2 {
+        return Err(Error::tiling("rocket_conv2d_int8/banks"));
+    }
+    let feat_budget = ((banks - 1 - wbanks) * CBUF_BANK_SIZE).min(CONV_FEAT_BUDGET_I8);
+
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    let min_ihs = {
+        let v = match knobs::int("ROCKET_CONV_MIN_IH") {
+            Some(v) if v > 0 => v as usize,
+            _ => 6,
+        };
+        v.max(CONV_MIN_DATAIN_H) // never below the hardware row floor
+    };
+    let feat = |rh: usize, cw: usize| {
+        ic * datain_h(rh, d.stride_y, d.kh, d.dil_y) * datain_h(cw, d.stride_x, d.kw, d.dil_x)
+    };
+    let mut rht_lo = 1;
+    while rht_lo < oh && datain_h(rht_lo, d.stride_y, d.kh, d.dil_y) < min_ihs {
+        rht_lo += 1;
+    }
+    let mut rht = oh;
+    let mut cwt = ow;
+    while rht > rht_lo && feat(rht, cwt) > feat_budget {
+        rht -= 1;
+    }
+    if feat(rht, cwt) > feat_budget {
+        while cwt > 1 && feat(rht, cwt) > feat_budget {
+            cwt -= 1;
+        }
+    }
+    if feat(rht, cwt) > feat_budget {
+        return Err(Error::tiling("rocket_conv2d_int8/cbuf"));
+    }
+    let mut rband = Vec::new();
+    let mut cband = Vec::new();
+    balance_bands(oh, rht, &mut rband);
+    balance_bands(ow, cwt, &mut cband);
+    Ok(ConvInt8Tiles {
+        ic,
+        oc_tile,
+        rband,
+        cband,
+    })
+}
+
+/// Run ONE int8 direct conv as a single NPU job (must fit one CBUF pass).
+///
+/// `in [IC][IH][IW]` int8, `W [OC][IC][KH][KW]` int8, `out [OC][OH][OW]` int32. The
+/// caller has already zero-padded `IC` to 32 and `OC` to 32 (the two cube groups).
+#[allow(clippy::too_many_arguments)]
+fn conv2d_int8_one_job(
+    ctx: &mut ConvContext,
+    ic: usize,
+    ih: usize,
+    iw: usize,
+    oc: usize,
+    oh: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sy: usize,
+    sx: usize,
+    pt: usize,
+    pl: usize,
+    dy: usize,
+    dx: usize,
+    input: &[i8],
+    w: &[i8],
+    out: &mut [i32],
+) -> Result<()> {
+    let dev = ctx.dev.clone();
+    // A datain_height below 4 reads the cube wrong at every IC: pad the job's input
+    // height with zero rows below the real data. OH stays the real output count, so the
+    // padded rows never enter a computed output's receptive field.
+    let ihj = ih.max(CONV_MIN_DATAIN_H);
+    let cube_in = ic.div_ceil(16) * 16 * ihj * iw; // int8 bytes
+    let wt_elems = oc * ic * kh * kw;
+    let cube_out = oc.div_ceil(4) * 4 * oh * ow; // int32 words
+    let nregs = crate::regcmd::conv::MAX_OPS;
+
+    ensure_bo(&dev, &mut ctx.guard, 4096)?;
+    ensure_bo(&dev, &mut ctx.input, cube_in + CBUF_BANK_SIZE)?;
+    ensure_bo(&dev, &mut ctx.weight, wt_elems + CBUF_BANK_SIZE)?;
+    ensure_bo(&dev, &mut ctx.rc, nregs * 8)?;
+    ensure_bo(&dev, &mut ctx.output, cube_out * 4 + CBUF_BANK_SIZE)?;
+
+    {
+        let bo = ctx.input.as_mut().expect("input BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        scatter_feature_i8(words, ic, ihj, iw, input);
+        bo.fini()?;
+    }
+    {
+        let bo = ctx.weight.as_mut().expect("weight BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        scatter_weights_i8(words, oc, ic, kh, kw, w);
+        bo.fini()?;
+    }
+
+    let mut p = crate::regcmd::conv::ConvInt8Params::new(
+        ic as u16,
+        ihj as u16,
+        iw as u16,
+        oc as u16,
+        oh as u16,
+        ow as u16,
+        kh as u16,
+        kw as u16,
+        ctx.input.as_ref().expect("input BO").dma_address() as u32,
+        ctx.weight.as_ref().expect("weight BO").dma_address() as u32,
+        ctx.output.as_ref().expect("output BO").dma_address() as u32,
+    );
+    p.stride_y = sy as u8;
+    p.stride_x = sx as u8;
+    p.pad_top = pt as u8;
+    p.pad_left = pl as u8;
+    p.dil_y = dy as u8;
+    p.dil_x = dx as u8;
+
+    let mut ops = Vec::with_capacity(nregs);
+    let count = crate::regcmd::conv::gen_conv2d_int8(&mut p, &mut ops)?;
+    if count > nregs {
+        log_error!("rocket_conv2d_int8: regcmd overflow (task_count {count} > {nregs} words)");
+        return Err(Error::tiling("rocket_conv2d_int8/regcmd"));
+    }
+    {
+        let bo = ctx.rc.as_mut().expect("rc BO");
+        bo.prep(0)?;
+        let bytes = bo.as_mut_slice();
+        for (i, op) in ops.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&op.0.to_ne_bytes());
+        }
+        bo.fini()?;
+    }
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(0)?;
+        bo_i8_mut(bo).fill(0);
+        bo.fini()?;
+    }
+
+    let task = DrmRocketTask {
+        regcmd: ctx.rc.as_ref().expect("rc BO").dma_address() as u32,
+        regcmd_count: count as u32,
+    };
+    let in_handles = [
+        ctx.input.as_ref().expect("input BO").handle(),
+        ctx.weight.as_ref().expect("weight BO").handle(),
+        ctx.rc.as_ref().expect("rc BO").handle(),
+    ];
+    let out_handles = [ctx.output.as_ref().expect("output BO").handle()];
+    dev.submit(&[task], &in_handles, &out_handles, 0)?;
+
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(CONV_WAIT_NS)?;
+        gather_output_i32(&bo_i32(bo)[..cube_out], oc, oh, ow, out);
+        bo.fini()?;
+    }
+    Ok(())
+}
+
+/// One independent OC/OH/OW tile of the int8 direct conv (`conv2d_int8_one_tile`):
+/// materialise the tile's sub-input (real halo + zero pad + channel pad), run the
+/// single job, scatter the int32 result into the output's disjoint region.
+#[allow(clippy::too_many_arguments)]
+fn conv2d_int8_one_tile(
+    ctx: &mut ConvContext,
+    ic: usize,
+    icr: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sy: usize,
+    sx: usize,
+    pt: usize,
+    pl: usize,
+    dy: usize,
+    dx: usize,
+    input: &[i8],
+    wuse: &[i8],
+    out: &mut [i32],
+    w_oc0: usize,
+    out_oc0: usize,
+    oc_n: usize,
+    r0: usize,
+    rh: usize,
+    c0: usize,
+    cw: usize,
+    sub_in: &mut [i8],
+    sub_out: &mut [i32],
+) -> Result<()> {
+    let ih_sub = (rh - 1) * sy + (kh - 1) * dy + 1;
+    let gh0 = r0 as isize * sy as isize - pt as isize;
+    let iw_sub = (cw - 1) * sx + (kw - 1) * dx + 1;
+    let gw0 = c0 as isize * sx as isize - pl as isize;
+
+    // materialise the tile's sub-input: real halo + zero pad, with the channel pad
+    // (ic >= icr stays zero from the fill).
+    sub_in[..ic * ih_sub * iw_sub].fill(0);
+    for c in 0..icr {
+        for j in 0..ih_sub {
+            let gih = gh0 + j as isize;
+            if gih < 0 || gih >= ih as isize {
+                continue;
+            }
+            let cs = gw0.max(0) as usize;
+            let ce = ((gw0 + iw_sub as isize).min(iw as isize)).max(0) as usize;
+            if cs >= ce {
+                continue;
+            }
+            let dst_off = (c * ih_sub + j) * iw_sub + (cs as isize - gw0) as usize;
+            let src_off = (c * ih + gih as usize) * iw + cs;
+            sub_in[dst_off..dst_off + (ce - cs)]
+                .copy_from_slice(&input[src_off..src_off + (ce - cs)]);
+        }
+    }
+
+    // `w_oc0` is the tile's place in the *weight* tensor (always the global output
+    // channel); `out_oc0` is its place in the caller's `out`, which a multicore worker
+    // has already offset to its own output-channel band.
+    let wslice = &wuse[w_oc0 * ic * kh * kw..(w_oc0 + oc_n) * ic * kh * kw];
+    conv2d_int8_one_job(
+        ctx, ic, ih_sub, iw_sub, oc_n, rh, cw, kh, kw, sy, sx, 0, 0, dy, dx, sub_in, wslice,
+        sub_out,
+    )?;
+
+    for o in 0..oc_n {
+        for r in 0..rh {
+            let dst = ((out_oc0 + o) * oh + (r0 + r)) * ow + c0;
+            let src = (o * rh + r) * cw;
+            out[dst..dst + cw].copy_from_slice(&sub_out[src..src + cw]);
+        }
+    }
+    Ok(())
+}
+
+/// The int8 direct tiling driver (`conv2d_int8_run`).
+///
+/// `ctxs[0]` is the coordinator (the C's `fd`/`ctx`), and with more than one context the
+/// independent tiles fan out across them — one NPU core each, `ctxs.len()` workers.
+fn conv2d_int8_run(
+    ctxs: &mut [ConvContext],
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    out: &mut [i32],
+) -> Result<()> {
+    if d.depthwise {
+        // int8 depthwise is the int8-out entry (`conv2d_dw_int8`).
+        return Err(Error::coded(
+            crate::Status::Shape,
+            -2,
+            "rocket_conv2d_int8/depthwise",
+        ));
+    }
+    if ctxs.is_empty() {
+        return Err(Error::shape("rocket_conv2d_int8/no-context"));
+    }
+
+    // OC % 32 != 0: pad OC up to the int8 weight oc group, run, slice the real OC off
+    // the front. The extra kernels are zero and each direct output channel is
+    // independent, so the first OC channels are bit-exact.
+    if !d.oc.is_multiple_of(32) {
+        let oc = d.oc;
+        let ocp = oc.div_ceil(32) * 32;
+        let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+        if oh == 0 || ow == 0 {
+            return Err(Error::coded(
+                crate::Status::Shape,
+                -3,
+                "rocket_conv2d_int8/out-extent",
+            ));
+        }
+        let mut dp = *d;
+        dp.oc = ocp;
+        let mut wp = vec![0i8; ocp * d.ic * d.kh * d.kw];
+        wp[..oc * d.ic * d.kh * d.kw].copy_from_slice(&w[..oc * d.ic * d.kh * d.kw]);
+        let mut op = vec![0i32; ocp * oh * ow];
+        conv2d_int8_run(ctxs, &dp, input, &wp, &mut op)?;
+        out[..oc * oh * ow].copy_from_slice(&op[..oc * oh * ow]);
+        return Ok(());
+    }
+
+    match conv2d_int8_plan_code(d) {
+        0 => {}
+        -3 => {
+            return Err(Error::coded(
+                crate::Status::Shape,
+                -3,
+                "rocket_conv2d_int8/out-extent",
+            ));
+        }
+        -4 => return Err(Error::tiling("rocket_conv2d_int8/cbuf")),
+        _ => return Err(Error::shape("rocket_conv2d_int8")),
+    }
+
+    let icr = d.ic;
+    let (ih, iw, oc, kh, kw) = (d.ih, d.iw, d.oc, d.kh, d.kw);
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    let (sy, sx, pt, pl) = (d.stride_y, d.stride_x, d.pad_top, d.pad_left);
+    let (dy, dx) = (d.dil_y, d.dil_x);
+
+    // First-layer IC < 32 (RGB): zero-pad the input channels up to the ic group of 32.
+    // The padded weight is built once; the input is padded lazily in the per-tile
+    // materialisation (ic >= ICr stays zero).
+    let ic = icr.div_ceil(32) * 32;
+    let wpad = if ic != icr {
+        let mut wp = vec![0i8; oc * ic * kh * kw];
+        for o in 0..oc {
+            for c in 0..icr {
+                let dst = ((o * ic + c) * kh) * kw;
+                let src = ((o * icr + c) * kh) * kw;
+                wp[dst..dst + kh * kw].copy_from_slice(&w[src..src + kh * kw]);
+            }
+        }
+        Some(wp)
+    } else {
+        None
+    };
+    let wuse: &[i8] = wpad.as_deref().unwrap_or(w);
+
+    // fast path: no channel pad AND the whole problem fits one CBUF pass
+    {
+        let ih_full = datain_h(oh, sy, kh, dy);
+        let iw_full = datain_h(ow, sx, kw, dx);
+        if ic == icr
+            && oc * ic * kh * kw <= 4 * CBUF_BANK_SIZE
+            && ic * ih_full * iw_full <= CONV_FEAT_BUDGET_I8
+        {
+            return conv2d_int8_one_job(
+                &mut ctxs[0],
+                ic,
+                ih,
+                iw,
+                oc,
+                oh,
+                ow,
+                kh,
+                kw,
+                sy,
+                sx,
+                pt,
+                pl,
+                dy,
+                dx,
+                input,
+                w,
+                out,
+            );
+        }
+    }
+
+    let plan = conv_int8_tile_plan(d)?;
+    let tiles = plan.tiles(d);
+
+    // Largest tile's materialised sub-input / output, for the per-worker scratch.
+    let rh_max = *plan.rband.iter().max().expect("bands");
+    let cw_max = *plan.cband.iter().max().expect("bands");
+    let ihs = datain_h(rh_max, sy, kh, dy);
+    let iws = datain_h(cw_max, sx, kw, dx);
+    let sub_in_sz = plan.ic * ihs * iws;
+    let sub_out_elems = plan.oc_tile * rh_max * cw_max;
+
+    // Multicore: hand each worker a CONTIGUOUS run of output-channel groups. That is
+    // what makes the output split expressible as disjoint slices — the C fans the same
+    // independent tiles over its worker fds, and tile assignment cannot change the
+    // result (each tile writes a disjoint region), so this is bit-identical.
+    let ngroups = d.oc.div_ceil(plan.oc_tile);
+    let nw = if ctxs.len() > 1 && ngroups > 1 {
+        ctxs.len().min(ngroups)
+    } else {
+        0
+    };
+    if nw > 1 {
+        let base = ngroups / nw;
+        let extra = ngroups % nw;
+        // (first output channel, channel count, this worker's output slice)
+        let mut bands: Vec<(usize, usize, &mut [i32])> = Vec::with_capacity(nw);
+        let mut rest = &mut out[..];
+        let mut cursor = 0;
+        for w in 0..nw {
+            let n = base + usize::from(w < extra);
+            let oc_base = cursor * plan.oc_tile;
+            let oc_n = (d.oc - oc_base).min(n * plan.oc_tile);
+            let (band, tail) = rest.split_at_mut(oc_n * oh * ow);
+            bands.push((oc_base, oc_n, band));
+            rest = tail;
+            cursor += n;
+        }
+
+        let base_aff = crate::device::affinity::base();
+        let results: Vec<Result<()>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(nw);
+            for (w, (ctx, (s, oc_n, band))) in ctxs.iter_mut().zip(bands).enumerate() {
+                let tiles = &tiles;
+                handles.push(scope.spawn(move || -> Result<()> {
+                    crate::device::affinity::pin_current(w, base_aff);
+                    let mut sub_in = vec![0i8; sub_in_sz];
+                    let mut sub_out = vec![0i32; sub_out_elems];
+                    for tl in tiles.iter().filter(|t| t.oc0 >= s && t.oc0 < s + oc_n) {
+                        conv2d_int8_one_tile(
+                            ctx,
+                            plan.ic,
+                            icr,
+                            ih,
+                            iw,
+                            oh,
+                            ow,
+                            kh,
+                            kw,
+                            sy,
+                            sx,
+                            pt,
+                            pl,
+                            dy,
+                            dx,
+                            input,
+                            wuse,
+                            band,
+                            tl.oc0,
+                            tl.oc0 - s,
+                            tl.oc_n,
+                            tl.r0,
+                            tl.rh,
+                            tl.c0,
+                            tl.cw,
+                            &mut sub_in,
+                            &mut sub_out,
+                        )?;
+                    }
+                    Ok(())
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().unwrap_or_else(|_| {
+                        Err(Error::device("rocket_conv2d_int8/worker-panic", 0))
+                    })
+                })
+                .collect()
+        });
+        return results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()));
+    }
+
+    // Serial: one scratch pair on the coordinator context.
+    let mut sub_in = vec![0i8; sub_in_sz];
+    let mut sub_out = vec![0i32; sub_out_elems];
+    for tl in &tiles {
+        conv2d_int8_one_tile(
+            &mut ctxs[0],
+            plan.ic,
+            icr,
+            ih,
+            iw,
+            oh,
+            ow,
+            kh,
+            kw,
+            sy,
+            sx,
+            pt,
+            pl,
+            dy,
+            dx,
+            input,
+            wuse,
+            out,
+            tl.oc0,
+            tl.oc0,
+            tl.oc_n,
+            tl.r0,
+            tl.rh,
+            tl.c0,
+            tl.cw,
+            &mut sub_in,
+            &mut sub_out,
+        )?;
+    }
+    Ok(())
+}
+
+/// `rocket_conv2d_int8`: the native int8 direct conv, int32-raw output.
+///
+/// `in [IC][IH][IW]` int8, `W [OC][IC][KH][KW]` int8, `out [OC][OH][OW]` int32.
+/// `OC` is zero-padded to 32 and `IC` to 32 internally; `depthwise` must be `false`
+/// (the `-2` of the C entry — int8 depthwise is [`conv2d_dw_int8`]).
+pub fn conv2d_int8(
+    dev: &Device,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    out: &mut [i32],
+) -> Result<()> {
+    let mut ctx = ConvContext::new(dev);
+    conv2d_int8_run(std::slice::from_mut(&mut ctx), d, input, w, out)
+}
+
+/// `rocket_conv2d_int8_ctx`: the same conv on a resident-BO context.
+pub fn conv2d_int8_ctx(
+    ctx: &mut ConvContext,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    out: &mut [i32],
+) -> Result<()> {
+    conv2d_int8_run(std::slice::from_mut(ctx), d, input, w, out)
+}
+
+/// The native int8/uint8 direct conv's multicore pool (`rocket_conv_pool`).
+///
+/// The driver pins one fd to one NPU core while it has queued work, so the single-fd
+/// entry serializes its independent OC/OH/OW tiles onto one core. A pool holds N
+/// persistent devices, each with its own resident [`ConvContext`], so the tiles fan out
+/// across the cores while keeping the resident-BO win. The pool **owns** its devices.
+///
+/// [`conv2d_int8_mt`] is bit-identical to [`conv2d_int8`] — same tiles, same single
+/// jobs — and falls back to the serial path for a single-tile conv.
+pub struct ConvInt8Pool {
+    ctxs: Vec<ConvContext>,
+}
+
+impl ConvInt8Pool {
+    /// `rocket_conv_pool_create`: open `nthreads` devices (clamped to `[1, 8]`).
+    ///
+    /// Degrades to however many devices opened, as C does; an `Err` only when none did.
+    pub fn new(nthreads: usize) -> Result<Self> {
+        let n = nthreads.clamp(1, CONV_POOL_MAX);
+        let mut ctxs = Vec::with_capacity(n);
+        for _ in 0..n {
+            match Device::open() {
+                Ok(dev) => ctxs.push(ConvContext::new(&dev)),
+                Err(e) => {
+                    log_debug!(
+                        "rocket_conv_pool_create: opened {} of {n} devices",
+                        ctxs.len()
+                    );
+                    if ctxs.is_empty() {
+                        return Err(e);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(Self { ctxs })
+    }
+
+    /// Worker contexts actually opened.
+    pub fn len(&self) -> usize {
+        self.ctxs.len()
+    }
+
+    /// True when no worker context exists (a pool is never constructed empty).
+    pub fn is_empty(&self) -> bool {
+        self.ctxs.is_empty()
+    }
+
+    /// The first worker's device.
+    pub fn device(&self) -> &Device {
+        self.ctxs[0].device()
+    }
+
+    /// `rocket_conv2d_int8_mt`: run a direct int8 conv across the pool's workers.
+    pub fn conv2d(
+        &mut self,
+        d: &Conv2dDesc,
+        input: &[i8],
+        w: &[i8],
+        out: &mut [i32],
+    ) -> Result<()> {
+        conv2d_int8_mt(self, d, input, w, out)
+    }
+}
+
+/// `rocket_conv2d_int8_mt`: the multicore direct int8 conv, bit-identical to
+/// [`conv2d_int8`].
+pub fn conv2d_int8_mt(
+    pool: &mut ConvInt8Pool,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    out: &mut [i32],
+) -> Result<()> {
+    if pool.ctxs.is_empty() {
+        return Err(Error::shape("rocket_conv2d_int8_mt/pool"));
+    }
+    conv2d_int8_run(&mut pool.ctxs, d, input, w, out)
+}
+
+// ############################################################################
+// PART 6 — native int8 DEPTHWISE conv (int8-out, on-chip requant)
+// ############################################################################
+
+/// The DPU output convertor's scale → register pair (`requant_params` in the C test's
+/// `requant_model.h`, the QNNPACK derivation the generator programs).
+///
+/// Returns `(mul, shift)` with `shift` the **register** value (already pre-decremented),
+/// so the hardware computes `sat8(round_half_even(acc * mul >> shift) + out_zp)`.
+pub fn requant_params(conv_scale: f32) -> (u32, u32) {
+    let bits = conv_scale.to_bits();
+    let shift = (127u32 + 31 - 32).wrapping_sub(bits >> 23) + 16 - 1;
+    let mut mul = ((bits >> 9) & 0x7FFF) + 1;
+    if mul < (1 << 14) {
+        mul |= 1 << 14;
+    }
+    (mul, shift)
+}
+
+/// The host model of the DPU's rounding shift: nearest, ties to **even** (measured on
+/// hardware — not the arithmetic-shift `(x + half) >> shift`, which takes ties toward
+/// +inf, and not round-half-away-from-zero).
+pub fn requant_round_shift(p: i64, shift: u32) -> i64 {
+    if shift == 0 {
+        return p;
+    }
+    let half = 1i64 << (shift - 1);
+    let mut v = (p + half) >> shift;
+    let rem = p & ((1i64 << shift) - 1);
+    if rem == half && (v & 1) != 0 {
+        v -= 1;
+    }
+    v
+}
+
+/// `acc * mul >> shift`, saturated to int8 (`requant_apply`).
+pub fn requant_apply(acc: i64, mul: u32, shift: u32) -> i8 {
+    let v = requant_round_shift(acc * mul as i64, shift);
+    v.clamp(-128, 127) as i8
+}
+
+/// The same, then the output zero point the OUT_CVT offset carries (`requant_apply_zp`).
+pub fn requant_apply_zp(acc: i64, mul: u32, shift: u32, out_zp: i32) -> i8 {
+    let v = requant_round_shift(acc * mul as i64, shift) + out_zp as i64;
+    v.clamp(-128, 127) as i8
+}
+
+/// The int8 depthwise int8-out host model: TFLite's accumulator, then the DPU requant.
+///
+/// This is the exact model of the program [`conv2d_dw_int8`] emits, so a device result
+/// must match it **bit for bit**. (The C library's `dw_int8_ref` is the same
+/// accumulator with TFLite's `lrintf` + round-to-nearest requant instead, which can
+/// differ by one where a value sits on a rounding boundary; the C self-test gates the
+/// device against this model and the library oracle within one, and this port does the
+/// same.)
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_dw_int8_model(
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    bias: Option<&[i32]>,
+    in_scale: f32,
+    w_scale: f32,
+    out_scale: f32,
+    in_zp: i32,
+    out_zp: i32,
+    out: &mut [i8],
+) {
+    let (mul, shift) = requant_params((in_scale * w_scale) / out_scale);
+    let (ih, iw, kh, kw) = (d.ih, d.iw, d.kh, d.kw);
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    for c in 0..d.ic {
+        for y in 0..oh {
+            for x in 0..ow {
+                let mut acc = bias.map(|b| b[c] as i64).unwrap_or(0);
+                for k in 0..kh {
+                    let yy = y * d.stride_y + k * d.dil_y;
+                    if yy < d.pad_top {
+                        continue;
+                    }
+                    let yy = yy - d.pad_top;
+                    if yy >= ih {
+                        continue;
+                    }
+                    for j in 0..kw {
+                        let xx = x * d.stride_x + j * d.dil_x;
+                        if xx < d.pad_left {
+                            continue;
+                        }
+                        let xx = xx - d.pad_left;
+                        if xx >= iw {
+                            continue;
+                        }
+                        acc += (input[(c * ih + yy) * iw + xx] as i64 - in_zp as i64)
+                            * w[(c * kh + k) * kw + j] as i64;
+                    }
+                }
+                out[(c * oh + y) * ow + x] = requant_apply_zp(acc, mul, shift, out_zp);
+            }
+        }
+    }
+}
+
+/// Run ONE int8 depthwise int8-out job (single CBUF pass).
+///
+/// `in [C][IH][IW]` int8 (model domain), `w [C][KH][KW]` int8, `bias_q [C]` int32
+/// (optional), `out [C][OH][OW]` int8 (model domain).
+#[allow(clippy::too_many_arguments)]
+fn conv2d_dw_int8_one_job(
+    ctx: &mut ConvContext,
+    c: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sy: usize,
+    sx: usize,
+    pt: usize,
+    pl: usize,
+    dy: usize,
+    dx: usize,
+    input: &[i8],
+    w: &[i8],
+    bias: Option<&[i32]>,
+    in_scale: f32,
+    w_scale: f32,
+    out_scale: f32,
+    in_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    out: &mut [i8],
+) -> Result<()> {
+    let dev = ctx.dev.clone();
+    let g = DW_INT8_G;
+    let cpad = c.div_ceil(g) * g;
+    let ihj = ih.max(CONV_MIN_DATAIN_H);
+    let cube_in = c.div_ceil(16) * 16 * ihj * iw;
+    let wt_elems = cpad * kh * kw;
+    let cube_out = c * oh * ow;
+
+    ensure_bo(&dev, &mut ctx.guard, 4096)?;
+    ensure_bo(&dev, &mut ctx.input, cube_in + CBUF_BANK_SIZE)?;
+    ensure_bo(&dev, &mut ctx.weight, wt_elems + CBUF_BANK_SIZE)?;
+    ensure_bo(&dev, &mut ctx.rc, crate::regcmd::conv::MAX_OPS * 8)?;
+    ensure_bo(&dev, &mut ctx.bias, cpad * 4 + CBUF_BANK_SIZE)?;
+    ensure_bo(&dev, &mut ctx.output, cube_out + CBUF_BANK_SIZE)?;
+
+    // Feature cube (C2 = 16): the raw int8 values, which the CNA reads signed.
+    {
+        let bo = ctx.input.as_mut().expect("input BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        scatter_feature_i8(words, c, ihj, iw, input);
+        bo.fini()?;
+    }
+    // DW weight cube (group G): the raw int8 values.
+    {
+        let bo = ctx.weight.as_mut().expect("weight BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        scatter_weights_dw_i8(words, c, kh, kw, g, w);
+        bo.fini()?;
+    }
+    // The per-OC int32 bias cube: bias_q - in_zp * sum_kernel(w - w_zp). The CNA pads
+    // with in_zp, so a padded tap adds in_zp * w and the fold takes it back out.
+    {
+        let bo = ctx.bias.as_mut().expect("bias BO");
+        bo.prep(0)?;
+        let bytes = bo.as_mut_slice();
+        let dst = &mut bytes[..cpad * 4];
+        dst.fill(0);
+        for ch in 0..c {
+            let mut sw = 0i32;
+            for k in 0..kh {
+                for j in 0..kw {
+                    sw += w[(ch * kh + k) * kw + j] as i32 - w_zp;
+                }
+            }
+            let b = bias.map(|b| b[ch]).unwrap_or(0) - in_zp * sw;
+            dst[ch * 4..ch * 4 + 4].copy_from_slice(&b.to_ne_bytes());
+        }
+        bo.fini()?;
+    }
+
+    let mut p = crate::regcmd::conv::ConvInt8Params::new(
+        c as u16,
+        ihj as u16,
+        iw as u16,
+        c as u16,
+        oh as u16,
+        ow as u16,
+        kh as u16,
+        kw as u16,
+        ctx.input.as_ref().expect("input BO").dma_address() as u32,
+        ctx.weight.as_ref().expect("weight BO").dma_address() as u32,
+        ctx.output.as_ref().expect("output BO").dma_address() as u32,
+    );
+    p.stride_y = sy as u8;
+    p.stride_x = sx as u8;
+    p.pad_top = pt as u8;
+    p.pad_left = pl as u8;
+    p.dil_y = dy as u8;
+    p.dil_x = dx as u8;
+    p.dw_group = g as u8;
+    p.int8_out = true;
+    p.in_scale = in_scale;
+    p.w_scale = w_scale;
+    p.out_scale = out_scale;
+    // The generator carries Mesa's uint8 formulas, so it takes the uint8-equivalent
+    // zero points: the pad lands on in_zp, the offset on out_zp, and the CPEND operand
+    // on 0 (a raw w_zp of 0 would give 0x80 and nearly every output would be wrong).
+    p.input_zero_point = in_zp + 0x80;
+    p.output_zero_point = out_zp + 0x80;
+    p.weight_zero_point = w_zp + 0x80;
+    p.bias_dma = ctx.bias.as_ref().expect("bias BO").dma_address() as u32;
+
+    let mut ops = Vec::with_capacity(crate::regcmd::conv::MAX_OPS);
+    let count = crate::regcmd::conv::gen_conv2d_dw_int8(&mut p, &mut ops)?;
+    if count > crate::regcmd::conv::MAX_OPS {
+        log_error!("rocket_conv2d_dw_int8: regcmd overflow (task_count {count})");
+        return Err(Error::tiling("rocket_conv2d_dw_int8/regcmd"));
+    }
+    {
+        let bo = ctx.rc.as_mut().expect("rc BO");
+        bo.prep(0)?;
+        let bytes = bo.as_mut_slice();
+        for (i, op) in ops.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&op.0.to_ne_bytes());
+        }
+        bo.fini()?;
+    }
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(0)?;
+        bo_i8_mut(bo).fill(0);
+        bo.fini()?;
+    }
+
+    let task = DrmRocketTask {
+        regcmd: ctx.rc.as_ref().expect("rc BO").dma_address() as u32,
+        regcmd_count: count as u32,
+    };
+    let in_handles = [
+        ctx.input.as_ref().expect("input BO").handle(),
+        ctx.weight.as_ref().expect("weight BO").handle(),
+        ctx.bias.as_ref().expect("bias BO").handle(),
+        ctx.rc.as_ref().expect("rc BO").handle(),
+    ];
+    let out_handles = [ctx.output.as_ref().expect("output BO").handle()];
+    dev.submit(&[task], &in_handles, &out_handles, 0)?;
+
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(CONV_WAIT_NS)?;
+        gather_output_i8(&bo_i8(bo)[..cube_out], c, oh, ow, out);
+        bo.fini()?;
+    }
+    Ok(())
+}
+
+/// The int8 depthwise driver (`conv2d_dw_int8_run`): validate, then channel-tile in
+/// `G = 64` chunks (channels are independent — each chunk is one job). There is no
+/// spatial tiling on this path (a single channel whose feature overflows one CBUF pass
+/// is refused, as in C).
+#[allow(clippy::too_many_arguments)]
+fn conv2d_dw_int8_run(
+    ctx: &mut ConvContext,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    bias: Option<&[i32]>,
+    in_scale: f32,
+    w_scale: f32,
+    out_scale: f32,
+    in_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    out: &mut [i8],
+) -> Result<()> {
+    match conv2d_dw_int8_plan_code(d) {
+        0 => {}
+        -2 => {
+            return Err(Error::coded(
+                crate::Status::Shape,
+                -2,
+                "rocket_conv2d_dw_int8/depthwise",
+            ));
+        }
+        -3 => {
+            return Err(Error::coded(
+                crate::Status::Shape,
+                -3,
+                "rocket_conv2d_dw_int8/out-extent",
+            ));
+        }
+        -5 => {
+            log_error!(
+                "rocket_conv2d_dw_int8: channel count C={} must be a multiple of 16 \
+                 (C2 feature-cube grain)",
+                d.ic
+            );
+            return Err(Error::coded(
+                crate::Status::Tiling,
+                -5,
+                "rocket_conv2d_dw_int8/channels",
+            ));
+        }
+        -4 => return Err(Error::tiling("rocket_conv2d_dw_int8/cbuf")),
+        _ => return Err(Error::shape("rocket_conv2d_dw_int8")),
+    }
+    // The fold carries in_zp * sum(w); a weight zero point would add w_zp * sum(x),
+    // which depends on the input and cannot be folded. TFLite's int8 weights are
+    // symmetric (the C refuses a non-zero w_zp on the device path only).
+    if w_zp != 0 {
+        log_error!(
+            "rocket_conv2d_dw_int8: weight zero point {w_zp}; the NPU path takes \
+             symmetric int8 weights only"
+        );
+        return Err(Error::unsupported("rocket_conv2d_dw_int8/weight-zp"));
+    }
+    let (ih, iw, kh, kw) = (d.ih, d.iw, d.kh, d.kw);
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    let (sy, sx, pt, pl) = (d.stride_y, d.stride_x, d.pad_top, d.pad_left);
+    let (dy, dx) = (d.dil_y, d.dil_x);
+    let cc = dw_int8_chunk(d.ic, ih, iw);
+    let mut c0 = 0;
+    while c0 < d.ic {
+        let cn = (d.ic - c0).min(cc);
+        conv2d_dw_int8_one_job(
+            ctx,
+            cn,
+            ih,
+            iw,
+            oh,
+            ow,
+            kh,
+            kw,
+            sy,
+            sx,
+            pt,
+            pl,
+            dy,
+            dx,
+            &input[c0 * ih * iw..(c0 + cn) * ih * iw],
+            &w[c0 * kh * kw..(c0 + cn) * kh * kw],
+            bias.map(|b| &b[c0..c0 + cn]),
+            in_scale,
+            w_scale,
+            out_scale,
+            in_zp,
+            w_zp,
+            out_zp,
+            &mut out[c0 * oh * ow..(c0 + cn) * oh * ow],
+        )?;
+        c0 += cn;
+    }
+    Ok(())
+}
+
+/// `rocket_conv2d_dw_int8`: int8-in / int8-out depthwise conv with the on-chip requant.
+///
+/// The caller passes the **raw model tensors**: `in [C][IH][IW]`, `w [C][KH][KW]`,
+/// `bias_q [C]` int32 (optional), `out [C][OH][OW]`, all in the model's int8 domain,
+/// plus the per-tensor scales and the model-domain zero points. `w_zp != 0` is
+/// [`crate::Status::Unsupported`] (the fold cannot carry a weight zero point), and `C`
+/// must be a multiple of 16 (the `C2` feature-cube grain).
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_dw_int8(
+    dev: &Device,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    bias: Option<&[i32]>,
+    in_scale: f32,
+    w_scale: f32,
+    out_scale: f32,
+    in_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    out: &mut [i8],
+) -> Result<()> {
+    let mut ctx = ConvContext::new(dev);
+    conv2d_dw_int8_run(
+        &mut ctx, d, input, w, bias, in_scale, w_scale, out_scale, in_zp, w_zp, out_zp, out,
+    )
+}
+
+/// `rocket_conv2d_dw_int8_ctx`: the same depthwise conv on a resident-BO context.
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_dw_int8_ctx(
+    ctx: &mut ConvContext,
+    d: &Conv2dDesc,
+    input: &[i8],
+    w: &[i8],
+    bias: Option<&[i32]>,
+    in_scale: f32,
+    w_scale: f32,
+    out_scale: f32,
+    in_zp: i32,
+    w_zp: i32,
+    out_zp: i32,
+    out: &mut [i8],
+) -> Result<()> {
+    conv2d_dw_int8_run(
+        ctx, d, input, w, bias, in_scale, w_scale, out_scale, in_zp, w_zp, out_zp, out,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1907,5 +3295,260 @@ mod tests {
             conv2d_act_code(&dw, Activation::Silu),
             CONV_ACT_ERR_DEPTHWISE
         );
+    }
+
+    // ── int8 conv ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn int8_reference_hand_cases() {
+        // 1x1: one tap per output, exact integer product.
+        let mut d = desc(2, 1, 2, 2, 1, 1);
+        d.ic = 2;
+        d.oc = 2;
+        let input = [1i8, -2, 3, 4]; // [ic][1][2]
+        let w = [2i8, 1, -1, 3]; // [oc][ic][1][1]
+        let mut out = [0i32; 4];
+        conv2d_ref_int8(&d, &input, &w, &mut out);
+        assert_eq!(out, [5, 0, 8, 14]);
+
+        // 3x3 pad 1 on a 2x2 input: out[0][0] only sees in[0][0] at tap (1,1).
+        let mut d = desc(1, 2, 2, 1, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let input = [5i8, -7, 11, 13];
+        let w: Vec<i8> = (1..=9).collect();
+        let mut out = [0i32; 4];
+        conv2d_ref_int8(&d, &input, &w, &mut out);
+        // out[0][0] = 5*5 + (-7)*6 + 11*8 + 13*9;
+        // out[0][1] = 5*4 + (-7)*5 + 11*7 + 13*8;
+        // out[1][0] = 5*2 + (-7)*3 + 11*5 + 13*6; out[1][1] = 5*1 + (-7)*2 + 11*4 + 13*5.
+        assert_eq!(out, [188, 166, 122, 100]);
+
+        // Depthwise (int32-raw): each channel reduces only itself.
+        let mut d = desc(2, 2, 1, 2, 2, 1);
+        d.depthwise = true;
+        let input = [1i8, 2, 3, 4];
+        let w = [1i8, 10, 2, 20]; // [c][kh][kw]
+        let mut out = [0i32; 2];
+        conv2d_ref_int8(&d, &input, &w, &mut out);
+        // oh = 2 - 2 + 1 = 1, ow = 1: c0 = 1*1 + 2*10 = 21; c1 = 3*2 + 4*20 = 86.
+        assert_eq!(out, [21, 86]);
+
+        // A stride-2 3x3 reads only the taps that land on the plane.
+        let mut d = desc(1, 4, 4, 1, 3, 3);
+        d.ic = 1;
+        d.oc = 1;
+        d.stride_y = 2;
+        d.stride_x = 2;
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let input: Vec<i8> = (0..16).collect();
+        let w = [1i8; 9];
+        let mut out = [0i32; 4];
+        conv2d_ref_int8(&d, &input, &w, &mut out);
+        assert_eq!(
+            out,
+            [
+                1 + 4 + 5,
+                1 + 2 + 3 + 5 + 6 + 7,
+                4 + 5 + 8 + 9 + 12 + 13,
+                90
+            ]
+        );
+    }
+
+    #[test]
+    fn int8_plan_codes_match_the_run_classes() {
+        // Direct 3x3 at the RGB stem IC=3 (padded to 32) is accepted.
+        let mut d = desc(3, 56, 56, 64, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        assert_eq!(conv2d_int8_plan_code(&d), 0);
+
+        // A depthwise descriptor belongs to the other entry.
+        let mut dw = desc(64, 56, 56, 64, 3, 3);
+        dw.pad_top = 1;
+        dw.pad_left = 1;
+        dw.depthwise = true;
+        assert_eq!(conv2d_int8_plan_code(&dw), -2);
+        assert_eq!(conv2d_dw_int8_plan_code(&dw), 0);
+        assert_eq!(conv2d_dw_int8_plan_code(&d), -2);
+        // An RGB-stem depthwise form hits the C2 = 16 channel grain (the C's -5, which
+        // it checks after the depthwise/OC match).
+        let mut dw3 = dw;
+        dw3.ic = 3;
+        dw3.oc = 3;
+        assert_eq!(conv2d_dw_int8_plan_code(&dw3), -5);
+
+        // A 3x3 kernel at IC 12000 cannot fit one bank even at 1 B/elem.
+        let d = desc(12000, 4, 4, 32, 3, 3);
+        assert_eq!(conv2d_int8_plan_code(&d), -4);
+        // The int8 depthwise group is 64: 64*25*25 > 32768 at k25.
+        let mut d = desc(64, 64, 64, 64, 25, 25);
+        d.depthwise = true;
+        assert_eq!(conv2d_dw_int8_plan_code(&d), -4);
+        // The C2 = 16 feature-cube grain refuses a C that is not a multiple of it.
+        let mut d = desc(24, 8, 8, 24, 3, 3);
+        d.depthwise = true;
+        assert_eq!(conv2d_dw_int8_plan_code(&d), -5);
+        // A collapsed extent.
+        let d = desc(32, 4, 4, 32, 5, 5);
+        assert_eq!(conv2d_int8_plan_code(&d), -3);
+        // Malformed.
+        let d = desc(0, 4, 4, 32, 1, 1);
+        assert_eq!(conv2d_int8_plan_code(&d), -1);
+    }
+
+    #[test]
+    fn int8_tile_plan_covers_the_output_once() {
+        // 128x112x112 at k3 p1: the weight tile shrinks to 96 (4 banks) and the rows
+        // band because 128 * 114 * 114 overflows the 7-bank int8 feature budget.
+        let mut d = desc(128, 112, 112, 128, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let plan = conv_int8_tile_plan(&d).expect("tileable");
+        assert_eq!(plan.ic, 128);
+        assert_eq!(plan.oc_tile, 96);
+        assert!(plan.rband.len() > 1, "row bands: {:?}", plan.rband);
+        assert_eq!(plan.rband.iter().sum::<usize>(), 112);
+        assert_eq!(plan.cband.iter().sum::<usize>(), 112);
+        let tiles = plan.tiles(&d);
+        assert_eq!(plan.count(&d), tiles.len());
+        let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+        let mut covered = 0usize;
+        let mut chan = vec![0usize; d.oc * oh * ow];
+        for t in &tiles {
+            covered += t.oc_n * t.rh * t.cw;
+            assert!(t.oc0 + t.oc_n <= d.oc && t.r0 + t.rh <= oh && t.c0 + t.cw <= ow);
+            for o in t.oc0..t.oc0 + t.oc_n {
+                for r in t.r0..t.r0 + t.rh {
+                    for c in t.c0..t.c0 + t.cw {
+                        chan[(o * oh + r) * ow + c] += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(covered, d.oc * oh * ow);
+        assert!(chan.iter().all(|&n| n == 1), "every element covered once");
+
+        // A small problem is a single tile (the fast path would serve it anyway).
+        let mut d = desc(32, 8, 8, 32, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let plan = conv_int8_tile_plan(&d).expect("tileable");
+        assert_eq!(plan.oc_tile, 32);
+        assert_eq!(plan.tiles(&d).len(), 1);
+    }
+
+    #[test]
+    fn int8_requant_model_and_registers_agree() {
+        // The register pair the emitter programs and the host model share one
+        // derivation; pin both against the C test's `requant_model.h` numbers.
+        let (mul, shift) = requant_params(0.0213 * 0.00347 / 0.0925);
+        assert_eq!((mul, shift), (0x68bc, 25));
+        // ... and the emitter writes exactly that (scale, shift-1 register).
+        let mut p = crate::regcmd::conv::ConvInt8Params::new(64, 8, 8, 64, 8, 8, 3, 3, 0, 0, 0);
+        p.pad_top = 1;
+        p.pad_left = 1;
+        p.dw_group = 64;
+        p.int8_out = true;
+        p.in_scale = 0.0213;
+        p.w_scale = 0.00347;
+        p.out_scale = 0.0925;
+        p.input_zero_point = 0x80;
+        p.output_zero_point = 0x80;
+        p.weight_zero_point = 0x80;
+        let mut ops = Vec::new();
+        crate::regcmd::conv::gen_conv2d_dw_int8(&mut p, &mut ops).unwrap();
+        let scale = ops
+            .iter()
+            .find(|o| {
+                o.target() == crate::regcmd::desc::DPU
+                    && o.reg() == crate::regcmd::desc::DPU_OUT_CVT_SCALE
+            })
+            .unwrap()
+            .value()
+            & 0xFFFF;
+        let reg_shift = ops
+            .iter()
+            .find(|o| {
+                o.target() == crate::regcmd::desc::DPU
+                    && o.reg() == crate::regcmd::desc::DPU_OUT_CVT_SHIFT
+            })
+            .unwrap()
+            .value()
+            & 0x3F;
+        assert_eq!(scale, mul);
+        assert_eq!(reg_shift, shift);
+
+        // Round half to even, both signs, and saturation after the offset.
+        assert_eq!(requant_round_shift(2, 1), 1); // 1.0
+        assert_eq!(requant_round_shift(1, 1), 0); // 0.5 -> 0
+        assert_eq!(requant_round_shift(3, 1), 2); // 1.5 -> 2
+        assert_eq!(requant_round_shift(-1, 1), 0); // -0.5 -> 0
+        assert_eq!(requant_round_shift(-3, 1), -2); // -1.5 -> -2
+        assert_eq!(requant_round_shift(7, 0), 7); // no shift
+        assert_eq!(requant_apply(1, 0x4000, 14), 1);
+        assert_eq!(requant_apply(1 << 40, 0x4000, 14), 127);
+        assert_eq!(requant_apply(-(1 << 40), 0x4000, 14), -128);
+        assert_eq!(requant_apply_zp(0, 0x4000, 14, 5), 5);
+    }
+
+    #[test]
+    fn int8_cube_round_trips() {
+        // int8 feature cube (C2 = 16) with a partial channel group.
+        let (c, h, w) = (3usize, 5usize, 7usize);
+        let src: Vec<i8> = (0..c * h * w).map(|i| (i as i8).wrapping_mul(3)).collect();
+        let mut cube = vec![0i8; c.div_ceil(16) * 16 * h * w];
+        scatter_feature_i8(&mut cube, c, h, w, &src);
+        let mut back = vec![0i8; c * h * w];
+        gather_output_i8(&cube, c, h, w, &mut back);
+        assert_eq!(src, back);
+        assert_eq!(feature_cube_index_i8(c, h, w, 1, 1, 1), 0);
+        assert_eq!(feature_cube_index_i8(c, h, w, 2, 1, 1), 1);
+        assert_eq!(feature_cube_index_i8(c, h, w, 1, 1, 2), 16);
+        assert_eq!(feature_cube_index_i8(c, h, w, 17, 1, 1), h * w * 16);
+
+        // int32 output cube (C2 = 4).
+        let (oc, oh, ow) = (6usize, 3usize, 4usize);
+        let src: Vec<i32> = (0..oc * oh * ow).map(|i| i as i32 - 7).collect();
+        let mut cube = vec![0i32; oc.div_ceil(4) * 4 * oh * ow];
+        for ch in 0..oc {
+            for r in 0..oh {
+                for col in 0..ow {
+                    cube[feature_data(oc, oh, ow, 4, ch + 1, r + 1, col + 1)] =
+                        src[(ch * oh + r) * ow + col];
+                }
+            }
+        }
+        let mut back = vec![0i32; oc * oh * ow];
+        gather_output_i32(&cube, oc, oh, ow, &mut back);
+        assert_eq!(src, back);
+
+        // The int8 direct weight cube at 1x1 collapses to the (N/32, K/32, 32, 32)
+        // matmul tile; the kernel spatial sits between the ic1 and oc2 groups. (OC and
+        // IC must be the group-padded extents the one-job path passes: 32/32 here.)
+        assert_eq!(weight_cube_index_i8(32, 1, 1, 1, 1, 1, 1), 0);
+        assert_eq!(weight_cube_index_i8(32, 1, 1, 32, 32, 1, 1), 31 * 32 + 31);
+        assert_eq!(weight_cube_index_i8(32, 1, 1, 33, 1, 1, 1), 32 * 32);
+        assert_eq!(weight_cube_index_i8(64, 3, 3, 1, 1, 1, 2), 32 * 32);
+        assert_eq!(weight_cube_index_i8(64, 3, 3, 2, 1, 1, 1), 32);
+
+        // Round trip the direct int8 weight scatter at the padded groups.
+        let wsrc: Vec<i8> = (0..32 * 32 * 3 * 3).map(|i| (i % 251) as i8).collect();
+        let mut wcube = vec![0i8; 32 * 32 * 3 * 3];
+        scatter_weights_i8(&mut wcube, 32, 32, 3, 3, &wsrc);
+        for o in 0..32 {
+            for k in 0..3 {
+                for j in 0..3 {
+                    for i in 0..32 {
+                        assert_eq!(
+                            wcube[weight_cube_index_i8(32, 3, 3, o + 1, i + 1, k + 1, j + 1)],
+                            wsrc[((o * 32 + i) * 3 + k) * 3 + j]
+                        );
+                    }
+                }
+            }
+        }
     }
 }

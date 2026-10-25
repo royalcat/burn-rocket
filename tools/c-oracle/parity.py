@@ -16,6 +16,13 @@ A final `pool` section covers the spatial-reduce machinery: the decomposition
 matrix, and the fp16 average-pool reciprocal (`recip`,
 `ppu_recip_kernel_fp16`) for every kernel extent.
 
+An `int8conv` section covers the native int8 CONV_2D generators over a shape /
+zero-point / scale matrix: `emit-conv-int8` (the direct int32-raw program) and
+`emit-conv-dw-int8` (the depthwise int8-out requant writer, and its int32-raw
+diagnostic form), including the C's own refusals. int8/uint8 *pooling* has no program
+of its own — the C routes it through `gen_pool_fp16` with an int8<->fp16 cube
+boundary — so those geometries appear as ordinary `emit-pool` rows.
+
 A `conv` section covers the fp16 CONV_2D family: `conv` (the `rocket_conv2d_plan`
 reason code) over the direct/depthwise/dilation/stride/explicit-extent matrix,
 `emit-conv` (`gen_conv2d_fp16` / `gen_conv2d_dw_fp16`, including the CNA
@@ -32,6 +39,7 @@ Usage:
   python3 tools/c-oracle/parity.py --kind fp16,int8
   python3 tools/c-oracle/parity.py --kind pool
   python3 tools/c-oracle/parity.py --kind conv
+  python3 tools/c-oracle/parity.py --kind int8conv
 """
 
 from __future__ import annotations
@@ -139,9 +147,21 @@ POOL_CASES: tuple[tuple, ...] = (
     ("kw17",    8,  4,  4, 2,  2,  2, 17,  2,  2, 0, 0, 0, 0, "avg", False),
     ("c8193", 8193, 4,  4, 2,  2,  2,  2,  2,  2, 0, 0, 0, 0, "avg", False),
     ("iw0",     8,  4,  0, 2,  2,  2,  2,  2,  2, 0, 0, 0, 0, "avg", False),
+    # The int8/uint8 pool geometries: those entries route through this same fp16
+    # program with an int8<->fp16 cube boundary, so there is no second encoding to
+    # compare — the 2x2 detection max and the padded 3x3 average are the shapes the
+    # delegated networks use.
+    ("i8 max",  32,  8,  8, 4,  4,  2,  2,  2,  2, 0, 0, 0, 0, "max", True),
+    ("i8 avg",  64,  7,  7, 7,  7,  3,  3,  1,  1, 1, 1, 1, 1, "avg", True),
+    ("u8 max",  16,  5,  5, 3,  3,  3,  3,  1,  1, 1, 1, 1, 1, "max", True),
+    ("u8 avg",   8, 14, 14, 1,  1, 14, 14, 14, 14, 0, 0, 0, 0, "avg", True),
 )
 
 POOL_METHODS = {"avg": 0, "max": 1, "min": 2}
+
+# The int8 conv harness's bias-cube IOVA (the feature/weight/output IOVAs are shared
+# with the fp16 conv rows above; they land in the program words verbatim).
+BIAS_DMA = "0x400000"
 
 # ── Conv matrix ───────────────────────────────────────────────────────────────
 #
@@ -225,6 +245,63 @@ CONV_ACTS: tuple[tuple, ...] = (
 
 # Emit cases the generator must refuse (an identical "-1" on both sides).
 CONV_EMIT_REFUSALS = {"feat banks", "k3 ic6000", "deconv dw", "deconv s2"}
+
+# ── int8 conv matrix ──────────────────────────────────────────────────────────
+#
+# The int8 generators take the same 12 geometry scalars and the three IOVAs; the DW
+# rows add the quant tail (the int8 direct path ignores it). IC/OC are the group-padded
+# extents the runtime passes (32 and 32 for the int8 weight cube) except where a row is
+# deliberately unaligned to pin the generator's own arithmetic.
+#
+# (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw_group, expect_ok)
+CONV_INT8_EMITS: tuple[tuple, ...] = (
+    # Direct: the plain 3x3, the RGB stem tile (IC padded to 32 by the caller), 1x1,
+    # stride 2, pad 0, a 7x7, and the spatial-tiled band shapes the tiler emits.
+    ("i8 3x3 p1",    32,   8,   8,  32, 3, 3, 1, 1, 1, 1, 1, 1, 0, True),
+    ("i8 3x3 p0",    64,  14,  14,  64, 3, 3, 1, 1, 0, 0, 1, 1, 0, True),
+    ("i8 1x1",       64,   8,   8,  64, 1, 1, 1, 1, 0, 0, 1, 1, 0, True),
+    ("i8 s2",        32,  16,  16,  32, 3, 3, 2, 2, 0, 0, 1, 1, 0, True),
+    ("i8 k7 p3",     32,  16,  16,  32, 7, 7, 1, 1, 3, 3, 1, 1, 0, True),
+    ("i8 dil2",      32,  16,  16,  32, 3, 3, 1, 1, 2, 2, 2, 2, 0, True),
+    # A 4-bank weight tile: 96 kernels at IC 128 3x3 = 110592 B.
+    ("i8 oc96",     128,  28,  28,  96, 3, 3, 1, 1, 1, 1, 1, 1, 0, True),
+    # A row-band tile: the same shape at a shallower height (the tiler's sub-job).
+    ("i8 band",     128,  14,  28,  96, 3, 3, 1, 1, 0, 0, 1, 1, 0, True),
+    # Unaligned extents the generator still encodes (the runtime pads them away).
+    ("i8 ic3",        3,  56,  56,  32, 3, 3, 1, 1, 1, 1, 1, 1, 0, True),
+    # Refusals: a feature above 11 banks (-1) and a kernel above one bank (-2).
+    ("i8 feat banks", 32, 400, 400, 32, 1, 1, 1, 1, 0, 0, 1, 1, 0, False),
+    ("i8 kernel bank", 12000, 4, 4, 32, 3, 3, 1, 1, 0, 0, 1, 1, 0, False),
+    # Depthwise, int8 out: the requant writer. The scale triple feeds the OUT_CVT
+    # derivation; the zero points are model-domain (the harness adds 0x80).
+    # (..., dw_group, int8_out, in_scale, w_scale, out_scale, in_zp, w_zp, out_zp)
+    ("i8dw 3x3",     64,   8,   8,  64, 3, 3, 1, 1, 1, 1, 1, 1, 64, True,
+     1, 0.0213, 0.00347, 0.0925, -2, 0, 5),
+    ("i8dw s2",      64,  16,  16,  64, 3, 3, 2, 2, 1, 1, 1, 1, 64, True,
+     1, 0.0213, 0.00347, 0.0925, 37, 0, -20),
+    ("i8dw zp ends", 64,   9,   7,  64, 3, 3, 1, 2, 1, 1, 1, 1, 64, True,
+     1, 0.0213, 0.00347, 0.0925, -128, 0, 127),
+    ("i8dw 5x5",     64,   8,  11,  64, 5, 5, 1, 1, 2, 2, 1, 1, 64, True,
+     1, 0.0156, 0.0078, 0.125, 127, 0, -128),
+    ("i8dw unit",    32,   6,   6,  32, 3, 3, 1, 1, 0, 0, 1, 1, 64, True,
+     1, 1.0, 1.0, 1.0, 0, 0, 0),
+    ("i8dw raw",     64,   8,   8,  64, 3, 3, 1, 1, 1, 1, 1, 1, 64, True,
+     0, 0.0213, 0.00347, 0.0925, -2, 0, 5),
+    ("i8dw g0",      64,   8,   8,  64, 3, 3, 1, 1, 1, 1, 1, 1, 0, True,
+     1, 0.0213, 0.00347, 0.0925, 0, 0, 0),
+    # The generator is more permissive than the runtime plan: a 25x25 G-chunk above one
+    # bank still *emits* (the DW branch only checks the whole weight cube against the
+    # banks the feature leaves; `conv2d_dw_int8_plan_code` is what refuses it), and a
+    # feature above 11 banks is the generator's own -1.
+    ("i8dw k25",     64,  64,  64,  64, 25, 25, 1, 1, 0, 0, 1, 1, 64, True,
+     1, 0.0213, 0.00347, 0.0925, 0, 0, 0),
+    ("i8dw feat banks", 64, 400, 400, 64, 3, 3, 1, 1, 0, 0, 1, 1, 64, False,
+     1, 0.0213, 0.00347, 0.0925, 0, 0, 0),
+)
+
+CONV_INT8_REFUSALS = {"i8 feat banks", "i8 kernel bank", "i8dw feat banks"}
+
+SCALE_BITS = lambda v: f"0x{struct.unpack('<I', struct.pack('<f', v))[0]:08x}"
 
 
 def check_conv(
@@ -641,6 +718,54 @@ def check_pool(
     return recip_checks, plan_checks, prog_checks
 
 
+def check_conv_int8(
+    oracle: Path,
+    dump: Path,
+    failures: list[Failure],
+    verbose: bool,
+) -> tuple[int, int]:
+    """The native int8 conv programs: (direct checks, depthwise checks)."""
+    kind = Dtype("int8conv", "emit-conv-int8", "emit-conv-dw-int8", n_align=1, k_align=1)
+    direct = 0
+    dwise = 0
+    for row in CONV_INT8_EMITS:
+        name = row[0]
+        (ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw_group) = row[1:14]
+        expect_ok = row[14]
+        if len(row) == 15:
+            args = ["emit-conv-int8", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                    str(sy), str(sx), str(pt), str(pl), str(dy), str(dx),
+                    IN_DMA, WT_DMA, OUT_DMA, str(dw_group)]
+            direct += 1
+        else:
+            (int8_out, in_s, w_s, out_s, in_zp, w_zp, out_zp) = row[15:22]
+            args = ["emit-conv-dw-int8", str(ic), str(ih), str(iw), str(oc), str(kh),
+                    str(kw), str(sy), str(sx), str(pt), str(pl), str(dy), str(dx),
+                    IN_DMA, WT_DMA, OUT_DMA, BIAS_DMA,
+                    SCALE_BITS(in_s), SCALE_BITS(w_s), SCALE_BITS(out_s),
+                    str(in_zp), str(w_zp), str(out_zp), str(int8_out), str(dw_group)]
+            dwise += 1
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        if not compare(failures, kind, f"{name}: {' '.join(args[1:])}", c_proc, r_proc):
+            continue
+        refused = c_proc.stdout.strip() == "-1"
+        if refused != (not expect_ok):
+            failures.append(
+                Failure(
+                    kind.name,
+                    name,
+                    f"expected {'a refusal' if not expect_ok else 'a program'}, "
+                    f"got {c_proc.stdout.strip()!r}",
+                )
+            )
+        elif verbose:
+            words = c_proc.stdout.splitlines()
+            what = "refused" if refused else f"{words[0]} words"
+            print(f"  {name:<14} {' '.join(args[1:])[:56]:<56} -> {what}")
+    return direct, dwise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare the Rust rocket-npu planner/emitters against the C oracle.",
@@ -671,7 +796,7 @@ def main() -> int:
         wanted: list[str] = []
         for chunk in args.kind:
             wanted.extend(part.strip() for part in chunk.split(",") if part.strip())
-        known = {d.name for d in DTYPES} | {"pool", "conv"}
+        known = {d.name for d in DTYPES} | {"pool", "conv", "int8conv"}
         unknown = [k for k in wanted if k not in known]
         if unknown:
             print(f"error: unknown --kind {', '.join(unknown)}; known: {', '.join(sorted(known))}",
@@ -683,10 +808,12 @@ def main() -> int:
         selected = tuple(d for d in DTYPES if d.name in wanted)
         pool_selected = "pool" in wanted
         conv_selected = "conv" in wanted
+        int8conv_selected = "int8conv" in wanted
     else:
         selected = DTYPES
         pool_selected = True
         conv_selected = True
+        int8conv_selected = True
 
     print(f"oracle: {oracle}")
     print(f"dump:   {dump}")
@@ -706,12 +833,18 @@ def main() -> int:
     if conv_selected:
         conv_counts = check_conv(oracle, dump, failures, args.verbose)
 
+    int8conv_counts: tuple[int, int] | None = None
+    if int8conv_selected:
+        int8conv_counts = check_conv_int8(oracle, dump, failures, args.verbose)
+
     print()
     names = [len(d.name) for d in selected]
     if pool_counts is not None:
         names.append(len("pool"))
     if conv_counts is not None:
         names.append(len("conv"))
+    if int8conv_counts is not None:
+        names.append(len("int8conv"))
     width = max(names)
     for dtype, status, plan_checks, emit_checks in results:
         if status == "pending":
@@ -728,6 +861,11 @@ def main() -> int:
         status = "fail" if any(f.dtype == "conv" for f in failures) else "pass"
         print(f"{'conv':<{width}}  {status.upper():<5}  "
               f"plan {plan_checks}, emit {prog_checks}, act {act_checks}")
+    if int8conv_counts is not None:
+        direct, dwise = int8conv_counts
+        status = "fail" if any(f.dtype == "int8conv" for f in failures) else "pass"
+        print(f"{'int8conv':<{width}}  {status.upper():<5}  "
+              f"direct {direct}, depthwise {dwise}")
 
     if failures:
         print()
@@ -753,6 +891,11 @@ def main() -> int:
         print(
             f"conv: {conv_counts[0]} plan(s) + {conv_counts[1]} program(s) + "
             f"{conv_counts[2]} fused-activation program(s) compared, all byte-identical"
+        )
+    if int8conv_counts is not None:
+        print(
+            f"int8conv: {int8conv_counts[0]} direct + {int8conv_counts[1]} depthwise "
+            f"program(s) compared, all byte-identical"
         )
     print("RESULT: PASS")
     return 0

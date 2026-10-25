@@ -25,6 +25,9 @@
  *   oracle conv         IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]
  *   oracle emit-conv    IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 IN WT OUT [DSY DSX]
  *   oracle emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT
+ *   oracle emit-conv-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT [DW_GROUP]
+ *   oracle emit-conv-dw-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT BIAS \
+ *        I_SCALE_BITS W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT
  *
  * A plan prints "Mt Kt Nt jobs", or "-1" for an unsupported shape.
  * An emit prints the task count, then one %016llx per NPUOP word.
@@ -75,8 +78,12 @@ static void usage(const char *argv0)
             "       %s emit-conv IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 "
             "IN WT OUT [DSY DSX]\n"
             "       %s emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND "
-            "IN WT OUT\n",
-            argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
+            "IN WT OUT\n"
+            "       %s emit-conv-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT "
+            "[DW_GROUP]\n"
+            "       %s emit-conv-dw-int8 IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT BIAS "
+            "I_SCALE_BITS W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT\n",
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int is_plan_mode(const char *mode)
@@ -153,6 +160,74 @@ int main(int argc, char **argv)
             /* The C's local rejection class (-1/-2/-3) does not line up with the port's
              * Status enum, so the harness compares the portable "-1", as the matmul
              * emits do. Valid programs are compared word for word. */
+            printf("-1\n");
+            return 0;
+        }
+        printf("%u\n", p.task_count);
+        for (uint32_t i = 0; i < p.task_count; i++)
+            printf("%016llx\n", (unsigned long long)ops[i]);
+        return 0;
+    }
+
+    if (!strcmp(mode, "emit-conv-int8") || !strcmp(mode, "emit-conv-dw-int8")) {
+        /* The int8 family: the emitters take the job's tile dims, as emit-conv does.
+         * Scale arguments are raw f32 BIT PATTERNS (hex) so the two harnesses read the
+         * identical value rather than reparsing a decimal. The zero points are
+         * MODEL-domain signed int8; the library adds 0x80 before calling the generator,
+         * and so does this oracle. */
+        if (argc < 17) {
+            fprintf(stderr, "emit-conv-int8 needs IC IH IW OC KH KW SY SX PT PL DY DX IN WT OUT\n");
+            return 2;
+        }
+        int dw = !strcmp(mode, "emit-conv-dw-int8");
+        conv_params_t p = {0};
+        /* The depthwise invariant OC == IC; a 0 in that argument means "the entry's
+         * own C" (the library passes p.oc = C). */
+        uint64_t ops[ORACLE_MAX_OPS] = {0};
+        p.tasks = ops;
+        p.ic = (uint16_t)atoi(argv[2]);
+        p.ih = (uint16_t)atoi(argv[3]);
+        p.iw = (uint16_t)atoi(argv[4]);
+        p.oc = (uint16_t)atoi(argv[5]);
+        if (dw && p.oc == 0) p.oc = p.ic;
+        p.kh = (uint16_t)atoi(argv[6]);
+        p.kw = (uint16_t)atoi(argv[7]);
+        p.oh = (uint16_t)rocket_conv_out_dim(atoi(argv[3]), atoi(argv[6]), atoi(argv[8]),
+                                             atoi(argv[10]), atoi(argv[12]));
+        p.ow = (uint16_t)rocket_conv_out_dim(atoi(argv[4]), atoi(argv[7]), atoi(argv[9]),
+                                             atoi(argv[11]), atoi(argv[13]));
+        p.stride_y = (uint8_t)atoi(argv[8]);
+        p.stride_x = (uint8_t)atoi(argv[9]);
+        p.pad_top = (uint8_t)atoi(argv[10]);
+        p.pad_left = (uint8_t)atoi(argv[11]);
+        p.dil_y = (uint8_t)atoi(argv[12]);
+        p.dil_x = (uint8_t)atoi(argv[13]);
+        p.input_dma = (uint32_t)strtoul(argv[14], NULL, 0);
+        p.weights_dma = (uint32_t)strtoul(argv[15], NULL, 0);
+        p.output_dma = (uint32_t)strtoul(argv[16], NULL, 0);
+        int rc;
+        if (!dw) {
+            p.dw_group = argc > 17 ? (uint8_t)atoi(argv[17]) : 0;
+            rc = gen_conv2d_int8(&p);
+        } else {
+            if (argc < 24) {
+                fprintf(stderr, "emit-conv-dw-int8 needs BIAS I W O SCALE_BITS IN_ZP W_ZP "
+                                "OUT_ZP INT8_OUT\n");
+                return 2;
+            }
+            union { uint32_t u; float f; } cv;
+            p.bias_dma = (uint32_t)strtoul(argv[17], NULL, 0);
+            cv.u = (uint32_t)strtoul(argv[18], NULL, 16); p.in_scale = cv.f;
+            cv.u = (uint32_t)strtoul(argv[19], NULL, 16); p.w_scale = cv.f;
+            cv.u = (uint32_t)strtoul(argv[20], NULL, 16); p.out_scale = cv.f;
+            p.input_zero_point = atoi(argv[21]) + 0x80;
+            p.output_zero_point = atoi(argv[22]) + 0x80;
+            p.weight_zero_point = atoi(argv[23]) + 0x80;
+            p.int8_out = argc > 24 ? (uint8_t)(atoi(argv[24]) != 0) : 1;
+            if (argc > 25) p.dw_group = (uint8_t)atoi(argv[25]);
+            rc = gen_conv2d_dw_int8(&p);
+        }
+        if (rc < 0) {
             printf("-1\n");
             return 0;
         }

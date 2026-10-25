@@ -265,6 +265,13 @@ struct Dpu {
     out_cvt_shift: u32,
     out_cvt_round: u8,
     surf_add: u32,
+    /// The int8-out depthwise path's per-OC int32 bias add in the BS ALU (the C
+    /// `npu_dpu_desc.bias_en`): the BS block is driven in add mode and BRDMA fetches
+    /// the bias cube. `false` keeps the BS block fully bypassed, which is what every
+    /// fp16 and int32-raw program does (`bias_en = 0` in the C default).
+    bias_en: bool,
+    /// `DPU_RDMA_BS_BASE_ADDR`, the int32 bias cube's IOVA (read only with `bias_en`).
+    bias_base_addr: u32,
 }
 
 /// `gen_conv2d_fp16`: emit one direct fp16 conv program into `ops`.
@@ -543,6 +550,417 @@ fn fill(p: &mut ConvParams<'_>, depthwise: bool, ops: &mut Vec<NpuOp>) -> Result
     Ok(count)
 }
 
+// ── int8 conv (the int8 sibling of `fill`) ────────────────────────────────────
+
+/// Parameters of one int8 conv tile (the int8 subset of the C `conv_params_t`).
+///
+/// The C reuses one `conv_params_t` for all four generators; this port keeps the fp16
+/// struct free of the quant fields ([`ConvInt8Params`] carries them) so neither has
+/// fields its own path cannot use. The direct int8 path ignores the scales, the zero
+/// points and `bias_dma` (it writes a raw int32 accumulator that the caller requants);
+/// the depthwise path with `int8_out` is the on-chip-requant writer and uses all of
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct ConvInt8Params {
+    /// Input channels. The direct path is called with `IC` already padded to 32 (the
+    /// weight `ic` group); depthwise with the channel count of this job's chunk.
+    pub ic: u16,
+    /// The job's input height, already padded to the 4-row CNA DMA floor when short.
+    pub ih: u16,
+    pub iw: u16,
+    /// Output channels (direct: padded to the 32-channel weight oc group by the caller).
+    pub oc: u16,
+    pub oh: u16,
+    pub ow: u16,
+    pub kh: u16,
+    pub kw: u16,
+    /// Window strides.
+    pub stride_y: u8,
+    pub stride_x: u8,
+    /// Dilation rate (`1` = none); emitted as rate - 1.
+    pub dil_y: u8,
+    pub dil_x: u8,
+    /// Symmetric leading pad.
+    pub pad_top: u8,
+    pub pad_left: u8,
+    /// NPU IOVA of the scattered int8 feature cube (`C2 = 16`).
+    pub input_dma: u32,
+    /// NPU IOVA of the scattered int8 weight cube (oc group 32 / ic group 32).
+    pub weights_dma: u32,
+    /// NPU IOVA of the int32 (direct) or int8 (depthwise) output cube.
+    pub output_dma: u32,
+    /// Depthwise channel group: `0` -> 64 (Mesa's int8 value);
+    /// `ROCKET_CONV_DW_GROUP` overrides it, as in C.
+    pub dw_group: u8,
+    /// `true` selects Mesa's int8-output writer with the on-chip requant (the depthwise
+    /// path); `false` keeps the validated int32-raw datapath.
+    pub int8_out: bool,
+    /// Per-tensor quant scales (`in_scale * w_scale / out_scale` is the requant scale).
+    pub in_scale: f32,
+    pub w_scale: f32,
+    pub out_scale: f32,
+    /// Zero points in the **uint8-centred** domain the generator's formulas use, i.e.
+    /// `model_zp + 0x80` (see [`crate::ops::conv`] and the C's note).
+    pub input_zero_point: i32,
+    pub output_zero_point: i32,
+    pub weight_zero_point: i32,
+    /// NPU IOVA of the per-OC int32 bias cube (BRDMA), read only with `int8_out`.
+    pub bias_dma: u32,
+    /// OUT: words written (the C `task_count`).
+    pub task_count: u32,
+}
+
+impl ConvInt8Params {
+    /// A plain direct int8 conv: int32-raw output, no depthwise, no quant fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ic: u16,
+        ih: u16,
+        iw: u16,
+        oc: u16,
+        oh: u16,
+        ow: u16,
+        kh: u16,
+        kw: u16,
+        input_dma: u32,
+        weights_dma: u32,
+        output_dma: u32,
+    ) -> Self {
+        Self {
+            ic,
+            ih,
+            iw,
+            oc,
+            oh,
+            ow,
+            kh,
+            kw,
+            stride_y: 1,
+            stride_x: 1,
+            dil_y: 1,
+            dil_x: 1,
+            pad_top: 0,
+            pad_left: 0,
+            input_dma,
+            weights_dma,
+            output_dma,
+            dw_group: 0,
+            int8_out: false,
+            in_scale: 0.0,
+            w_scale: 0.0,
+            out_scale: 1.0,
+            input_zero_point: 0,
+            output_zero_point: 0,
+            weight_zero_point: 0,
+            bias_dma: 0,
+            task_count: 0,
+        }
+    }
+}
+
+/// `gen_conv2d_int8`: emit one direct int8 conv program (`int8 x int8 -> int32`).
+///
+/// The mechanical int8 deltas vs [`gen_conv2d_fp16`]: 1 B/element, `C2 = 16` feature
+/// cube, `OC`-group-32 weight cube, `data_entries = ceil(IW*IC/64)`, `QD_EN = 0`, the
+/// int32 output writer (`OUT_PRECISION = int32`, `size_e = 7`, `surf_add = stride*8`)
+/// and — the hardware finding the C records — **one extra CBUF bank for the feature**
+/// (`data_bank = fd_banks + 1`), because the int8 C2=16 feature-cube DMA over-reads one
+/// bank past its `ceil` allocation at near-bank-full geometries.
+pub fn gen_conv2d_int8(p: &mut ConvInt8Params, ops: &mut Vec<NpuOp>) -> Result<usize> {
+    fill_int8(p, false, ops)
+}
+
+/// `gen_conv2d_dw_int8`: the depthwise variant. With [`ConvInt8Params::int8_out`] it is
+/// Mesa's int8-output writer with the on-chip requant (`QD_EN = 1`, the BS ALU bias add
+/// from BRDMA, the three-field OUT_CVT, `size_e = 3` / `surf_add = stride*4`); without
+/// it the int32-raw depthwise encoding (kept for the hardware sweep, as in C).
+pub fn gen_conv2d_dw_int8(p: &mut ConvInt8Params, ops: &mut Vec<NpuOp>) -> Result<usize> {
+    fill_int8(p, true, ops)
+}
+
+/// The shared int8 body (`gen_conv2d_int8_fill`).
+fn fill_int8(p: &mut ConvInt8Params, depthwise: bool, ops: &mut Vec<NpuOp>) -> Result<usize> {
+    let banks = crate::hw::current().cbuf_banks;
+    let bank = CBUF_BANK_SIZE;
+    let ic = p.ic as u32;
+    let ih = p.ih as u32;
+    let iw = p.iw as u32;
+    let oc = p.oc as u32;
+    let oh = p.oh as u32;
+    let ow = p.ow as u32;
+    let kh = p.kh as u32;
+    let kw = p.kw as u32;
+
+    let mut cna = Cna {
+        conv_mode: if depthwise { 3 } else { DIRECT_CONVOLUTION },
+        in_precision: PRECISION_INT8,
+        proc_precision: PRECISION_INT8,
+        kernel_groups: 0,
+        feature_grains: ih + 1,
+        ..Default::default()
+    };
+    if let Some(v) = knobs::u32_auto("ROCKET_CONV_GRAINS") {
+        cna.feature_grains = v & 0xFFFF;
+    }
+    {
+        let mut sx = p.stride_x as u32;
+        let mut sy = p.stride_y as u32;
+        if knobs::present("ROCKET_CONV_STRIDE_SWAP") {
+            std::mem::swap(&mut sx, &mut sy);
+        }
+        cna.conv_x_stride = sx;
+        cna.conv_y_stride = sy;
+    }
+    {
+        let dx = if p.dil_x > 0 { p.dil_x as u32 } else { 1 };
+        let dy = if p.dil_y > 0 { p.dil_y as u32 } else { 1 };
+        let bias = if knobs::present("ROCKET_CONV_DIL_RAW") {
+            0
+        } else {
+            1
+        };
+        cna.atrous_x = dx.wrapping_sub(bias);
+        cna.atrous_y = dy.wrapping_sub(bias);
+    }
+
+    cna.datain_width = iw;
+    cna.datain_height = ih;
+    cna.datain_channel = ic;
+    cna.dataout_width = ow;
+    cna.dataout_height = oh;
+    cna.dataout_atomics = ow * oh;
+    cna.weight_width = kw;
+    cna.weight_height = kh;
+
+    // 1 byte per element on this path.
+    let fd_bytes = (iw * ih * ic) as usize;
+    let fd_banks = fd_bytes.div_ceil(bank);
+    if fd_banks > banks - 1 {
+        return Err(Error::tiling("gen_conv2d_int8/feature-banks"));
+    }
+
+    let weight_banks;
+    if depthwise {
+        // Mesa's int8 group is 64 (feature atom 16 x 4); the fp16 value is 32. The
+        // HW-unconfirmed int8 group is an env sweep, as in C.
+        let mut g = if p.dw_group != 0 {
+            p.dw_group as u32
+        } else {
+            64
+        };
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_DW_GROUP") {
+            g = v;
+        }
+        if g == 0 {
+            g = 64;
+        }
+        let cpad = ic.div_ceil(g) * g;
+        cna.weight_kernels = 1;
+        cna.weight_bytes_per_kernel = kw * kh * ic; // one int8 filter per channel
+        cna.weight_bytes = cpad * kh * kw;
+        let wb = (cna.weight_bytes as usize).div_ceil(bank);
+        if fd_banks + wb > banks {
+            return Err(Error::tiling("gen_conv2d_int8/dw-banks"));
+        }
+        weight_banks = banks - fd_banks;
+    } else {
+        cna.weight_kernels = oc;
+        cna.weight_bytes_per_kernel = kw * kh * ic;
+        cna.weight_bytes = cna.weight_bytes_per_kernel * cna.weight_kernels;
+        if cna.weight_bytes_per_kernel as usize <= bank {
+            weight_banks = banks - fd_banks;
+        } else {
+            return Err(Error::tiling("gen_conv2d_int8/weight-bank"));
+        }
+    }
+
+    cna.weight_bank = weight_banks as u32;
+    cna.data_bank = fd_banks as u32;
+
+    // The int8 C2=16 feature-cube DMA over-reads ONE CBUF bank past its ceil
+    // allocation at near-bank-full geometries (HW-proven for this conv path, the
+    // identical signature `gen_matmul_int8` has). Reserve it; the weight takes the
+    // rest. The tiler reserves the matching bank, so `fd_banks + 1 + weight <= 12`.
+    if fd_banks + 1 > banks - 1 {
+        log_error!(
+            "gen_conv2d_int8: int8 CBUF bank-slack does not fit (fd_banks={fd_banks}, \
+             need fd_banks+1 <= {}) — use the int8 conv tiler",
+            banks - 1
+        );
+        return Err(Error::tiling("gen_conv2d_int8/bank-slack"));
+    }
+    {
+        let mut data_bank = fd_banks + 1;
+        cna.data_bank = data_bank as u32;
+        cna.weight_bank = (banks - data_bank) as u32;
+        // The audit sentinel, kept for future RE exactly as C (`ROCKET_CONV_I8_FDBANK_EXTRA`):
+        // -1 reproduces the old exact fit, +1 over-reserves.
+        if let Some(x) = knobs::int("ROCKET_CONV_I8_FDBANK_EXTRA") {
+            let mut nb = data_bank as i64 + x;
+            if nb < 1 {
+                nb = 1;
+            }
+            if nb > (banks - 1) as i64 {
+                nb = (banks - 1) as i64;
+            }
+            data_bank = nb as usize;
+            cna.data_bank = data_bank as u32;
+            cna.weight_bank = (banks - data_bank) as u32;
+        }
+    }
+    cna.data_entries = (iw * ic).div_ceil(64);
+    if let Some(v) = knobs::u32_auto("ROCKET_CONV_DENTRIES") {
+        cna.data_entries = v & 0xFFFF;
+    }
+    cna.data_sign = 1;
+    cna.cvt_type = 1;
+    cna.cvt_bypass = 1;
+    cna.cvt_scale0 = 1;
+    cna.cvt_scale1 = 1;
+    cna.cvt_scale2 = 1;
+    cna.cvt_scale3 = 1;
+    cna.fc_skip_en = 0;
+    cna.data_offset = 0;
+    cna.pad_left = p.pad_left as u32;
+    cna.pad_top = p.pad_top as u32;
+    cna.feature_base_addr = p.input_dma;
+    cna.weight_offset = 0;
+    cna.weight_burst_len = 0xF;
+    cna.data_burst_len = 0xF;
+    // Same float-correct feature surface stride as the fp16 conv (`IW*(IH-4)`): the cube
+    // atom is 16 B for both dtypes, so the stride is element-size independent.
+    cna.line_stride = iw * 4;
+    let surf = cna.line_stride as i64 * (ih as i64 - 4) / 4;
+    cna.surf_stride = if surf < 0 { 0 } else { surf as u32 };
+    cna.dma_width = iw;
+    cna.dma_height = ih;
+    cna.dma_channel = ic;
+    cna.decompress_addr0 = p.weights_dma;
+
+    let mut core = Core {
+        proc_precision: PRECISION_INT8,
+        qd_en: 0,
+        dw_en: depthwise as u32,
+        dataout_height: oh - 1,
+        dataout_width: ow - 1,
+        dataout_channel: oc - 1,
+    };
+
+    let mut dpu = Dpu {
+        burst_len: 0xF,
+        conv_mode: if depthwise { 3 } else { DIRECT_CONVOLUTION },
+        output_mode: 0x2,
+        flying_mode: 0,
+        out_precision: PRECISION_INT32,
+        in_precision: PRECISION_INT8,
+        proc_precision: PRECISION_INT8,
+        dst_base_addr: p.output_dma,
+        dst_surf_stride: oh * ow,
+        width: core.dataout_width,
+        height: core.dataout_height,
+        channel: core.dataout_channel,
+        bs_bypass: 1,
+        bs_alu_bypass: 1,
+        bs_mul_bypass: 1,
+        bs_relu_bypass: 1,
+        bn_bypass: 1,
+        bn_alu_bypass: 1,
+        bn_mul_bypass: 1,
+        bn_relu_bypass: 1,
+        ew_bypass: 1,
+        ew_op_bypass: 1,
+        ew_lut_bypass: 1,
+        ew_op_cvt_bypass: 1,
+        ew_relu_bypass: 1,
+        fp32tofp16_en: 0,
+        out_cvt_scale: 1,
+        ..Default::default()
+    };
+    // The int32-output stride quirk (== gen_matmul_int8): size_e = 7, surf_add =
+    // stride * 8. 3/4 (the float-native 4-byte pattern) strides the int32 wrong.
+    {
+        let mut se = 7u32;
+        let mut sm = 8u32;
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_INT8_SIZE_E") {
+            se = v;
+        }
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_INT8_SURF_MULT") {
+            sm = v;
+        }
+        dpu.size_e_2 = se & 0x7;
+        dpu.size_e_1 = se & 0x7;
+        dpu.size_e_0 = se & 0x7;
+        dpu.surf_add = dpu.dst_surf_stride * sm;
+    }
+    dpu.od_bypass = 1;
+    dpu.width_wdma = core.dataout_width;
+    dpu.height_wdma = core.dataout_height;
+    dpu.channel_wdma = core.dataout_channel;
+
+    if depthwise {
+        // Depthwise output geometry: the universal DW fields, then the int8-out writer.
+        dpu.od_bypass = 0;
+        if !knobs::present("ROCKET_CONV_GRAINS") {
+            cna.feature_grains = 50 + p.stride_y as u32 + 1;
+        }
+        dpu.bs_ow_op = 0x80u32.wrapping_sub(p.weight_zero_point as u32);
+
+        if p.int8_out {
+            // Mesa's DW int8-output regcmd: QD_EN required, int8 border pad, int8 out.
+            core.qd_en = 1;
+            // The CNA border pad: the zero point in the uint8-centred domain, one BYTE
+            // per lane (the odd channels of a group read byte 1 of the word).
+            let pb = ((p.input_zero_point & 0xFF) - 0x80) & 0xFF;
+            cna.pad_con1 = (pb as u32) * 0x0101_0101;
+            dpu.out_precision = PRECISION_INT8;
+            // int8-out writer stride: size_e = 3, surf_add = stride * 4 (NOT 7/8).
+            dpu.size_e_2 = 3;
+            dpu.size_e_1 = 3;
+            dpu.size_e_0 = 3;
+            dpu.surf_add = dpu.dst_surf_stride * 4;
+
+            // The OUT_CVT requant triple, derived exactly as Mesa (QNNPACK
+            // requantization.h): conv_scale bits -> shift 126 - exp + 16 - 1, an odd
+            // 15-bit mantissa forced into [2^14, 2^15), offset = out_zp - 0x80.
+            let conv_scale = (p.in_scale * p.w_scale) / p.out_scale;
+            let bits = conv_scale.to_bits();
+            // C unsigned arithmetic: an exponent above 126 wraps, exactly as it does
+            // in the reference emitter.
+            let shift = (127u32 + 31 - 32).wrapping_sub(bits >> 23).wrapping_add(16);
+            let mut scale = ((bits >> 9) & 0x7FFF) + 1;
+            if scale < (1 << 14) {
+                scale |= 1 << 14;
+            }
+            dpu.out_cvt_scale = scale & 0xFFFF;
+            dpu.out_cvt_shift = shift.wrapping_sub(1);
+            dpu.out_cvt_offset = (p.output_zero_point - 0x80) as u32;
+
+            // The per-OC int32 bias add in the BS ALU, fetched by BRDMA.
+            dpu.bias_en = true;
+            dpu.bias_base_addr = p.bias_dma;
+        }
+
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_DW_SIZEE") {
+            let se = v & 0x7;
+            dpu.size_e_2 = se;
+            dpu.size_e_1 = se;
+            dpu.size_e_0 = se;
+        }
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_DW_SURF_MULT") {
+            dpu.surf_add = dpu.dst_surf_stride * v;
+        }
+        if let Some(v) = knobs::u32_auto("ROCKET_CONV_DW_BSOWOP") {
+            dpu.bs_ow_op = v;
+        }
+    }
+
+    let start = ops.len();
+    emit_task(ops, &cna, &core, &dpu, None)?;
+    let count = ops.len() - start;
+    p.task_count = count as u32;
+    Ok(count)
+}
+
 fn emit_task(
     ops: &mut Vec<NpuOp>,
     cna: &Cna,
@@ -724,10 +1142,16 @@ fn emit_task(
     push(
         DPU,
         DPU_BS_CFG,
-        ((dpu.bs_relu_bypass & 1) << 6)
-            | ((dpu.bs_mul_bypass & 1) << 4)
-            | ((dpu.bs_alu_bypass & 1) << 1)
-            | (dpu.bs_bypass & 1),
+        if dpu.bias_en {
+            // The BS ALU add mode reading the per-OC int32 bias from BRDMA (Mesa's
+            // int8 word: BS_ALU_ALGO(2) | BS_ALU_SRC(1) | RELU/MUL bypass).
+            (2 << 16) | (1 << 8) | (1 << 6) | (1 << 4)
+        } else {
+            ((dpu.bs_relu_bypass & 1) << 6)
+                | ((dpu.bs_mul_bypass & 1) << 4)
+                | ((dpu.bs_alu_bypass & 1) << 1)
+                | (dpu.bs_bypass & 1)
+        },
     );
     push(DPU, DPU_BS_ALU_CFG, 0);
     push(DPU, DPU_BS_MUL_CFG, 0);
@@ -890,8 +1314,16 @@ fn emit_task(
     push(DPU_RDMA, DPU_RDMA_DATA_CUBE_HEIGHT, dpu.height & 0x1FFF);
     push(DPU_RDMA, DPU_RDMA_DATA_CUBE_CHANNEL, dpu.channel & 0x1FFF);
     push(DPU_RDMA, DPU_RDMA_SRC_BASE_ADDR, 0);
-    push(DPU_RDMA, DPU_RDMA_BRDMA_CFG, 0);
-    push(DPU_RDMA, DPU_RDMA_BS_BASE_ADDR, 0);
+    push(
+        DPU_RDMA,
+        DPU_RDMA_BRDMA_CFG,
+        if dpu.bias_en { 1 << 1 } else { 0 },
+    );
+    push(
+        DPU_RDMA,
+        DPU_RDMA_BS_BASE_ADDR,
+        if dpu.bias_en { dpu.bias_base_addr } else { 0 },
+    );
     push(DPU_RDMA, DPU_RDMA_NRDMA_CFG, 0);
     push(DPU_RDMA, DPU_RDMA_BN_BASE_ADDR, 0);
     push(DPU_RDMA, DPU_RDMA_ERDMA_CFG, RDMA_ERDMA_DISABLE);
@@ -1108,5 +1540,128 @@ mod tests {
             .find(|op| op.target() == DPU && op.reg() == DPU_BN_CFG)
             .unwrap();
         assert_eq!(bn.value(), (2 << 16) | (1 << 6));
+    }
+
+    fn int8_params(ic: u16, ih: u16, iw: u16, oc: u16, kh: u16, kw: u16) -> ConvInt8Params {
+        let oh = (ih as usize + 2 - kh as usize) + 1;
+        let ow = (iw as usize + 2 - kw as usize) + 1;
+        let mut p = ConvInt8Params::new(
+            ic, ih, iw, oc, oh as u16, ow as u16, kh, kw, 0x1000, 0x2000, 0x3000,
+        );
+        p.pad_top = 1;
+        p.pad_left = 1;
+        p
+    }
+
+    fn word(ops: &[NpuOp], target: u64, reg: u32) -> u32 {
+        ops.iter()
+            .find(|op| op.target() == target && op.reg() == reg)
+            .unwrap_or_else(|| panic!("missing {target:#x}/{reg:#x}"))
+            .value()
+    }
+
+    /// The direct int8 deltas: 1 B/element, the +1 feature slack bank, `C2 = 16`-
+    /// independent `data_entries = ceil(IW*IC/64)`, and the int32 output writer.
+    #[test]
+    fn int8_direct_packs_the_slack_bank_and_int32_writer() {
+        let mut p = int8_params(32, 8, 8, 16, 3, 3);
+        let mut ops = Vec::new();
+        let count = gen_conv2d_int8(&mut p, &mut ops).unwrap();
+        assert_eq!(count as u32, p.task_count);
+        assert!(count <= MAX_OPS, "count {count}");
+
+        // 8*8*32 = 2048 B -> 1 bank; the feature takes fd_banks + 1 and the weight the
+        // remaining 10 of the 12 CBUF banks.
+        assert_eq!(word(&ops, CNA, CNA_CBUF_CON0), (10 << 4) | 2);
+        assert_eq!(word(&ops, CNA, CNA_CBUF_CON1), 4); // ceil(8*32/64)
+        // int8 precisions on the CNA/CORE/DPU; the output is a raw int32 accumulator.
+        assert_eq!(word(&ops, CNA, CNA_CONV_CON1) & 0x7F, 0);
+        assert_eq!(word(&ops, CORE, CORE_MISC_CFG) & 0x700, 0);
+        // OUT_PRECISION = int32 (4), IN/PROC = int8 (0).
+        assert_eq!(word(&ops, DPU, DPU_DATA_FORMAT), 4 << 29);
+        // size_e = 7 and surf_add = OH*OW*8 (the int32 stride quirk).
+        assert_eq!((word(&ops, DPU, DPU_BS_OW_CFG) >> 2) & 0x7, 7);
+        assert_eq!((word(&ops, DPU, DPU_BS_OW_CFG) >> 1) & 1, 1, "od_bypass");
+        assert_eq!(word(&ops, DPU, DPU_SURFACE_ADD), (8 * 8 * 8) << 4);
+        // The BS block stays bypassed and BRDMA is not armed on the int32 path.
+        assert_eq!(
+            word(&ops, DPU, DPU_BS_CFG),
+            (1 << 6) | (1 << 4) | (1 << 1) | 1
+        );
+        assert_eq!(word(&ops, DPU_RDMA, DPU_RDMA_BRDMA_CFG), 0);
+        assert_eq!(word(&ops, DPU_RDMA, DPU_RDMA_BS_BASE_ADDR), 0);
+        // 1-byte weight cube: KW*KH*IC per kernel.
+        assert_eq!(word(&ops, CNA, CNA_WEIGHT_SIZE1), 3 * 3 * 32);
+        assert_eq!(word(&ops, CNA, CNA_WEIGHT_SIZE0), 3 * 3 * 32 * 16);
+        // The trailer is the plain conv one.
+        assert_eq!(
+            ops[count - 1],
+            NpuOp::new(OP_ENABLE, PC_OPERATION_ENABLE, 0x1D)
+        );
+    }
+
+    /// The int8-out depthwise writer: QD_EN, the byte-replicated border pad, the int32
+    /// bias in the BS ALU (BRDMA armed) and the three OUT_CVT requant fields.
+    #[test]
+    fn int8_depthwise_packs_the_requant_registers() {
+        let mut p = int8_params(64, 8, 8, 64, 3, 3);
+        p.int8_out = true;
+        p.in_scale = 0.0213;
+        p.w_scale = 0.00347;
+        p.out_scale = 0.0925;
+        p.input_zero_point = -2 + 0x80;
+        p.output_zero_point = 5 + 0x80;
+        p.weight_zero_point = 0x80; // raw w_zp 0 -> the uint8-centred 0x80
+        p.bias_dma = 0x4000;
+        let mut ops = Vec::new();
+        gen_conv2d_dw_int8(&mut p, &mut ops).unwrap();
+
+        assert_eq!(word(&ops, CORE, CORE_MISC_CFG) & 1, 1, "QD_EN");
+        assert_eq!((word(&ops, CORE, CORE_MISC_CFG) >> 1) & 1, 1, "DW_EN");
+        // The pad byte is (in_zp & 0xff) - 0x80, repeated in all four lanes: the
+        // signed model zero point -2 as a byte (0xFE).
+        assert_eq!(word(&ops, CNA, CNA_PAD_CON1), 0xFEFE_FEFE);
+        // int8 out/proc precision, the int8 writer stride and od_bypass dropped.
+        assert_eq!(word(&ops, DPU, DPU_DATA_FORMAT), 0);
+        assert_eq!((word(&ops, DPU, DPU_BS_OW_CFG) >> 2) & 0x7, 3);
+        assert_eq!((word(&ops, DPU, DPU_BS_OW_CFG) >> 1) & 1, 0);
+        assert_eq!(word(&ops, DPU, DPU_SURFACE_ADD), (8 * 8 * 4) << 4);
+        // 0x80 - the uint8-centred weight zero point (0x80 for a symmetric int8 weight
+        // set), i.e. 0 — the CPEND operand the C notes must be 0.
+        assert_eq!(word(&ops, DPU, DPU_BS_OW_OP), 0);
+        // The BS ALU add + BRDMA bias fetch.
+        let bs = word(&ops, DPU, DPU_BS_CFG);
+        assert_eq!(bs, (2 << 16) | (1 << 8) | (1 << 6) | (1 << 4));
+        assert_eq!(word(&ops, DPU_RDMA, DPU_RDMA_BRDMA_CFG), 1 << 1);
+        assert_eq!(word(&ops, DPU_RDMA, DPU_RDMA_BS_BASE_ADDR), 0x4000);
+        // The hand-derived OUT_CVT triple (conv_scale 0.0213*0.00347/0.0925).
+        assert_eq!(word(&ops, DPU, DPU_OUT_CVT_SCALE), 0x68bc);
+        assert_eq!(word(&ops, DPU, DPU_OUT_CVT_SHIFT), 25);
+        assert_eq!(word(&ops, DPU, DPU_OUT_CVT_OFFSET), 5);
+        // feature_grains = 50 + stride_y + 1 for the DW path.
+        assert_eq!((word(&ops, CNA, CNA_CONV_CON2) >> 4) & 0x3FF, 52);
+        // G-padded weight cube bytes: 64*3*3.
+        assert_eq!(word(&ops, CNA, CNA_WEIGHT_SIZE0), 64 * 3 * 3);
+    }
+
+    /// The C generator's own refusals: a feature above 11 banks, a kernel above one bank.
+    #[test]
+    fn int8_refuses_over_budget_tiles() {
+        let mut p = int8_params(32, 400, 400, 16, 1, 1);
+        p.pad_top = 0;
+        p.pad_left = 0;
+        let mut ops = Vec::new();
+        assert_eq!(
+            gen_conv2d_int8(&mut p, &mut ops).unwrap_err().status(),
+            crate::Status::Tiling
+        );
+        let mut p = int8_params(6000, 1, 1, 16, 3, 3);
+        p.pad_top = 0;
+        p.pad_left = 0;
+        let mut ops = Vec::new();
+        assert_eq!(
+            gen_conv2d_int8(&mut p, &mut ops).unwrap_err().status(),
+            crate::Status::Tiling
+        );
     }
 }
