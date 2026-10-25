@@ -399,9 +399,11 @@ impl Qwen3Attention {
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
         if self.npu_attn {
             // NPU attention takes the [1, S, heads*D] layout directly (the
-            // head-major f16 buffers and the causal mask are prepared inside).
+            // head-major f16 buffers and the mask are prepared inside). Long
+            // prompts run in query chunks with a per-chunk causal mask; short ones
+            // take the dense op (identical to the pre-chunking binary).
             let kv = self.n_kv_heads;
-            let o = burn_rocket::attention(
+            let o = crate::util::causal::causal_attention(
                 q.reshape([b, s, h * d]),
                 k.reshape([b, s, kv * d]),
                 v.reshape([b, s, kv * d]),
@@ -410,7 +412,9 @@ impl Qwen3Attention {
                 d,
                 1.0 / (d as f64).sqrt(),
                 None,
-                true,
+                None,
+                0,
+                crate::util::causal::causal_chunk(),
             );
             return self.o_proj.forward(o, quantized);
         }

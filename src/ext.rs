@@ -142,6 +142,25 @@ pub trait RocketOps: Backend {
         q_start: i64,
         kv_start: i64,
     ) -> FloatTensor<Self>;
+    /// Chunked causal attention: query `q_start + i` attends to key `kv_start + j`
+    /// iff `kv_start + j <= q_start + i` and, when `window >= 0`,
+    /// `q_start + i - window < kv_start + j`. `q` is `[1, n_q, H*D]`, `k`/`v` are
+    /// `[1, n_kv_len, KV*D]`; `n_kv_len` is typically the visible key prefix, so
+    /// the mask/score matrix stays `[n_q, n_kv_len]` instead of `[n, n]`.
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_causal_block(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+        q_start: i64,
+        kv_start: i64,
+    ) -> FloatTensor<Self>;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +250,7 @@ pub fn trim_scratch() {
         e.ctx.trim_scratch();
         for fa in &mut e.fa {
             fa.fa.trim_scratch();
+            fa.trim_host();
         }
     }
 }
@@ -332,6 +352,12 @@ struct FaState {
     /// Cached query-chunk band mask key: `(n_q, n_kv_len, window, q0 - k0)`.
     wb: Option<(usize, usize, usize, usize)>,
     wb_mask: Vec<f16>, // [n_q][n_kv_len] block band mask
+    /// Cached query-chunk causal mask key:
+    /// `(n_q, n_kv_len, window, q0 - k0)`; the predicate is translation
+    /// invariant, so a chunk run rebuilds it only when the key length or the
+    /// offset changes (first / interior / last chunk).
+    cb: Option<(usize, usize, Option<usize>, isize)>,
+    cb_mask: Vec<f16>, // [n_q][n_kv_len] block causal (window) mask
     q: Vec<f16>,       // [n_head][n][head_dim]
     k: Vec<f16>,       // [n_kv_heads][n_k][head_dim]
     v: Vec<f16>,       // [n_kv_heads][head_dim][n_k]  (per-head transposed)
@@ -360,10 +386,35 @@ impl FaState {
             cw_mask: Vec::new(),
             wb: None,
             wb_mask: Vec::new(),
+            cb: None,
+            cb_mask: Vec::new(),
             q: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
             out: Vec::new(),
+        }
+    }
+
+    /// Release the host q/k/v/out capacity a much larger request left behind (the
+    /// same 4x rule the driver's scratch uses: a steady request stream never
+    /// reallocates, one long request followed by short ones returns the memory).
+    /// The buffers grow/shrink to the live shape per call, so trimming them to the
+    /// last request's size is safe.
+    fn trim_host(&mut self) {
+        let need_q = self.n_head * self.n * self.head_dim;
+        let need_k = self.n_kv * self.n_k * self.head_dim;
+        for (buf, need) in [
+            (&mut self.q, need_q),
+            (&mut self.k, need_k),
+            (&mut self.v, need_k),
+            (&mut self.out, need_q),
+        ] {
+            if buf.len() > need {
+                buf.truncate(need);
+            }
+            if buf.capacity() > need.saturating_mul(4).max(1024) {
+                buf.shrink_to(need);
+            }
         }
     }
 }
@@ -571,6 +622,37 @@ impl RocketOps for Flex {
             }
         };
         attention_impl(q, k, v, n_head, n_kv_heads, head_dim, scale, softcap, mode)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rocket_attention_causal_block(
+        q: FloatTensor<Self>,
+        k: FloatTensor<Self>,
+        v: FloatTensor<Self>,
+        n_head: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        scale: f64,
+        softcap: Option<f32>,
+        window: i64,
+        q_start: i64,
+        kv_start: i64,
+    ) -> FloatTensor<Self> {
+        attention_impl(
+            q,
+            k,
+            v,
+            n_head,
+            n_kv_heads,
+            head_dim,
+            scale,
+            softcap,
+            MaskMode::CausalBlock {
+                window: (window >= 0).then_some(window as usize),
+                q0: q_start.max(0) as usize,
+                k0: kv_start.max(0) as usize,
+            },
+        )
     }
 }
 
@@ -1265,6 +1347,14 @@ enum MaskMode {
     /// Band over a query chunk at absolute offset `q0`, against keys starting at
     /// `k0`: keep key `j` iff `|(q0 + i) - (k0 + j)| <= window`.
     WindowBlock { window: usize, q0: usize, k0: usize },
+    /// Causal over a query chunk at absolute offset `q0`, against keys starting at
+    /// `k0`: keep key `j` iff `k0 + j <= q0 + i` (and `q0 + i - window < k0 + j`
+    /// with a window). `n_k != n` is allowed.
+    CausalBlock {
+        window: Option<usize>,
+        q0: usize,
+        k0: usize,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1301,7 +1391,10 @@ fn attention_impl(
         vec![1, n_k, n_kv * head_dim],
         "NPU attention: v must be [1, S, KV*D]"
     );
-    if !matches!(mode, MaskMode::WindowBlock { .. } | MaskMode::NoneBlock) {
+    if !matches!(
+        mode,
+        MaskMode::WindowBlock { .. } | MaskMode::NoneBlock | MaskMode::CausalBlock { .. }
+    ) {
         assert_eq!(
             n_k, n,
             "the full-sequence mask modes need equal query/key lengths"
@@ -1343,10 +1436,25 @@ fn attention_impl(
             st.cw_mask.clear();
             st.wb = None;
             st.wb_mask.clear();
-            st.q = vec![f16::ZERO; n_head * n * head_dim];
-            st.k = vec![f16::ZERO; n_kv * n_k * head_dim];
-            st.v = vec![f16::ZERO; n_kv * head_dim * n_k];
-            st.out = vec![f16::ZERO; n_head * n * head_dim];
+            st.cb = None;
+            st.cb_mask.clear();
+        }
+        // Grow/shrink in place: a causal chunk run walks the key axis upward (each
+        // chunk's prefix is longer than the previous one), so re-allocating and
+        // re-zeroing the whole prefix per chunk and per layer would cost more than
+        // the op itself. `resize` keeps the allocation and zeroes only the delta;
+        // the exact lengths are what the fill/flash calls require.
+        let need_q = n_head * n * head_dim;
+        let need_k = n_kv * n_k * head_dim;
+        for (buf, need) in [
+            (&mut st.q, need_q),
+            (&mut st.k, need_k),
+            (&mut st.v, need_k),
+            (&mut st.out, need_q),
+        ] {
+            if buf.len() != need {
+                buf.resize(need, f16::ZERO);
+            }
         }
 
         let t_conv = Instant::now();
@@ -1375,21 +1483,33 @@ fn attention_impl(
                 st.wb = Some(key);
             }
         }
+        if let MaskMode::CausalBlock { window, q0, k0 } = mode {
+            // Same translation invariance as the band block: a causal chunk run
+            // walks `n_k` up while `q0 - k0` stays fixed, so the mask is rebuilt
+            // per chunk; a steady (windowed) run reuses it across the interior
+            // chunks of a layer anyway.
+            let key = (n, n_k, window, q0 as isize - k0 as isize);
+            if st.cb != Some(key) {
+                st.cb_mask = crate::masks::build_causal_window_mask_block(n, n_k, q0, k0, window);
+                st.cb = Some(key);
+            }
+        }
         let FaState {
             fa,
             mask,
             win_mask,
             cw_mask,
             wb_mask,
+            cb_mask,
             q,
             k,
             v,
             out,
             ..
         } = st;
-        fill_heads(&qf, n, n_head, head_dim, q);
-        fill_heads(&kf, n_k, n_kv, head_dim, k);
-        fill_heads_transposed(&vf, n_k, n_kv, head_dim, v);
+        fill_heads(&qf, n, n_head, head_dim, &mut q[..need_q]);
+        fill_heads(&kf, n_k, n_kv, head_dim, &mut k[..need_k]);
+        fill_heads_transposed(&vf, n_k, n_kv, head_dim, &mut v[..need_k]);
         T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t_npu = Instant::now();
@@ -1399,6 +1519,7 @@ fn attention_impl(
             MaskMode::Window(_) => Some(&win_mask[..]),
             MaskMode::CausalWindow(_) => Some(&cw_mask[..]),
             MaskMode::WindowBlock { .. } => Some(&wb_mask[..]),
+            MaskMode::CausalBlock { .. } => Some(&cb_mask[..]),
         };
         fa.flash_attn(
             n,
@@ -1409,18 +1530,18 @@ fn attention_impl(
             n_kv,
             scale as f32,
             softcap.unwrap_or(0.0),
-            q,
-            k,
-            v,
+            &q[..need_q],
+            &k[..need_k],
+            &v[..need_k],
             mask,
-            out,
+            &mut out[..need_q],
         )
         .unwrap_or_else(|err| op_failure("rocket_flash_attn_fp16_ctx", err.rc, n, n_k, head_dim));
         T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
         NPU_CALLS.fetch_add(1, Ordering::Relaxed);
 
         let t_conv = Instant::now();
-        let o = unpack_heads(out, n, n_head, head_dim);
+        let o = unpack_heads(&out[..need_q], n, n_head, head_dim);
         T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
         o
     });
@@ -1578,6 +1699,78 @@ pub fn attention_window_block<const D: usize>(
     kv_start: i64,
 ) -> Tensor<D> {
     Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_window_block(
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
+        n_head,
+        n_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        window,
+        q_start,
+        kv_start,
+    ))
+}
+
+/// Chunked causal grouped-query attention on the NPU: `q` is `[1, n_q, H*D]`,
+/// `k`/`v` are `[1, n_kv_len, KV*D]`, and query `q_start + i` attends to key
+/// `kv_start + j` iff `kv_start + j <= q_start + i`.
+///
+/// Lets a causal layer run a query chunk against the key prefix it can see, so
+/// neither the additive mask nor the score matrix has to be the model's full
+/// `[n, n]` (the dense [`attention`] causal path materializes that mask host-side
+/// and OOMs the board at long context). `q_start`/`kv_start` are the chunk's
+/// absolute positions; `n_kv_len != n_q` is the normal case.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_causal_block<const D: usize>(
+    q: Tensor<D>,
+    k: Tensor<D>,
+    v: Tensor<D>,
+    n_head: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    softcap: Option<f32>,
+    q_start: i64,
+    kv_start: i64,
+) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_causal_block(
+        q.into_dispatch(),
+        k.into_dispatch(),
+        v.into_dispatch(),
+        n_head,
+        n_kv_heads,
+        head_dim,
+        scale,
+        softcap,
+        -1,
+        q_start,
+        kv_start,
+    ))
+}
+
+/// Chunked causal sliding-window grouped-query attention on the NPU: query
+/// `q_start + i` attends to key `kv_start + j` iff
+/// `q_start + i - window < kv_start + j <= q_start + i` (`window < 0` = plain
+/// causal, the same as [`attention_causal_block`]). Same layout as
+/// [`attention_causal_block`]; the key slice typically starts at
+/// `q_start - window`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_causal_block_window<const D: usize>(
+    q: Tensor<D>,
+    k: Tensor<D>,
+    v: Tensor<D>,
+    n_head: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    scale: f64,
+    softcap: Option<f32>,
+    window: i64,
+    q_start: i64,
+    kv_start: i64,
+) -> Tensor<D> {
+    Tensor::from_dispatch(<Dispatch as RocketOps>::rocket_attention_causal_block(
         q.into_dispatch(),
         k.into_dispatch(),
         v.into_dispatch(),

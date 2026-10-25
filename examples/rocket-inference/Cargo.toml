@@ -35,6 +35,13 @@ name = "vision_attn_bench"
 path = "src/bin/vision_attn_bench.rs"
 required-features = ["npu"]
 
+# Causal block attention probe (P2a): the chunked NPU causal path vs the dense
+# masked op and the f64 host oracle. aarch64 + NPU only.
+[[bin]]
+name = "causal_attn_bench"
+path = "src/bin/causal_attn_bench.rs"
+required-features = ["npu"]
+
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 burn-rocket = { path = "../..", default-features = false, optional = true }
 

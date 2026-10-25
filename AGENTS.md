@@ -445,14 +445,76 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   0.95x, 512x30,016 0.88x, vision 2,400² 0.99x; one 8k window read 1.40x at load
   12, i.e. board noise is +-20 %. Forced on below its crossover it loses as expected
   (1,024 keys, 256 tile: 1.39x), which is why the default `min_kv` is 8,192. The
-  caller's `[n][n]` additive mask is still O(n²), so a *model* run at 30k still needs
-  the app-side causal block mask. The round also fixed a **pre-existing MLA bug**: the
+  caller's `[n][n]` additive mask was still O(n²); **P2a below adds the app-side causal
+  block mask** (the M5b tiled path is orthogonal: that one bounds the driver's score
+  matrix along the *key* axis, P2a bounds the mask along the *query* axis). The round
+  also fixed a **pre-existing MLA bug**: the
   chained group path indexed the V groups with the QK stride (`Kn*dk`) while
   `GroupBufs::ensure` sized them `Kn*dv`, so a `dv != dk` shape panicked when `dv < dk`
   and read the wrong columns when `dv > dk` (the M5a binary panics the same way). The C
   `fa_heads_range` skips the batched path for MLA and now so do we (per-head path;
   verified at 3,008 keys with dk/dv 64/32 and 32/64, cosine 1.0 vs the materialized
   arm, and `mha_self` unchanged).
+  **P2a causal block attention** (2026-10-25): `burn_rocket::attention_causal_block` and
+  `attention_causal_block_window` (`MaskMode::CausalBlock`) plus
+  `masks::build_causal_mask_block` / `build_causal_window_mask_block`. A query chunk at
+  absolute `q_start` sees key `kv_start + j` iff `kv_start + j <= q_start + i` (and
+  `q_start + i - window < kv_start + j` with a window, the same `t - window < j <= t`
+  convention as the dense causal-window mask); `n_kv_len != n_q` is the normal case and
+  the additive mask is `[n_q, n_kv_len]`, cached in the geometry's `FaState` on the
+  translation-invariant key `(n_q, n_kv_len, window, q_start - kv_start)` exactly like
+  the band block. `FaState`'s host q/k/v/out buffers now `resize` in place instead of
+  being reallocated per shape (a causal chunk run walks the key axis upward, so the old
+  reallocate-and-zero touched the whole prefix for every chunk of every layer); exact
+  slices go to `fill_heads`/`flash_attn`, so nothing else changed. No driver change was
+  needed (`crates/rocket-npu` untouched).
+  App side: `examples/rocket-inference/src/util/causal.rs` — `causal_chunk_plan` (pure;
+  host tests cover ragged tails, `q_offset`, a shorter key axis and the window band) and
+  `causal_attention`, used by qwen3's `npu_attn` path and Gemma 4's NPU prefill. Chunk
+  width `ROCKET_CAUSAL_CHUNK` (default 1024, `0` = the dense op); keys `[0, q1)` for
+  causal, `[q0 - (w - 1), q1)` for a sliding layer; below the threshold the dense op runs
+  unchanged (bit-identical to the pre-P2a binary). The probe
+  `examples/rocket-inference/src/bin/causal_attn_bench.rs` (chunked vs dense vs
+  `attn::flash_attn_ref`, `--window`, `--kv N` for a single long-context chunk) is the
+  numeric gate.
+  Numerics (board, cores 0-3): **chunked == dense bit for bit for pure causal at 512
+  (chunk 128/256) and 8192** (8k: 21 signed zeros only, cos 1.0); sliding-window chunks
+  differ from the dense mask in a fraction of the values by ≤ 6.1e-5 (n=512 w=256:
+  1,146/1,048,576 values, max|d| 3.05e-5, cos 1.0; n=1000 w=200: 5 %, cos 0.999999997;
+  n=2048 w=512: cos 0.999999981 chunk 256 / 0.999999990 chunk 1024) — the band's offset
+  inside the K-tile grid changes the fp16 partial grouping, the pure-causal prefix does
+  not. Against the f64 oracle `flash_attn_ref` every arm is 0.999999955 (max|d| 2.44e-4),
+  causal and windowed. Within-process repeats are bit-identical in every arm.
+  Footprint (`mem_stats` attention BO+host): dense whole-sequence 8k = **1706 MiB** vs
+  chunk-1024 **1102 MiB** / chunk-256 **871 MiB** (both arms in one process, so the dense
+  classes are still cached). Per-chunk shape (the real 30k-context working set), one
+  1024-row chunk against an 8k / 16k / 30k key prefix: **944 / 1154 / 898 MiB** and
+  1.32 / 2.42 / 3.78 s per chunk (two reps, probe peak anon 1.0 / 1.5 / 1.6 GiB including
+  the whole q/k/v/o). The scratch is *linear* in the prefix, not `[n, n]`: the chained
+  head group is capped at a 32M-element score matrix (`group_size`), so a longer prefix
+  shrinks the group instead of growing the scratch, and the remaining prefix-linear part
+  is the per-head `[Tp, Kn]` host/BO pair (~0.9 GiB at 30k with `chunk = 1024`;
+  `ROCKET_CAUSAL_CHUNK=512` is the low-memory setting). A 30k prefill's attention is
+  then ~27 min of chunk ops (Σ over 30 chunks × 28 layers), which is the n²/2 work, not
+  a memory cliff.
+  Model level (qwen3-embedding-0.6B f32 `--npu`, `data/long30k.txt`, busy board
+  load 6-30): 8k dense 302 s wall / 246 s compute (32.5 tok/s) at 2153 MiB peak anon vs
+  chunk-1024 203-245 s wall / 181-203 s compute (39.5-44.3 tok/s) at 2042-2126 MiB — the
+  chunked path saves the masked half of the attention work. 8k chunked-vs-dense model
+  cosine 0.9999914-1.0 (one pair bit-identical, i.e. the arms agree exactly and the
+  spread is *between runs*: two identical 8k runs scatter by ~5e-6 cosine while
+  within-process attention repeats and the `--npu-attn cpu` fallback at 1024 are
+  bit-identical to the pre-P2a binary). 30k: **dense never completes** (killed at rc=137
+  under a 5 GB cgroup in ~2 min — its `[n, n]` f16 mask alone is 1.8 GiB and the driver's
+  score matrix another 1.8 GiB *per worker*); the chunked f32 run gets through the
+  attention (~0.9 GiB of chunk scratch) but peaks at **4080 MiB anon** and was killed by the
+  board (global OOM at 40 min — the box has only 2-4 GB headroom because `deposit` holds
+  4-5 GB, so 30k f32 does not fit *this* board today; the residual is the model's 30k-row
+  activations, not the mask). **Operational note:** DRM BOs are not charged to the
+  process's memory cgroup, so `systemd-run -p MemoryMax=…` does **not** bound the NPU-side
+  allocations — a large dense attention allocation still pushes the whole box into global
+  OOM, and the kernel then kills the biggest anon task (that is how `deposit` was killed
+  twice during these runs). Run long-context gates only when ≥5 GB is free.
   **M6a activation + elementwise** (2026-10-25): the whole of `rocket_activation.c` is
   ported as `crates/rocket-npu/src/ops/activation.rs` (+ the program in
   `regcmd/activation.rs`). API: `ops::activation::{activation, leaky_relu, elu, selu,
@@ -900,8 +962,8 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
 | `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
-| `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
-| `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
+| `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`, `attention_window`/`_block`, `attention_causal_window`, `attention_causal_block`/`_window`) |
+| `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
 | `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`) |
@@ -909,7 +971,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
 | `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
-| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), and `hf-hub` model resolution (`hub`) |
+| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
 | `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs` |
@@ -917,6 +979,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`), CLI |
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
 | `examples/rocket-inference/src/bin/vision_attn_bench.rs` | vision-tower attention/softmax microbenchmark (`fused-f16/bf16`, `npu`, `npu-chunk`, `matmul`, `attn-batch`, `softmax`; `npu` feature, log-gemma §18.4/§19/§20) |
+| `examples/rocket-inference/src/bin/causal_attn_bench.rs` | causal block attention probe (P2a): the chunked NPU path (`util/causal.rs` compiled from the same source) vs the dense masked op and `attn::flash_attn_ref`, `--window`/`--ref`/`--reps` (`npu` feature) |
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
@@ -1238,8 +1301,13 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   q_start, kv_start)` (2026-10-08) runs a query chunk against a *subset* of keys
   (`n_kv != n_q`; key `kv_start + j` visible to query `q_start + i` iff
   `|(q_start + i) - (kv_start + j)| <= window`) — the sliding layers' chunked path,
-  with the block mask cached on the translation-invariant offset. Both attention ops
-  cache their f16 masks per geometry/shape in the engine.
+  with the block mask cached on the translation-invariant offset;
+  `attention_causal_block(..., q_start, kv_start)` and
+  `attention_causal_block_window(..., window, q_start, kv_start)` (P2a, 2026-10-25) are the
+  causal counterparts (key `kv_start + j` visible iff `kv_start + j <= q_start + i`,
+  and `q_start + i - window < kv_start + j` with a window), the ops the example's
+  query-chunked causal path calls (`util/causal.rs`, `ROCKET_CAUSAL_CHUNK`). All
+  attention ops cache their f16 masks per geometry/shape in the engine.
 - The host score pass is the **S1 fast softmax**
   (`crates/rocket-npu/src/attn/softmax.rs`): a branch-free NEON `exp2`
   polynomial (8-lane with native f16 convert on aarch64, scalar fallback),
@@ -1494,13 +1562,21 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   attention (log-gemma §15), fixing the 8k memory blow-up (full layers were the
   remaining `[s, s]` case). The driver-side `[Tp, Kn]` score matrix is no longer
   required either: the M5b tiled path (`ROCKET_FA_TILE_KV`, opt-in, default off)
-  walks the key axis in tiles at a flat footprint (see "Port status"). What still
-  scales with the *context²* in a model run is the **caller's** additive mask: the
-  example's `masks.rs` / `build_causal_mask` materialize `[n][n]` f16, so qwen3 and
-  gemma4 prefill still OOM at ~30k. The next step is the same query-chunking idea
-  with a causal block mask (per-chunk `[C, q1]` masks, prefix keys) on the app side,
-  then a 30k measurement of both the emb2 chunked path and the tiled attention path
-  (the CPU path does 52.4 tok/s at 32 dev threads).
+  walks the key axis in tiles at a flat footprint (see "Port status"). The
+  **caller's** additive mask is now bounded too: P2a's causal block op + the
+  example's `util/causal.rs` chunk causal prefill (qwen3 `--npu`, Gemma 4 prefill) at
+  `ROCKET_CAUSAL_CHUNK` (default 1024) with per-chunk `[C, q1]` masks and prefix keys,
+  measured bit-identical to the dense causal op at 8k, with the chunk scratch linear in
+  the key prefix (~0.9 GiB at a 30k prefix instead of the dense 1.8 GiB mask plus its
+  `[n, n]` score matrices). What is left for a *completed* 30k f32 run is board headroom, not the
+  attention: the model's own 30k-row activations peak at ~4.1 GiB anon, so on the busy
+  board (deposit 4-5 GB resident, 2-4 GB free) it is OOM-killed at ~40 min even though
+  every op fits. Re-run the gate on an idle board (≥5 GB free) or in bf16; do **not**
+  guard with a memory cgroup and expect containment (DRM BOs bypass it; see the P2a
+  operational note). Gemma 4 prefill at 30k also needs its own headroom: the f16
+  checkpoint is 8.9 GiB (12.5 GiB f32), which the board cannot host alongside the live
+  services, so that path is validated structurally + by the shared qwen3 shapes and the
+  geometry-agnostic probe.
 - Board service: redeploy `home-llm-gateway-embed-1` from `main` to pick up the
   S1 fast host softmax, the S2 NPU vision default and the ffmpeg runtime (the
   deployed `:latest` is `94f99bd`, pre-S1/S2 and pre-ffmpeg), then re-measure the
@@ -1668,6 +1744,23 @@ cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 ./vision_attn_bench 2394 5              # fused CPU vs NPU attention, chunk sweep
 ./vision_attn_bench softmax 2394 5      # exact vs fast host softmax (S1)
 SOFTMAX_EXACT=1 ./vision_attn_bench 2394 5
+# causal block attention probe (P2a): chunked vs dense vs the f64 oracle, plus the
+# flat long-context footprint. Host side: the chunk-plan tests are device-free.
+cargo test -p rocket-inference --no-default-features util::causal
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu --bin causal_attn_bench
+./causal_attn_bench 512 256 2 --ref              # bit-identical + f64 ref (cos 0.999999955)
+./causal_attn_bench 512 128,256 1 --window 256 --ref  # sliding layers: cos >= 0.99999999
+./causal_attn_bench 8192 1024,256 1              # 8k: cos 1.0, scratch 1706 -> 1102/871 MiB
+./causal_attn_bench 1024 1024 --kv 30000 1       # one 30k-context chunk: 898 MiB, 3.78 s
+# ... and the model-level A/B (only when the board has >= 5 GB free; the dense arm's
+# [n, n] mask does not fit at 30k, and a memory cgroup does not contain the NPU BOs):
+ROCKET_CAUSAL_CHUNK=0 ./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b \
+    --dtype f32 --npu --text-file data/long30k.txt --tokens 8000 --out /tmp/dense8k.json
+./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b --dtype f32 --npu \
+    --text-file data/long30k.txt --tokens 8000 --out /tmp/chunk8k.json
+ROCKET_CAUSAL_CHUNK=512 ./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b \
+    --dtype f32 --npu --text-file data/long30k.txt --tokens 30000 --out /tmp/chunk30k.json
 # example npu compile check (the dep is aarch64-gated, so use the target)
 cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
 # formatting + lint gates (both clean)

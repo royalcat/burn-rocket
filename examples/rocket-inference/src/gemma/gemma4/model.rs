@@ -426,22 +426,24 @@ impl GenAttention {
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
         if s > 1 && crate::gemma::layers::prefill_mode() {
             // Generation prefill on the NPU: causal (full layers) or causal +
-            // sliding window (sliding layers); decode stays on the CPU.
-            let window = if spec.sliding {
-                gspec.sliding_window as i64
-            } else {
-                -1
-            };
-            let o = burn_rocket::attention_causal_window(
+            // sliding window (sliding layers); decode stays on the CPU. Long
+            // prompts run in query chunks with a per-chunk causal mask (the dense
+            // `[s, s]` mask is what OOMs at long context); short ones take the
+            // dense op unchanged. The `[kvh, kn, d] -> [kn, kvh*d]` reshape is the
+            // pre-existing layout assumption here (Gemma 4 E2B has one KV head).
+            let kn = k.dims()[2];
+            let o = crate::util::causal::causal_attention(
                 q.reshape([b, s, h * d]),
-                k.reshape([b, s, kvh * d]),
-                v.reshape([b, s, kvh * d]),
+                k.reshape([b, kn, kvh * d]),
+                v.reshape([b, kn, kvh * d]),
                 h,
                 kvh,
                 d,
                 1.0,
                 None,
-                window,
+                spec.sliding.then_some(gspec.sliding_window),
+                seq_start,
+                crate::util::causal::causal_chunk(),
             );
             return lin(&self.o_proj, o);
         }

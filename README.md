@@ -83,6 +83,16 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   let out = burn_rocket::attention_window(
       q, k, v, 4, 2, 256, 1.0, None, 512,
   );
+
+  // causal attention over a query chunk against its key prefix (decoders): the
+  // mask/score matrix is [n_q, n_kv], not the model's whole [n, n]
+  let out = burn_rocket::attention_causal_block(
+      qc, kc, vc, 16, 8, 128, scale, None, q_start, kv_start,
+  );
+  // ... and with a sliding window (t - window < j <= t)
+  let out = burn_rocket::attention_causal_block_window(
+      qc, kc, vc, 16, 8, 128, scale, None, 512, q_start, kv_start,
+  );
   ```
 
   `pack`/`pack2`/`pack3` consume f32/f16 weights and keep fp16 resident copies in NPU
@@ -102,6 +112,14 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   example after each request; `ROCKET_TRIM=0` disables it). `ROCKET_M_BUCKET=0`
   restores exact-`M` slots, and `ROCKET_MEM_LOG=1` prints the live split
   (weights / matmul BO+host / attention BO+host).
+
+  Causal decoding attention has a chunked entry too: `attention_causal_block` (and
+  `attention_causal_block_window` for a sliding layer) takes `q_start`/`kv_start` as the
+  chunk's absolute positions, so one call covers a query chunk against just its key
+  prefix and the additive mask and score matrix stay `[n_q, n_kv]`. That is what lets
+  a causal model run 30k-token prompts without the dense `[n, n]` f16 mask
+  (~1.8 GiB at 30k) — see the example's `--npu` path, which chunks at
+  `ROCKET_CAUSAL_CHUNK` (default 1024, `0` = dense).
 
 - **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
   `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention` and its stateless
@@ -463,6 +481,11 @@ projections and runs its attention on the NPU too (`--vision-attn npu`, the
 attention kernel) at cosine 0.99999 vs the HF f32 reference in the f32 arm and
 0.99988 with the deployed q8 text backbone. Gemma 4 E2B-it greedily reproduces
 the HF reference token-for-token, and its QAT mobile checkpoints load bit-exactly.
+Long causal prompts run in query chunks on the NPU (`ROCKET_CAUSAL_CHUNK`, default
+1024): at 8k tokens the Qwen3 path is 246 → 181 s of compute (32.5 → 44.3 tok/s) and
+bit-identical to the dense causal op, and one 1024-row chunk against a 30k-key prefix
+keeps ~0.9 GiB of chunked attention scratch instead of the dense 1.8 GiB mask plus its
+`[n, n]` score matrices.
 
 ## License
 

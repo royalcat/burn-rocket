@@ -401,7 +401,14 @@ packing them into resident NPU weights (`--npu` packs them by default),
 `ROCKET_NPU_FUSED=0` packs them one per projection instead of the fused
 q|k|v / gate|up groups (`--npu` fuses them by default), and
 `ROCKET_VISION_LOG=1` prints one vision-tower line per forward (plus the NPU
-split under `--npu`). `ROCKET_FA_TILE_KV=<width>` switches the NPU attention
+split under `--npu`). `ROCKET_CAUSAL_CHUNK=<rows>` sets the query-chunk width of
+the causal NPU path (default 1024, `0` = the dense masked op): long prompts get
+per-chunk `[chunk, prefix]` causal masks and key slices instead of the whole
+`[n, n]` mask, which is what makes 8k+ prompts fit — the chunked op is
+bit-identical to the dense causal one, and only a *sliding* layer's chunks differ
+(≤ 6.1e-5 absolute, cosine ≥ 0.99999999, from where the band falls inside the K-tile
+grid).
+`ROCKET_FA_TILE_KV=<width>` switches the NPU attention
 op to its tiled long-context path (default 0 = off: the materialized
 `[tokens, keys]` score matrix; `2048` is the tuned width) and
 `ROCKET_FA_TILE_MIN_KV=<keys>` moves the crossover below which it stays

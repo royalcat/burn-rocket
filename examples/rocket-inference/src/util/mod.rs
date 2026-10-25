@@ -1,5 +1,6 @@
 //! Generic, family-agnostic helpers shared by every model in this crate.
 
+pub mod causal;
 pub mod checkpoint;
 pub mod device;
 pub mod gguf;
