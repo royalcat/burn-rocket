@@ -3,8 +3,9 @@
 //! This crate replaces the C `librocketnpu` with a native Rust implementation of the
 //! same algorithms: DRM-accel device handling, register-command generation, the
 //! tiled matmul engine (fp16, int8, int4, int16, bf16, tf32), resident weights,
-//! multi-threaded fan-out, and flash attention. It is an independent crate: no Burn
-//! dependency, no C toolchain, no kernel headers.
+//! multi-threaded fan-out, flash attention, and the DPU LUT activation/elementwise
+//! block. It is an independent crate: no Burn dependency, no C toolchain, no kernel
+//! headers.
 //!
 //! The layout follows the upstream C library closely enough that a function can be
 //! read side by side with its original (`rocket_matmul.c`, `npu_regcmd.c`, …):
@@ -13,6 +14,9 @@
 //! - [`regcmd`] — register-command encoding (the hardware program).
 //! - [`matmul`] — geometry planning, host packing, resident/streaming engines.
 //! - [`attn`] — flash attention on top of the matmul engine.
+//! - [`ops`] — the elementwise families: the DPU LUT activation block, the
+//!   conv-main EW binary ops and the composites on top of them (clip, PReLU,
+//!   LeakyReLU/ELU/SELU, divide).
 //! - [`knobs`], [`hw`], [`error`] — diagnostics, the RK3588 profile, typed failures.
 //!
 //! The crate is inference-only and targets the RK3588 only. Failure payloads carry
@@ -21,7 +25,7 @@
 //!
 //! # Surface covered and deliberately missing
 //!
-//! This is a focused port of the C library's matmul/attention core, not a
+//! This is a focused port of the C library's matmul/attention/activation core, not a
 //! function-for-function replacement of the full 367-entry API. Implemented:
 //!
 //! - device/uAPI: open/caps, BO allocation (32-bit IOVA checked), prep/fini
@@ -69,6 +73,23 @@
 //!   resident or group-wise tf32 variant, so this is the complete tf32 surface;
 //! - the `rocket_weights_bytes`/`rocket_i8_weights_bytes` footprint helpers and
 //!   `rocket_pad_m` ([`matmul::pad_m`]);
+//! - the activation + elementwise family ([`ops::activation`], the port of
+//!   `rocket_activation.c`): every `rocket_activation_fp16` kind
+//!   ([`ops::activation::activation`], the `ROCKET_ACTIVATION_*` enum with all 19
+//!   values), the parametric [`ops::activation::leaky_relu`] /
+//!   [`ops::activation::elu`] / [`ops::activation::selu`] /
+//!   [`ops::activation::prelu`], the conv-main EW binary ops
+//!   ([`ops::activation::ew_mul`], `ew_add`, `ew_sub`, `ew_max`, `ew_min`),
+//!   [`ops::activation::clip`] and [`ops::activation::div`]; the device-free
+//!   references (`*_ref`, the exact math with one RNE rounding, glibc `erf` for the
+//!   GELU shapes), the single-pass epilogue builder
+//!   ([`ops::activation::lut_epilogue_build`], byte-identical to the C) and the
+//!   LUT-chain model ([`ops::activation::lut_apply`]) the board self-test compares
+//!   against. The gated kinds (SiLU/GELU/HardSwish/Mish) run the C's two-pass
+//!   `x·gate(x)` route (host multiply by default, `ROCKET_ACT_NPU_MUL` for the NPU
+//!   EW multiply, `ROCKET_ACT_WIDE_LUT` for the single-pass table); the register
+//!   program ([`regcmd::activation`]) is word-for-word the C generator's 1070-word
+//!   flying-mode DPU/DPU_RDMA layout;
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
@@ -93,9 +114,10 @@
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
 //! - a resident bf16 weight (the C library has none either);
-//! - the `*_ref_fp16` host references of the non-matmul op families (the matmul and
-//!   attention ones are ported), the `_planes` and transposed-output variants, and the
-//!   RK3576-specific entries;
+//! - the `*_ref_fp16` host references of the remaining non-matmul op families (matmul,
+//!   attention and activation/elementwise are ported), the `_planes` and
+//!   transposed-output variants, and the RK3576-specific entries (including
+//!   `rocket_act_int8_rk3576`);
 //! - the non-fp16 batch wrappers (`rocket_mm_batch_*` for int8/int4);
 //! - chaining outside the fp16 CPU-accumulation and batched paths: the KACC submit loop
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
@@ -107,8 +129,9 @@
 //!   sequential across tiles);
 //! - tiled MLA: the tiled path requires `dv == dk`, so a value dim that differs from
 //!   the head dim (`mha_self` is the only user) stays on the materialized path;
-//! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
-//!   reduce, resize/upsample, encoder, SAM/SigLIP and graph execution.
+//! - every remaining op family: conv (2d/1d/transpose/depthwise), pool,
+//!   norm/FFN/encoder, softmax and reduce, resize/upsample, SAM/SigLIP and graph
+//!   execution. The activation + elementwise family is implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.
@@ -119,6 +142,7 @@ pub mod error;
 pub mod hw;
 pub mod knobs;
 pub mod matmul;
+pub mod ops;
 pub mod regcmd;
 
 mod log;

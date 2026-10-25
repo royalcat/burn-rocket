@@ -24,6 +24,12 @@ pub struct MatmulParams {
     /// Adds `add_dma` (the running partial) into the conv result on the NPU.
     pub accumulate: bool,
     pub add_dma: u32,
+    /// `EW_OP_TYPE = multiply` instead of the accumulated add (the conv-main EW
+    /// multiply; only meaningful with [`MatmulParams::accumulate`]).
+    pub ew_mul: bool,
+    /// Selects the EW ALU algo on the same conv-main datapath: `0` keeps the
+    /// add/multiply encoding, `2` is MAX, `3` is MIN.
+    pub ew_op: u32,
     pub weight_reuse: bool,
     pub data_reuse: bool,
 }
@@ -40,6 +46,8 @@ impl MatmulParams {
             fp32_to_fp16: true,
             accumulate: false,
             add_dma: 0,
+            ew_mul: false,
+            ew_op: 0,
             weight_reuse: false,
             data_reuse: false,
         }
@@ -317,7 +325,12 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
         dpu.ew_surf_notch = notch << 4;
     }
     {
-        let mut ew = EW_CFG_ALU_BASE | (2 << 16); // add
+        let mut ew = match params.ew_op {
+            2 => EW_CFG_ALU_BASE,             // MAX (EW_ALU_ALGO 0)
+            3 => EW_CFG_ALU_BASE | (1 << 16), // MIN (EW_ALU_ALGO 1)
+            _ if params.ew_mul => EW_CFG_MUL, // EW_OP_TYPE = multiply
+            _ => EW_CFG_ALU_BASE | (2 << 16), // add
+        };
         let mut erd = ERDMA_CFG_16B;
         let mut fmc = rdma_fmc_burst_len(15)
             | rdma_fmc_comb_use(5)

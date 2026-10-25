@@ -433,12 +433,48 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   `fa_heads_range` skips the batched path for MLA and now so do we (per-head path;
   verified at 3,008 keys with dk/dv 64/32 and 32/64, cosine 1.0 vs the materialized
   arm, and `mha_self` unchanged).
+  **M6a activation + elementwise** (2026-10-25): the whole of `rocket_activation.c` is
+  ported as `crates/rocket-npu/src/ops/activation.rs` (+ the program in
+  `regcmd/activation.rs`). API: `ops::activation::{activation, leaky_relu, elu, selu,
+  prelu, ew_mul, ew_add, ew_sub, ew_max, ew_min, clip, div}` for the device,
+  `{activation_ref, leaky_relu_ref, elu_ref, selu_ref, prelu_ref, ew_*_ref, clip_ref,
+  div_ref}` for the fp16-rounded exact math (glibc `erf` for GELU, so it matches the C
+  bit for bit), `lut_epilogue_build` (the 1026-word table + `LutEpilogue`, the C's
+  `lut_epilogue_t`), `lut_apply` (the host model of the DPU LUT chain) and
+  `table_domain`. All 19 `ROCKET_ACTIVATION_*` values are there; the gated kinds
+  (HARDSWISH/SILU/GELU/MISH) keep the C's two-pass `x·gate(x)` route (host multiply by
+  default, `ROCKET_ACT_NPU_MUL` present = the NPU EW multiply, `ROCKET_ACT_WIDE_LUT` =
+  the single-pass table), and the knobs keep the C names and are read per call
+  (`ROCKET_LUT_*`, `ROCKET_ACT_*`, `ROCKET_LEAKY_R`/`_NOREPAIR`, `ROCKET_ELU_R`/
+  `_NOREPAIR`). Layout/numerics: `n` pads to the C2=8 cube atom, the LUT path tiles at
+  `DPU_LUT_MAXN` = 32768 elements, the EW path reshapes to `[M,32]` with `M >= 12`,
+  `M % 4`, 1020 rows per tile; one submit + one fence wait per tile. The identity-matmul
+  EW wiring needed two new `MatmulParams` fields (`ew_mul`, `ew_op` 0/2/3 = add-mul/
+  MAX/MIN) — the existing fp16 programs are byte-identical (parity.py still 6/6).
+  Host byte-parity: the `--dump-lut` output (epilogue + 1026 words for kinds 0..=18)
+  and the `--dump-gen` program (1070 words) are **byte-identical** to the C
+  `rocket_lut_epilogue_build` / `gen_lut_activation_fp16`. Board (cores 0-3):
+  `activation_selftest` PASS for every kind at n = 1/31/4096/262144 and every EW op at
+  4096/262144, and a **C-vs-Rust A/B is bit-identical** for all 19 kinds and the six
+  EW ops (the C side is built natively on the board; see the verification commands).
+  Device-vs-`lut_apply` residual is <= 1 output ULP for the non-gated kinds and <= 2
+  for the gated ones. Two HW facts the model had to learn: the interpolated table
+  value **saturates to [0, 32767]** before OUT_CVT (that is what stops tanh's LE slope
+  exactly at -1 and floors a gate's negative tail at 0), and the sign-based LE/LO mux
+  still glitches in a razor-thin `x≈0` band for tables that straddle 0 (tanh's default
+  affine path: an isolated +8.0 spike, exactly as in C — the C gates never sample
+  exactly 0; the self-test counts those as `glitch=` and leaves them out of the gate).
+  `cargo test -p rocket-npu` pins the LUT words/epilogue fields, the program hash, the
+  refs' identities, the knob overrides and the table domains.
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
-  therefore complete), the `*_ref_fp16` host references of the *non-matmul* families,
-  `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
-  the non-fp16 batch wrappers, tiled MLA (a `dv != dk` geometry), on-NPU softmax, and
-  all non-matmul op families. (The tiled long-context path *is* implemented — M5b above.)
+  therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
+  families, `_planes`/transposed variants, RK3576 entries (including
+  `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
+  wrappers, tiled MLA (a `dv != dk` geometry), on-NPU softmax, and the other op
+  families: conv (2d/1d/transpose/depthwise), pool, norm/FFN/encoder, softmax/reduce,
+  resize/upsample, SAM/SigLIP, graph execution. (The tiled long-context attention path
+  *is* implemented — M5b above; the activation family is M6a.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -453,7 +489,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `hw`, `knobs`, `error`; `src/bin/` has the parity dump and board self-tests |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters and `activation` (the LUT flying-mode program)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
@@ -1080,6 +1116,17 @@ cargo test -p rocket-npu
 # dtype parity vs the C oracle: plan + every regcmd word, all six dtypes
 cargo build -p rocket-npu --bin regcmd_dump
 python3 tools/c-oracle/parity.py
+# activation/elementwise: LUT + epilogue and program byte-parity vs the C builder
+# (a throwaway C dumper in /tmp links build-host/librocketnpu.a and prints
+# `rocket_lut_epilogue_build` for kinds 0..=18 plus `gen_lut_activation_fp16` for a
+# fixed n=1024/TANH geometry; the same knobs must be unset on both sides)
+cargo run -p rocket-npu --bin activation_selftest -- --dump-lut > /tmp/opencode/rust-lut.txt
+cargo run -p rocket-npu --bin activation_selftest -- --dump-gen > /tmp/opencode/rust-gen.txt
+diff /tmp/opencode/c-lut.txt /tmp/opencode/rust-lut.txt     # BYTE-IDENTICAL
+diff /tmp/opencode/c-gen.txt /tmp/opencode/rust-gen.txt     # BYTE-IDENTICAL (1070 words)
+# clippy must be clean on both targets (the driver has aarch64-only device paths)
+cargo clippy -p rocket-npu --all-targets -- -D warnings
+cargo clippy -p rocket-npu --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench
@@ -1152,6 +1199,27 @@ On the board (after the cross-build + scp above; the NPU-enabled binary):
 ```sh
 ssh root@rock-5b-plus.lan
 cd /root/rocket-inference
+# activation + elementwise self-test (cycles 0-3; the live service keeps 4-7)
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin activation_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/activation_selftest root@rock-5b-plus.lan:/root/rocket-m6a/
+taskset -c 0-3 ./activation_selftest                  # all kinds x {1,31,4096,262144} + EW
+taskset -c 0-3 ./activation_selftest --kind tanh --n 4096 --reps 1
+taskset -c 0-3 ./activation_selftest --shape 64 64 64 --reps 1
+taskset -c 0-3 ./activation_selftest --ew --n 262144
+# C-vs-Rust A/B for one kind: write the input, run both, compare raw f16 (bit-identical)
+taskset -c 0-3 ./activation_selftest --write-in silu 4096 in.raw
+taskset -c 0-3 ./act_board act 3 in.raw c.raw          # C library binary, see below
+taskset -c 0-3 ./activation_selftest --cross silu c.raw
+# ... and for an EW op
+taskset -c 0-3 ./activation_selftest --ew-in mul a.raw b.raw rust.raw
+taskset -c 0-3 ./act_board ew mul a.raw b.raw c.raw     # then cmp c.raw rust.raw
+# the C side: build librocketnpu natively on the board (the host cross build picks up
+# the host's 32-bit __kernel_size_t and rocket_open() then reads an empty driver name,
+# so a cross-built C binary cannot open the device)
+scp ref-src.tgz root@rock-5b-plus.lan:/root/rocket-m6a/   # src include cmake graph tests CMakeLists.txt
+ssh root@rock-5b-plus.lan 'cd /root/rocket-m6a && tar xzf ref-src.tgz -C ref &&
+  cmake -S ref -B ref/build -DCMAKE_BUILD_TYPE=Release && cmake --build ref/build --target rocketnpu -j4 &&
+  gcc -O2 -I ref/include -I ref act_board.c ref/build/librocketnpu.a -lm -lpthread -o act_board'
 # driver dtype selftests (bare binaries, no model; any spare cores)
 #   int8: --dense / --prepacked-dense are int32-exact, the gw pair matches the
 #   dequantized reference (and each other bit-for-bit at a group-pinned Kt);
