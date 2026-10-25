@@ -119,8 +119,7 @@ same planners, register programs and numerics. The per-milestone write-up is in
   board even though every op fits.
 - **Still out** (deliberate; see `lib.rs`): RK3576 entries and the RK3576 graph
   runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants,
-  non-fp16 batch wrappers, `ROCKET_CONV_BATCH`, and resident bf16 (the C library has
-  none).
+  non-fp16 batch wrappers, and resident bf16 (the C library has none).
 
 ## Status (2026-10-06, extended 2026-10-07/08)
 
@@ -1122,13 +1121,13 @@ same planners, register programs and numerics. The per-milestone write-up is in
   part's own conv encoder, the packed-image datapath, the int8 pooling entry with its
   zero point and the prepacked/cube handles; `rocket_conv2d_int8_rk3576`,
   `rocket_conv2d_dw_int8_rk3576`, `rocket_pool_int8_rk3576*`,
-  `rocket_conv2d_int8_pack_rk3576`), the int8 conv's opt-in `ROCKET_CONV_BATCH`
-  batched (gapped multi-task) submit — bit-identical to the per-tile path this port
-  runs — and graph execution (the RK3576-only graph runner). (The tiled
+  `rocket_conv2d_int8_pack_rk3576`) and graph execution (the RK3576-only graph
+  runner). (The tiled
   long-context attention path *is* implemented — M5b above; the activation family is
   M6a, the reduce + softmax family M6b, the norms/vision norms/FFN/encoder M7, the
   fp16 convolution family M8a, the int8 convolution + PPU pooling + upsample families
-  M8b, and the SAM + SigLIP model encoders M9.)
+  M8b, the SAM + SigLIP model encoders M9, and the int8 conv's opt-in
+  `ROCKET_CONV_BATCH` coalesced multi-task submit.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -1719,10 +1718,36 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   average rounds half to even and the pad value is the input zero point) and its LUT
   activation. A different geometry encoding from the RK3588 generators, so nothing in
   `regcmd::*` is shared.
-- **`ROCKET_CONV_BATCH`**: the C's opt-in coalesced multi-task submit for the int8
-  direct conv's tiles (one submit/fence per job slice instead of per tile). The port
-  runs the per-tile path, which is bit-identical; wiring it needs
-  `matmul::chain::pack` plus a gapped batched submit in the conv tiler.
+- **`ROCKET_CONV_BATCH` (done)**: the C's opt-in coalesced multi-task submit for the
+  int8 direct conv's tiles. `ops::conv`'s private `conv2d_int8_batch_tiles` (the C
+  function of the same name) packs a run of tiles
+  into ONE gapped multi-task job (one ioctl + one IOMMU attach + one fence wait; up to 64
+  tiles per job, larger tilings split into groups, never a lone trailing tile), each
+  tile's complete program in a `CONV_RC_STRIDE` (256-word, = `regcmd::conv::MAX_OPS`)
+  slot and its cubes in bank-aligned slots (`conv_batch_layout`, `bank_round(cube) +
+  CBUF_BANK`, the whole BOs zeroed so the int8 `C2 = 16` DMA over-read reads zeros).
+  Bit-identical to the per-tile path, which stays the default; a single-tile run falls
+  back to it. When `matmul::chain::enabled()` (i.e. `ROCKET_BATCH_SUBMIT=1` on a kernel
+  honoring `DRM_ROCKET_JOB_BATCHED`) and every program is the same length the run also
+  goes contiguous + self-chained (one hardware kick; the C's conv batch always packs
+  gapped slots, so the chain is a port extension). No capability gate is needed for the
+  gapped form — multi-task jobs are the stock path (`matmul::batch` uses the same shape);
+  the chain gate lives in `batch_chain_plan`. `ROCKET_CONV_BATCH_DEBUG=1` logs the chosen
+  layout. Board (`conv_selftest --int8-batch-ab`, cores 0-3, busy board load 8.3-9.3,
+  medians of 7 interleaved ABBA samples per arm, three runs): 128x112x112 k3 oc128
+  **18 tiles 51-56 -> 39-41 ms** serial (**1.31-1.37x**, CPU 43.7 -> 35.5 ms) and
+  18-23 -> 17.5-17.8 ms on the 3-device pool (1.03-1.31x, i.e. noisier); 128x224x224 k3
+  oc128 74 tiles (two groups, 64 + 10) 192.5 -> 148.4 ms (1.30x); 32x112x112 k3 2 tiles
+  5.4-6.8 -> 3.7-4.6 ms (1.05-1.48x); 128x28x28 k3 s2 oc128 2 tiles 1.07-1.27x; one tile
+  (fast path) 0.98-1.10x — no change, the per-tile path runs and no batch log appears.
+  Chained vs gapped is within noise of each other here (1.31x vs 1.33-1.37x), so the win is
+  the coalesced submit, not the single IRQ. Every arm is int32-exact against
+  `conv2d_ref_int8` (`exact=n/n`) and `ab_compare.py --conv` is bit-identical C-vs-Rust
+  with the knob 0, 1 and 1+`ROCKET_BATCH_SUBMIT=1`. The C's +7.6% does not reproduce
+  verbatim: the gain is larger here because this board's per-job submit+fence cost is high
+  while the production embedding service shares the NPU (~0.5 ms saved per avoided
+  submit), and at 2 tiles there is little to win; the one shape where batching *loses*
+  (128x28x28 pool, 0.91-1.4x across runs) is inside the board's noise.
 - **Graph execution** (the RK3576-only graph runner) is the remaining op family of the
   C library.
 - **int8 GEMM on the flex CPU path** is the only lever that would close the qwen3
@@ -1897,9 +1922,25 @@ cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin con
 scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/conv_selftest \
     root@rock-5b-plus.lan:/root/rocket-m8a/
 taskset -c 0-3 ./conv_selftest --all --reps 2
-taskset -c 0-3 ./conv_selftest --shape 32 112 112 32 3 3 1 1 1 1 1 1   # one direct case
 taskset -c 0-3 ./conv_selftest --transpose --reps 3                   # both routes
 taskset -c 0-3 ./conv_selftest --int8 --int8-mt --int8-dw --pool --resize  # M8b families
+# NB the `--shape`/`--dw-shape` OPTIONAL tail is not addressable today (the parser reads it
+# but the argument cursor only advances past the 6 mandatory values, so the tail is
+# re-parsed as flags); pass the mandatory 6 and let the defaults apply.
+taskset -c 0-3 ./conv_selftest --int8 --shape 32 112 112 32 3 3  # one tiled int8 case
+# ROCKET_CONV_BATCH (the int8 direct conv's coalesced multi-task submit): both arms must
+# be int32-exact against the reference, and the A/B prints per-shape wall/CPU medians
+# (interleaved ABBA samples) for the serial entry and the pool. The knob is read per
+# call, and each arm gets its own resident context so one arm's BO growth cannot change
+# the other's zeroing cost. --reps >= 5 on a busy board: its variance is +-30 %.
+ROCKET_CONV_BATCH=0 taskset -c 0-3 ./conv_selftest --int8 --int8-mt --reps 2
+ROCKET_CONV_BATCH=1 taskset -c 0-3 ./conv_selftest --int8 --int8-mt --reps 2
+taskset -c 0-3 ./conv_selftest --int8-batch-ab --reps 7
+ROCKET_BATCH_SUBMIT=1 taskset -c 0-3 ./conv_selftest --int8-batch-ab --reps 7  # chained
+ROCKET_CONV_BATCH_DEBUG=1 ROCKET_CONV_BATCH=1 taskset -c 0-3 ./conv_selftest --int8-batch-ab --reps 1
+# (the debug line names the layout: "gapped slots" or "contiguous + self-chained", the
+# per-tile word count, the rc words and the three BO sizes; a single-tile or fast-path
+# shape prints nothing because it never leaves the per-tile path)
 # one case each through the raw-file A/B layout (ab_board.c shares it):
 taskset -c 0-3 ./conv_selftest --io conv_int8 32 16 16 32 3 3 1 1 1 1 1 1 IN W OUT
 taskset -c 0-3 ./conv_selftest --io pool_int8 1 32 8 8 2 2 2 2 0 0 0 0 IN OUT
@@ -1910,7 +1951,16 @@ taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selfte
     --conv ./conv_selftest --c ./ab_board --work /tmp/ab_m8a --no-wide
 # ... which also drives the M8b families (int8 conv/dw, the three pools, both
 # upscales); its M8b section is `m8b()` in ab_compare.py, and the C side is the same
-# natively-built ab_board (the new families need no extra C library target).
+# natively-built ab_board (the new families need no extra C library target). Its
+# conv_int8 cases are the ROCKET_CONV_BATCH A/B too: the env var is inherited by BOTH
+# binaries (the C reads it in conv_batch_enabled), so run it three times — 0, 1, and
+# 1+ROCKET_BATCH_SUBMIT=1 (the last one is the Rust chained layout against the C's
+# gapped batch, which must still be bit-identical).
+for cb in "0" "1" "1 ROCKET_BATCH_SUBMIT=1"; do
+    taskset -c 0-3 env ROCKET_CONV_BATCH=$cb python3 ab_compare.py \
+        --rust ./reduce_selftest --ops ./ops_selftest --conv ./conv_selftest \
+        --c ./ab_board --work /tmp/ab_cb --no-wide
+done
 # the C library's own conv gates on the same board (they must PASS for the A/B to mean
 # anything; conv2d_fp16_rocket covers the direct + depthwise sweeps, conv_transpose the
 # 21 shapes / 13 deconv-route cases, conv_act the fusion's accuracy + QUIRK 1 counts)

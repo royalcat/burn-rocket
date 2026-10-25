@@ -70,17 +70,28 @@
 //! `ROCKET_CONV_DW_GROUP`, `ROCKET_CONV_DW_FEAT_BANKS`, `ROCKET_CONV_DW_SIZEE`,
 //! `ROCKET_CONV_DW_BSOWOP`, `ROCKET_CONV_DW_OCPAD`, `ROCKET_CONV_DW_DEBUG`,
 //! `ROCKET_CONV_DW_NATIVE` (accepted no-op), `ROCKET_CONV_MIN_IH`, `ROCKET_CONV_GRAINS`,
-//! `ROCKET_CONV_DENTRIES`, `ROCKET_CONV_STRIDE_SWAP`, `ROCKET_CONV_DIL_RAW`, plus the
-//! LUT builder's own set through `lut_epilogue_build`.
+//! `ROCKET_CONV_DENTRIES`, `ROCKET_CONV_STRIDE_SWAP`, `ROCKET_CONV_DIL_RAW`,
+//! `ROCKET_CONV_BATCH` (the int8 direct conv's coalesced multi-task submit, off by
+//! default), plus the LUT builder's own set through `lut_epilogue_build`.
+//!
+//! # Batched int8 tiles
+//!
+//! `ROCKET_CONV_BATCH=1` runs a contiguous run of the int8 direct conv's independent tiles
+//! as **one** gapped multi-task job (C `conv2d_int8_batch_tiles`): one submit ioctl, one
+//! IOMMU attach and one fence wait for the whole run, with the tiles' complete programs in
+//! fixed-size slots of one regcmd BO and their feature/weight cubes in bank-aligned slots
+//! of one input/weight BO. The hardware still runs the tiles as separate kicks and each
+//! writes a disjoint region of the output, so the result is **bit-identical** to the
+//! per-tile path, which stays the default.
 
 use half::f16;
 
 use crate::Device;
 use crate::device::Bo;
-use crate::device::uapi::DrmRocketTask;
+use crate::device::uapi::{DRM_ROCKET_JOB_BATCHED, DrmRocketTask};
 use crate::error::{Error, Result};
 use crate::knobs;
-use crate::log::{log_debug, log_error};
+use crate::log::{log_debug, log_error, log_info};
 use crate::ops::activation::{Activation, lut_epilogue_build};
 use crate::ops::reduce::feature_data;
 use crate::regcmd::conv::{ConvAct, ConvParams, gen_conv2d_dw_fp16, gen_conv2d_fp16};
@@ -2100,6 +2111,45 @@ fn conv2d_int8_one_job(
     Ok(())
 }
 
+/// Materialise one tile's sub-input: the real halo rows/columns plus the explicit zero
+/// pad, with the channel pad (`ic >= icr` stays zero from the fill).
+///
+/// `gh0`/`gw0` are the sub-input's top-left corner in the global input, i.e.
+/// `r0 * stride_y - pad_top` and `c0 * stride_x - pad_left`. Shared by the per-tile job
+/// and the batched slots so both hand the CNA the same bytes.
+#[allow(clippy::too_many_arguments)]
+fn materialize_sub_input(
+    sub_in: &mut [i8],
+    ic: usize,
+    icr: usize,
+    ih: usize,
+    iw: usize,
+    ih_sub: usize,
+    iw_sub: usize,
+    gh0: isize,
+    gw0: isize,
+    input: &[i8],
+) {
+    sub_in[..ic * ih_sub * iw_sub].fill(0);
+    for c in 0..icr {
+        for j in 0..ih_sub {
+            let gih = gh0 + j as isize;
+            if gih < 0 || gih >= ih as isize {
+                continue;
+            }
+            let cs = gw0.max(0) as usize;
+            let ce = ((gw0 + iw_sub as isize).min(iw as isize)).max(0) as usize;
+            if cs >= ce {
+                continue;
+            }
+            let dst_off = (c * ih_sub + j) * iw_sub + (cs as isize - gw0) as usize;
+            let src_off = (c * ih + gih as usize) * iw + cs;
+            sub_in[dst_off..dst_off + (ce - cs)]
+                .copy_from_slice(&input[src_off..src_off + (ce - cs)]);
+        }
+    }
+}
+
 /// One independent OC/OH/OW tile of the int8 direct conv (`conv2d_int8_one_tile`):
 /// materialise the tile's sub-input (real halo + zero pad + channel pad), run the
 /// single job, scatter the int32 result into the output's disjoint region.
@@ -2138,26 +2188,7 @@ fn conv2d_int8_one_tile(
     let iw_sub = (cw - 1) * sx + (kw - 1) * dx + 1;
     let gw0 = c0 as isize * sx as isize - pl as isize;
 
-    // materialise the tile's sub-input: real halo + zero pad, with the channel pad
-    // (ic >= icr stays zero from the fill).
-    sub_in[..ic * ih_sub * iw_sub].fill(0);
-    for c in 0..icr {
-        for j in 0..ih_sub {
-            let gih = gh0 + j as isize;
-            if gih < 0 || gih >= ih as isize {
-                continue;
-            }
-            let cs = gw0.max(0) as usize;
-            let ce = ((gw0 + iw_sub as isize).min(iw as isize)).max(0) as usize;
-            if cs >= ce {
-                continue;
-            }
-            let dst_off = (c * ih_sub + j) * iw_sub + (cs as isize - gw0) as usize;
-            let src_off = (c * ih + gih as usize) * iw + cs;
-            sub_in[dst_off..dst_off + (ce - cs)]
-                .copy_from_slice(&input[src_off..src_off + (ce - cs)]);
-        }
-    }
+    materialize_sub_input(sub_in, ic, icr, ih, iw, ih_sub, iw_sub, gh0, gw0, input);
 
     // `w_oc0` is the tile's place in the *weight* tensor (always the global output
     // channel); `out_oc0` is its place in the caller's `out`, which a multicore worker
@@ -2174,6 +2205,431 @@ fn conv2d_int8_one_tile(
             let src = (o * rh + r) * cw;
             out[dst..dst + cw].copy_from_slice(&sub_out[src..src + cw]);
         }
+    }
+    Ok(())
+}
+
+// ── Batched (one gapped multi-task job) int8 direct tiles ─────────────────────
+
+/// The C `CONV_RC_STRIDE`: the per-task regcmd slot of a batched int8 conv job.
+///
+/// It is the generator's own word cap ([`MAX_OPS`](crate::regcmd::conv::MAX_OPS), 256
+/// words), so a slot always holds a whole program and the layout never has to vary its
+/// stride: the slots are fixed-size, exactly as the C lays them out.
+pub const CONV_RC_STRIDE: usize = crate::regcmd::conv::MAX_OPS;
+
+/// Whether the int8 direct conv coalesces a run of tiles into one multi-task submit
+/// (C `conv_batch_enabled`, `ROCKET_CONV_BATCH`).
+///
+/// The C's rule is `atoi(getenv(...)) > 0` with the answer cached once per process; this
+/// reads it per call so an A/B can flip it inside one process. Unset (or `0`) keeps the
+/// per-tile path, which is the default and stays byte-for-byte what it was.
+pub fn conv_batch_enabled() -> bool {
+    knobs::int("ROCKET_CONV_BATCH").is_some_and(|v| v > 0)
+}
+
+/// Round `n` bytes up to a whole CBUF bank (C `bank_round`).
+///
+/// Every slot of a batched job starts on a bank boundary, so its base has the alignment a
+/// standalone job's freshly allocated BO has and the int8 `C2 = 16` feature DMA's one-bank
+/// over-read lands in the zeroed spare bank that follows it.
+fn bank_round(n: usize) -> usize {
+    n.div_ceil(CBUF_BANK_SIZE) * CBUF_BANK_SIZE
+}
+
+/// One tile's slots inside a batched int8 conv job (C `conv2d_int8_batch_tiles` pass 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvBatchSlot {
+    /// The tile this slot serves.
+    pub tile: ConvInt8Tile,
+    /// The tile's real (halo-grown) sub-input extent, and its height at the 4-row CNA
+    /// DMA floor.
+    pub ih_sub: usize,
+    pub iw_sub: usize,
+    pub ihj: usize,
+    /// Bytes of row-major sub-input scratch this tile needs.
+    pub sub_in: usize,
+    /// Byte offsets of this tile's input / weight / output slot in the job's BOs.
+    pub in_off: usize,
+    pub wt_off: usize,
+    pub out_off: usize,
+}
+
+impl ConvBatchSlot {
+    /// The tile's scattered feature-cube size in bytes (`C2 = 16`, always `ihj` rows).
+    pub fn in_bytes(&self, ic: usize) -> usize {
+        ic.div_ceil(16) * 16 * self.ihj * self.iw_sub
+    }
+
+    /// The tile's scattered weight-cube size in bytes (the int8 `oc` group is 32).
+    ///
+    /// The tiler keeps `oc_n` a multiple of 32, so this is the C's `OCn * IC * KH * KW`;
+    /// the rounding only guards a hand-built tile list from writing past its slot.
+    pub fn wt_bytes(&self, ic: usize, kh: usize, kw: usize) -> usize {
+        self.tile.oc_n.div_ceil(32) * 32 * ic * kh * kw
+    }
+
+    /// The tile's int32 output-cube size in bytes (`C2 = 4`).
+    pub fn out_bytes(&self) -> usize {
+        self.tile.oc_n.div_ceil(4) * 4 * self.tile.rh * self.tile.cw * 4
+    }
+}
+
+/// A batched job's slot layout: the per-tile slots and the BO sizes they need
+/// (C `conv2d_int8_batch_tiles` pass 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvBatchLayout {
+    /// One slot per tile, in tile order.
+    pub slots: Vec<ConvBatchSlot>,
+    /// Bytes the job's input / weight / output BOs must hold.
+    pub in_bytes: usize,
+    pub wt_bytes: usize,
+    pub out_bytes: usize,
+    /// Largest single-tile sub-input, for the host scratch.
+    pub max_sub_in: usize,
+}
+
+/// Lay `tiles` into bank-aligned slots of one batched job.
+///
+/// `ic` is the padded input-channel count the tiler resolved (`plan.ic`), i.e. what the
+/// per-tile job scatters. Each region is `bank_round(cube) + CBUF_BANK` bytes, so every
+/// slot starts on a bank boundary and is followed by the zeroed spare bank the int8
+/// feature DMA over-reads into — exactly the bytes a standalone job's own BO provides.
+pub fn conv_batch_layout(d: &Conv2dDesc, ic: usize, tiles: &[ConvInt8Tile]) -> ConvBatchLayout {
+    let (mut in_bytes, mut wt_bytes, mut out_bytes, mut max_sub_in) = (0, 0, 0, 0);
+    let mut slots = Vec::with_capacity(tiles.len());
+    for &tile in tiles {
+        let ih_sub = (tile.rh - 1) * d.stride_y + (d.kh - 1) * d.dil_y + 1;
+        let iw_sub = (tile.cw - 1) * d.stride_x + (d.kw - 1) * d.dil_x + 1;
+        let slot = ConvBatchSlot {
+            tile,
+            ih_sub,
+            iw_sub,
+            ihj: ih_sub.max(CONV_MIN_DATAIN_H),
+            sub_in: ic * ih_sub * iw_sub,
+            in_off: in_bytes,
+            wt_off: wt_bytes,
+            out_off: out_bytes,
+        };
+        max_sub_in = max_sub_in.max(slot.sub_in);
+        in_bytes += bank_round(slot.in_bytes(ic)) + CBUF_BANK_SIZE;
+        wt_bytes += bank_round(slot.wt_bytes(ic, d.kh, d.kw)) + CBUF_BANK_SIZE;
+        out_bytes += bank_round(slot.out_bytes()) + CBUF_BANK_SIZE;
+        slots.push(slot);
+    }
+    ConvBatchLayout {
+        slots,
+        in_bytes,
+        wt_bytes,
+        out_bytes,
+        max_sub_in,
+    }
+}
+
+/// Every tile's program of a batched job, concatenated, with each tile's `(first word,
+/// word count)` in the run (C `conv2d_int8_batch_tiles`' program pass).
+struct BatchPrograms {
+    group: Vec<u64>,
+    spans: Vec<(usize, u32)>,
+}
+
+/// Generate each slot's program against the slot's addresses.
+///
+/// Device-free (the emitters are pure), so a host test can gate the batched slot programs
+/// against the per-tile job's. The geometry is `conv2d_int8_one_tile`'s: the tile's real
+/// output extent, the halo-grown sub-input (raised to the 4-row DMA floor), and
+/// `pad_top = pad_left = 0` because the halo is materialised.
+fn batch_programs(
+    layout: &ConvBatchLayout,
+    ic: usize,
+    d: &Conv2dDesc,
+    in_dma: u32,
+    wt_dma: u32,
+    out_dma: u32,
+) -> Result<BatchPrograms> {
+    let mut group: Vec<u64> = Vec::with_capacity(layout.slots.len() * CONV_RC_STRIDE);
+    let mut spans: Vec<(usize, u32)> = Vec::with_capacity(layout.slots.len());
+    for slot in &layout.slots {
+        let t = slot.tile;
+        let mut p = crate::regcmd::conv::ConvInt8Params::new(
+            ic as u16,
+            slot.ihj as u16,
+            slot.iw_sub as u16,
+            t.oc_n as u16,
+            t.rh as u16,
+            t.cw as u16,
+            d.kh as u16,
+            d.kw as u16,
+            in_dma.wrapping_add(slot.in_off as u32),
+            wt_dma.wrapping_add(slot.wt_off as u32),
+            out_dma.wrapping_add(slot.out_off as u32),
+        );
+        p.stride_y = d.stride_y as u8;
+        p.stride_x = d.stride_x as u8;
+        p.dil_y = d.dil_y as u8;
+        p.dil_x = d.dil_x as u8;
+        let mut ops = Vec::with_capacity(CONV_RC_STRIDE);
+        let count = crate::regcmd::conv::gen_conv2d_int8(&mut p, &mut ops)?;
+        if count > CONV_RC_STRIDE {
+            log_error!(
+                "rocket_conv2d_int8 batch: regcmd overflow (task_count {count} > \
+                 {CONV_RC_STRIDE} words)"
+            );
+            return Err(Error::tiling("rocket_conv2d_int8/regcmd"));
+        }
+        spans.push((group.len(), count as u32));
+        group.extend(ops.iter().map(|op| op.0));
+    }
+    Ok(BatchPrograms { group, spans })
+}
+
+/// Whether a group's programs go down the contiguous self-chained layout, and the regcmd
+/// words that needs. `Some(words)` = chained, `None` = gapped slots.
+///
+/// Chaining is **this port's** extension — the C's conv batch always packs gapped slots
+/// (`rkt_chain_pack(0, ...)`) — and it needs every program the same length, so a run whose
+/// lengths disagree keeps the gapped slots. A chained run must also fit the gapped
+/// layout's own budget, so a batch never reserves more regcmd BO for the chain than it
+/// would for fixed slots. `want` is [`chain::enabled`](crate::matmul::chain::enabled),
+/// passed in so the decision is host-testable.
+fn batch_chain_plan(want: bool, spans: &[(usize, u32)], gapped_words: usize) -> Option<usize> {
+    let uniform = spans.first().is_some_and(|first| {
+        spans
+            .iter()
+            .all(|s| s.1 == first.1 && s.1 <= CONV_RC_STRIDE as u32)
+    });
+    let chained = uniform
+        && crate::matmul::chain::group_chained(
+            want,
+            spans.len(),
+            spans.iter().map(|s| s.1),
+            gapped_words,
+        );
+    chained.then(|| crate::matmul::chain::words(spans[0].1) * spans.len())
+}
+
+/// Split a run of `tn` tiles into the groups one batched job carries.
+///
+/// A group holds at most [`BATCH`](crate::regcmd::desc::BATCH) tiles — the matmul batch's
+/// job size, which bounds the batched BOs — and never a single trailing tile: one tile is
+/// what the per-tile path is for, so a lone tail folds into the group before it.
+fn batch_groups(tn: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < tn {
+        let mut end = (start + crate::regcmd::desc::BATCH).min(tn);
+        if tn - end == 1 {
+            end += 1;
+        }
+        groups.push(start..end);
+        start = end;
+    }
+    groups
+}
+
+/// De-scatter one tile's int32 output cube straight into its region of `out`.
+///
+/// The batch has no per-tile `sub_out` scratch: every tile writes only its own rows and
+/// columns of the caller's output (the C's de-scatter does the same), so `out_oc0` is the
+/// tile's first channel *in this slice* — a multicore worker passes its band's base.
+fn gather_output_i32_tile(
+    cube: &[i32],
+    t: &ConvInt8Tile,
+    oh: usize,
+    ow: usize,
+    out_oc0: usize,
+    out: &mut [i32],
+) {
+    for o in 0..t.oc_n {
+        for r in 0..t.rh {
+            for c in 0..t.cw {
+                out[((out_oc0 + o) * oh + (t.r0 + r)) * ow + t.c0 + c] =
+                    cube[feature_data(t.oc_n, t.rh, t.cw, 4, o + 1, r + 1, c + 1)];
+            }
+        }
+    }
+}
+
+/// Batch `tiles` into ONE multi-task int8 conv job (C `conv2d_int8_batch_tiles`).
+///
+/// Every tile's complete program goes into its own [`CONV_RC_STRIDE`]-word slot of one
+/// regcmd BO, and its feature/weight cubes into bank-aligned slots of one input/weight BO;
+/// the whole run is then submitted as a single job — one ioctl, one IOMMU attach and one
+/// fence wait, while the hardware still runs the tiles as separate kicks. Every tile
+/// carries the program the per-tile path emits against the same cube bytes, so the batch
+/// is **bit-identical** to [`conv2d_int8_one_tile`] per tile; only the submit is coalesced.
+/// Opt-in through [`conv_batch_enabled`], which `conv2d_int8_run` reads once per call.
+///
+/// No capability gate is needed: the gapped multi-task job is the stock driver's own shape
+/// (the matmul batch already relies on it), and the **chained** layout — this port's
+/// extension when [`chain::enabled`](crate::matmul::chain::enabled) — is gated by
+/// [`batch_chain_plan`], which asks the kernel's batched-submit probe itself.
+///
+/// `out_oc0_base` is the output channel `out[0]` stands for: `0` on the serial path, a
+/// multicore worker's band base otherwise (the C's `out_oc0`).
+#[allow(clippy::too_many_arguments)]
+fn conv2d_int8_batch_tiles(
+    ctx: &mut ConvContext,
+    ic: usize,
+    d: &Conv2dDesc,
+    input: &[i8],
+    wuse: &[i8],
+    out: &mut [i32],
+    out_oc0_base: usize,
+    tiles: &[ConvInt8Tile],
+) -> Result<()> {
+    if tiles.is_empty() {
+        return Ok(());
+    }
+    let dev = ctx.dev.clone();
+    let layout = conv_batch_layout(d, ic, tiles);
+    let (ih, iw) = (d.ih, d.iw);
+    let (oh, ow) = (conv2d_oh(d), conv2d_ow(d));
+    let (kh, kw) = (d.kh, d.kw);
+
+    ensure_bo(&dev, &mut ctx.guard, 4096)?;
+    ensure_bo(&dev, &mut ctx.input, layout.in_bytes)?;
+    ensure_bo(&dev, &mut ctx.weight, layout.wt_bytes)?;
+    ensure_bo(&dev, &mut ctx.output, layout.out_bytes)?;
+
+    // The emitters read their slots' addresses, so every BO but the regcmd one is grown
+    // first (growing a BO moves it).
+    let progs = batch_programs(
+        &layout,
+        ic,
+        d,
+        ctx.input.as_ref().expect("input BO").dma_address() as u32,
+        ctx.weight.as_ref().expect("weight BO").dma_address() as u32,
+        ctx.output.as_ref().expect("output BO").dma_address() as u32,
+    )?;
+    let g = progs.spans.len();
+    let gapped_words = g * CONV_RC_STRIDE;
+    let chain_words = batch_chain_plan(crate::matmul::chain::enabled(), &progs.spans, gapped_words);
+    let chained = chain_words.is_some();
+    ensure_bo(&dev, &mut ctx.rc, chain_words.unwrap_or(gapped_words) * 8)?;
+    if knobs::present("ROCKET_CONV_BATCH_DEBUG") {
+        let second = layout.slots.get(1).or_else(|| layout.slots.first());
+        log_info!(
+            "conv int8 batch: {g} tile(s) of {} words, {}, rc {} words, in {} B + wt {} B + \
+             out {} B, slot 1 at in+{} wt+{} out+{}",
+            progs.spans[0].1,
+            if chained {
+                "contiguous + self-chained"
+            } else {
+                "gapped slots"
+            },
+            chain_words.unwrap_or(gapped_words),
+            layout.in_bytes,
+            layout.wt_bytes,
+            layout.out_bytes,
+            second.map_or(0, |s| s.in_off),
+            second.map_or(0, |s| s.wt_off),
+            second.map_or(0, |s| s.out_off),
+        );
+    }
+
+    // Feature cubes: every tile's halo/pad sub-input, scattered into its own slot. The
+    // whole BO is zeroed, so the slots' spare banks and the channel pad read zero exactly
+    // as a fresh single-job BO does.
+    let mut sub_in = vec![0i8; layout.max_sub_in.max(1)];
+    {
+        let bo = ctx.input.as_mut().expect("input BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        for slot in &layout.slots {
+            let t = slot.tile;
+            let gh0 = t.r0 as isize * d.stride_y as isize - d.pad_top as isize;
+            let gw0 = t.c0 as isize * d.stride_x as isize - d.pad_left as isize;
+            materialize_sub_input(
+                &mut sub_in,
+                ic,
+                d.ic,
+                ih,
+                iw,
+                slot.ih_sub,
+                slot.iw_sub,
+                gh0,
+                gw0,
+                input,
+            );
+            let cube = &mut words[slot.in_off..slot.in_off + slot.in_bytes(ic)];
+            scatter_feature_i8(cube, ic, slot.ihj, slot.iw_sub, &sub_in[..slot.sub_in]);
+        }
+        bo.fini()?;
+    }
+    // Weight cubes: each tile's own OC slice of the (already IC-padded) weights.
+    {
+        let bo = ctx.weight.as_mut().expect("weight BO");
+        bo.prep(0)?;
+        let words = bo_i8_mut(bo);
+        words.fill(0);
+        let span = ic * kh * kw;
+        for slot in &layout.slots {
+            let t = slot.tile;
+            let wslice = &wuse[t.oc0 * span..(t.oc0 + t.oc_n) * span];
+            let cube = &mut words[slot.wt_off..slot.wt_off + slot.wt_bytes(ic, kh, kw)];
+            scatter_weights_i8(cube, t.oc_n, ic, kh, kw, wslice);
+        }
+        bo.fini()?;
+    }
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(0)?;
+        bo_i8_mut(bo).fill(0);
+        bo.fini()?;
+    }
+
+    // Regcmd: each program in its slot (gapped, or contiguous and self-chained).
+    let mut tasks = vec![DrmRocketTask::default(); g];
+    {
+        let bo = ctx.rc.as_mut().expect("rc BO");
+        bo.prep(0)?;
+        let base = bo.dma_address() as u32;
+        let dst = crate::matmul::bos::u64_words(bo);
+        for (i, &(off, count)) in progs.spans.iter().enumerate() {
+            crate::matmul::chain::pack(
+                chained,
+                dst,
+                base,
+                &mut tasks,
+                i,
+                &progs.group[off..off + count as usize],
+                count,
+                CONV_RC_STRIDE,
+            )?;
+        }
+        if chained {
+            crate::matmul::chain::verify(
+                dst,
+                base,
+                &tasks,
+                crate::matmul::chain::words(progs.spans[0].1),
+            )?;
+        }
+        bo.fini()?;
+    }
+
+    let in_handles = [
+        ctx.input.as_ref().expect("input BO").handle(),
+        ctx.weight.as_ref().expect("weight BO").handle(),
+        ctx.rc.as_ref().expect("rc BO").handle(),
+    ];
+    let out_handles = [ctx.output.as_ref().expect("output BO").handle()];
+    let flags = if chained { DRM_ROCKET_JOB_BATCHED } else { 0 };
+    let mut scratch: Vec<DrmRocketTask> = Vec::with_capacity(g);
+    dev.submit_tasks_pre(&mut scratch, &tasks, &in_handles, &out_handles, flags)?;
+
+    // ONE fence wait for the whole job, then every tile's de-scatter.
+    {
+        let bo = ctx.output.as_mut().expect("output BO");
+        bo.prep(CONV_WAIT_NS)?;
+        let words = bo_i32(bo);
+        for slot in &layout.slots {
+            let cube = &words[slot.out_off / 4..];
+            gather_output_i32_tile(cube, &slot.tile, oh, ow, slot.tile.oc0 - out_oc0_base, out);
+        }
+        bo.fini()?;
     }
     Ok(())
 }
@@ -2297,6 +2753,13 @@ fn conv2d_int8_run(
     let plan = conv_int8_tile_plan(d)?;
     let tiles = plan.tiles(d);
 
+    // `ROCKET_CONV_BATCH`: coalesce a run of the independent tiles into ONE multi-task
+    // job instead of one job per tile. Read once per call; off keeps the per-tile path
+    // byte-for-byte. The stock driver already runs a job's tasks back to back on one core
+    // (`matmul::batch` relies on it), so this needs no extra capability — only the
+    // optional chained layout does, and `batch_chain_plan` asks the kernel itself.
+    let batch = conv_batch_enabled();
+
     // Largest tile's materialised sub-input / output, for the per-worker scratch.
     let rh_max = *plan.rband.iter().max().expect("bands");
     let cw_max = *plan.cband.iter().max().expect("bands");
@@ -2339,9 +2802,30 @@ fn conv2d_int8_run(
                 let tiles = &tiles;
                 handles.push(scope.spawn(move || -> Result<()> {
                     crate::device::affinity::pin_current(w, base_aff);
+                    // A worker's tiles are a CONTIGUOUS run of the plan (the output-channel
+                    // group is its outer axis), which is what makes the band a disjoint
+                    // slice of `out`.
+                    let lo = tiles.partition_point(|t| t.oc0 < s);
+                    let hi = lo + tiles[lo..].partition_point(|t| t.oc0 < s + oc_n);
+                    let band_tiles = &tiles[lo..hi];
+                    if batch && band_tiles.len() > 1 {
+                        for g in batch_groups(band_tiles.len()) {
+                            conv2d_int8_batch_tiles(
+                                ctx,
+                                plan.ic,
+                                d,
+                                input,
+                                wuse,
+                                band,
+                                s,
+                                &band_tiles[g],
+                            )?;
+                        }
+                        return Ok(());
+                    }
                     let mut sub_in = vec![0i8; sub_in_sz];
                     let mut sub_out = vec![0i32; sub_out_elems];
-                    for tl in tiles.iter().filter(|t| t.oc0 >= s && t.oc0 < s + oc_n) {
+                    for tl in band_tiles.iter() {
                         conv2d_int8_one_tile(
                             ctx,
                             plan.ic,
@@ -2387,7 +2871,14 @@ fn conv2d_int8_run(
         return results.into_iter().find(|r| r.is_err()).unwrap_or(Ok(()));
     }
 
-    // Serial: one scratch pair on the coordinator context.
+    // Serial: one scratch pair on the coordinator context, or — with
+    // `ROCKET_CONV_BATCH` — each group of tiles coalesced into one multi-task job.
+    if batch && tiles.len() > 1 {
+        for g in batch_groups(tiles.len()) {
+            conv2d_int8_batch_tiles(&mut ctxs[0], plan.ic, d, input, wuse, out, 0, &tiles[g])?;
+        }
+        return Ok(());
+    }
     let mut sub_in = vec![0i8; sub_in_sz];
     let mut sub_out = vec![0i32; sub_out_elems];
     for tl in &tiles {
@@ -3550,5 +4041,214 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── int8 batched submit (ROCKET_CONV_BATCH) ───────────────────────────────
+
+    #[test]
+    fn int8_batch_slots_are_bank_aligned_and_disjoint() {
+        // 128x112x112 k3 p1 is the tiler's own multi-tile shape: OC shrinks to 96 and the
+        // rows band, so the slots get several geometries.
+        let mut d = desc(128, 112, 112, 128, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let plan = conv_int8_tile_plan(&d).expect("tileable");
+        let tiles = plan.tiles(&d);
+        assert!(tiles.len() > 1, "tiles: {}", tiles.len());
+
+        let layout = conv_batch_layout(&d, plan.ic, &tiles);
+        assert_eq!(layout.slots.len(), tiles.len());
+
+        let (mut in_end, mut wt_end, mut out_end, mut max_sub) = (0, 0, 0, 0);
+        for (slot, &tile) in layout.slots.iter().zip(&tiles) {
+            assert_eq!(slot.tile, tile);
+            // Every slot starts on a whole CBUF bank, so its feature DMA base has the
+            // alignment a fresh single-job BO has.
+            for off in [slot.in_off, slot.wt_off, slot.out_off] {
+                assert!(
+                    off.is_multiple_of(CBUF_BANK_SIZE),
+                    "slot offset {off} is not bank-aligned"
+                );
+            }
+            // ... and the slots are laid end to end, in tile order.
+            assert_eq!(
+                (slot.in_off, slot.wt_off, slot.out_off),
+                (in_end, wt_end, out_end)
+            );
+
+            // The tile's real (halo-grown) sub-input, raised to the 4-row DMA floor.
+            let ih_sub = (tile.rh - 1) * d.stride_y + (d.kh - 1) * d.dil_y + 1;
+            let iw_sub = (tile.cw - 1) * d.stride_x + (d.kw - 1) * d.dil_x + 1;
+            assert_eq!((slot.ih_sub, slot.iw_sub), (ih_sub, iw_sub));
+            assert_eq!(slot.ihj, ih_sub.max(CONV_MIN_DATAIN_H));
+            assert_eq!(slot.sub_in, plan.ic * ih_sub * iw_sub);
+            max_sub = max_sub.max(slot.sub_in);
+
+            // Each region holds its cube plus one spare bank (the int8 over-read's zeros).
+            let in_slot = bank_round(slot.in_bytes(plan.ic)) + CBUF_BANK_SIZE;
+            let wt_slot = bank_round(slot.wt_bytes(plan.ic, d.kh, d.kw)) + CBUF_BANK_SIZE;
+            let out_slot = bank_round(slot.out_bytes()) + CBUF_BANK_SIZE;
+            assert!(slot.in_bytes(plan.ic) <= in_slot - CBUF_BANK_SIZE);
+            assert!(slot.wt_bytes(plan.ic, d.kh, d.kw) <= wt_slot - CBUF_BANK_SIZE);
+            assert!(slot.out_bytes() <= out_slot - CBUF_BANK_SIZE);
+            in_end += in_slot;
+            wt_end += wt_slot;
+            out_end += out_slot;
+        }
+        assert_eq!(
+            (layout.in_bytes, layout.wt_bytes, layout.out_bytes),
+            (in_end, wt_end, out_end)
+        );
+        assert_eq!(layout.max_sub_in, max_sub);
+
+        // Batching changes only the submit: the tiles still cover the output exactly once.
+        let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+        let mut covered = 0usize;
+        let mut chan = vec![0usize; d.oc * oh * ow];
+        for t in &tiles {
+            covered += t.oc_n * t.rh * t.cw;
+            for o in t.oc0..t.oc0 + t.oc_n {
+                for r in t.r0..t.r0 + t.rh {
+                    for c in t.c0..t.c0 + t.cw {
+                        chan[(o * oh + r) * ow + c] += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(covered, d.oc * oh * ow);
+        assert!(chan.iter().all(|&n| n == 1), "every element covered once");
+    }
+
+    #[test]
+    fn an_int8_batch_slot_runs_the_per_tile_program() {
+        let mut d = desc(128, 112, 112, 128, 3, 3);
+        d.pad_top = 1;
+        d.pad_left = 1;
+        let plan = conv_int8_tile_plan(&d).expect("tileable");
+        let tiles = plan.tiles(&d);
+        let batch = &tiles[..3];
+
+        // BO base 0, so a slot's program is addressed at its own slot offsets and the
+        // per-tile job below can be handed the very same addresses.
+        let layout = conv_batch_layout(&d, plan.ic, batch);
+        let progs = batch_programs(&layout, plan.ic, &d, 0, 0, 0).expect("emitters");
+
+        for (i, slot) in layout.slots.iter().enumerate() {
+            let t = slot.tile;
+            // The per-tile path's program for the same tile (`conv2d_int8_one_job`'s call:
+            // the halo-grown sub-input, the real output extent, materialised pad).
+            let mut p = crate::regcmd::conv::ConvInt8Params::new(
+                plan.ic as u16,
+                slot.ihj as u16,
+                slot.iw_sub as u16,
+                t.oc_n as u16,
+                t.rh as u16,
+                t.cw as u16,
+                d.kh as u16,
+                d.kw as u16,
+                slot.in_off as u32,
+                slot.wt_off as u32,
+                slot.out_off as u32,
+            );
+            p.stride_y = d.stride_y as u8;
+            p.stride_x = d.stride_x as u8;
+            p.dil_y = d.dil_y as u8;
+            p.dil_x = d.dil_x as u8;
+            let mut ops = Vec::new();
+            let count = crate::regcmd::conv::gen_conv2d_int8(&mut p, &mut ops).unwrap();
+
+            let (off, span) = progs.spans[i];
+            assert_eq!(span as usize, count, "tile {i} op count");
+            let want: Vec<u64> = ops.iter().map(|op| op.0).collect();
+            assert_eq!(
+                &progs.group[off..off + count],
+                &want[..],
+                "tile {i} program"
+            );
+        }
+
+        // The gapped slots put each program at its own descriptor, one CONV_RC_STRIDE
+        // apart — the layout the per-tile path's jobs would each get on their own.
+        let base = 0x1000_0000u32;
+        let g = layout.slots.len();
+        let mut dst = vec![0u64; g * CONV_RC_STRIDE];
+        let mut tasks = vec![DrmRocketTask::default(); g];
+        for (i, &(off, count)) in progs.spans.iter().enumerate() {
+            crate::matmul::chain::pack(
+                false,
+                &mut dst,
+                base,
+                &mut tasks,
+                i,
+                &progs.group[off..off + count as usize],
+                count,
+                CONV_RC_STRIDE,
+            )
+            .unwrap();
+            assert_eq!(tasks[i].regcmd, base + (i * CONV_RC_STRIDE * 8) as u32);
+            assert_eq!(tasks[i].regcmd_count, count);
+            let slot = &dst[i * CONV_RC_STRIDE..i * CONV_RC_STRIDE + count as usize];
+            assert_eq!(slot, &progs.group[off..off + count as usize]);
+        }
+    }
+
+    #[test]
+    fn int8_batch_groups_cover_the_tiles_once() {
+        assert!(batch_groups(0).is_empty());
+        assert_eq!(batch_groups(1), vec![0..1]);
+        for tn in [2usize, 3, 7, 63, 64, 65, 66, 127, 128, 129, 130, 1000] {
+            let groups = batch_groups(tn);
+            assert_eq!(groups.first().unwrap().start, 0);
+            assert_eq!(groups.last().unwrap().end, tn);
+            let mut next = 0;
+            let mut total = 0;
+            for g in &groups {
+                assert_eq!(g.start, next, "groups are contiguous at tn={tn}");
+                assert!(g.len() <= crate::regcmd::desc::BATCH + 1, "tn={tn}");
+                assert!(
+                    g.len() > 1,
+                    "a lone tile belongs on the per-tile path (tn={tn})"
+                );
+                next = g.end;
+                total += g.len();
+            }
+            assert_eq!((next, total), (tn, tn));
+        }
+    }
+
+    #[test]
+    fn int8_batch_chain_layout_needs_uniform_programs() {
+        let uniform = [(0usize, 10u32), (10, 10), (20, 10)];
+        // Chaining is opt-in (`ROCKET_BATCH_SUBMIT`), and the gapped slots are the C's.
+        assert_eq!(batch_chain_plan(false, &uniform, 300), None);
+        assert_eq!(batch_chain_plan(true, &uniform, 300), Some(30));
+        // A chain may not need more regcmd BO than the fixed slots it replaces.
+        assert_eq!(batch_chain_plan(true, &uniform, 29), None);
+        // One PC stride cannot describe mixed program lengths.
+        assert_eq!(batch_chain_plan(true, &[(0, 10), (10, 12)], 512), None);
+        // A program longer than a slot is not a state this tiler produces.
+        assert_eq!(batch_chain_plan(true, &[(0, 300), (300, 300)], 4096), None);
+        assert_eq!(batch_chain_plan(true, &[], 0), None);
+    }
+
+    #[test]
+    fn conv_batch_knob_is_read_per_call() {
+        let _guard = crate::knobs::TEST_ENV
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe { std::env::remove_var("ROCKET_CONV_BATCH") };
+        assert!(!conv_batch_enabled(), "the per-tile path is the default");
+        for (v, want) in [
+            ("0", false),
+            ("1", true),
+            ("2", true),
+            ("-1", false),
+            ("junk", false),
+        ] {
+            unsafe { std::env::set_var("ROCKET_CONV_BATCH", v) };
+            assert_eq!(conv_batch_enabled(), want, "ROCKET_CONV_BATCH={v}");
+        }
+        unsafe { std::env::remove_var("ROCKET_CONV_BATCH") };
+        assert!(!conv_batch_enabled());
     }
 }

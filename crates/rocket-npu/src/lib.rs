@@ -172,7 +172,15 @@
 //!   BRDMA and the three-field OUT_CVT), its host model
 //!   [`ops::conv::conv2d_dw_int8_model`] (nearest, ties to even — the DPU's measured
 //!   rule) and the `requant_*` helpers, plus [`ops::conv::ConvContext::conv2d_int8`] /
-//!   `conv2d_dw_int8` and the pure tiler ([`ops::conv::conv_int8_tile_plan`]);
+//!   `conv2d_dw_int8` and the pure tiler ([`ops::conv::conv_int8_tile_plan`]). Its
+//!   opt-in batched submit (`ROCKET_CONV_BATCH=1`, the C's `conv2d_int8_batch_tiles`)
+//!   coalesces a run of tiles into **one** multi-task job — one ioctl, one IOMMU
+//!   attach and one fence wait — with the tiles' programs in
+//!   [`CONV_RC_STRIDE`](ops::conv::CONV_RC_STRIDE)-word slots of one regcmd BO and
+//!   their cubes in bank-aligned slots ([`ops::conv::conv_batch_layout`]); it is
+//!   bit-identical to the per-tile path,
+//!   which stays the default, and its contiguous self-chained variant is gated by
+//!   [`matmul::chain::enabled`] plus uniform program lengths;
 //! - the PPU pooling family ([`ops::pool`], the port of `rocket_pool.c`):
 //!   [`ops::pool::pool_fp16`] / [`ops::pool::pool_ref_fp16`] (MaxPool and
 //!   AveragePool over the `C2 = 8` cube with the `fp16(65536/k)` reciprocal and the
@@ -262,9 +270,7 @@
 //! - the `rocket_ctx_nthreads` helper;
 //! - the RK3576-specific convolution and pooling entries (the part's own conv encoder,
 //!   the packed-image datapath, the int8 pooling entry with its own zero point and the
-//!   prepacked/cube handles), and the int8 convolution's batched (gapped multi-task)
-//!   submit — the C's opt-in `ROCKET_CONV_BATCH`, which is bit-identical to the per-tile
-//!   path this port runs;
+//!   prepacked/cube handles);
 //! - graph execution (the RK3576-only graph runner). The activation + elementwise, the
 //!   reduce + softmax, the transformer/vision norms, the FFN/MLP (including the fused
 //!   entries' cube residency: the projections' full output cubes feed the consumer

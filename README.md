@@ -517,17 +517,33 @@ remaining non-matmul families, the
 activation), the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, the RK3576-specific convolution and pooling
 entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
-entry with its zero point and the prepacked/cube handles), the int8 convolution's
-opt-in `ROCKET_CONV_BATCH` batched submit (bit-identical to the per-tile path this
-port runs), and graph execution (the RK3576-only graph runner).
+entry with its zero point and the prepacked/cube handles), and graph execution (the
+RK3576-only graph runner).
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
 the FFN/MLP (the fused entries are cube-resident: the projections leave their full
 output cubes, the bias/activation run over the cube bytes and the down/fc2 matmul reads
 the product cube directly, so no `[M,I]` intermediate is de-tiled and re-packed), the
 encoder block, the fp16 and int8 convolution families (direct/
-depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant), the
+depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant, and the
+int8 direct conv's opt-in `ROCKET_CONV_BATCH` coalesced multi-task submit), the
 PPU pooling family, the upsample and the two model encoders (SAM ViT-Det and
 SigLIP-B/16) are implemented. See the `rocket-npu` crate docs for the full list.
+
+The int8 direct conv runs one job per independent OC/row/column tile by default.
+`ROCKET_CONV_BATCH=1` instead coalesces a run of tiles (up to 64 per job; larger tilings
+split into groups) into **one** multi-task job: one submit ioctl, one IOMMU attach and one
+fence wait for the whole run, with the tiles' programs in fixed 256-word regcmd slots and
+their feature/weight cubes in bank-aligned slots of one input/weight BO (the spare bank
+after each slot is the zeroed bytes the int8 `C2 = 16` feature DMA over-reads). It is
+bit-identical to the per-tile path (the same tile program against the same cube bytes)
+and, when `ROCKET_BATCH_SUBMIT=1` is also set on a kernel that honors
+`DRM_ROCKET_JOB_BATCHED` *and* every program is the same length, the run also goes
+contiguous and self-chained (one hardware kick). `ROCKET_CONV_BATCH_DEBUG=1` logs the
+layout it chose. Measured on the busy board (cores 0-3, `conv_selftest --int8-batch-ab`,
+medians of 7 interleaved samples per arm, three runs): 128x112x112 k3 oc128 (18 tiles)
+51-56 -> 39-41 ms serial (1.31-1.37x) and 18-23 -> 17.5-17.8 ms on the 3-device pool,
+128x224x224 k3 oc128 (74 tiles, two groups) 192.5 -> 148.4 ms, 32x112x112 k3 (2 tiles)
+5.4-6.8 -> 3.7-4.6 ms, and no change at one tile (the per-tile path is taken).
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and

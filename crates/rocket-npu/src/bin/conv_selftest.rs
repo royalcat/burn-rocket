@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose]
-//!               [--int8] [--int8-dw] [--pool] [--resize] [--all]
+//!               [--int8] [--int8-mt] [--int8-batch-ab] [--int8-dw] [--pool] [--resize]
+//!               [--all]
 //!               [--reps R]
 //!               [--shape IC IH IW OC KH KW [SY SX PT PL DY DX]]
 //!               [--dw-shape C IH IW KH KW [SY SX PT PL DY DX]]
@@ -46,8 +47,9 @@ use half::f16;
 use rocket_npu::Device;
 use rocket_npu::ops::activation::Activation;
 use rocket_npu::ops::conv::{
-    Conv2dDesc, ConvContext, ConvInt8Pool, conv1d, conv2d, conv2d_act, conv2d_dw_int8,
-    conv2d_dw_int8_model, conv2d_int8, conv2d_oh, conv2d_ow, conv2d_ref, conv2d_ref_int8,
+    Conv2dDesc, ConvContext, ConvInt8Pool, conv_int8_tile_plan, conv1d, conv2d, conv2d_act,
+    conv2d_dw_int8, conv2d_dw_int8_model, conv2d_int8, conv2d_oh, conv2d_ow, conv2d_ref,
+    conv2d_ref_int8,
 };
 use rocket_npu::ops::conv_transpose::{
     ConvTranspose2dDesc, conv_transpose2d, conv_transpose2d_oh, conv_transpose2d_ow,
@@ -587,6 +589,143 @@ fn run_int8_mt(dev: &Device, s: ConvShape, workers: usize, reps: usize) -> bool 
         if same { "PASS" } else { "FAIL" }
     );
     same
+}
+
+/// The median of a sample set (the board's variance makes the mean misleading).
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v.get(v.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// `(user + sys)` CPU seconds of this process.
+fn cpu_s() -> f64 {
+    // SAFETY: getrusage fills the zeroed struct on success, which is the only case read.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return 0.0;
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+/// One engine's A/B: the per-tile and batched arms, sampled interleaved (ABBA) with the
+/// median reported, since this board's variance on a busy day is +-30 %.
+///
+/// `run(batch, out)` runs the engine with `ROCKET_CONV_BATCH` already set, and each arm gets
+/// its **own** context: a job zeroes its whole (grown) BO, so a shared context would let
+/// one arm's BO growth change the other's cost.
+fn batch_ab_engine(
+    label: &str,
+    s: ConvShape,
+    ntiles: usize,
+    reps: usize,
+    want: &[i32],
+    run: &mut impl FnMut(bool, &mut [i32]),
+) -> bool {
+    let n_out = want.len();
+    let mut outs = [vec![0i32; n_out], vec![0i32; n_out]];
+    let mut walls = [Vec::new(), Vec::new()];
+    let mut cpus = [Vec::new(), Vec::new()];
+    let mut pass = true;
+    // One untimed run per arm: BO growth, the pool's device contexts, the caches.
+    for out in &mut outs {
+        run(true, out);
+    }
+    for rep in 0..reps {
+        // ABBA: a rep's second sample runs the arms in the other order.
+        let order: [usize; 2] = if rep % 2 == 0 { [0, 1] } else { [1, 0] };
+        for arm in order {
+            let cpu0 = cpu_s();
+            let t0 = Instant::now();
+            run(arm == 1, &mut outs[arm]);
+            walls[arm].push(t0.elapsed().as_secs_f64() * 1000.0);
+            cpus[arm].push(cpu_s() - cpu0);
+        }
+    }
+    let exact = outs[0].iter().zip(&outs[1]).filter(|(a, b)| a == b).count();
+    let ref_ok = outs.iter().all(|o| o.iter().zip(want).all(|(a, b)| a == b));
+    let same = exact == n_out;
+    pass &= same && ref_ok;
+    let tile_ms = median(walls[0].clone());
+    let batch_ms = median(walls[1].clone());
+    println!(
+        "  {:<32} tiles={:<3} tile {tile_ms:7.2} ms / {c0:7.2} cpu   \
+         batch {batch_ms:7.2} ms / {c1:7.2} cpu   {ratio:5.2}x  exact={exact}/{n_out} \
+         ref={}  -> {}",
+        format!("int8 batch ab {label} {}x{}x{} oc{}", s.0, s.1, s.2, s.3),
+        ntiles,
+        if ref_ok { "ok" } else { "MISMATCH" },
+        if same && ref_ok { "PASS" } else { "FAIL" },
+        c0 = median(cpus[0].clone()) * 1000.0,
+        c1 = median(cpus[1].clone()) * 1000.0,
+        ratio = tile_ms / batch_ms,
+    );
+    pass
+}
+
+/// `ROCKET_CONV_BATCH` A/B: the same conv through the per-tile jobs and through one
+/// coalesced multi-task job, on the serial entry and on the pool.
+///
+/// The two arms must be **bit-identical** — each tile runs the same program against the
+/// same cube bytes, only the submit is coalesced — and both must match the int64
+/// reference. The wall/CPU ratio is the point of the knob. A single-tile conv exercises
+/// the fallback: there is nothing to coalesce, so both arms take the per-tile path.
+fn run_int8_batch_ab(dev: &Device, s: ConvShape, workers: usize, reps: usize) -> bool {
+    let d = conv_desc(s);
+    let (oh, ow) = (conv2d_oh(&d), conv2d_ow(&d));
+    let n_in = d.ic * d.ih * d.iw;
+    let n_w = d.oc * d.ic * d.kh * d.kw;
+    let n_out = d.oc * oh * ow;
+    let input = fill_i8(n_in, 0xB1 + (n_in % 9973) as u32);
+    let w = fill_i8(n_w, 0xB2 + (n_w % 9973) as u32);
+    let mut want = vec![0i32; n_out];
+    conv2d_ref_int8(&d, &input, &w, &mut want);
+    let ntiles = conv_int8_tile_plan(&d).map(|p| p.count(&d)).unwrap_or(1);
+
+    let saved = std::env::var_os("ROCKET_CONV_BATCH");
+    let mut pass = true;
+    let mut serial: [ConvContext; 2] = [ConvContext::new(dev), ConvContext::new(dev)];
+    let mut pools: [Option<ConvInt8Pool>; 2] = [None, None];
+    for (arm, pool) in pools.iter_mut().enumerate() {
+        *pool = match ConvInt8Pool::new(workers) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                if arm == 0 {
+                    println!("  int8 batch ab pool: {e}");
+                }
+                None
+            }
+        };
+    }
+
+    // The knob is read per call, so each sample sets it for its own arm (the C caches it;
+    // this port does not). SAFETY: the arms run one at a time between device calls.
+    let arm = |batch: bool| unsafe {
+        std::env::set_var("ROCKET_CONV_BATCH", if batch { "1" } else { "0" });
+    };
+    // The serial arm allocates a fresh context per call in normal use; here each arm keeps
+    // its own resident one so the comparison isolates the submit.
+    let mut run_serial = |batch: bool, out: &mut [i32]| {
+        arm(batch);
+        let ctx = &mut serial[usize::from(batch)];
+        let _ = ctx.conv2d_int8(&d, &input, &w, out);
+    };
+    pass &= batch_ab_engine("serial", s, ntiles, reps, &want, &mut run_serial);
+
+    if pools[0].is_some() {
+        let mut run_pool = |batch: bool, out: &mut [i32]| {
+            arm(batch);
+            let pool = pools[usize::from(batch)].as_mut().expect("pool");
+            let _ = pool.conv2d(&d, &input, &w, out);
+        };
+        pass &= batch_ab_engine("pool", s, ntiles, reps, &want, &mut run_pool);
+    }
+
+    match saved {
+        Some(v) => unsafe { std::env::set_var("ROCKET_CONV_BATCH", v) },
+        None => unsafe { std::env::remove_var("ROCKET_CONV_BATCH") },
+    }
+    pass
 }
 
 // ── int8 depthwise (int8-out, on-chip requant) ────────────────────────────────
@@ -1168,7 +1307,8 @@ fn io_mode(dev: &Device, args: &[String]) -> Result<(), String> {
 fn usage() {
     eprintln!(
         "usage: conv_selftest [--conv] [--dw] [--act] [--conv1d] [--transpose]\n\
-         \x20      [--int8] [--int8-mt] [--int8-dw] [--pool] [--resize] [--all] [--reps R]\n\
+         \x20      [--int8] [--int8-mt] [--int8-batch-ab] [--int8-dw] [--pool] [--resize]\n\
+         \x20      [--all] [--reps R]\n\
          \x20      [--shape IC IH IW OC KH KW [SY SX PT PL DY DX]]\n\
          \x20      [--dw-shape C IH IW KH KW [SY SX PT PL DY DX]]\n\
          \x20      [--conv1d-shape IC IT OC KW STRIDE PAD]\n\
@@ -1183,6 +1323,8 @@ fn usage() {
          Transpose: deconv (stride 2/4), lowered (IC % 32, stride 2/4/8, opad),\n\
          depthwise, and opad 0/1.\n\
          int8: 3x3/1x1, IC 3/32/64, OC 16/32/64, stride 1/2, pad 0/1, spatial tiling.\n\
+         int8 batch ab: ROCKET_CONV_BATCH=0 vs 1 per shape (serial and pool), which must\n\
+         be bit-identical.\n\
          int8 depthwise: C 32/64/96, 3x3, stride 1/2, zero points at both ends, bias.\n\
          pool: fp16 max/avg at pads 0/1 plus int8/uint8 max/avg.\n\
          resize: nearest and bilinear at scales 2/3/4.\n\
@@ -1226,6 +1368,7 @@ fn main() -> ExitCode {
     let (mut conv, mut dw, mut act, mut c1d, mut tr) = (false, false, false, false, false);
     let (mut i8, mut i8dw, mut pool, mut resize) = (false, false, false, false);
     let mut i8mt = false;
+    let mut i8batch = false;
     let mut all = args.is_empty();
     let mut reps = 1usize;
     let mut conv_shape: Option<ConvShape> = None;
@@ -1245,6 +1388,7 @@ fn main() -> ExitCode {
             "--int8" => i8 = true,
             "--int8-dw" => i8dw = true,
             "--int8-mt" => i8mt = true,
+            "--int8-batch-ab" => i8batch = true,
             "--pool" => pool = true,
             "--resize" => resize = true,
             "--all" => all = true,
@@ -1328,8 +1472,11 @@ fn main() -> ExitCode {
         (conv, dw, act, c1d, tr) = (true, true, true, true, true);
         (i8, i8dw, pool, resize) = (true, true, true, true);
         i8mt = true;
+        i8batch = true;
     }
-    if io.is_none() && !(conv || dw || act || c1d || tr || i8 || i8dw || pool || resize || i8mt) {
+    if io.is_none()
+        && !(conv || dw || act || c1d || tr || i8 || i8dw || pool || resize || i8mt || i8batch)
+    {
         usage();
         return ExitCode::FAILURE;
     }
@@ -1489,6 +1636,27 @@ fn main() -> ExitCode {
         };
         for s in shapes {
             pass &= run_int8_mt(&dev, s, 3, reps);
+        }
+        println!();
+    }
+    if i8batch {
+        println!("int8 direct conv, ROCKET_CONV_BATCH A/B (per-tile vs one multi-task job):");
+        let shapes = match conv_shape {
+            Some(s) => vec![s],
+            None => vec![
+                // The default matrix's multi-tile shapes plus the OC-tiled ones, and a
+                // fast-path shape (a single job, so nothing to coalesce: the fallback).
+                (64, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1),
+                (128, 28, 28, 128, 3, 3, 2, 2, 1, 1, 1, 1),
+                (32, 112, 112, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+                // 2 OC groups x 9 row bands: 18 tiles, so the pool gets 9 per worker and
+                // the serial arm one 18-task group.
+                (128, 112, 112, 128, 3, 3, 1, 1, 1, 1, 1, 1),
+                (32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 1, 1),
+            ],
+        };
+        for s in shapes {
+            pass &= run_int8_batch_ab(&dev, s, 3, reps);
         }
         println!();
     }
