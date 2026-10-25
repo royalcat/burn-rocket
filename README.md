@@ -104,10 +104,11 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   (weights / matmul BO+host / attention BO+host).
 
 - **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
-  `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention`, `f16` helpers,
-  driver/counter helpers) for callers that do not want Burn tensor routing. The
-  `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old surface. See
-  `examples/probe.rs` for a runnable smoke test.
+  `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention` and its stateless
+  `flash_attn`/`flash_attn_mt`/`flash_attn_ref`/`mha_self`/`mha_self_ref` siblings,
+  `f16` helpers, driver/counter helpers) for callers that do not want Burn tensor
+  routing. The `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old
+  surface. See `examples/probe.rs` for a runnable smoke test.
 
 The ops are **inference-only**: the extension macro generates no autodiff and calling
 them with an autodiff context panics inside Burn. The driver contexts are not
@@ -165,14 +166,17 @@ are at or above the C library's speed.
 fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
 and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
 both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
-the tf32 one-shot and its planner, masked
-GQA attention with chained per-head QK/AV batching, the device/BO/submit primitives
-(including multi-job submit and the opt-in chained layout), and the dtype parity
-harness (`tools/c-oracle` + `parity.py`).
+the tf32 one-shot and its planner, masked GQA attention (the persistent
+`attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
+the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching, the
+two f64 host oracles (`flash_attn_ref`, `mha_self_ref`), the device/BO/submit
+primitives (including multi-job submit and the opt-in chained layout), and the dtype
+parity harness (`tools/c-oracle` + `parity.py`).
 
 Not exposed yet: resident bf16 (the C library has no variant either, and it has none
-for tf32 either — that surface is complete), `mha_self`, the `*_ref` host references,
-the `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*`
+for tf32 either — that surface is complete), the `*_ref_fp16` host references of the
+non-matmul families, the
+`_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*`
 aliases, the non-fp16 batch wrappers, the long-context tiled attention path, on-NPU
 softmax, and every non-matmul op family (conv, pool, activation, norm, FFN, softmax,
 reduce, resize, encoders, graph). See the `rocket-npu` crate docs for the full list.

@@ -1,78 +1,39 @@
-//! On-device attention self-test against an f64 reference, plus the chained-batch A/B.
+//! On-device attention self-tests: the stateless entries against the f64 host
+//! reference, the encoder `mha_self` pair, and the chained-batch A/B.
 //!
 //! Usage: `attn_selftest [tokens] [kv] [heads] [kv_heads] [--dk N] [--dv N]
-//! [--chain 0|1] [--reps N] [--ref 0|1]`
+//! [--chain 0|1] [--reps N] [--ref 0|1] [--mem] [--oneshot] [--mt N] [--mha]
+//! [--softcap F] [--mask none|causal|window]`
 //!
 //! `ROCKET_FA_CHAIN` (the `--chain` flag) selects the per-head path (`0`) or the chained
-//! group batching (`1`). With no `--chain` the test runs BOTH — interleaved, so a drifting
-//! board cannot bias one mode — and asserts the outputs are bit-identical (the M1d
-//! contract), reporting the median wall and CPU time of each. `--dk`/`--dv` pick the head
-//! geometry (default 128/128; the embedding model's vision tower is 64/64 at 2394
-//! patches).
+//! group batching (`1`). With no `--chain` the default mode runs BOTH — interleaved, so
+//! a drifting board cannot bias one mode — and asserts the outputs are bit-identical
+//! (the M1d contract), reporting the median wall and CPU time of each.
+//!
+//! `--oneshot` instead runs the stateless entries (`rocket_flash_attn_fp16` and its
+//! `_mt` fan-out, one context per call) and compares both with
+//! [`flash_attn_ref`](rocket_npu::attn::flash_attn_ref), asserting the fan-out is
+//! bit-identical to the single-fd call. `--mha` runs the encoder composition
+//! (`rocket_mha_self_fp16`, with `d = dk * heads`) against its f64 reference and
+//! asserts the `nthreads` projection fan-out changes no bits. Both flags may be given
+//! together; either one replaces the chained-batch bench.
+//!
+//! `--dk`/`--dv` pick the head geometry (default 128/128; the embedding model's vision
+//! tower is 64/64 at 2394 patches). `--softcap` and `--mask` pick the score post-
+//! processing (`window` is a bidirectional band of `tokens/8` keys).
 
 use std::time::Instant;
 
 use half::f16;
-use rocket_npu::attn::Attention;
+use rocket_npu::attn::{
+    Attention, flash_attn, flash_attn_mt, flash_attn_ref, mha_self, mha_self_ref,
+};
 
 fn rnd(seed: &mut u64) -> f16 {
     *seed ^= *seed << 13;
     *seed ^= *seed >> 7;
     *seed ^= *seed << 17;
     f16::from_f32(((*seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ref_attn(
-    t: usize,
-    kv: usize,
-    dk: usize,
-    dv: usize,
-    h: usize,
-    hkv: usize,
-    scale: f32,
-    q: &[f16],
-    k: &[f16],
-    v: &[f16],
-    mask: Option<&[f16]>,
-) -> Vec<f64> {
-    let gqa = h / hkv;
-    let mut out = vec![0.0f64; h * t * dv];
-    for head in 0..h {
-        let hk = head / gqa;
-        for row in 0..t {
-            let mut sc = vec![0.0f64; kv];
-            let mut mx = f64::NEG_INFINITY;
-            for j in 0..kv {
-                let mut s = 0.0f64;
-                for c in 0..dk {
-                    s += q[(head * t + row) * dk + c].to_f64() * k[(hk * kv + j) * dk + c].to_f64();
-                }
-                let mut s = (s as f32) * scale;
-                if let Some(m) = mask {
-                    s += m[row * kv + j].to_f32();
-                }
-                if s < -30000.0 {
-                    s = -30000.0;
-                }
-                sc[j] = s as f64;
-                mx = mx.max(sc[j]);
-            }
-            let mut sum = 0.0f64;
-            for x in &mut sc {
-                *x = (*x - mx).exp();
-                sum += *x;
-            }
-            for c in 0..dv {
-                let mut a = 0.0f64;
-                for j in 0..kv {
-                    a += sc[j] * v[(hk * dv + c) * kv + j].to_f64();
-                }
-                out[(head * t + row) * dv + c] = a / sum;
-            }
-        }
-    }
-    out
 }
 
 /// `(user + sys)` CPU seconds of this process.
@@ -91,11 +52,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     v.get(v.len() / 2).copied().unwrap_or(0.0)
 }
 
-/// Cosine and max abs deviation against the f64 reference.
-fn compare(got: &[f16], want: &[f64]) -> (f64, f64) {
+/// Cosine and max abs deviation of two f16 matrices.
+fn compare(got: &[f16], want: &[f16]) -> (f64, f64) {
     let (mut dot, mut na, mut nb, mut max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (g, w) in got.iter().zip(want) {
-        let g = g.to_f64();
+        let (g, w) = (g.to_f64(), w.to_f64());
         dot += g * w;
         na += g * g;
         nb += w * w;
@@ -104,7 +65,29 @@ fn compare(got: &[f16], want: &[f64]) -> (f64, f64) {
     (dot / (na.sqrt() * nb.sqrt()), max)
 }
 
-/// One attention call with the test's fixed arguments (softcap 0, the causal mask).
+/// `(differing elements, max |difference|)` by f16 bit pattern.
+fn bit_diff(a: &[f16], b: &[f16]) -> (usize, f32) {
+    let diff = a
+        .iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count();
+    let max = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| (x.to_f32() - y.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    (diff, max)
+}
+
+fn verdict(diff: usize, total: usize, max: f32) -> String {
+    format!(
+        "{} ({diff} differing of {total}, max_abs {max:.6})",
+        if diff == 0 { "YES" } else { "NO" }
+    )
+}
+
+/// One attention call with the test's fixed arguments.
 struct Case<'a> {
     t: usize,
     kv: usize,
@@ -113,13 +96,18 @@ struct Case<'a> {
     heads: usize,
     hkv: usize,
     scale: f32,
+    softcap: f32,
     q: &'a [f16],
     k: &'a [f16],
     v: &'a [f16],
-    mask: &'a [f16],
+    mask: Option<&'a [f16]>,
 }
 
 impl Case<'_> {
+    fn out_len(&self) -> usize {
+        self.heads * self.t * self.dv
+    }
+
     fn run(&self, attn: &mut Attention, out: &mut [f16]) -> rocket_npu::Result<()> {
         attn.flash(
             self.t,
@@ -129,14 +117,261 @@ impl Case<'_> {
             self.heads,
             self.hkv,
             self.scale,
-            0.0,
+            self.softcap,
             self.q,
             self.k,
             self.v,
-            Some(self.mask),
+            self.mask,
             out,
         )
     }
+
+    fn run_oneshot(&self, out: &mut [f16]) -> rocket_npu::Result<()> {
+        flash_attn(
+            self.t,
+            self.kv,
+            self.dk,
+            self.dv,
+            self.heads,
+            self.hkv,
+            self.scale,
+            self.softcap,
+            self.q,
+            self.k,
+            self.v,
+            self.mask,
+            out,
+        )
+    }
+
+    fn run_mt(&self, out: &mut [f16], threads: usize) -> rocket_npu::Result<()> {
+        flash_attn_mt(
+            self.t,
+            self.kv,
+            self.dk,
+            self.dv,
+            self.heads,
+            self.hkv,
+            self.scale,
+            self.softcap,
+            self.q,
+            self.k,
+            self.v,
+            self.mask,
+            out,
+            threads,
+        )
+    }
+
+    fn reference(&self) -> rocket_npu::Result<Vec<f16>> {
+        let mut out = vec![f16::ZERO; self.out_len()];
+        flash_attn_ref(
+            self.t,
+            self.kv,
+            self.dk,
+            self.dv,
+            self.heads,
+            self.hkv,
+            self.scale,
+            self.softcap,
+            self.q,
+            self.k,
+            self.v,
+            self.mask,
+            &mut out,
+        )?;
+        Ok(out)
+    }
+}
+
+/// The stateless entries: single fd, the head fan-out, and both against the reference.
+fn oneshot_block(
+    case: &Case,
+    want: Option<&[f16]>,
+    threads: usize,
+    reps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A row the mask empties is uniform over the *padded* key count on the device, so it
+    // reads n_kv/Kn of the unpadded reference (the C behaviour). Say so when it happens,
+    // instead of letting it look like a numerics failure.
+    if let Some(mask) = case.mask {
+        let empty = rocket_npu::attn::fully_masked_rows(mask, case.t, case.kv);
+        if empty > 0 {
+            let kn = case.kv.div_ceil(32) * 32;
+            println!(
+                "note: {empty} of {} rows are fully masked; the device spreads them over \
+                 Kn={kn} columns (V=0 there), so those rows are {:.4}x the reference",
+                case.t,
+                case.kv as f64 / kn as f64
+            );
+        }
+    }
+    let (mut one, mut many) = (
+        vec![f16::ZERO; case.out_len()],
+        vec![f16::ZERO; case.out_len()],
+    );
+    // Warm both (opens the worker fds, sizes the scratch) before timing.
+    case.run_oneshot(&mut one)?;
+    case.run_mt(&mut many, threads)?;
+    let (mut w1, mut wm, mut c1, mut cm) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..reps {
+        let cpu = cpu_s();
+        let t0 = Instant::now();
+        case.run_oneshot(&mut one)?;
+        w1.push(t0.elapsed().as_secs_f64() * 1e3);
+        c1.push((cpu_s() - cpu) * 1e3);
+
+        let cpu = cpu_s();
+        let t0 = Instant::now();
+        case.run_mt(&mut many, threads)?;
+        wm.push(t0.elapsed().as_secs_f64() * 1e3);
+        cm.push((cpu_s() - cpu) * 1e3);
+    }
+    for (label, out, walls, cpus) in [("single-fd", &one, &w1, &c1), ("mt", &many, &wm, &cm)] {
+        let head = if label == "mt" {
+            format!("mt({threads})")
+        } else {
+            label.to_string()
+        };
+        println!(
+            "oneshot {head:<10}: wall {:9.2} ms  cpu {:9.2} ms  (median of {reps})",
+            median(walls.clone()),
+            median(cpus.clone())
+        );
+        if let Some(want) = want {
+            let (cos, max) = compare(out, want);
+            println!("                         cosine {cos:.8} max_abs {max:.6}");
+        }
+    }
+    let (diff, max) = bit_diff(&one, &many);
+    println!(
+        "oneshot bit-identical single-fd vs mt: {}",
+        verdict(diff, one.len(), max)
+    );
+    if diff != 0 {
+        return Err("flash_attn_mt is not bit-identical to flash_attn".into());
+    }
+    Ok(())
+}
+
+/// The encoder composition: `mha_self` with one and with `threads` projection workers,
+/// both against the f64 reference.
+fn mha_block(
+    t: usize,
+    dh: usize,
+    heads: usize,
+    threads: usize,
+    reps: usize,
+    force_ref: Option<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let d = dh * heads;
+    println!("mha_self T={t} d={d} n_head={heads} dh={dh} threads={threads}");
+    let mut seed = 0x005e_ed0f_0a7e_5713_u64;
+    let x: Vec<f16> = (0..t * d).map(|_| rnd(&mut seed)).collect();
+    let mat = |n: usize, seed: &mut u64| -> Vec<f16> { (0..n).map(|_| rnd(seed)).collect() };
+    let (wq, wk, wv, wo) = (
+        mat(d * d, &mut seed),
+        mat(d * d, &mut seed),
+        mat(d * d, &mut seed),
+        mat(d * d, &mut seed),
+    );
+    // The C's Whisper case: bq, bv and bo present, bk NULL.
+    let (bq, bv, bo) = (mat(d, &mut seed), mat(d, &mut seed), mat(d, &mut seed));
+
+    // The f64 oracle is O(4·T·d² + 2·n_head·T²·dh); skip it when it would dominate.
+    let work = 4.0 * t as f64 * (d * d) as f64 + 2.0 * heads as f64 * (t * t * dh) as f64;
+    let do_ref = force_ref.unwrap_or(work <= 2e9);
+    let want = if do_ref {
+        let t0 = Instant::now();
+        let mut want = vec![f16::ZERO; t * d];
+        mha_self_ref(
+            t,
+            d,
+            heads,
+            &x,
+            &wq,
+            Some(&bq),
+            &wk,
+            None,
+            &wv,
+            Some(&bv),
+            &wo,
+            Some(&bo),
+            &mut want,
+        )?;
+        println!(
+            "mha_self_ref     : wall {:9.2} ms",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Some(want)
+    } else {
+        println!("mha_self_ref     : skipped ({work:.1e} MACs; --ref 1 forces it)");
+        None
+    };
+
+    let mut outs = [vec![f16::ZERO; t * d], vec![f16::ZERO; t * d]];
+    let threads_of = [1usize, threads];
+    // Warm both (packs the projections once, sizes the scratch).
+    for (o, &n) in outs.iter_mut().zip(&threads_of) {
+        mha_self(
+            t,
+            d,
+            heads,
+            &x,
+            &wq,
+            Some(&bq),
+            &wk,
+            None,
+            &wv,
+            Some(&bv),
+            &wo,
+            Some(&bo),
+            o,
+            n,
+        )?;
+    }
+    let mut walls = vec![Vec::new(); 2];
+    for _ in 0..reps {
+        for (i, (o, &n)) in outs.iter_mut().zip(&threads_of).enumerate() {
+            let t0 = Instant::now();
+            mha_self(
+                t,
+                d,
+                heads,
+                &x,
+                &wq,
+                Some(&bq),
+                &wk,
+                None,
+                &wv,
+                Some(&bv),
+                &wo,
+                Some(&bo),
+                o,
+                n,
+            )?;
+            walls[i].push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    for (i, &n) in threads_of.iter().enumerate() {
+        println!(
+            "mha_self(threads={n:<2}): wall {:9.2} ms  (median of {reps})",
+            median(walls[i].clone())
+        );
+        if let Some(want) = &want {
+            let (cos, max) = compare(&outs[i], want);
+            println!("                    cosine {cos:.8} max_abs {max:.6}");
+        }
+    }
+    let (diff, max) = bit_diff(&outs[0], &outs[1]);
+    println!(
+        "mha_self bit-identical threads=1 vs {threads}: {}",
+        verdict(diff, outs[0].len(), max)
+    );
+    if diff != 0 {
+        return Err("mha_self with a projection fan-out is not bit-identical".into());
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -148,6 +383,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut reps = 3usize;
     let mut want_ref: Option<bool> = None;
     let mut mem = false;
+    let mut oneshot = false;
+    let mut mha = false;
+    let mut threads = 4usize;
+    let mut softcap = 0.0f32;
+    let mut mask_kind = "causal".to_string();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
@@ -165,10 +405,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--reps" => reps = value()?.parse::<usize>()?.max(1),
             "--ref" => want_ref = Some(value()?.trim() != "0"),
             "--mem" => mem = true,
+            "--oneshot" => oneshot = true,
+            "--mha" => mha = true,
+            "--mt" => threads = value()?.parse::<usize>()?.max(1),
+            "--softcap" => softcap = value()?.parse()?,
+            "--mask" => mask_kind = value()?,
             "--help" | "-h" => {
                 println!(
                     "usage: attn_selftest [tokens] [kv] [heads] [kv_heads] \
-                     [--dk N] [--dv N] [--chain 0|1] [--reps N] [--ref 0|1] [--mem]"
+                     [--dk N] [--dv N] [--chain 0|1] [--reps N] [--ref 0|1] [--mem] \
+                     [--oneshot] [--mt N] [--mha] [--softcap F] [--mask none|causal|window]"
                 );
                 return Ok(());
             }
@@ -190,20 +436,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dv = dk;
     }
     let scale = 1.0 / (dk as f32).sqrt();
-    println!("attn T={t} kv={kv} heads={heads} kv_heads={hkv} dk={dk} dv={dv} reps={reps}");
+    println!(
+        "attn T={t} kv={kv} heads={heads} kv_heads={hkv} dk={dk} dv={dv} reps={reps} \
+         mask={mask_kind} softcap={softcap}"
+    );
 
     let mut seed = 0xdead_beef_1234_5678u64;
     let q: Vec<f16> = (0..heads * t * dk).map(|_| rnd(&mut seed)).collect();
     let k: Vec<f16> = (0..hkv * kv * dk).map(|_| rnd(&mut seed)).collect();
     let v: Vec<f16> = (0..hkv * dv * kv).map(|_| rnd(&mut seed)).collect();
-    let mut mask = vec![f16::ZERO; t * kv];
-    for row in 0..t {
-        for j in 0..kv {
-            if j > row {
-                mask[row * kv + j] = f16::NEG_INFINITY;
+    let mask: Option<Vec<f16>> = match mask_kind.as_str() {
+        "none" => None,
+        // Causal: key j is visible to row i iff j <= i.
+        "causal" => {
+            let mut m = vec![f16::ZERO; t * kv];
+            for row in 0..t {
+                for j in 0..kv {
+                    if j > row {
+                        m[row * kv + j] = f16::NEG_INFINITY;
+                    }
+                }
             }
+            Some(m)
         }
-    }
+        // A bidirectional band of t/8 keys (the sliding-layer shape).
+        "window" => {
+            let w = (t / 8).max(1) as i64;
+            let mut m = vec![f16::ZERO; t * kv];
+            for row in 0..t {
+                for j in 0..kv {
+                    if (j as i64 - row as i64).abs() > w {
+                        m[row * kv + j] = f16::NEG_INFINITY;
+                    }
+                }
+            }
+            Some(m)
+        }
+        other => return Err(format!("--mask {other}: expected none|causal|window").into()),
+    };
     let case = Case {
         t,
         kv,
@@ -212,42 +482,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         heads,
         hkv,
         scale,
+        softcap,
         q: &q,
         k: &k,
         v: &v,
-        mask: &mask,
+        mask: mask.as_deref(),
     };
 
     // The f64 oracle is O(heads * t * kv * dk); skip it when it would dominate the run
     // (the chained A/B does not need it).
     let ref_work = (heads * t * kv * dk) as f64;
     let do_ref = want_ref.unwrap_or(ref_work <= 2e9);
-    if !do_ref {
-        println!("reference: skipped ({ref_work:.1e} MACs; --ref 1 forces it)");
-    }
     let want = if do_ref {
-        Some(ref_attn(
-            t,
-            kv,
-            dk,
-            dv,
-            heads,
-            hkv,
-            scale,
-            &q,
-            &k,
-            &v,
-            Some(&mask),
-        ))
+        Some(case.reference()?)
     } else {
+        println!("reference: skipped ({ref_work:.1e} MACs; --ref 1 forces it)");
         None
     };
 
-    let threads = std::env::var("ROCKET_THREADS")
+    if oneshot {
+        oneshot_block(&case, want.as_deref(), threads, reps)?;
+    }
+    if mha {
+        mha_block(t, dk, heads, threads, reps, want_ref)?;
+    }
+    if oneshot || mha {
+        return Ok(());
+    }
+
+    let attn_threads = std::env::var("ROCKET_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    let mut attn = Attention::new(threads)?;
+    let mut attn = Attention::new(attn_threads)?;
     let modes: Vec<bool> = match chain {
         Some(c) => vec![c],
         None => vec![false, true],
@@ -258,7 +525,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // interleave the timed reps so a drifting board hits both modes alike.
     let mut outs: Vec<Vec<f16>> = modes
         .iter()
-        .map(|_| vec![f16::ZERO; heads * t * dv])
+        .map(|_| vec![f16::ZERO; case.out_len()])
         .collect();
     let mut walls: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
     let mut cpus: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
@@ -291,21 +558,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if modes.len() == 2 {
         let (per_head, chained) = (&outs[0], &outs[1]);
-        let diff = per_head
-            .iter()
-            .zip(chained)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        let max = per_head
-            .iter()
-            .zip(chained)
-            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-            .fold(0.0f32, f32::max);
-        println!(
-            "bit-identical: {} ({diff} differing of {}, max_abs {max:.6})",
-            if diff == 0 { "YES" } else { "NO" },
-            per_head.len()
-        );
+        let (diff, max) = bit_diff(per_head, chained);
+        println!("bit-identical: {}", verdict(diff, per_head.len(), max));
         let ratio = |v: &[Vec<f64>]| {
             let (a, b) = (median(v[0].clone()), median(v[1].clone()));
             (a, b, if b > 0.0 { a / b } else { 0.0 })
@@ -335,12 +589,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             heads,
             hkv,
             scale,
+            softcap,
             q: &q3,
             k: &k3,
             v: &v3,
-            mask: &mask3,
+            mask: Some(&mask3),
         };
-        let mut out3 = vec![f16::ZERO; heads * t3 * dv];
+        let mut out3 = vec![f16::ZERO; tiny.out_len()];
         tiny.run(&mut attn, &mut out3)?;
         report_mem(&attn, "after a 3-token request, before trim");
         attn.trim_scratch();

@@ -70,13 +70,17 @@
 //! - the `rocket_weights_bytes`/`rocket_i8_weights_bytes` footprint helpers and
 //!   `rocket_pad_m` ([`matmul::pad_m`]);
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
-//!   ([`attn::Attention`]); the host softmax has a fast branch-free `exp` path
-//!   ([`attn::Softmax`]) and keeps the original scalar one behind
-//!   `SOFTMAX_EXACT=1`. Each worker batches its per-head QK and AV matmuls into one
-//!   [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of the C
-//!   `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a shape
-//!   that needs more than one fp16 K-accumulation tile stays on the per-head path so
-//!   the two remain bit-identical);
+//!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
+//!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
+//!   [`attn::flash_attn_mt`] (the `_mt` head fan-out); the device-free f64 oracles
+//!   [`attn::flash_attn_ref`] and [`attn::mha_self_ref`]; and the encoder sublayer
+//!   [`attn::mha_self`] (`rocket_mha_self_fp16`). The host softmax has a fast
+//!   branch-free `exp` path ([`attn::Softmax`]) and keeps the original scalar one
+//!   behind `SOFTMAX_EXACT=1`. Each worker batches its per-head QK and AV matmuls into
+//!   one [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of
+//!   the C `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a
+//!   shape that needs more than one fp16 K-accumulation tile stays on the per-head path
+//!   so the two remain bit-identical);
 //!
 //! Missing (no API in this crate yet; callers get a compile error, not a silent
 //! wrong result):
@@ -84,8 +88,9 @@
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
 //! - a resident bf16 weight (the C library has none either);
-//! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
-//!   transposed-output variants, and the RK3576-specific entries;
+//! - the `*_ref_fp16` host references of the non-matmul op families (the matmul and
+//!   attention ones are ported), the `_planes` and transposed-output variants, and the
+//!   RK3576-specific entries;
 //! - the non-fp16 batch wrappers (`rocket_mm_batch_*` for int8/int4);
 //! - chaining outside the fp16 CPU-accumulation and batched paths: the KACC submit loop
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves

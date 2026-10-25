@@ -35,7 +35,7 @@ use half::f16;
 use crate::knobs;
 
 /// Scores at or below this clamp to it (the C library's `-30000` padding key).
-const PAD_KEY_SCORE: f32 = -30000.0;
+pub(crate) const PAD_KEY_SCORE: f32 = -30000.0;
 
 /// `1 / ln 2`: `exp(x) = 2^(x·LOG2E)`.
 const LOG2E: f32 = std::f32::consts::LOG2_E;

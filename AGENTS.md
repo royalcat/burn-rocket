@@ -376,12 +376,32 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   cut the score pass 4.3× (log-gemma §19); EmbeddingGemma 2's vision tower runs its
   attention on the NPU by default under `--npu` (S2, §20). End-to-end: qwen3
   3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
+  **M5a one-shot / reference entries** (2026-10-25): the C library's stateless
+  attention entries are wired too — `attn::flash_attn` (`rocket_flash_attn_fp16`),
+  `attn::flash_attn_mt` (the `_mt` head fan-out, bit-identical to single-fd; it pays
+  the whole context setup per call, so at 64-257 keys one fd is faster (T=257: 65-69 ms
+  vs 74-115 ms) and it only wins at long context: 2394 keys 0.80 vs 1.01 s, 1.27×,
+  CPU 1260 vs 690 ms — the workers wait on the shared NPU), the device-free f64 oracles
+  `attn::flash_attn_ref` / `attn::mha_self_ref`, and the encoder sublayer
+  `attn::mha_self` (`rocket_mha_self_fp16`, `Tp`/`Tn` padding + host softmax; its
+  `nthreads` fans the q/k/v projections and the head ranges out without splitting any
+  matmul, so it is bit-identical to `nthreads = 1`: T=257 d=1024 150 vs 557 ms, 3.7×;
+  T=82 d=512 23 vs 54 ms, 2.4×). `fully_masked_rows` marks the one padding artefact
+  inherited from C: a query row the mask empties is uniform over `Kn` on the device but
+  over `n_kv` in the reference, so it reads `n_kv/Kn` (causal masks never empty a row;
+  a band mask over a shorter key axis can).
+  Board (`attn_selftest --oneshot`/`--mha`, cores 0-3, busy board): flash cosine
+  0.99999989-0.99999996 vs the ref (vision 2394/64d, T=257 GQA 8/2 causal+causal-cross+
+  band, softcap 0-50, T=64), zero differing bits single-fd vs mt everywhere; mha_self
+  0.99999927 (d=512, T=82) / 0.99999812 (d=1024, T=257) vs its f64 ref. Deviations
+  from C: host (fast) softmax both places, and the scores stay f32 between matmul and
+  softmax instead of round-tripping f16.
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
-  therefore complete), `mha_self`, `*_ref` host references, `_planes`/transposed
-  variants, RK3576 entries, the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, tiled long-context attention, on-NPU softmax, and all non-matmul op
-  families.
+  therefore complete), the `*_ref_fp16` host references of the *non-matmul* families,
+  `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
+  the non-fp16 batch wrappers, tiled long-context attention, on-NPU softmax, and all
+  non-matmul op families.
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -401,7 +421,7 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype), the `parity.py` dtype parity harness, and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference) |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1102,6 +1122,15 @@ cd /root/rocket-inference
 #   inputs (no args = the built-in shape list: tiny, medium, ragged M/N, K > Kt,
 #   and the padded M == 1 shim).  Shape args are M K N (int8: M K N GROUP; the
 #   int4 group is the flag argument).
+#   attention (attn_selftest): the default runs the chained-vs-per-head A/B and
+#   asserts bit-identity; --oneshot compares flash_attn / flash_attn_mt with
+#   flash_attn_ref and asserts single-fd == mt; --mha does the same for
+#   mha_self vs mha_self_ref at d = --dk * heads. --mask none|causal|window,
+#   --softcap F, --mt N and --ref 0|1 pick the case (the f64 oracle auto-skips
+#   above 2e9 MACs).
+taskset -c 0-3 ./attn_selftest 257 257 8 2 --oneshot --mt 4 --mask causal --softcap 30
+taskset -c 0-3 ./attn_selftest 2394 2394 12 12 --dk 64 --dv 64 --mask none --oneshot --ref 1
+taskset -c 0-3 ./attn_selftest 82 82 8 8 --dk 64 --mha --mt 2
 taskset -c 0-3 ./int8_selftest --dense 264 320 288
 taskset -c 0-3 ./int8_selftest --gw-one-shot 512 1024 512 32
 taskset -c 0-3 ./int4_selftest 64 256 128

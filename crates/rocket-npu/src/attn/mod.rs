@@ -8,6 +8,11 @@
 //! - `mask`: `[n_tokens][n_kv]` additive f16 (or none)
 //! - `out`: `[n_head][n_tokens][dv]`
 //!
+//! [`Attention`] is the persistent form (`rocket_fa_ctx_*`); the module also holds the
+//! C library's stateless entries ([`flash_attn`], [`flash_attn_mt`]), its device-free
+//! f64 oracles ([`flash_attn_ref`], [`mha_self_ref`]) and the encoder composition
+//! ([`mha_self`]).
+//!
 //! Scores are brought host-side for the mandatory additive mask, scale, optional
 //! soft-cap and softmax, then uploaded as the AV operand (the C default,
 //! `ROCKET_ATTN_HOST_SOFTMAX=1`). Heads split into contiguous ranges across worker
@@ -57,8 +62,12 @@ use crate::matmul::bos::Bos;
 use crate::matmul::plan::Plan;
 use crate::matmul::run::{compute_cpu, compute_kacc};
 
+mod oneshot;
 mod softmax;
 
+pub use oneshot::{
+    flash_attn, flash_attn_mt, flash_attn_ref, fully_masked_rows, mha_self, mha_self_ref,
+};
 pub use softmax::{Softmax, SoftmaxMode};
 
 const MAX_WORKERS: usize = 8;
@@ -662,6 +671,48 @@ fn batch_context<'a>(slot: &'a mut Option<MmBatch>, dev: &Device) -> Result<&'a 
     Ok(slot.as_mut().expect("created above"))
 }
 
+/// The masked-GQA shape contract of the C library (`rocket_flash_attn_fp16`'s checks),
+/// shared by the device context and the host reference so the two agree. Returns the
+/// GQA ratio (`n_head / n_kv_heads`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_flash(
+    n_tokens: usize,
+    n_kv: usize,
+    head_dim: usize,
+    dv: usize,
+    n_head: usize,
+    n_kv_heads: usize,
+    q: &[f16],
+    k: &[f16],
+    v: &[f16],
+    mask: Option<&[f16]>,
+    out: &[f16],
+) -> Result<usize> {
+    if n_tokens == 0 || n_kv == 0 || head_dim == 0 || dv == 0 {
+        return Err(Error::shape("flash_attn/dims"));
+    }
+    if n_head == 0 || n_kv_heads == 0 || !n_head.is_multiple_of(n_kv_heads) {
+        return Err(Error::shape("flash_attn/heads"));
+    }
+    if !head_dim.is_multiple_of(32) || !dv.is_multiple_of(16) {
+        return Err(Error::shape("flash_attn/dims"));
+    }
+    let gqa = n_head / n_kv_heads;
+    if q.len() < n_head * n_tokens * head_dim
+        || k.len() < n_kv_heads * n_kv * head_dim
+        || v.len() < n_kv_heads * dv * n_kv
+        || out.len() < n_head * n_tokens * dv
+    {
+        return Err(Error::shape("flash_attn/buffers"));
+    }
+    if let Some(m) = mask
+        && m.len() < n_tokens * n_kv
+    {
+        return Err(Error::shape("flash_attn/mask"));
+    }
+    Ok(gqa)
+}
+
 /// A persistent attention context: one device fd per worker, per-shape scratch.
 pub struct Attention {
     workers: Vec<Worker>,
@@ -731,25 +782,9 @@ impl Attention {
         mask: Option<&[f16]>,
         out: &mut [f16],
     ) -> Result<()> {
-        if n_head == 0 || n_kv_heads == 0 || !n_head.is_multiple_of(n_kv_heads) {
-            return Err(Error::shape("flash_attn/heads"));
-        }
-        if !head_dim.is_multiple_of(32) || !dv.is_multiple_of(16) {
-            return Err(Error::shape("flash_attn/dims"));
-        }
-        let gqa = n_head / n_kv_heads;
-        if q.len() < n_head * n_tokens * head_dim
-            || k.len() < n_kv_heads * n_kv * head_dim
-            || v.len() < n_kv_heads * dv * n_kv
-            || out.len() < n_head * n_tokens * dv
-        {
-            return Err(Error::shape("flash_attn/buffers"));
-        }
-        if let Some(m) = mask
-            && m.len() < n_tokens * n_kv
-        {
-            return Err(Error::shape("flash_attn/mask"));
-        }
+        let gqa = check_flash(
+            n_tokens, n_kv, head_dim, dv, n_head, n_kv_heads, q, k, v, mask, out,
+        )?;
 
         let threads = self.workers.len().min(n_head);
         // Balanced contiguous ranges: 16 heads over 5 workers is 3/3/3/3/4, not
