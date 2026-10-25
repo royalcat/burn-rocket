@@ -694,6 +694,99 @@ pub fn detile_accum_bf16(
     detile_accum_f32(acc, n, slot, m0, n0, mtile, ntile);
 }
 
+// ── tf32 cubes: feature C2=4, weight (N/16,K/16,16,16), fp32 output C2=4 ────────
+//
+// The only 4-byte INPUT layout on this stack. The feature cube's atom is 4 channels
+// (16 B), and the weight block is the fixed 1024-byte hardware tile shaped
+// `(N/16, K/16, 16, 16)`: for a 4-byte element the K-group HALVES from fp16's 32 and
+// the N-group does not (16). Values are stored **raw** — unlike bf16 there is no host
+// truncation; the MAC truncates each operand's mantissa to 10 bits (toward zero).
+
+/// tf32 feature-cube element index (1-based row/channel, C2=4).
+#[inline]
+pub fn feat_idx_tf32(h: usize, ch: usize, row: usize) -> usize {
+    ((ch - 1) / 4) * h * 4 + 4 * (row - 1) + (ch - 1) % 4
+}
+
+/// tf32 weight-cube element index (1-based output channel `k` / K `ch`).
+#[inline]
+pub fn wt_idx_tf32(c: usize, k: usize, ch: usize) -> usize {
+    ((ch - 1) / 16) * 16 * 16 + ((k - 1) / 16) * 16 * c + ((ch - 1) % 16) + ((k - 1) % 16) * 16
+}
+
+/// Scatter one row-major `A[m0.., k0..]` tile into the `(K/4, Mt, 4)` fp32 feature cube.
+pub fn feat_scatter_tf32(
+    slot: &mut [f32],
+    a: &[f32],
+    astride: usize,
+    m0: usize,
+    k0: usize,
+    mtile: usize,
+    ktile: usize,
+) {
+    let h = mtile;
+    for row in 0..mtile {
+        let arow = &a[(m0 + row) * astride + k0..][..ktile];
+        let mut col = 0;
+        while col + 4 <= ktile {
+            let g = col / 4;
+            let dst = &mut slot[g * h * 4 + 4 * row..][..4];
+            dst.copy_from_slice(&arow[col..col + 4]);
+            col += 4;
+        }
+        while col < ktile {
+            slot[feat_idx_tf32(h, col + 1, row + 1)] = arow[col];
+            col += 1;
+        }
+    }
+}
+
+/// Scatter one weight row `brow[k0..k0+ktile]` for output channel `kk` (0-based).
+pub fn wt_scatter_row_tf32(slot: &mut [f32], brow: &[f32], kk: usize, ktile: usize) {
+    let c = ktile;
+    let kbase = (kk / 16) * 16 * c + (kk % 16) * 16;
+    let mut col = 0;
+    while col + 16 <= ktile {
+        let dst = &mut slot[(col / 16) * 16 * 16 + kbase..][..16];
+        dst.copy_from_slice(&brow[col..col + 16]);
+        col += 16;
+    }
+    while col < ktile {
+        slot[wt_idx_tf32(c, kk + 1, col + 1)] = brow[col];
+        col += 1;
+    }
+}
+
+/// Scatter a contiguous `B[n0.., k0..]` weight tile into a tf32 weight cube slot.
+pub fn wt_scatter_tile_tf32(
+    slot: &mut [f32],
+    b: &[f32],
+    bstride: usize,
+    n0: usize,
+    k0: usize,
+    ntile: usize,
+    ktile: usize,
+) {
+    for kk in 0..ntile {
+        let brow = &b[(n0 + kk) * bstride + k0..][..ktile];
+        wt_scatter_row_tf32(slot, brow, kk, ktile);
+    }
+}
+
+/// Accumulate one fp32 output cube into the f64 accumulator (the tf32 one-shot's
+/// readback: the C also gathers tf32 at `out_idx_i16`, the C2=4 fp32 cube).
+pub fn detile_accum_tf32(
+    acc: &mut [f64],
+    n: usize,
+    slot: &[f32],
+    m0: usize,
+    n0: usize,
+    mtile: usize,
+    ntile: usize,
+) {
+    detile_accum_f32(acc, n, slot, m0, n0, mtile, ntile);
+}
+
 #[cfg(test)]
 mod int4_tests {
     use super::*;
@@ -981,5 +1074,140 @@ mod int8_bf16_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tf32_tests {
+    use super::*;
+
+    fn value(i: usize) -> f32 {
+        i as f32 * 0.375 - 2.0
+    }
+
+    #[test]
+    fn tf32_index_math_is_the_4_byte_cube() {
+        // Feature cube C2=4: 4 channels 16 B, groups stride by H*4.
+        assert_eq!(feat_idx_tf32(4, 1, 1), 0);
+        assert_eq!(feat_idx_tf32(4, 2, 1), 1);
+        assert_eq!(feat_idx_tf32(4, 5, 1), 4 * 4);
+        assert_eq!(feat_idx_tf32(4, 1, 2), 4);
+        // Weight cube (N/16, K/16, 16, 16): the K-group is 16 (fp16's is 32) and its
+        // group stride is 16*16, the N group's stride is 16*C.
+        assert_eq!(wt_idx_tf32(16, 1, 1), 0);
+        assert_eq!(wt_idx_tf32(16, 1, 2), 1);
+        assert_eq!(wt_idx_tf32(16, 2, 1), 16);
+        assert_eq!(wt_idx_tf32(16, 1, 17), 16 * 16);
+        assert_eq!(wt_idx_tf32(16, 17, 1), 16 * 16);
+        assert_eq!(wt_idx_tf32(32, 17, 1), 16 * 32);
+    }
+
+    #[test]
+    fn tf32_feature_round_trip() {
+        let (mt, kt): (usize, usize) = (12, 64);
+        let a: Vec<f32> = (0..mt * kt).map(value).collect();
+        let mut slot = vec![0.0f32; mt.div_ceil(4) * 4 * kt];
+        feat_scatter_tf32(&mut slot, &a, kt, 0, 0, mt, kt);
+        for row in 0..mt {
+            for col in 0..kt {
+                assert_eq!(
+                    slot[feat_idx_tf32(mt, col + 1, row + 1)],
+                    a[row * kt + col],
+                    "row={row} col={col}"
+                );
+            }
+        }
+        // A ragged height uses the LIVE tile height (the C macro's H is ROWS).
+        let mut ragged = vec![0.0f32; 8 * 32];
+        feat_scatter_tf32(&mut ragged, &a, kt, 4, 32, 5, 32);
+        assert_eq!(ragged[feat_idx_tf32(5, 1, 5)], a[(4 + 4) * kt + 32]);
+        assert_eq!(ragged[feat_idx_tf32(5, 32, 5)], a[(4 + 4) * kt + 63]);
+    }
+
+    #[test]
+    fn tf32_feature_scatter_writes_the_scalar_tail() {
+        // The planner only hands K%16 tiles, but a 20-wide tile exercises the tail
+        // branch the C keeps as a safety net.
+        let (mt, kt): (usize, usize) = (5, 20);
+        let a: Vec<f32> = (0..mt * kt).map(value).collect();
+        let mut slot = vec![0.0f32; 8 * 20];
+        feat_scatter_tf32(&mut slot, &a, kt, 0, 0, mt, kt);
+        for row in 0..mt {
+            for col in 0..kt {
+                assert_eq!(
+                    slot[feat_idx_tf32(mt, col + 1, row + 1)],
+                    a[row * kt + col],
+                    "row={row} col={col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tf32_weight_round_trip() {
+        let (nt, kt): (usize, usize) = (20, 96);
+        let b: Vec<f32> = (0..nt * kt).map(value).collect();
+        let mut slot = vec![0.0f32; nt.div_ceil(16) * 16 * kt];
+        wt_scatter_tile_tf32(&mut slot, &b, kt, 0, 0, nt, kt);
+        for k in 0..nt {
+            for c in 0..kt {
+                assert_eq!(
+                    slot[wt_idx_tf32(kt, k + 1, c + 1)],
+                    b[k * kt + c],
+                    "k={k} c={c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tf32_weight_slice_offsets() {
+        let (n, k) = (32, 64);
+        let b: Vec<f32> = (0..n * k).map(value).collect();
+        let mut slot = vec![0.0f32; 16 * 32];
+        wt_scatter_tile_tf32(&mut slot, &b, k, 16, 32, 16, 32);
+        for kk in 0..16 {
+            for cc in 0..32 {
+                assert_eq!(
+                    slot[wt_idx_tf32(32, kk + 1, cc + 1)],
+                    b[(16 + kk) * k + 32 + cc]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tf32_output_detiles_at_the_c2_4_index() {
+        // The tf32 output is the fp32 cube C2=4, i.e. the C's out_idx_i16 gather: same
+        // name, same numbers as the shared f32 de-tile, with a ragged (5, 6) tile at a
+        // non-zero origin and an earlier K-tile's partial already in the accumulator.
+        let (mt, nt): (usize, usize) = (5, 6);
+        let (alloc_m, alloc_n) = (mt.div_ceil(4) * 4, nt.div_ceil(4) * 4);
+        let slot: Vec<f32> = (0..alloc_m * alloc_n)
+            .map(|i| i as f32 * 0.5 - 3.0)
+            .collect();
+        let (n, m0, n0) = (20, 4, 4);
+        let mut acc = vec![0.0f64; (m0 + mt + 1) * n];
+        acc[(m0 + 2) * n + n0 + 1] = 7.0;
+        detile_accum_tf32(&mut acc, n, &slot, m0, n0, mt, nt);
+        for row in 0..mt {
+            for col in 0..nt {
+                let want = slot[out_idx_i16(mt, col + 1, row + 1)] as f64;
+                let want = if (row, col) == (2, 1) {
+                    want + 7.0
+                } else {
+                    want
+                };
+                assert_eq!(acc[(m0 + row) * n + n0 + col], want, "row={row} col={col}");
+            }
+        }
+        assert_eq!(acc[0], 0.0);
+        assert_eq!(acc[(m0 + mt) * n + n0], 0.0);
+        assert_eq!(acc[m0 * n + n0 + nt], 0.0);
+        // The tf32 name is an alias of the shared fp32 de-tile, not a second layout.
+        let mut plain = vec![0.0f64; (m0 + mt + 1) * n];
+        plain[(m0 + 2) * n + n0 + 1] = 7.0;
+        detile_accum_f32(&mut plain, n, &slot, m0, n0, mt, nt);
+        assert_eq!(plain, acc);
     }
 }

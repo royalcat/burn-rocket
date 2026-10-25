@@ -351,16 +351,22 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   batched matmul, dense *and* group-wise int8 (one-shot plus resident per-channel /
   group-wise weights), dense *and* group-wise int4 (one-shot with the C's
   int16-saturation `kt_cap`, plus the resident `I4Context` in both modes), its planner
-  and nibble-cube pack/gather, `int16_exact`, the native bf16 stream
-  and masked GQA attention are ported
+  and nibble-cube pack/gather, `int16_exact`, the native bf16 stream, the tf32
+  one-shot (raw-f32 operands, 4-byte cube, fp32 out and f64 host K-accumulation; the
+  MAC *truncates* each mantissa to 10 bits toward zero, so the parity reference is the
+  C's `tf32rt` (zero the low 13 bits), not a round-to-nearest tf32; planner + emitter
+  byte-equal, `tf32_selftest` is the board check) and masked GQA
+  attention are ported
   (`int8_selftest --dense|--gw-one-shot|--prepacked-dense|--prepacked-gw`,
-  `int4_selftest --dense|--gw-one-shot G|--prepacked|--prepacked-gw G` and
-  `int16_selftest` are the board checks: int32/i64-exact vs the CPU
-  reference on ragged shapes, one-shot gw bit-identical to the resident gw at group
-  32-512 for both int8 and int4).
-  Planner and regcmd output are byte-equal to the C library (dtype parity
-  harness: `tools/c-oracle` + `parity.py`); fp16/bf16 cosine >= 0.99999, int8
-  matches its dequantized reference and int4 is int32-exact against the int64 CPU
+  `int4_selftest --dense|--gw-one-shot G|--prepacked|--prepacked-gw G`,
+  `int16_selftest` and `tf32_selftest` are the board checks: int32/i64-exact vs the
+  CPU reference on ragged shapes, one-shot gw bit-identical to the resident gw at
+  group 32-512 for both int8 and int4, tf32 inside the fp32-accumulation envelope of a
+  tf32-rounded f64 reference).
+  Planner and regcmd output are byte-equal to the C library over the whole parity
+  matrix — all six dtypes (`fp16/int8/int8-gw/int4/tf32/bf16`) PASS for plan and emit;
+  fp16/bf16 cosine >= 0.99999, int8 matches its dequantized reference, int4 is
+  int32-exact against the int64 CPU reference and tf32 matches a tf32-rounded f64
   reference. Board microbenchmarks: int8 512x3072x1024
   62-70 ms vs C 59-66, bf16 stream 24-27 ms vs C 22-26. Attention uses a per-worker
   head split and batches each worker's per-head QK/AV matmuls into one job
@@ -370,11 +376,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   cut the score pass 4.3× (log-gemma §19); EmbeddingGemma 2's vision tower runs its
   attention on the NPU by default under `--npu` (S2, §20). End-to-end: qwen3
   3,633-token `bench --npu` 59.4 s vs the C binary's 61.5 s.
-  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): tf32
-  (one-shot, resident, group-wise, plans), resident bf16 (the C library has no
-  variant either), `mha_self`, `*_ref` host references, `_planes`/transposed variants,
-  RK3576 entries, the public `rocket_stream_*` aliases, tiled long-context attention,
-  on-NPU softmax, and all non-matmul op families.
+  **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
+  (the C library has no variant either — and neither has it for tf32, whose surface is
+  therefore complete), `mha_self`, `*_ref` host references, `_planes`/transposed
+  variants, RK3576 entries, the public `rocket_stream_*` aliases, the non-fp16 batch
+  wrappers, tiled long-context attention, on-NPU softmax, and all non-matmul op
+  families.
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -389,12 +396,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16 emitters), `matmul/` (plan, layout, bos, run, context + the int8/int4 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `hw`, `knobs`, `error`; `src/bin/` has the parity dump and board self-tests |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`), `attn/` (flash attention + the fast host softmax), `hw`, `knobs`, `error`; `src/bin/` has the parity dump and board self-tests |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype), the `parity.py` dtype parity harness, and the board A/B benches used to validate the port; build with `tools/c-oracle/build.sh` |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity), `selftest` (fp16 matmul), `attn_selftest` (attention), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -825,7 +832,8 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   2-byte geometry, fp32 accumulate and NO scaling, but streaming-only: no
   resident-weight variant, so `ROCKET_BF16_STREAM=1` keeps weights host-native and
   feeds `rocket_matmul_bf16_stream` an f32 conversion per call, `_mt` on a refusal);
-  and tf32 (the only 4-byte-input path, explicitly half-rate). bf16 has no speed
+  and tf32 (the only 4-byte-input path, explicitly half-rate; ported as
+  `rocket_npu::matmul::one_shot_tf32` and unused by the extension). bf16 has no speed
   advantage over fp16 on the NPU (the device ties; the library docs call it
   token-identical), and its stream re-packs the weight per call — 26-30 % slower
   end-to-end than the resident path (log §16), which is why bf16 weights pack
@@ -1007,6 +1015,9 @@ cargo check -p burn-rocket --no-default-features
 cargo check -p burn-rocket --no-default-features --features flex
 # driver unit tests (planner, capacity classes, emitters, layout)
 cargo test -p rocket-npu
+# dtype parity vs the C oracle: plan + every regcmd word, all six dtypes
+cargo build -p rocket-npu --bin regcmd_dump
+python3 tools/c-oracle/parity.py
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench
@@ -1087,14 +1098,18 @@ cd /root/rocket-inference
 #   gw pair (--gw-one-shot G / --prepacked-gw G) matches the f64 dequantized
 #   reference and each other bit-for-bit, and both resident modes re-compute a
 #   weight packed at M=256 at a second M (the canonical-tiling contract);
-#   int16_exact is i64-exact.  Shape args are M K N (int8: M K N GROUP; the int4
-#   group is the flag argument).
+#   int16_exact is i64-exact; tf32 matches an f64 dot product of the tf32-rounded
+#   inputs (no args = the built-in shape list: tiny, medium, ragged M/N, K > Kt,
+#   and the padded M == 1 shim).  Shape args are M K N (int8: M K N GROUP; the
+#   int4 group is the flag argument).
 taskset -c 0-3 ./int8_selftest --dense 264 320 288
 taskset -c 0-3 ./int8_selftest --gw-one-shot 512 1024 512 32
 taskset -c 0-3 ./int4_selftest 64 256 128
 taskset -c 0-3 ./int4_selftest --gw-one-shot 32 512 1024 512
 taskset -c 0-3 ./int4_selftest --prepacked-gw 64 264 320 320
 taskset -c 0-3 ./int16_selftest 64 256 128
+taskset -c 0-3 ./tf32_selftest
+taskset -c 0-3 ./tf32_selftest 512 1024 512
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
 taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1

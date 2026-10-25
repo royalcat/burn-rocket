@@ -14,6 +14,7 @@ pub mod int8_dense;
 pub mod layout;
 pub mod plan;
 pub mod run;
+pub mod tf32;
 
 pub use batch::{MmBatch, batch};
 pub use bf16::Bf16Stream;
@@ -34,3 +35,4 @@ pub use run::{
     compute_cpu, compute_kacc, i8_weights_bytes, one_shot, one_shot_bf16, one_shot_bf16_mt,
     one_shot_mt, pad_m, weights_bytes,
 };
+pub use tf32::{one_shot_tf32, plan_tf32};

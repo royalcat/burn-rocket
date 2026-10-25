@@ -60,7 +60,7 @@ DTYPES: tuple[Dtype, ...] = (
     Dtype("int8-gw", "plan-int8-gw", "emit-int8", n_align=32, k_align=32,
           groups=(None, 32, 64, 128, 256, 512, 2048)),
     Dtype("int4", "plan-int4", "emit-int4", n_align=64, k_align=32),
-    Dtype("tf32", "plan-tf32", "emit-tf32", n_align=16, k_align=16, milestone="M4"),
+    Dtype("tf32", "plan-tf32", "emit-tf32", n_align=16, k_align=16),
     Dtype("bf16", "plan-bf16", "emit-bf16", n_align=16, k_align=32),
 )
 

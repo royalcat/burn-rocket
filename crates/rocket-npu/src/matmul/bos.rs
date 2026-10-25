@@ -238,6 +238,22 @@ pub(crate) fn i32_words_ref(bo: &Bo) -> &[i32] {
     unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i32>(), bytes.len() / 4) }
 }
 
+/// The BO as f32 words (the tf32 in/weight/output cubes, which are raw fp32).
+pub(crate) fn f32_words(bo: &mut Bo) -> &mut [f32] {
+    let bytes = bo.as_mut_slice();
+    assert_eq!(bytes.len() % 4, 0);
+    // SAFETY: the tf32 BOs are whole numbers of 4-byte floats and page-aligned.
+    unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<f32>(), bytes.len() / 4) }
+}
+
+/// The BO as f32 words, read-only.
+pub(crate) fn f32_words_ref(bo: &Bo) -> &[f32] {
+    let bytes = bo.as_slice();
+    assert_eq!(bytes.len() % 4, 0);
+    // SAFETY: see f32_words.
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<f32>(), bytes.len() / 4) }
+}
+
 /// The BO as int16 words (the int4 output cube).
 pub(crate) fn i16_words_ref(bo: &Bo) -> &[i16] {
     let bytes = bo.as_slice();

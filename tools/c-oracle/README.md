@@ -112,8 +112,9 @@ planned tile dims with fixed DMA addresses (`0x1000/0x2000/0x3000`, accumulate
 
 Comparison is exact: plan text, task count and every NPUOP word. On a mismatch
 the harness prints the first differing line with both values and exits nonzero.
-Dtypes whose Rust planner/emitter is not ported yet print a visible `PENDING`
-line and do not fail the run — currently **int4 (M3)** and **tf32 (M4)**.
+Every dtype in the matrix is ported now, so a full run is six PASS lines; the
+`PENDING` path (a `not implemented in the Rust port yet` refusal) is kept for a
+future rung.
 
 ## Board selftest matrix (numerics)
 
@@ -122,9 +123,10 @@ Parity above is host-only and structural. The numeric check runs the
 
 ```sh
 cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu \
-    --bin selftest --bin int8_selftest --bin bf16_selftest --bin attn_selftest
+    --bin selftest --bin int8_selftest --bin bf16_selftest --bin attn_selftest \
+    --bin int4_selftest --bin int16_selftest --bin tf32_selftest
 ssh root@rock-5b-plus.lan 'mkdir -p /root/rocket-npu-selftest'
-scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/{selftest,int8_selftest,bf16_selftest,attn_selftest} \
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/{selftest,int8_selftest,bf16_selftest,attn_selftest,int4_selftest,int16_selftest,tf32_selftest} \
     root@rock-5b-plus.lan:/root/rocket-npu-selftest/
 ```
 
@@ -144,6 +146,8 @@ cd /root/rocket-npu-selftest
 # bf16 stream
 ./bf16_selftest 4 32 16
 ./bf16_selftest 256 1024 512
+# tf32 one-shot: no arguments runs the built-in shape list (tiny, ragged, K > Kt)
+./tf32_selftest
 # attention: short causal and long causal
 ./attn_selftest 82
 ./attn_selftest 2587 2587 8 8
@@ -164,6 +168,8 @@ covers both the program bytes and the hardware result.
   not implement; the C library's own comment says that encoding is not
   bit-exact and production never uses it. `parity.py` therefore emits int8 with
   the defaults only. fp16 does exercise `FP32TOFP16=0` and `ACCUMULATE=1`.
-- int4/tf32 planners and emitters are deliberately left for M3/M4; their
-  `regcmd_dump` subcommands exist only to make `parity.py` report `PENDING` and
-  exit nonzero with `not implemented in the Rust port yet`.
+- The int4 and tf32 generators ignore `FP32TOFP16`/`ACCUMULATE`/`ADD_DMA` (plain
+  conv, fixed output writer), so those flags never change their programs.
+- tf32's program is the one place where the *precision* is per-stage: CNA in/proc
+  and CORE proc are 7, while all three DPU fields are fp32 (5) — there is no
+  tf32 code in the DPU enum.

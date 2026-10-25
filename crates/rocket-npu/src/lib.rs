@@ -2,9 +2,9 @@
 //!
 //! This crate replaces the C `librocketnpu` with a native Rust implementation of the
 //! same algorithms: DRM-accel device handling, register-command generation, the
-//! tiled matmul engine (fp16, int8, int4, int16, bf16), resident weights, multi-threaded
-//! fan-out, and flash attention. It is an independent crate: no Burn dependency, no C
-//! toolchain, no kernel headers.
+//! tiled matmul engine (fp16, int8, int4, int16, bf16, tf32), resident weights,
+//! multi-threaded fan-out, and flash attention. It is an independent crate: no Burn
+//! dependency, no C toolchain, no kernel headers.
 //!
 //! The layout follows the upstream C library closely enough that a function can be
 //! read side by side with its original (`rocket_matmul.c`, `npu_regcmd.c`, …):
@@ -61,6 +61,12 @@
 //!   decomposition into four int8 products (inputs clamped to `[-32768, 32639]`);
 //! - bf16: the native streaming path ([`matmul::Bf16Stream`]) plus the one-shot
 //!   `_bf16`/`_mt` wrappers over it;
+//! - tf32: [`matmul::one_shot_tf32`] and its 4-byte planner ([`matmul::plan_tf32`]).
+//!   The caller feeds raw fp32 and the MAC truncates the mantissa to 10 bits (toward
+//!   zero, the C `tf32rt` rounding); the output
+//!   is the fp32 cube and K-tile partials sum on the host in f64. Alignment `K % 16`,
+//!   `N % 16`, `M % 4` (or `M == 1`, padded), Kt ceiling 8192. The C library has no
+//!   resident or group-wise tf32 variant, so this is the complete tf32 surface;
 //! - the `rocket_weights_bytes`/`rocket_i8_weights_bytes` footprint helpers and
 //!   `rocket_pad_m` ([`matmul::pad_m`]);
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
@@ -77,7 +83,6 @@
 //!
 //! - the public `rocket_stream_*` aliases (use [`matmul::Context`] for the resident and
 //!   streaming forms);
-//! - tf32 (one-shot, resident, group-wise, plans);
 //! - a resident bf16 weight (the C library has none either);
 //! - `rocket_mha_self_fp16`, the `*_ref_fp16` host references, the `_planes` and
 //!   transposed-output variants, and the RK3576-specific entries;
@@ -92,8 +97,8 @@
 //! - every non-matmul op family: conv, pool, activation, norm, FFN, softmax,
 //!   reduce, resize/upsample, encoder, SAM/SigLIP and graph execution.
 //!
-//! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16 and
-//! attention knobs that are implemented keep their C names and semantics.
+//! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
+//! and attention knobs that are implemented keep their C names and semantics.
 
 pub mod attn;
 pub mod device;

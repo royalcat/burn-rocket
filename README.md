@@ -149,10 +149,12 @@ Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
 dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weights),
 dense and group-wise int4 (one-shot with the C's int16-saturation `kt_cap`, plus the
 resident `I4Context` in both modes and its planner), `int16_exact`, the native bf16
-stream and masked GQA attention are ported and
+stream, the tf32 one-shot (raw-f32 operands; the MAC truncates to a 10-bit mantissa,
+fp32 out with f64 host K-accumulation) and masked GQA attention are ported and
 validated on the board. Planner and regcmd output are byte-equal to the C library for
-fp16/int8/int8-group-wise/int4/bf16; fp16/bf16 cosine >= 0.99999, int8 matches its
-dequantized reference and int4 is int32-exact against the int64 CPU reference. Qwen3
+every matmul dtype (fp16/int8/int8-group-wise/int4/tf32/bf16); fp16/bf16 cosine
+>= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against the
+int64 CPU reference and tf32 matches a tf32-rounded f64 reference. Qwen3
 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16 microbenchmarks
 are at or above the C library's speed.
 
@@ -163,17 +165,17 @@ are at or above the C library's speed.
 fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
 and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
 both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
-masked
+the tf32 one-shot and its planner, masked
 GQA attention with chained per-head QK/AV batching, the device/BO/submit primitives
 (including multi-job submit and the opt-in chained layout), and the dtype parity
 harness (`tools/c-oracle` + `parity.py`).
 
-Not exposed yet: tf32 (one-shot, resident, group-wise, plans), resident bf16
-(the C library has no variant either), `mha_self`, the `*_ref` host references, the
-`_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*` aliases,
-the long-context tiled attention path, on-NPU softmax, and every non-matmul op family
-(conv, pool, activation, norm, FFN, softmax, reduce, resize, encoders, graph). See the
-`rocket-npu` crate docs for the full list.
+Not exposed yet: resident bf16 (the C library has no variant either, and it has none
+for tf32 either — that surface is complete), `mha_self`, the `*_ref` host references,
+the `_planes`/transposed variants, RK3576 entries, the public `rocket_stream_*`
+aliases, the non-fp16 batch wrappers, the long-context tiled attention path, on-NPU
+softmax, and every non-matmul op family (conv, pool, activation, norm, FFN, softmax,
+reduce, resize, encoders, graph). See the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module
 (`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and

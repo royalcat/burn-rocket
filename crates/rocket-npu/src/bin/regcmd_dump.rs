@@ -5,28 +5,26 @@
 //!   regcmd_dump plan-int8    M K N
 //!   regcmd_dump plan-int8-gw M K N [GROUP]
 //!   regcmd_dump plan-int4    M K N
+//!   regcmd_dump plan-tf32    M K N
 //!   regcmd_dump plan-bf16    M K N
 //!   regcmd_dump emit         M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!   regcmd_dump emit-int8    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!   regcmd_dump emit-int4    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
+//!   regcmd_dump emit-tf32    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!   regcmd_dump emit-bf16    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
 //!
 //! The emitters take the TILE dims (Mt Kt Nt), not the full problem dims, and a
 //! plan prints `Mt Kt Nt jobs` or `-1`, matching `tools/c-oracle/oracle`.
 //!
-//! tf32 has no Rust planner/emitter yet (M4). Its subcommands exist only so the
-//! parity harness can report them as PENDING; they exit nonzero without writing a
-//! plan/program.
-//!
 //! `emit-int8` with ACCUMULATE=1 is not ported: the C int8 emitter has an
 //! EW-add path there, but the C library itself documents that encoding as
 //! non-bit-exact and never used in production, so the Rust port leaves it out.
-//! `emit-int4` ignores FP32TOFP16/ACCUMULATE/ADD_DMA, as the C's plain-conv int4
-//! generator does.
+//! `emit-int4` and `emit-tf32` ignore FP32TOFP16/ACCUMULATE/ADD_DMA, as the C's
+//! plain-conv int4/tf32 generators do.
 
 use std::process::ExitCode;
 
-use rocket_npu::matmul::plan::{self, BF16, INT4, INT8, INT8_GW, Plan};
+use rocket_npu::matmul::plan::{self, BF16, INT4, INT8, INT8_GW, Plan, TF32};
 use rocket_npu::regcmd::fp16::{MatmulParams, emit};
 
 fn dma(arg: &str) -> u32 {
@@ -64,6 +62,7 @@ fn emit_program(kind: &str, params: &MatmulParams) -> ExitCode {
         "emit" => emit(params, &mut ops),
         "emit-int8" => rocket_npu::regcmd::int8::emit(params, &mut ops),
         "emit-int4" => rocket_npu::regcmd::int4::emit(params, &mut ops),
+        "emit-tf32" => rocket_npu::regcmd::tf32::emit(params, &mut ops),
         "emit-bf16" => rocket_npu::regcmd::bf16::emit(params, &mut ops),
         _ => unreachable!(),
     };
@@ -82,19 +81,14 @@ fn emit_program(kind: &str, params: &MatmulParams) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn not_implemented(mode: &str, milestone: &str) -> ExitCode {
-    eprintln!("{mode}: not implemented in the Rust port yet ({milestone})");
-    ExitCode::FAILURE
-}
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 5 {
         eprintln!(
-            "usage: regcmd_dump plan|plan-int8|plan-int8-gw|plan-int4|plan-bf16 M K N [GROUP]"
+            "usage: regcmd_dump plan|plan-int8|plan-int8-gw|plan-int4|plan-tf32|plan-bf16 M K N [GROUP]"
         );
         eprintln!(
-            "       regcmd_dump emit|emit-int8|emit-int4|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]"
+            "       regcmd_dump emit|emit-int8|emit-int4|emit-tf32|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]"
         );
         return ExitCode::FAILURE;
     }
@@ -132,8 +126,11 @@ fn main() -> ExitCode {
             print_plan(&INT4, 0, m, k, n);
             ExitCode::SUCCESS
         }
-        "plan-tf32" => not_implemented(mode, "M4"),
-        "emit" | "emit-int8" | "emit-bf16" => {
+        "plan-tf32" => {
+            print_plan(&TF32, 0, m, k, n);
+            ExitCode::SUCCESS
+        }
+        "emit" | "emit-int8" | "emit-tf32" | "emit-bf16" => {
             if args.len() < 8 {
                 eprintln!("emit needs M K N IN WT OUT");
                 return ExitCode::FAILURE;
@@ -173,7 +170,6 @@ fn main() -> ExitCode {
             );
             emit_program(mode, &p)
         }
-        "emit-tf32" => not_implemented(mode, "M4"),
         other => {
             eprintln!("unknown mode {other}");
             ExitCode::FAILURE

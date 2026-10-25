@@ -26,6 +26,10 @@ pub struct Geometry {
     pub k_align: usize,
     pub kt_ceil: usize,
     pub bank_slack: usize,
+    /// The feature/weight cube's K granule: 32 for every 1/2/4-byte-per-two dtype,
+    /// 16 for tf32's 4-byte tile (a 64-byte hardware "data entry" holds 32 fp16 but
+    /// only 16 fp32).
+    pub k_group: usize,
     /// The weight slot's N granularity (`weight_int8` groups 32, `weight_int4` 64).
     pub wt_n_align: usize,
     pub asym_nt: bool,
@@ -41,6 +45,7 @@ pub const FP16: Geometry = Geometry {
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 0,
+    k_group: 32,
     wt_n_align: 16,
     asym_nt: true,
     pick_nt: false,
@@ -57,6 +62,7 @@ pub const INT8: Geometry = Geometry {
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 1,
+    k_group: 32,
     wt_n_align: 32,
     asym_nt: false,
     pick_nt: false,
@@ -73,6 +79,7 @@ pub const INT8_GW: Geometry = Geometry {
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 1,
+    k_group: 32,
     wt_n_align: 32,
     asym_nt: false,
     pick_nt: true,
@@ -88,6 +95,7 @@ pub const BF16: Geometry = Geometry {
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 0,
+    k_group: 32,
     wt_n_align: 16,
     asym_nt: false,
     pick_nt: false,
@@ -104,13 +112,34 @@ pub const INT4: Geometry = Geometry {
     k_align: 32,
     kt_ceil: 16384,
     bank_slack: 0,
+    k_group: 32,
     wt_n_align: 64,
     asym_nt: false,
     pick_nt: false,
     grouped: false,
 };
 
-/// A resolved tiling plan plus its per-tile slot sizes (in fp16 elements).
+/// tf32 geometry (`gen_matmul_tf32`): 4 B per element in an fp32 container, N align
+/// 16, **K align 16** (a 4-byte element halves the K-group) and the Kt ceiling halved
+/// to 8192 — the weight tile is `Kt * 4` bytes and the generator refuses above the
+/// 64 KiB CBUF bank. No bank slack, no asymmetric-Nt heuristic.
+pub const TF32: Geometry = Geometry {
+    name: "tf32",
+    elem_num: 4,
+    elem_den: 1,
+    n_align: 16,
+    k_align: 16,
+    kt_ceil: 8192,
+    bank_slack: 0,
+    k_group: 16,
+    wt_n_align: 16,
+    asym_nt: false,
+    pick_nt: false,
+    grouped: false,
+};
+
+/// A resolved tiling plan plus its per-tile slot sizes, counted in the dtype's own
+/// elements (fp32 for tf32, nibbles for int4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plan {
     pub m: usize,
@@ -146,8 +175,9 @@ impl Plan {
     }
 
     /// [`Plan::derive`] for an explicit geometry: the slot sizes are the dtype's
-    /// (weight-N granularity differs — 16 fp16/bf16, 32 int8, 64 int4 — while the
-    /// feature and output cubes keep their 4/32/16 element groups).
+    /// (weight-N granularity differs — 16 fp16/bf16/tf32, 32 int8, 64 int4 — and so
+    /// does the cube K granule, 32 except tf32's 16, while the feature and output
+    /// cubes keep their 4/16 element groups).
     pub fn derive_geom(
         geom: &Geometry,
         m: usize,
@@ -167,8 +197,8 @@ impl Plan {
             nmt: m.div_ceil(mt),
             nnt: n.div_ceil(nt),
             nkt: k.div_ceil(kt),
-            in_slot: rup(mt, 4) * rup(kt, 32),
-            wt_slot: rup(nt, geom.wt_n_align) * rup(kt, 32),
+            in_slot: rup(mt, 4) * rup(kt, geom.k_group),
+            wt_slot: rup(nt, geom.wt_n_align) * rup(kt, geom.k_group),
             out_slot: rup(mt, 4) * rup(nt, 16),
         }
     }
