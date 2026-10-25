@@ -16,6 +16,12 @@ A final `pool` section covers the spatial-reduce machinery: the decomposition
 matrix, and the fp16 average-pool reciprocal (`recip`,
 `ppu_recip_kernel_fp16`) for every kernel extent.
 
+A `conv` section covers the fp16 CONV_2D family: `conv` (the `rocket_conv2d_plan`
+reason code) over the direct/depthwise/dilation/stride/explicit-extent matrix,
+`emit-conv` (`gen_conv2d_fp16` / `gen_conv2d_dw_fp16`, including the CNA
+deconvolution strides and the refusals) and `emit-conv-act` (the fused-activation
+program with its two 513-word LUT uploads).
+
 Dtypes whose Rust planner/emitter is not ported yet report a visible PENDING
 line instead of failing. Any mismatch exits nonzero and prints the first
 differing line with both values.
@@ -25,6 +31,7 @@ Usage:
   python3 tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
   python3 tools/c-oracle/parity.py --kind fp16,int8
   python3 tools/c-oracle/parity.py --kind pool
+  python3 tools/c-oracle/parity.py --kind conv
 """
 
 from __future__ import annotations
@@ -135,6 +142,164 @@ POOL_CASES: tuple[tuple, ...] = (
 )
 
 POOL_METHODS = {"avg": 0, "max": 1, "min": 2}
+
+# ── Conv matrix ───────────────────────────────────────────────────────────────
+#
+# `IM2COL = 0` in every row: this family never materialises one. The 13 scalars after
+# the mode are `IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE`; the plan adds `OH OW`
+# (0 = derive) and the emitters add `FP32TOFP16|KIND IN WT OUT [DSY DSX]`.
+#
+# (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, depthwise, oh, ow, expect_code)
+# `expect_code` pins the C's reason class: 0 runnable, -1..-4 the negated refusals.
+CONV_PLANS: tuple[tuple, ...] = (
+    # Direct: the plain 3x3, the RGB stem (IC=3 padded to 32), an SSD OC=24 (padded to
+    # 32 by the weight group), 1x1, stride 2, pad 2, dilation 2, and a 7x7 k3 pad 3.
+    ("3x3 s1 p1",   32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
+    ("rgb stem",     3,  56,  56,  64, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0),
+    ("rgb s2",       3, 224, 224,  32, 3, 3, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0),
+    ("oc24 head",   32,   8,   8,  24, 5, 5, 1, 1, 2, 2, 1, 1, 0, 0, 0, 0),
+    ("1x1",         64,  14,  14, 128, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0),
+    ("k3 s2 p1",   128,  28,  28, 128, 3, 3, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0),
+    ("k5 dil2",     32,  16,  16,  64, 5, 5, 1, 1, 4, 4, 2, 2, 0, 0, 0, 0),
+    ("k7 p3",       32,  16,  16,  32, 7, 7, 1, 1, 3, 3, 1, 1, 0, 0, 0, 0),
+    ("conv1d k3",   80, 3000,   1, 384, 3, 1, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0),
+    ("conv1d s2",   80, 3000,   1, 384, 3, 1, 2, 1, 1, 0, 1, 1, 0, 0, 0, 0),
+    # Depthwise (OC == IC, IC % 32 == 0).
+    ("dw 3x3",      32,  56,  56,  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0),
+    ("dw s2",       64,  56,  56,  64, 3, 3, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0),
+    ("dw 1x1",      96,  14,  14,  96, 1, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 0),
+    # An explicit extent: one that matches is accepted, one that does not is -1.
+    ("explicit ok", 32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 8, 8, 0),
+    ("explicit bad", 32,  8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 9, 8, -1),
+    # Refusals: depthwise OC != IC (-2), depthwise IC % G (-2), a kernel that cannot fit
+    # one CBUF bank (-4), a collapsed extent (-3), and malformed fields (-1).
+    ("dw oc!=ic",   32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 1, 0, 0, -2),
+    ("dw ic%32",    24,   8,   8,  24, 3, 3, 1, 1, 1, 1, 1, 1, 1, 0, 0, -2),
+    ("dw k25",      32,  32,  32,  32, 25, 25, 1, 1, 0, 0, 1, 1, 1, 0, 0, -4),
+    ("k3 ic6000", 6000,   4,   4,  16, 3, 3, 1, 1, 0, 0, 1, 1, 0, 0, 0, -4),
+    ("k5 ih4",      32,   4,   4,  16, 5, 5, 1, 1, 0, 0, 1, 1, 0, 0, 0, -3),
+    ("ic0",          0,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 0, -1),
+    ("sy0",         32,   8,   8,  16, 3, 3, 0, 1, 1, 1, 1, 1, 0, 0, 0, -1),
+    ("dy0",         32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 0, 1, 0, 0, 0, -1),
+)
+
+# The emitters: the same geometries plus fp32-out, deconvolution and refusals.
+# (name, ..., depthwise, fp32tofp16, dsy, dsx)
+CONV_EMITS: tuple[tuple, ...] = (
+    ("3x3 s1 p1",   32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1),
+    ("3x3 fp32 out", 32,  8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1),
+    ("rgb stem",     3,  56,  56,  64, 3, 3, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1),
+    ("oc24 head",   32,   8,   8,  24, 5, 5, 1, 1, 2, 2, 1, 1, 0, 1, 1, 1),
+    ("1x1",         64,  14,  14, 128, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1),
+    ("k3 s2 p1",   128,  28,  28, 128, 3, 3, 2, 2, 1, 1, 1, 1, 0, 1, 1, 1),
+    ("k5 dil2",     32,  16,  16,  64, 5, 5, 1, 1, 4, 4, 2, 2, 0, 1, 1, 1),
+    ("k7 p3",       32,  16,  16,  32, 7, 7, 1, 1, 3, 3, 1, 1, 0, 1, 1, 1),
+    # A conv1d *tile*: the full 3000-step sequence is the tiler's job (the row bands),
+    # so the single-job generator is asked for one band's worth of rows.
+    ("conv1d tile", 80,  256,   1, 384, 3, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1),
+    ("dw 3x3",      32,  56,  56,  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    ("dw 1x1",      96,  14,  14,  96, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1),
+    # The CNA deconvolution mode: the interior-dilation strides land in CONV_CON1/3.
+    ("deconv 2x2",  32,  24,  24,  32, 3, 3, 1, 1, 4, 4, 1, 1, 0, 1, 2, 2),
+    ("deconv 4x2",  32,  24,  24,  32, 3, 3, 1, 1, 4, 4, 1, 1, 0, 1, 4, 2),
+    ("deconv 8x8",  32,   8,   8,  16, 3, 3, 1, 1, 5, 5, 1, 1, 0, 1, 8, 8),
+    # Refusals: the feature alone cannot exceed 11 banks (-1), a kernel must fit a bank
+    # (-2), and the deconvolution mode takes a direct stride-1 conv only (-1).
+    ("feat banks",  32, 400, 400,  16, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1),
+    ("k3 ic6000", 6000,   4,   4,  16, 3, 3, 1, 1, 0, 0, 1, 1, 0, 1, 1, 1),
+    ("deconv dw",   32,  24,  24,  32, 3, 3, 1, 1, 4, 4, 1, 1, 1, 1, 2, 2),
+    ("deconv s2",   32,  24,  24,  32, 3, 3, 2, 2, 4, 4, 1, 1, 0, 1, 2, 2),
+)
+
+# The fused-activation programs: (name, ..., depthwise, kind). KIND is a smooth
+# single-pass ROCKET_ACTIVATION_* value (3 SiLU, 4 tanh, 5 GELU); the generator accepts
+# these on either path (the entry point, not the generator, is what refuses depthwise).
+CONV_ACTS: tuple[tuple, ...] = (
+    ("act silu",    32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 3),
+    ("act tanh",    32,   8,   8,  16, 3, 3, 1, 1, 1, 1, 1, 1, 0, 4),
+    ("act gelu",    32,   8,   8,  24, 3, 3, 1, 1, 1, 1, 1, 1, 0, 5),
+    ("act k3 s2",  128,  28,  28, 128, 3, 3, 2, 2, 1, 1, 1, 1, 0, 5),
+    ("act rgb",      3,  56,  56,  64, 3, 3, 1, 1, 1, 1, 1, 1, 0, 5),
+    ("act dw",      32,  56,  56,  32, 3, 3, 1, 1, 1, 1, 1, 1, 1, 3),
+)
+
+# Emit cases the generator must refuse (an identical "-1" on both sides).
+CONV_EMIT_REFUSALS = {"feat banks", "k3 ic6000", "deconv dw", "deconv s2"}
+
+
+def check_conv(
+    oracle: Path,
+    dump: Path,
+    failures: list[Failure],
+    verbose: bool,
+) -> tuple[int, int, int]:
+    """Returns (plan checks, direct/dw program checks, fused-act program checks)."""
+    kind = Dtype("conv", "conv", "emit-conv", n_align=1, k_align=1)
+    plan_checks = 0
+    for row in CONV_PLANS:
+        (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw, oh, ow,
+         expect) = row
+        args = ["conv", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(dy), str(dx), str(dw)]
+        if oh or ow:
+            args += [str(oh), str(ow)]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        plan_checks += 1
+        if not compare(failures, kind, f"{name}: {' '.join(args[1:])}", c_proc, r_proc):
+            continue
+        got = c_proc.stdout.strip()
+        if got != str(expect):
+            failures.append(
+                Failure(kind.name, name, f"expected plan code {expect}, got {got}")
+            )
+        elif verbose:
+            print(f"  {name:<12} {' '.join(args[1:])[:62]:<62} -> {got}")
+
+    prog_checks = 0
+    for row in CONV_EMITS:
+        (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw, fp32,
+         dsy, dsx) = row
+        args = ["emit-conv", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(dy), str(dx), str(dw),
+                str(fp32), IN_DMA, WT_DMA, OUT_DMA, str(dsy), str(dsx)]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        prog_checks += 1
+        if not compare(failures, kind, f"{name}: {' '.join(args[1:])}", c_proc, r_proc):
+            continue
+        refused = c_proc.stdout.strip() == "-1"
+        if refused != (name in CONV_EMIT_REFUSALS):
+            failures.append(
+                Failure(
+                    kind.name,
+                    name,
+                    f"expected {'a refusal' if name in CONV_EMIT_REFUSALS else 'a program'}, "
+                    f"got {c_proc.stdout.strip()!r}",
+                )
+            )
+        elif verbose:
+            words = c_proc.stdout.splitlines()
+            what = "refused" if refused else f"{words[0]} words"
+            print(f"  {name:<12} {' '.join(args[1:])[:58]:<58} -> {what}")
+
+    act_checks = 0
+    for row in CONV_ACTS:
+        name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw, k = row
+        args = ["emit-conv-act", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(dy), str(dx), str(dw),
+                str(k), IN_DMA, WT_DMA, OUT_DMA]
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        act_checks += 1
+        if not compare(failures, kind, f"{name}: {' '.join(args[1:])}", c_proc, r_proc):
+            continue
+        if c_proc.stdout.strip() == "-1":
+            failures.append(Failure(kind.name, name, "the fused program was refused"))
+        elif verbose:
+            words = c_proc.stdout.splitlines()
+            print(f"  {name:<12} {' '.join(args[1:])[:58]:<58} -> {words[0]} words")
+    return plan_checks, prog_checks, act_checks
 
 # (C, H, W) for the decomposition (`pool C H W`): the plan reason code plus the per-axis
 # factor lists. Covers every branch of `rocket_global_avgpool_plan` — square, equal-count
@@ -506,7 +671,7 @@ def main() -> int:
         wanted: list[str] = []
         for chunk in args.kind:
             wanted.extend(part.strip() for part in chunk.split(",") if part.strip())
-        known = {d.name for d in DTYPES} | {"pool"}
+        known = {d.name for d in DTYPES} | {"pool", "conv"}
         unknown = [k for k in wanted if k not in known]
         if unknown:
             print(f"error: unknown --kind {', '.join(unknown)}; known: {', '.join(sorted(known))}",
@@ -517,9 +682,11 @@ def main() -> int:
             return 2
         selected = tuple(d for d in DTYPES if d.name in wanted)
         pool_selected = "pool" in wanted
+        conv_selected = "conv" in wanted
     else:
         selected = DTYPES
         pool_selected = True
+        conv_selected = True
 
     print(f"oracle: {oracle}")
     print(f"dump:   {dump}")
@@ -535,10 +702,16 @@ def main() -> int:
     if pool_selected:
         pool_counts = check_pool(oracle, dump, failures, args.verbose)
 
+    conv_counts: tuple[int, int, int] | None = None
+    if conv_selected:
+        conv_counts = check_conv(oracle, dump, failures, args.verbose)
+
     print()
     names = [len(d.name) for d in selected]
     if pool_counts is not None:
         names.append(len("pool"))
+    if conv_counts is not None:
+        names.append(len("conv"))
     width = max(names)
     for dtype, status, plan_checks, emit_checks in results:
         if status == "pending":
@@ -550,6 +723,11 @@ def main() -> int:
         status = "fail" if any(f.dtype == "pool" for f in failures) else "pass"
         print(f"{'pool':<{width}}  {status.upper():<5}  "
               f"recip {recip_checks}, plan {plan_checks}, program {prog_checks}")
+    if conv_counts is not None:
+        plan_checks, prog_checks, act_checks = conv_counts
+        status = "fail" if any(f.dtype == "conv" for f in failures) else "pass"
+        print(f"{'conv':<{width}}  {status.upper():<5}  "
+              f"plan {plan_checks}, emit {prog_checks}, act {act_checks}")
 
     if failures:
         print()
@@ -570,6 +748,11 @@ def main() -> int:
         print(
             f"pool: {pool_counts[0]} reciprocal(s) + {pool_counts[1]} plan(s) + "
             f"{pool_counts[2]} program(s) compared, all byte-identical"
+        )
+    if conv_counts is not None:
+        print(
+            f"conv: {conv_counts[0]} plan(s) + {conv_counts[1]} program(s) + "
+            f"{conv_counts[2]} fused-activation program(s) compared, all byte-identical"
         )
     print("RESULT: PASS")
     return 0

@@ -6,10 +6,11 @@ Run it on the board (the C side must be built natively there, because a cross-bu
 librocketnpu reads an empty driver name and cannot open the device). Both binaries use
 the same `--io` argument layout, so this script only has to produce inputs, run each
 side and compare the raw outputs. It covers the M6b reduce/softmax family through
-`reduce_selftest` and the M7 norm/vision/FFN/encoder family through `ops_selftest`:
+`reduce_selftest`, the M7 norm/vision/FFN/encoder family through `ops_selftest` and the
+M8a fp16 convolution family through `conv_selftest`:
 
-    python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest --c ./ab_board \
-        [--work DIR] [--no-wide]
+    python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest \
+        --conv ./conv_selftest --c ./ab_board [--work DIR] [--no-wide]
 
 For every case it prints the bit-identical element count, the cosine and the max-abs of
 the C output against the Rust output, then PASS/FAIL. A mismatch exits nonzero.
@@ -39,6 +40,18 @@ gate is cosine >= 0.9999 and max-abs <= 5e-2, and the exact count is printed so 
 regression to "not even close" is visible):
 
   ffn / ffn_fused / mlp_fused / encoder_block
+
+The M8a convolution family runs the same programs and the same host scatter on both
+sides, so it is gated STRICTLY (bit-identical):
+
+  conv (direct, every stride/pad/dilation/tiling shape)   -> bit-identical
+  conv depthwise                                         -> bit-identical
+  conv1d                                                 -> bit-identical
+  conv_transpose (deconv route and the lowering)          -> bit-identical
+
+The fused conv->activation path adds the DPU LUT interpolation, which the C header says
+to gate with a tolerance, so it is gated relatively (cosine + max-abs); the exact count
+is printed either way.
 """
 
 from __future__ import annotations
@@ -162,6 +175,8 @@ def main() -> int:
                     help="the reduce_selftest binary (M6b families)")
     ap.add_argument("--ops", type=Path,
                     help="the ops_selftest binary (M7 families; skipped when missing)")
+    ap.add_argument("--conv", type=Path,
+                    help="the conv_selftest binary (M8a families; skipped when missing)")
     ap.add_argument("--c", required=True, type=Path)
     ap.add_argument("--work", default=Path("/tmp/ab_m6b"), type=Path)
     ap.add_argument("--no-wide", action="store_true",
@@ -240,6 +255,9 @@ def main() -> int:
 
     if args.ops is not None:
         m7(run, args.ops)
+
+    if args.conv is not None:
+        m8a(run, args.conv)
 
     print()
     print("ab_compare:", "FAIL" if run.fail else "PASS")
@@ -404,6 +422,103 @@ def m7(run: Runner, ops: Path) -> None:
                 ln2_g, ln2_b, wf1, bf1, wf2, bf2]
         c_vals, r_vals = run.run(f"enc_{t}x{d}x{nh}x{dff}", args, x, False, t * d)
         run.report(f"encoder T={t} d={d} h={nh} ff={dff}", c_vals, r_vals, tol=enc_tol)
+
+    run.rust = m6b
+
+
+def conv_out_dim(i: int, k: int, s: int, p: int, d: int = 1) -> int:
+    return (i + 2 * p - (d * (k - 1) + 1)) // s + 1
+
+
+def m8a(run: "Runner", conv: Path) -> None:
+    """The M8a fp16 convolution family through `conv_selftest --io`."""
+    m6b = run.rust
+    run.rust = conv.resolve()
+
+    def tensor(name: str, n: int, lo: float, hi: float, seed: int) -> Path:
+        path = run.work / name
+        w_f16(path, lcg(n, lo, hi, seed))
+        return path
+
+    print("direct conv:")
+    # (ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, depthwise)
+    conv_cases = [
+        ("k3 p1", 32, 16, 16, 16, 3, 3, 1, 1, 1, 1, 1, 1, 0),
+        ("k3 s2", 32, 16, 16, 32, 3, 3, 2, 2, 0, 0, 1, 1, 0),
+        ("k5 p2", 32, 16, 16, 16, 5, 5, 1, 1, 2, 2, 1, 1, 0),
+        ("k5 s2 d2", 64, 16, 16, 16, 5, 5, 2, 2, 0, 0, 2, 2, 0),
+        ("1x1", 64, 8, 8, 16, 1, 1, 1, 1, 0, 0, 1, 1, 0),
+        ("rgb 1x1", 3, 32, 32, 16, 1, 1, 1, 1, 0, 0, 1, 1, 0),
+        ("rgb stem", 3, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1, 0),
+        ("oc24", 32, 8, 8, 24, 5, 5, 1, 1, 2, 2, 1, 1, 0),
+        ("oc tile", 64, 56, 56, 64, 3, 3, 1, 1, 1, 1, 1, 1, 0),
+        ("s2 tile", 128, 28, 28, 128, 3, 3, 2, 2, 1, 1, 1, 1, 0),
+        ("space tile", 32, 112, 112, 32, 3, 3, 1, 1, 1, 1, 1, 1, 0),
+        ("dw k3", 32, 56, 56, 32, 3, 3, 1, 1, 1, 1, 1, 1, 1),
+        ("dw s2", 64, 28, 28, 64, 3, 3, 2, 2, 1, 1, 1, 1, 1),
+        ("dw 1x1", 96, 14, 14, 96, 1, 1, 1, 1, 0, 0, 1, 1, 1),
+        ("dw oc tile", 128, 28, 28, 128, 3, 3, 1, 1, 1, 1, 1, 1, 1),
+    ]
+    for case in conv_cases:
+        name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, dy, dx, dw = case
+        oh = conv_out_dim(ih, kh, sy, pt, dy)
+        ow = conv_out_dim(iw, kw, sx, pl, dx)
+        src = tensor(f"conv_{name}.in", ic * ih * iw, -1.5, 1.5, 0xC1 + ic * 31 + ih)
+        wn = ic * kh * kw if dw else oc * ic * kh * kw
+        wt = tensor(f"conv_{name}.w", wn, -0.5, 0.5, 0xC2 + oc * 31 + kh)
+        args = ["conv", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), str(dy), str(dx), str(dw)]
+        c_vals, r_vals = run.run_files(f"conv_{name}", args, [src, wt], False,
+                                       oc * oh * ow)
+        run.report(f"conv {name} {ic}x{ih}x{iw} oc{oc}", c_vals, r_vals, strict=True)
+
+    print("conv1d:")
+    for (ic, it, oc, kw, stride, pad) in [(80, 512, 384, 3, 1, 1), (80, 512, 384, 3, 2, 1)]:
+        ot = conv_out_dim(it, kw, stride, pad)
+        src = tensor(f"conv1d_{ic}x{it}.in", ic * it, -1.5, 1.5, 0xC3 + ic * 31 + it)
+        wt = tensor(f"conv1d_{ic}x{it}.w", oc * ic * kw, -0.4, 0.4, 0xC4 + oc + kw)
+        args = ["conv1d", str(ic), str(it), str(oc), str(kw), str(stride), str(pad)]
+        c_vals, r_vals = run.run_files(f"conv1d_{ic}x{it}_s{stride}", args, [src, wt],
+                                       False, oc * ot)
+        run.report(f"conv1d {ic}x{it} k{kw}s{stride} p{pad} oc{oc}", c_vals, r_vals,
+                   strict=True)
+
+    print("conv -> activation fusion:")
+    for kind, kname in ((3, "silu"), (4, "tanh"), (5, "gelu")):
+        ic, ih, iw, oc, kh, kw = 32, 16, 16, 32, 3, 3
+        oh = conv_out_dim(ih, kh, 1, 1)
+        ow = conv_out_dim(iw, kw, 1, 1)
+        src = tensor(f"act_{kname}.in", ic * ih * iw, -2.0, 2.0, 0xC5 + ic)
+        wt = tensor(f"act_{kname}.w", oc * ic * kh * kw, -0.5, 0.5, 0xC6 + oc)
+        args = ["conv_act", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                "1", "1", "1", "1", "1", "1", "0", str(kind)]
+        c_vals, r_vals = run.run_files(f"act_{kname}", args, [src, wt], False,
+                                       oc * oh * ow)
+        run.report(f"conv_act {kname}", c_vals, r_vals, tol=(0.9999, 5e-3))
+
+    print("transposed conv:")
+    # (ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, opad_y, opad_x, depthwise)
+    t_cases = [
+        ("deconv s2", 32, 16, 16, 32, 3, 3, 2, 2, 1, 1, 1, 1, 0),
+        ("deconv opad0", 32, 16, 16, 16, 3, 3, 2, 2, 1, 1, 0, 0, 0),
+        ("deconv s4", 64, 8, 8, 32, 4, 4, 4, 4, 2, 2, 0, 0, 0),
+        ("lowered ic24", 24, 16, 16, 24, 3, 3, 2, 2, 1, 1, 1, 1, 0),
+        ("lowered s3", 32, 16, 16, 16, 3, 3, 3, 3, 1, 1, 1, 1, 0),
+        ("lowered s1", 32, 16, 16, 32, 3, 3, 1, 1, 1, 1, 0, 0, 0),
+        ("dw s2", 32, 16, 16, 32, 2, 2, 2, 2, 0, 0, 0, 0, 1),
+    ]
+    for case in t_cases:
+        (name, ic, ih, iw, oc, kh, kw, sy, sx, pt, pl, oy, ox, dw) = case
+        oh = (ih - 1) * sy - 2 * pt + (kh - 1) + oy + 1
+        ow = (iw - 1) * sx - 2 * pl + (kw - 1) + ox + 1
+        src = tensor(f"t_{name}.in", ic * ih * iw, -1.5, 1.5, 0xC7 + ic * 31 + ih)
+        wn = ic * kh * kw if dw else ic * oc * kh * kw
+        wt = tensor(f"t_{name}.w", wn, -0.5, 0.5, 0xC8 + oc * 31 + kh)
+        args = ["conv_t", str(ic), str(ih), str(iw), str(oc), str(kh), str(kw),
+                str(sy), str(sx), str(pt), str(pl), "1", "1", str(oy), str(ox), str(dw)]
+        c_vals, r_vals = run.run_files(f"t_{name}", args, [src, wt], False,
+                                       oc * oh * ow)
+        run.report(f"conv_t {name} {ic}x{ih}x{iw} oc{oc}", c_vals, r_vals, strict=True)
 
     run.rust = m6b
 

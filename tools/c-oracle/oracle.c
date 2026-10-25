@@ -22,10 +22,20 @@
  *   oracle recip        K
  *   oracle pool         C H W
  *   oracle emit-pool    C IH IW OH OW KH KW SY SX PT PL PB PR METHOD RW RH IN_DMA OUT_DMA
+ *   oracle conv         IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]
+ *   oracle emit-conv    IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 IN WT OUT [DSY DSX]
+ *   oracle emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT
  *
  * A plan prints "Mt Kt Nt jobs", or "-1" for an unsupported shape.
  * An emit prints the task count, then one %016llx per NPUOP word.
  * The emitters take the TILE dims (Mt Kt Nt), not the full problem dims.
+ *
+ * `conv` prints `rocket_conv2d_plan`'s raw code (0 or the negated reason). `emit-conv`
+ * runs `gen_conv2d_fp16` / `gen_conv2d_dw_fp16` (DEPTHWISE selects the latter) with the
+ * optional deconvolution interior-dilation strides DSY/DSX (1 = off) and prints the word
+ * count + program, or "-1" if the generator refuses. `emit-conv-act` fuses a smooth
+ * activation (KIND is the ROCKET_ACTIVATION_* value) through
+ * `rocket_lut_epilogue_build`, which is what makes that program ~1200 words, not ~130.
  *
  * `recip` prints the fp16 average-pool reciprocal bits of K (the C
  * `ppu_recip_kernel_fp16`, the PPU's only division). `pool` prints the spatial-reduce
@@ -43,11 +53,14 @@
 
 #include "npu_matmul.h"
 #include "npu_pool.h"
+#include "rocket_activation.h"
+#include "rocket_conv.h"
 #include "rocket_matmul.h"
 #include "rocket_reduce.h"
 
-/* One regcmd program is <= RC_STRIDE (128) words; 512 leaves headroom. */
-#define ORACLE_MAX_OPS 512
+/* One regcmd program is <= RC_STRIDE (128) words for a matmul; the conv->activation
+ * fusion appends the two 513-word table uploads and lands near 1200. 2048 covers it. */
+#define ORACLE_MAX_OPS 2048
 
 static void usage(const char *argv0)
 {
@@ -57,8 +70,13 @@ static void usage(const char *argv0)
             "[FP32TOFP16] [ACCUMULATE] [ADD_DMA]\n"
             "       %s recip K\n"
             "       %s pool C H W\n"
-            "       %s emit-pool C IH IW OH OW KH KW SY SX PT PL PB PR METHOD RW RH IN OUT\n",
-            argv0, argv0, argv0, argv0, argv0);
+            "       %s emit-pool C IH IW OH OW KH KW SY SX PT PL PB PR METHOD RW RH IN OUT\n"
+            "       %s conv IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]\n"
+            "       %s emit-conv IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 "
+            "IN WT OUT [DSY DSX]\n"
+            "       %s emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND "
+            "IN WT OUT\n",
+            argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0);
 }
 
 static int is_plan_mode(const char *mode)
@@ -135,6 +153,84 @@ int main(int argc, char **argv)
             /* The C's local rejection class (-1/-2/-3) does not line up with the port's
              * Status enum, so the harness compares the portable "-1", as the matmul
              * emits do. Valid programs are compared word for word. */
+            printf("-1\n");
+            return 0;
+        }
+        printf("%u\n", p.task_count);
+        for (uint32_t i = 0; i < p.task_count; i++)
+            printf("%016llx\n", (unsigned long long)ops[i]);
+        return 0;
+    }
+
+    if (!strcmp(mode, "conv") || !strcmp(mode, "emit-conv") ||
+        !strcmp(mode, "emit-conv-act")) {
+        if (argc < 15) {
+            fprintf(stderr, "conv needs IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE\n");
+            return 2;
+        }
+        rocket_conv2d_desc d = {0};
+        d.ic = atoi(argv[2]);
+        d.ih = atoi(argv[3]);
+        d.iw = atoi(argv[4]);
+        d.oc = atoi(argv[5]);
+        d.kh = atoi(argv[6]);
+        d.kw = atoi(argv[7]);
+        d.stride_y = atoi(argv[8]);
+        d.stride_x = atoi(argv[9]);
+        d.pad_top = atoi(argv[10]);
+        d.pad_left = atoi(argv[11]);
+        d.dil_y = atoi(argv[12]);
+        d.dil_x = atoi(argv[13]);
+        d.depthwise = atoi(argv[14]);
+        if (!strcmp(mode, "conv")) {
+            if (argc > 15) d.oh = atoi(argv[15]);
+            if (argc > 16) d.ow = atoi(argv[16]);
+            printf("%d\n", rocket_conv2d_plan(&d));
+            return 0;
+        }
+        if (argc < 19) {
+            fprintf(stderr, "emit-conv needs FP32TOFP16|KIND IN WT OUT\n");
+            return 2;
+        }
+        conv_params_t p = {0};
+        p.ic = (uint16_t)d.ic;
+        p.ih = (uint16_t)d.ih;
+        p.iw = (uint16_t)d.iw;
+        p.oc = (uint16_t)d.oc;
+        p.oh = (uint16_t)rocket_conv2d_oh(&d);
+        p.ow = (uint16_t)rocket_conv2d_ow(&d);
+        p.kh = (uint16_t)d.kh;
+        p.kw = (uint16_t)d.kw;
+        p.stride_y = (uint8_t)d.stride_y;
+        p.stride_x = (uint8_t)d.stride_x;
+        p.dil_y = (uint8_t)d.dil_y;
+        p.dil_x = (uint8_t)d.dil_x;
+        p.pad_top = (uint8_t)d.pad_top;
+        p.pad_left = (uint8_t)d.pad_left;
+        p.input_dma = (uint32_t)strtoul(argv[16], NULL, 0);
+        p.weights_dma = (uint32_t)strtoul(argv[17], NULL, 0);
+        p.output_dma = (uint32_t)strtoul(argv[18], NULL, 0);
+        p.deconv_sy = argc > 19 ? (uint8_t)atoi(argv[19]) : 1;
+        p.deconv_sx = argc > 20 ? (uint8_t)atoi(argv[20]) : 1;
+        uint64_t ops[ORACLE_MAX_OPS] = {0};
+        p.tasks = ops;
+        int rc;
+        if (!strcmp(mode, "emit-conv-act")) {
+            uint16_t lut[1026];
+            lut_epilogue_t ep;
+            int b = rocket_lut_epilogue_build(atoi(argv[15]), lut, &ep);
+            if (b < 0) {
+                printf("-1\n");
+                return 0;
+            }
+            p.fp32tofp16 = 1;
+            p.act = &ep;
+            rc = d.depthwise ? gen_conv2d_dw_fp16(&p) : gen_conv2d_fp16(&p);
+        } else {
+            p.fp32tofp16 = (uint8_t)(atoi(argv[15]) != 0);
+            rc = d.depthwise ? gen_conv2d_dw_fp16(&p) : gen_conv2d_fp16(&p);
+        }
+        if (rc < 0) {
             printf("-1\n");
             return 0;
         }

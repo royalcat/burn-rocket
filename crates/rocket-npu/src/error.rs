@@ -56,6 +56,9 @@ pub struct Error {
     status: Status,
     errno: i32,
     detail: Option<String>,
+    /// The C library's own code when it is not a [`Status`] class (`-10`/`-11` from
+    /// the conv→activation entries); otherwise the status code.
+    code: i32,
 }
 
 impl Error {
@@ -65,6 +68,23 @@ impl Error {
             status,
             errno,
             detail: None,
+            code: status.code(),
+        }
+    }
+
+    /// A failure whose C code falls outside [`Status`]'s range.
+    ///
+    /// The C's conv→activation entry answers `-10` (depthwise) and `-11` (unsupported
+    /// kind); those are the library's own local codes, not `ROCKET_E_*` classes, so
+    /// the [`Status`] names the closest class while [`Error::c_code`] keeps the
+    /// original number for a caller that mirrors the C switch.
+    pub fn coded(status: Status, code: i32, op: &'static str) -> Self {
+        Self {
+            op,
+            status,
+            errno: 0,
+            detail: None,
+            code,
         }
     }
 
@@ -99,6 +119,12 @@ impl Error {
 
     pub fn status(&self) -> Status {
         self.status
+    }
+
+    /// The C library's status code for this failure: the [`Status`] code for every
+    /// constructor but [`Error::coded`], which keeps its explicit value.
+    pub fn c_code(&self) -> i32 {
+        self.code
     }
 
     pub fn op(&self) -> &'static str {
@@ -180,5 +206,14 @@ mod tests {
         assert!(Error::tiling("x").is_fallback());
         assert!(!Error::nomem("x").is_fallback());
         assert!(!Error::device("x", 19).is_fallback());
+    }
+
+    #[test]
+    fn c_code_keeps_the_explicit_value() {
+        assert_eq!(Error::tiling("x").c_code(), -2);
+        assert_eq!(Error::device("x", 19).c_code(), -4);
+        let e = Error::coded(Status::Unsupported, -10, "conv2d_act");
+        assert_eq!(e.c_code(), -10);
+        assert_eq!(e.status(), Status::Unsupported);
     }
 }

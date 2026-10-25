@@ -24,8 +24,16 @@
 //!
 //! [`encoder`] is the port of `rocket_encoder.c`: one pre-norm Whisper/transformer
 //! encoder block assembled from the primitives above and [`crate::attn::mha_self`].
+//!
+//! [`conv`] is the port of the RK3588 fp16 half of `rocket_conv.c`: the native
+//! convolution engine (direct and depthwise, 1D, and the conv→activation fusion with
+//! its tiling and resident-BO context), and [`conv_transpose`] is
+//! `rocket_conv_transpose.c`'s transposed conv (the hardware deconvolution route and the
+//! dilated-input lowering).
 
 pub mod activation;
+pub mod conv;
+pub mod conv_transpose;
 pub mod encoder;
 pub mod ffn;
 pub mod norm;
@@ -39,6 +47,21 @@ pub use activation::{
     eval, ew_add, ew_add_ref, ew_max, ew_max_ref, ew_min, ew_min_ref, ew_mul, ew_mul_ref, ew_ref,
     ew_sub, ew_sub_ref, leaky_relu, leaky_relu_model, leaky_relu_ref, lut_apply,
     lut_epilogue_build, prelu, prelu_ref, selu, selu_model, selu_ref, table_domain,
+};
+pub use conv::{
+    CONV_MIN_DATAIN_H, Conv2dDesc, ConvContext, balance_bands, conv_dw_group, conv_out_dim, conv1d,
+    conv2d, conv2d_act, conv2d_act_code, conv2d_act_ctx, conv2d_ctx, conv2d_deconv,
+    conv2d_deconv_fits, conv2d_job_extent, conv2d_oh, conv2d_ow, conv2d_plan, conv2d_plan_code,
+    conv2d_ref, conv2d_trail_x, conv2d_trail_y, datain_h, dw_chunk_fits, feature_cube_index,
+    gather_output, scatter_feature, scatter_weights, scatter_weights_dw, weight_cube_dw_index,
+    weight_cube_index,
+};
+pub use conv_transpose::{
+    ConvTranspose2dDesc, ConvTransposeRoute, ROCKET_CONV_TRANSPOSE_DECONV,
+    ROCKET_CONV_TRANSPOSE_LOWERED, conv_transpose2d, conv_transpose2d_ctx,
+    conv_transpose2d_deconv_eligible, conv_transpose2d_oh, conv_transpose2d_ow,
+    conv_transpose2d_plan, conv_transpose2d_plan_code, conv_transpose2d_ref,
+    conv_transpose2d_route, conv_transpose2d_route_code, lower_desc,
 };
 pub use encoder::{EncoderParams, encoder_block, encoder_block_ref};
 pub use ffn::{ffn, ffn_fused, ffn_ref, geglu, geglu_ref, mlp, mlp_fused, mlp_ref};

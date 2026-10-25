@@ -6,6 +6,7 @@
 
 pub mod activation;
 pub mod bf16;
+pub mod conv;
 pub mod desc;
 pub mod fp16;
 pub mod int4;

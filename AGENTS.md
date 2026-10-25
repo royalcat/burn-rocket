@@ -369,7 +369,10 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   `mlp_fused`, the host-handoff `mlp`) and the **encoder block** (one pre-norm Whisper
   layer over two LayerNorms, `mha_self`, the EW residual adds and the fused MLP over
   `Tp = (T+3) & ~3` rows, `ROCKET_ENCODER_NOFUSE` for the C's host-handoff A/B route;
-  M7 below) are ported
+  M7 below), and the **fp16 convolution family** (the native CNA conv — direct,
+  depthwise, 1D and the conv→activation fusion — with its OC / spatial / channel tiling
+  and resident-BO context, plus the transposed conv's hardware deconvolution route and
+  dilated-input lowering; M8a below) are ported
   (`int8_selftest --dense|--gw-one-shot|--prepacked-dense|--prepacked-gw`,
   `int4_selftest --dense|--gw-one-shot G|--prepacked|--prepacked-gw G`,
   `int16_selftest` and `tf32_selftest` are the board checks: int32/i64-exact vs the
@@ -377,7 +380,9 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   group 32-512 for both int8 and int4, tf32 inside the fp32-accumulation envelope of a
   tf32-rounded f64 reference).
   Planner and regcmd output are byte-equal to the C library over the whole parity
-  matrix — all six dtypes (`fp16/int8/int8-gw/int4/tf32/bf16`) PASS for plan and emit;
+  matrix — all six dtypes (`fp16/int8/int8-gw/int4/tf32/bf16`) PASS for plan and emit,
+  and the `conv` section (`parity.py --kind conv`) PASSes for 23 plans + 18 programs +
+  6 fused-activation programs;
   fp16/bf16 cosine >= 0.99999, int8 matches its dequantized reference, int4 is
   int32-exact against the int64 CPU reference and tf32 matches a tf32-rounded f64
   reference. Board microbenchmarks: int8 512x3072x1024
@@ -619,6 +624,82 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   `ab_compare.py` grew a `--ops` argument (the `ops_selftest` binary) and a per-case
   `strict` gate: the EW/reduce/LUT families require bit-identity, the matmul-bearing
   ones a cosine/max-abs pair (the exact count is printed for both).
+- **M8a fp16 convolution** (2026-10-25): `src/rocket_conv.c`'s RK3588 fp16 half
+  (`conv2d_one_job` / `conv2d_run` / `dw_spatial` / the deconvolution route / the
+  planner / the reference) and `src/rocket_conv_transpose.c` are ported as
+  `ops/conv.rs` + `ops/conv_transpose.rs`, with the two generators
+  (`gen_conv2d_task` / `gen_conv2d_fill` → `gen_conv2d_fp16` / `gen_conv2d_dw_fp16`)
+  as `regcmd/conv.rs`.
+  API: `ops::conv::{Conv2dDesc, conv2d_plan, conv2d_plan_code, conv2d, conv2d_ctx via
+  ConvContext, conv2d_act, conv2d_act_code, conv1d, conv2d_ref, conv_out_dim,
+  conv2d_oh, conv2d_ow, conv2d_trail_y, conv2d_trail_x, conv_dw_group, dw_chunk_fits,
+  datain_h, balance_bands, feature_cube_index, weight_cube_index,
+  weight_cube_dw_index, scatter_feature/gather_output/scatter_weights/
+  scatter_weights_dw, conv2d_deconv_fits, conv2d_deconv, conv2d_job_extent}` and
+  `ops::conv_transpose::{ConvTranspose2dDesc, ConvTransposeRoute,
+  conv_transpose2d_route, conv_transpose2d_route_code, conv_transpose2d_plan,
+  conv_transpose2d_plan_code, conv_transpose2d, conv_transpose2d_ctx,
+  conv_transpose2d_ref, conv_transpose2d_oh/_ow, lower_desc,
+  conv_transpose2d_deconv_eligible}`. `regcmd::conv::{ConvParams, ConvAct,
+  gen_conv2d_fp16, gen_conv2d_dw_fp16, MAX_OPS, MAX_OPS_ACT}`.
+  Faithful behaviour: the host scatters the feature into the NC1HWC2 cube (`C2 = 8`)
+  and the weights into the `(OC/16, IC/32, KH, KW, 16, 32)` conv cube; **direct**
+  pads `IC` up to 32 (the RGB stem, `IC = 3`, is accepted and zero-padded — no
+  `IC % 32` requirement) and `OC` up to 16 (an `OC = 24` head is accepted), then tiles
+  over OC (mult-16) and over **space** (OH rows, then OW columns); each spatial tile
+  **materialises its edge padding** into the sub-input and runs with
+  `pad_top = pad_left = 0` (`rocket_conv2d_trail_*` is the pure helper), the row
+  budget never drops the materialised height below `CONV_MIN_DATAIN_H = 4` (the CNA
+  DMA is 4-row blocked; a shorter sub-input is wrong at any IC), and
+  `balance_bands` splits an axis into the fewest near-equal bands so no remainder stub
+  falls under that floor. **Depthwise** tiles over channels (multiples of `G`, 32 for
+  fp16, `ROCKET_CONV_DW_GROUP`) and, when even one `G`-chunk overflows the validated
+  8-bank feature budget, over space as well (`dw_spatial`) — note the upstream header
+  still says "not yet implemented" while its code does implement it; this port follows
+  the code. The C's refusals are preserved as `conv2d_plan_code`'s `0/-1/-2/-3/-4`
+  (malformed / depthwise mismatch / non-positive extent / CBUF) and mapped to typed
+  `Error`s; `conv2d_act_code` keeps the fusion's own `-10` (depthwise) and `-11`
+  (kind), reported through `Error::coded`/`Error::c_code`.
+  `conv1d` is the **height-1** mapping (`IH = KH = OH = 1`, time on the height axis, so
+  the row tiler can split a long sequence; the width-on-time form would leave `OH = 1`
+  untilable for Whisper's `IC = 512`). The fusion is the same job's DPU LUT epilogue
+  (BN index scale → EW LUT → affine OUT_CVT) built by
+  `ops::activation::lut_epilogue_build`, direct-only and smooth-kind only.
+  ConvTranspose: both routes, chosen by `conv_transpose2d_route` — `DECONV` (the CNA's
+  hardware deconvolution mode: direct, dilation 1, power-of-two strides, `opad <
+  stride`, `k-1-pad <= 11`, `IC % 32`, compact input fitting one CBUF pass beside a
+  16-channel weight tile; kernel rotated + channel-transposed on the host) and
+  `LOWERED` (interior-dilated + border-padded input, 180°-rotated kernel, stride-1
+  forward conv) — with `ROCKET_CONV_TRANSPOSE_HW=0` forcing the lowering. `opad 0/1`
+  and depthwise both work; `conv_transpose2d_ref` is the direct scatter-add oracle, so
+  the gate validates the route rather than just the forward conv.
+  Program parity: `oracle conv|emit-conv|emit-conv-act` + `regcmd_dump`'s same three
+  modes, and `parity.py`'s new `conv` section compares **23 plans, 18 direct/depthwise
+  /deconv programs and 6 fused-activation programs byte for byte** (the fused one is
+  1152 words: 126 + the two 513-word table uploads). Board (`crates/rocket-npu/src/bin/
+  conv_selftest`, cores 0-3, busy board at load ~7, 600 MHz module): the whole default
+  matrix PASSes against `conv2d_ref`/`conv_transpose2d_ref` — direct convs cosine 1.0
+  with <= 1e-3 relative on the significant elements (>= 99.7 % bit-identical, the rest
+  one fp16 ULP), depthwise **bit-identical** (100352/100352, 12544/12544, 18816/18816),
+  conv1d 80x3000 k3 s1 1.15 M/1.152 M exact and at 80 ms (s2 31 ms), transposes
+  1.6-3.9 ms, wall 0.5 ms for a 32x16x16 k3 on a resident context vs 1.3 ms through the
+  alloc-per-call entry, 5.3 ms at 64x56x56 k3, 5.8 ms at 128x28x28 k3 s2, 7.4 ms at
+  32x112x112 k3 and 4.7 ms for a 32x56x56 depthwise. The fused path is the C's
+  **single-pass** table, so its own `QUIRK 1` artifacts appear in both libraries
+  (the `x≈0` mux spike and gelu's saturated tail, up to 128); the selftest gates the
+  device against the `lut_apply` model of that table (<= 5e-3 relative on the
+  significant elements) and prints the table-vs-exact-f deviation without gating it.
+  C-vs-Rust A/B (`ab_board.c` + `ab_compare.py --conv`): **bit-identical for every
+  M8a case** — 15 direct convs (incl. the RGB stem, the OC=24 head, the OC-only and
+  OC+spatial tiling shapes), 2 conv1d, 3 fused activations, 7 transposed convs (both
+  routes) — and the C library's own `conv2d_fp16_rocket` / `conv1d_rocket` /
+  `conv_transpose_rocket` / `conv_act_rocket` gates PASS on the same board.
+  `cargo test -p rocket-npu` pins the geometry helpers, the plan accept/refuse classes,
+  the cube scatter/gather and weight-cube round trips, `conv1d`'s mapping, the
+  transposed-conv dims/route table (including the `ROCKET_CONV_TRANSPOSE_HW=0`
+  override) and hand-computed `conv2d_ref`/`conv_transpose2d_ref` cases (1x1, 3x3 pad
+  1, stride 2, dilation 2, depthwise, a box spread).
+
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
@@ -628,11 +709,17 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
   cube-resident *mechanism* of the fused FFN/MLP (the pinned tiling, the matched-tiling
   gate and the KACC routing are bit-identical to the C; the intermediates still come
   back to row-major between ops, so the C's `RESIDENT-FUSION NOTE` round-trip
-  optimization is what remains), and the other op families: the `rocket_pool.c`
-  MaxPool/AveragePool API (only the PPU global-pool decomposition is ported), conv
-  (2d/1d/transpose/depthwise), resize/upsample, SAM/SigLIP, graph execution. (The tiled
+  optimization is what remains), the **int8 convolution** entries of `rocket_conv.c`
+  (the direct int8→int32 accumulator, the int8-out depthwise requant with its on-chip
+  OUT_CVT, the int8 multicore pool and the RK3576 conv entries — M8b, i.e.
+  `rocket_conv2d_int8`, `_ctx`, `_mt`, `rocket_conv2d_dw_int8`, `_ctx`,
+  `rocket_conv2d_ref_int8` and the RK3576 `_plan`/`_pack`/cube surface), and the other
+  op families: the `rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool
+  decomposition is ported), resize/upsample, SAM/SigLIP, graph execution. (The tiled
   long-context attention path *is* implemented — M5b above; the activation family is
-  M6a, the reduce + softmax family M6b, and the norms/vision norms/FFN/encoder M7.)
+  M6a, the reduce + softmax family M6b, the norms/vision norms/FFN/encoder M7, and the
+  fp16 convolution family — direct/depthwise/1D/conv→act and the transposed conv —
+  M8a.)
 - Not done: int8 GEMM on the *flex CPU* path (still the only lever that would close
   the qwen3 speed gap; flex lacks it, and burn-cpu/CubeCL quantized matmul is
   unverified and cannot cross-compile) — the *NPU* int8 path is now implemented for
@@ -647,12 +734,12 @@ workspace is `cargo fmt --all --check` clean. All builds below are warning-free 
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program) and `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference) and `conv_transpose` (both routes + the scatter-add reference)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal), the `parity.py` dtype+pool parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax and norm/vision/FFN/encoder raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode) |
+| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, and the conv plan/direct/dw/act programs), the `parity.py` dtype+pool+conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder and conv/transpose raw-file A/B), and `build.sh` for the oracle itself |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool` and `conv`/`emit-conv`/`emit-conv-act`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest`, `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
@@ -1207,6 +1294,19 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ## Future work
 
+- **M8b — the native int8 convolution**: `rocket_conv.c`'s remaining half. The direct
+  entry writes a raw int32 accumulator (`gen_conv2d_int8`, feature cube `C2 = 16`,
+  weight cube oc-group 32, int32 out cube `C2 = 4`, host requant), and the depthwise
+  entry requantizes on chip to int8 (`rocket_conv2d_dw_int8`: QD_EN, the BS ALU int32
+  bias from BRDMA, OUT_CVT from the three scales and two zero points). Both share the
+  OC/row/column tiling and the `IC % 32` / `OC % 32` pads with the fp16 path, so the
+  port is mostly a second emitter (`gen_conv2d_task` with the int8 deltas: int8
+  precision, 1 B/elem, `data_entries = ceil(IW*IC/64)`, `qd_en = 0`, int32 out with
+  `size_e = 7` / `surf_add*8`, plus the int8 feature-DMA `+1` CBUF bank slack the tiler
+  must reserve) on top of the same tiler. Then the int8 multicore pool
+  (`rocket_conv_pool`, `rocket_conv2d_int8_mt`, the batched gapped submit) and the
+  RK3576 conv entries (a different geometry encoding entirely), and finally the
+  `rocket_conv2d_int8_pack_rk3576` cube-handle surface.
 - **int8 GEMM on the flex CPU path** is the only lever that would close the qwen3
   speed gap with production. flex has none; the candidates are the `burn-cpu`
   (CubeCL/LLVM) backend (CPU quantized matmul unverified, cannot cross-compile — would
@@ -1272,11 +1372,13 @@ cargo check -p burn-rocket --no-default-features --features flex
 # driver unit tests (planner, capacity classes, emitters, layout)
 cargo test -p rocket-npu
 # dtype parity vs the C oracle: plan + every regcmd word, all six dtypes, plus the
-# PPU pool section (20 decomposition plans + 19 reciprocals + 18 pool programs)
+# PPU pool section (20 decomposition plans + 19 reciprocals + 18 pool programs) and
+# the conv section (23 plans + 18 direct/depthwise/deconv programs + 6 fused-act programs)
 cargo build -p rocket-npu --bin regcmd_dump
 python3 tools/c-oracle/parity.py
-# ... or just the pool half:
+# ... or just one section:
 python3 tools/c-oracle/parity.py --kind pool
+python3 tools/c-oracle/parity.py --kind conv --verbose
 # activation/elementwise: LUT + epilogue and program byte-parity vs the C builder
 # (a throwaway C dumper in /tmp links build-host/librocketnpu.a and prints
 # `rocket_lut_epilogue_build` for kinds 0..=18 plus `gen_lut_activation_fp16` for a
@@ -1325,6 +1427,26 @@ taskset -c 0-3 ./ops_selftest --encoder --encoder-shape 8 64 2 128
 gcc -O2 -I ref/include -I ref ab_board.c ref/build/librocketnpu.a -lm -lpthread -o ab_board
 taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest \
     --c ./ab_board --no-wide --work /tmp/ab_m7
+# fp16 convolution family on the board (cores 0-3): direct, depthwise, conv1d, the
+# fused activations and both transposed-conv routes vs the fp32-accumulate references
+cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin conv_selftest
+scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/conv_selftest \
+    root@rock-5b-plus.lan:/root/rocket-m8a/
+taskset -c 0-3 ./conv_selftest --all --reps 2
+taskset -c 0-3 ./conv_selftest --shape 32 112 112 32 3 3 1 1 1 1 1 1   # one direct case
+taskset -c 0-3 ./conv_selftest --transpose --reps 3                   # both routes
+# C-vs-Rust A/B for the same family: `conv_selftest --io` and ab_board.c share the
+# raw-file layout (IN, W and OUT are fp16; W is [OC][IC][KH][KW] / [C][KH][KW] / [IC][OC][KH][KW])
+taskset -c 0-3 python3 ab_compare.py --rust ./reduce_selftest --ops ./ops_selftest \
+    --conv ./conv_selftest --c ./ab_board --work /tmp/ab_m8a --no-wide
+# the C library's own conv gates on the same board (they must PASS for the A/B to mean
+# anything; conv2d_fp16_rocket covers the direct + depthwise sweeps, conv_transpose the
+# 21 shapes / 13 deconv-route cases, conv_act the fusion's accuracy + QUIRK 1 counts)
+cmake --build ref/build --target conv2d_fp16_rocket conv1d_rocket conv_transpose_rocket \
+    conv_act_rocket -j4
+for t in conv2d_fp16_rocket conv1d_rocket conv_transpose_rocket conv_act_rocket; do
+    taskset -c 0-3 ./ref/build/$t || echo "C gate $t FAILED"
+done
 # vision-tower attention/softmax probe (separate aarch64 npu bin; run on the board)
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
     --no-default-features --features npu --bin vision_attn_bench

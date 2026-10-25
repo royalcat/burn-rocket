@@ -15,6 +15,9 @@
 //!   regcmd_dump recip        K
 //!   regcmd_dump pool         C H W
 //!   regcmd_dump emit-pool    C IH IW OH OW KH KW SY SX PT PL PB PR METHOD RW RH IN_DMA OUT_DMA
+//!   regcmd_dump conv         IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]
+//!   regcmd_dump emit-conv    IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 IN WT OUT [DSY DSX]
+//!   regcmd_dump emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT
 //!
 //! The emitters take the TILE dims (Mt Kt Nt), not the full problem dims, and a
 //! plan prints `Mt Kt Nt jobs` or `-1`, matching `tools/c-oracle/oracle`.
@@ -27,6 +30,13 @@
 //! `regcmd::pool::gen_pool_fp16`, or `-1` when the generator refuses the params (the C
 //! oracle prints the same portable rejection line).
 //!
+//! `conv` prints `ops::conv::conv2d_plan_code` (0 or the negated reason). `emit-conv`
+//! prints the word count and the program of `regcmd::conv::gen_conv2d_fp16` /
+//! `gen_conv2d_dw_fp16` (DEPTHWISE selects the latter), with the optional deconvolution
+//! interior-dilation strides DSY/DSX (1 = off); `emit-conv-act` fuses a smooth
+//! activation through `ops::activation::lut_epilogue_build`. Both print `-1` when the
+//! generator refuses, like the C oracle.
+//!
 //! `emit-int8` with ACCUMULATE=1 is not ported: the C int8 emitter has an
 //! EW-add path there, but the C library itself documents that encoding as
 //! non-bit-exact and never used in production, so the Rust port leaves it out.
@@ -36,6 +46,9 @@
 use std::process::ExitCode;
 
 use rocket_npu::matmul::plan::{self, BF16, INT4, INT8, INT8_GW, Plan, TF32};
+use rocket_npu::ops::activation::{Activation, LutTable, lut_epilogue_build};
+use rocket_npu::ops::conv::{Conv2dDesc, conv2d_oh, conv2d_ow, conv2d_plan_code};
+use rocket_npu::regcmd::conv::{ConvAct, ConvParams, gen_conv2d_dw_fp16, gen_conv2d_fp16};
 use rocket_npu::regcmd::fp16::{MatmulParams, emit};
 use rocket_npu::regcmd::pool::{PoolMethod, PoolParams, gen_pool_fp16};
 
@@ -93,6 +106,121 @@ fn emit_program(kind: &str, params: &MatmulParams) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The conv family: `conv` (the plan code), `emit-conv` / `emit-conv-act` (the program).
+///
+/// The argument layout is `tools/c-oracle/oracle`'s: 13 scalars after the mode, then the
+/// mode's own tail (OH/OW for the plan, `FP32TOFP16|KIND IN WT OUT [DSY DSX]` for the
+/// emitters).
+fn conv_mode(mode: &str, args: &[String]) -> ExitCode {
+    if args.len() < 15 {
+        eprintln!("conv needs IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE");
+        return ExitCode::FAILURE;
+    }
+    let n = |i: usize| args[i].parse::<usize>().unwrap_or(0);
+    let mut d = Conv2dDesc {
+        ic: n(2),
+        ih: n(3),
+        iw: n(4),
+        oc: n(5),
+        kh: n(6),
+        kw: n(7),
+        ..Default::default()
+    };
+    d.stride_y = n(8);
+    d.stride_x = n(9);
+    d.pad_top = n(10);
+    d.pad_left = n(11);
+    d.dil_y = n(12);
+    d.dil_x = n(13);
+    d.depthwise = n(14) != 0;
+
+    if mode == "conv" {
+        if args.len() > 15 {
+            d.oh = n(15);
+        }
+        if args.len() > 16 {
+            d.ow = n(16);
+        }
+        println!("{}", conv2d_plan_code(&d));
+        return ExitCode::SUCCESS;
+    }
+    if args.len() < 19 {
+        eprintln!("emit-conv needs FP32TOFP16|KIND IN WT OUT [DSY DSX]");
+        return ExitCode::FAILURE;
+    }
+    let mut p = ConvParams::new(
+        d.ic as u16,
+        d.ih as u16,
+        d.iw as u16,
+        d.oc as u16,
+        conv2d_oh(&d) as u16,
+        conv2d_ow(&d) as u16,
+        d.kh as u16,
+        d.kw as u16,
+        dma(&args[16]),
+        dma(&args[17]),
+        dma(&args[18]),
+    );
+    p.stride_y = d.stride_y as u8;
+    p.stride_x = d.stride_x as u8;
+    p.dil_y = d.dil_y as u8;
+    p.dil_x = d.dil_x as u8;
+    p.pad_top = d.pad_top as u8;
+    p.pad_left = d.pad_left as u8;
+    p.deconv_sy = args.get(19).map(|v| v.parse().unwrap_or(1)).unwrap_or(1);
+    p.deconv_sx = args.get(20).map(|v| v.parse().unwrap_or(1)).unwrap_or(1);
+
+    let mut ops = Vec::new();
+    let r = if mode == "emit-conv-act" {
+        let code: i32 = args[15].parse().unwrap_or(-1);
+        let Some(kind) = Activation::from_code(code) else {
+            println!("-1");
+            eprintln!("unknown activation kind {code}");
+            return ExitCode::SUCCESS;
+        };
+        let mut lut = LutTable::zeroed();
+        match lut_epilogue_build(kind, &mut lut) {
+            Ok(ep) => {
+                p.fp32_to_fp16 = true;
+                p.act = Some(ConvAct {
+                    lut: lut.words(),
+                    ep: &ep,
+                });
+                if d.depthwise {
+                    gen_conv2d_dw_fp16(&mut p, &mut ops)
+                } else {
+                    gen_conv2d_fp16(&mut p, &mut ops)
+                }
+            }
+            Err(e) => {
+                println!("-1");
+                eprintln!("{e}");
+                return ExitCode::SUCCESS;
+            }
+        }
+    } else {
+        p.fp32_to_fp16 = args[15] != "0";
+        if d.depthwise {
+            gen_conv2d_dw_fp16(&mut p, &mut ops)
+        } else {
+            gen_conv2d_fp16(&mut p, &mut ops)
+        }
+    };
+    match r {
+        Ok(count) => {
+            println!("{count}");
+            for op in ops {
+                println!("{:016x}", op.0);
+            }
+        }
+        Err(e) => {
+            println!("-1");
+            eprintln!("{e}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -107,9 +235,20 @@ fn main() -> ExitCode {
         eprintln!(
             "       regcmd_dump emit-pool C IH IW OH OW KH KW SY SX PT PL PB PR METHOD RW RH IN OUT"
         );
+        eprintln!("       regcmd_dump conv IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE [OH OW]");
+        eprintln!(
+            "       regcmd_dump emit-conv IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE FP32TOFP16 IN WT OUT [DSY DSX]"
+        );
+        eprintln!(
+            "       regcmd_dump emit-conv-act IC IH IW OC KH KW SY SX PT PL DY DX DEPTHWISE KIND IN WT OUT"
+        );
         return ExitCode::FAILURE;
     }
     let mode = args[1].as_str();
+
+    if mode == "conv" || mode == "emit-conv" || mode == "emit-conv-act" {
+        return conv_mode(mode, &args);
+    }
 
     if mode == "recip" {
         let k: String = args[2].clone();

@@ -107,8 +107,9 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention` and its stateless
   `flash_attn`/`flash_attn_mt`/`flash_attn_ref`/`mha_self`/`mha_self_ref` siblings,
   the `rocket_npu::ops` families — activation/elementwise, reduce/softmax, the
-  transformer and vision norms, the gated FFN and the encoder block — each with its
-  device-free `*_ref`,
+  transformer and vision norms, the gated FFN, the encoder block and the fp16
+  convolution family (direct/depthwise/1D, the conv→activation fusion and the
+  transposed conv) — each with its device-free `*_ref`,
   `f16` helpers, driver/counter helpers) for callers that do not want Burn tensor
   routing. The `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old
   surface. See `examples/probe.rs` for a runnable smoke test.
@@ -169,13 +170,20 @@ InstanceNorm and L2-Normalize over the `[N,C,P]` channels-major layout), the gat
 family (`rocket_ffn.c`: the GeGLU/SwiGLU core, the three-matmul block, the pinned-tile
 `ffn_fused` and `mlp_fused`, the host-handoff `mlp`) and the encoder block
 (`rocket_encoder.c`: one pre-norm Whisper layer over the two norms, `mha_self`, the
-residual adds and the fused MLP) are ported and validated on the board. Planner and
-regcmd output are byte-equal to the C library for every matmul dtype
+residual adds and the fused MLP) and the fp16 convolution family (`rocket_conv.c`: the
+native CNA conv — direct, depthwise, 1D and the conv→activation fusion, with the OC /
+spatial / channel tiling and the resident-BO context — and `rocket_conv_transpose.c`:
+the hardware deconvolution route and the dilated-input lowering) are ported and
+validated on the board. Planner and regcmd output are byte-equal to the C library for
+every matmul dtype
 (fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation program (1070 words,
 word-for-word) and for the PPU pool program (30 words, over an 18-case
 shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the plan
-reason code and both factor lists) and the fp16 average-reciprocal convention; the LUT
-tables and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
+reason code and both factor lists), the fp16 average-reciprocal convention and the
+convolution family (`conv`: 23 plan cases over the direct/depthwise/dilation/stride/
+explicit-extent matrix, `emit-conv`: 18 programs including the CNA deconvolution
+strides and the refusals, `emit-conv-act`: 6 fused-activation programs); the LUT tables
+and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
 >= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
 the int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
 
@@ -221,6 +229,25 @@ pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`. Board wall
 0-3, busy board): a 257x1024 LayerNorm 69 ms, RMSNorm 44 ms,
 a 64x512x2048 FFN 36 ms and the encoder blocks 32 ms / 48 ms.
 
+The M8a convolution family is **bit-identical to the C library on the board across the
+whole measured matrix** (`ab_compare.py` again): direct convs over the kernel/stride/
+pad/dilation sweep, the RGB stem (`IC = 3` zero-padded to 32), an `OC = 24` head (padded
+to 32), the tiling shapes that force OC-only and OC+spatial bands (64x56x56 k3,
+128x28x28 k3 s2, 32x112x112 k3), four depthwise shapes, conv1d at both strides,
+the fused SiLU/tanh/GELU epilogues, and seven transposed convs covering both routes
+(hardware deconvolution at strides 2/4, the lowering at `IC = 24`, stride 3 and
+stride 1) plus depthwise. Against the device-free fp32-accumulate references: the
+direct/depthwise/1D convs hold cosine 1.0 with <= 1e-3 relative on the significant
+elements (>= 99.7 % of elements bit-identical per shape, the rest one fp16 ULP), the
+transposed convs the same against the route-independent scatter-add oracle, and the
+fused activation sits at <= 2e-3 relative on the significant elements with the C's own
+single-pass table artifacts reported separately (the `x≈0` mux spike and gelu's
+saturated tail). Board wall (cores 0-3, busy board at load ~7, 600 MHz module): 32x16x16
+k3 1.3 ms through the alloc-per-call entry and 0.5 ms on a resident context, a
+64x56x56 k3 5.3 ms, a 128x28x28 k3 s2 5.8 ms, a 32x112x112 k3 7.4 ms, a 32x56x56
+depthwise 4.7 ms, the Whisper front-end conv1d (80x3000 k3 s1, 384 outputs) 80 ms and
+its stride-2 form 31 ms, and the transposed convs 1.6-3.9 ms.
+
 Attention also has its long-context form, the opt-in tiled path
 (`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
 one key tile at a time with the online softmax, instead of the `[Tp, Kn]` score
@@ -248,7 +275,12 @@ transformer norms (`rmsnorm`/`layernorm` plus the shared `square_prescale_k` fp1
 guard), the vision norms (`batchnorm`/`groupnorm`/`instancenorm`/`l2norm`), the FFN
 family (`geglu`, `ffn`, the pinned-tile `ffn_fused`/`mlp_fused`, the host-handoff
 `mlp`, and `ffn_ref`/`geglu_ref`/`mlp_ref`), the encoder block
-(`encoder_block`/`encoder_block_ref`), and
+(`encoder_block`/`encoder_block_ref`), the fp16 convolution family
+(`conv2d`/`conv2d_act`/`conv1d`/`conv2d_ref` with `ConvContext`, `conv2d_plan`/
+`conv2d_plan_code`, the `conv2d_deconv`/`conv2d_deconv_fits` deconvolution route and
+the weight/feature cube index math; `conv_transpose2d`/`conv_transpose2d_ctx`/
+`conv_transpose2d_ref` with `conv_transpose2d_plan`/`_plan_code` and the route enum),
+and
 masked GQA attention (the persistent
 `attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
 the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching and
@@ -264,6 +296,8 @@ program byte for byte. `crates/rocket-npu/src/bin/reduce_selftest.rs` does the s
 the reduce/softmax families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape`,
 `--reps`), `crates/rocket-npu/src/bin/ops_selftest.rs` for the norm/vision/FFN/encoder
 families (`--norm`, `--vision`, `--ffn`, `--encoder`, the four per-family shape
+overrides, `--reps`), `crates/rocket-npu/src/bin/conv_selftest.rs` for the convolution
+family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, the four per-family shape
 overrides, `--reps`), and their `--io` raw-file modes are the exchange format of
 `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board.
 
@@ -283,12 +317,14 @@ aliases, the non-fp16 batch wrappers, tiled MLA (a `dv != dk` head geometry stay
 materialized), on-NPU **attention** softmax, the cube-resident *mechanism* of the fused
 FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
 bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
-optimization is the remaining work), and the remaining op families: the
-`rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool decomposition is
-ported), conv (2d/1d/transpose/depthwise), resize/upsample, SAM/SigLIP and graph
-execution.
+optimization is the remaining work), the **int8 convolution** entries of
+`rocket_conv.c` (the direct int8→int32 accumulator, the int8-out depthwise requant, the
+int8 multicore pool and the RK3576 conv paths — M8b), and the remaining op families:
+the `rocket_pool.c` MaxPool/AveragePool API (only the PPU global-pool decomposition is
+ported), resize/upsample, SAM/SigLIP and graph execution.
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
-the FFN/MLP and the encoder block are implemented. See
+the FFN/MLP, the encoder block and the fp16 convolution family (direct/depthwise/1D,
+the conv→activation fusion and the transposed conv) are implemented. See
 the `rocket-npu` crate docs for the full list.
 
 On the board the NPU boots at 200 MHz; the patched 600 MHz module

@@ -21,7 +21,9 @@
 //!   row softmax / log-softmax / cross-entropy; the transformer norms (the
 //!   per-row broadcast scale, RMSNorm, LayerNorm); the vision norms (BatchNorm,
 //!   GroupNorm, InstanceNorm, L2-Normalize); the gated FFN (GeGLU/SwiGLU), its
-//!   fused form and the encoder MLP; and the pre-norm encoder block.
+//!   fused form and the encoder MLP; the pre-norm encoder block; and the fp16
+//!   convolution family (the native CNA conv — direct, depthwise, 1D and the
+//!   conv→activation fusion — plus the transposed conv).
 //! - [`knobs`], [`hw`], [`error`] — diagnostics, the RK3588 profile, typed failures.
 //!
 //! The crate is inference-only and targets the RK3588 only. Failure payloads carry
@@ -136,6 +138,27 @@
 //!   the two LayerNorms, [`attn::mha_self`], the EW residual adds and the fused
 //!   MLP over `Tp = (T+3) & ~3` rows (`ROCKET_ENCODER_NOFUSE` selects the C's
 //!   host-handoff A/B route), plus [`ops::encoder::encoder_block_ref`];
+//! - the fp16 convolution family ([`ops::conv`], the RK3588 half of
+//!   `rocket_conv.c`): [`ops::conv::conv2d`] / [`ops::conv::conv2d_act`] /
+//!   [`ops::conv::conv1d`] over [`ops::conv::Conv2dDesc`], the CNA's native
+//!   sliding-window MAC with the host feature/weight cube scatter, OC % 16 and
+//!   IC < 32 padding, the OC / output-row / output-column tiling (each spatial
+//!   tile materialising its edge padding), the depthwise channel + spatial
+//!   tiling, [`ops::conv::ConvContext`] (the resident-BO pool), the planner
+//!   ([`ops::conv::conv2d_plan`] / [`ops::conv::conv2d_plan_code`] with the C's
+//!   `0`..`-4` classes), [`ops::conv::conv2d_ref`] (the fp32-accumulate oracle)
+//!   and the pure geometry/cube helpers ([`ops::conv::conv2d_oh`],
+//!   [`ops::conv::conv_out_dim`], [`ops::conv::weight_cube_index`],
+//!   [`ops::conv::feature_cube_index`], ...); [`ops::conv::conv2d_deconv`] /
+//!   [`ops::conv::conv2d_deconv_fits`] are the CNA deconvolution mode;
+//! - the transposed conv ([`ops::conv_transpose`], the port of
+//!   `rocket_conv_transpose.c`): [`ops::conv_transpose::conv_transpose2d`] with
+//!   both routes ([`ops::conv_transpose::ConvTransposeRoute`] — the hardware
+//!   deconvolution mode and the dilated-input lowering), the route/plan queries
+//!   ([`ops::conv_transpose::conv_transpose2d_route`] and `_plan_code`, with
+//!   `ROCKET_CONV_TRANSPOSE_HW=0` forcing the lowering) and
+//!   [`ops::conv_transpose::conv_transpose2d_ref`] (the route-independent
+//!   scatter-add oracle);
 //! - attention: masked GQA with host mask/soft-cap/softmax, per-worker head split
 //!   ([`attn::Attention`], the persistent `rocket_fa_ctx_*` form); the stateless
 //!   entries [`attn::flash_attn`] (`rocket_flash_attn_fp16`) and
@@ -182,10 +205,14 @@
 //!   intermediates come back to row-major between ops instead of staying in the
 //!   projection's output cube — the elementwise passes commute with the cube reindex, so
 //!   only the host round-trip the C's `RESIDENT-FUSION NOTE` describes is missing;
-//! - every remaining op family: the `rocket_pool.c` MaxPool/AveragePool API (only the
-//!   PPU global-pool decomposition is ported here), conv (2d/1d/transpose/depthwise),
-//!   resize/upsample, SAM/SigLIP and graph execution. The activation + elementwise, the
-//!   reduce + softmax, the transformer/vision norms, the FFN/MLP and the encoder block
+//! - the **int8** convolution entries of `rocket_conv.c` (the direct
+//!   int8 → int32 accumulator, the int8-out depthwise requant, the int8 multicore
+//!   pool and the RK3576 conv paths), which are M8b;
+//! - the remaining op families: the `rocket_pool.c` MaxPool/AveragePool API (only the
+//!   PPU global-pool decomposition is ported here), resize/upsample, SAM/SigLIP and
+//!   graph execution. The activation + elementwise, the reduce + softmax, the
+//!   transformer/vision norms, the FFN/MLP, the encoder block and the fp16 convolution
+//!   family (direct/depthwise/1D, the conv→activation fusion and the transposed conv)
 //!   are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32

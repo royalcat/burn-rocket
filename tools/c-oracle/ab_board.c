@@ -27,6 +27,16 @@
  *   ab_board encoder T D H DFF EPS LN1G LN1B WQ BQ WK BK WV BV WO BO \
  *                    LN2G LN2B WF1 BF1 WF2 BF2 X OUT
  *
+ * M8a (fp16 convolution). Same argument layout as `conv_selftest --io`:
+ *
+ *   ab_board conv     IC IH IW OC KH KW SY SX PT PL DY DX DW  IN W OUT
+ *   ab_board conv_act IC IH IW OC KH KW SY SX PT PL DY DX DW KIND IN W OUT
+ *   ab_board conv1d   IC IT OC KW STRIDE PAD  IN W OUT
+ *   ab_board conv_t   IC IH IW OC KH KW SY SX PT PL DY DX OPADY OPADX DW  IN W OUT
+ *
+ * (`W` is `[OC][IC][KH][KW]`/`[C][KH][KW]` for a conv, `[OC][IC][KW]` for conv1d and
+ * `[IC][OC][KH][KW]`/`[C][KH][KW]` for a transposed conv.)
+ *
  * (In the encoder line any of LN1B/BQ/BK/BV/BO/LN2B/BF1/BF2 may be `-`. `mlp` is the
  * C's internal host-handoff MLP, which has no public entry point: the fused entry is
  * what this harness can call, so `mlp` is rejected with a message.)
@@ -43,6 +53,7 @@
 #include <stdint.h>
 
 #include "rocket_npu.h"
+#include "rocket_conv.h"
 #include "rocket_reduce.h"
 #include "rocket_softmax.h"
 #include "rocket_norm.h"
@@ -352,6 +363,69 @@ int main(int argc, char **argv)
         free(x); free(ln1_g); free(ln1_b); free(wq); free(bq); free(wk); free(bk);
         free(wv); free(bv); free(wo); free(bo); free(ln2_g); free(ln2_b); free(wf1);
         free(bf1); free(wf2); free(bf2); free(out);
+    } else if (!strcmp(family, "conv") || !strcmp(family, "conv_act")) {
+        int act = !strcmp(family, "conv_act");
+        /* conv IC IH IW OC KH KW SY SX PT PL DY DX DW [KIND] IN W OUT */
+        if (argc < (act ? 19 : 18)) die("conv IC IH IW OC KH KW SY SX PT PL DY DX DW [KIND] IN W OUT");
+        rocket_conv2d_desc d = {0};
+        d.ic = atoi(argv[2]);  d.ih = atoi(argv[3]);  d.iw = atoi(argv[4]);
+        d.oc = atoi(argv[5]);  d.kh = atoi(argv[6]);  d.kw = atoi(argv[7]);
+        d.stride_y = atoi(argv[8]);  d.stride_x = atoi(argv[9]);
+        d.pad_top = atoi(argv[10]);  d.pad_left = atoi(argv[11]);
+        d.dil_y = atoi(argv[12]);    d.dil_x = atoi(argv[13]);
+        d.depthwise = atoi(argv[14]);
+        int kind = 0;
+        char **a = &argv[15];
+        if (act) { kind = atoi(a[0]); a = &argv[16]; }
+        _Float16 *in = slurp_f16(a[0], (size_t)d.ic * d.ih * d.iw);
+        size_t wn = d.depthwise ? (size_t)d.ic * d.kh * d.kw
+                                : (size_t)d.oc * d.ic * d.kh * d.kw;
+        _Float16 *w = slurp_f16(a[1], wn);
+        size_t on = (size_t)d.oc * rocket_conv2d_oh(&d) * rocket_conv2d_ow(&d);
+        _Float16 *out = calloc(on, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = act ? rocket_conv2d_act_fp16(fd, &d, kind, in, w, out)
+                 : rocket_conv2d_fp16(fd, &d, in, w, out);
+        if (rc) die("conv op failed");
+        spit(a[2], out, on * sizeof(_Float16));
+        free(in); free(w); free(out);
+    } else if (!strcmp(family, "conv1d")) {
+        /* conv1d IC IT OC KW STRIDE PAD IN W OUT */
+        if (argc < 11) die("conv1d IC IT OC KW STRIDE PAD IN W OUT");
+        int ic = atoi(argv[2]), it = atoi(argv[3]), oc = atoi(argv[4]), kw = atoi(argv[5]);
+        int stride = atoi(argv[6]), pad = atoi(argv[7]);
+        _Float16 *in = slurp_f16(argv[8], (size_t)ic * it);
+        _Float16 *w = slurp_f16(argv[9], (size_t)oc * ic * kw);
+        int ot = rocket_conv_out_dim(it, kw, stride, pad, 1);
+        _Float16 *out = calloc((size_t)oc * ot, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = rocket_conv1d_fp16(fd, ic, it, oc, kw, stride, pad, in, w, out);
+        if (rc) die("conv1d op failed");
+        spit(argv[10], out, (size_t)oc * ot * sizeof(_Float16));
+        free(in); free(w); free(out);
+    } else if (!strcmp(family, "conv_t")) {
+        /* conv_t IC IH IW OC KH KW SY SX PT PL DY DX OPADY OPADX DW IN W OUT */
+        if (argc < 20) die("conv_t IC IH IW OC KH KW SY SX PT PL DY DX OPADY OPADX DW IN W OUT");
+        rocket_conv_transpose2d_desc d = {0};
+        d.ic = atoi(argv[2]);  d.ih = atoi(argv[3]);  d.iw = atoi(argv[4]);
+        d.oc = atoi(argv[5]);  d.kh = atoi(argv[6]);  d.kw = atoi(argv[7]);
+        d.stride_y = atoi(argv[8]);  d.stride_x = atoi(argv[9]);
+        d.pad_top = atoi(argv[10]);  d.pad_left = atoi(argv[11]);
+        d.dil_y = atoi(argv[12]);    d.dil_x = atoi(argv[13]);
+        d.opad_y = atoi(argv[14]);   d.opad_x = atoi(argv[15]);
+        d.depthwise = atoi(argv[16]);
+        _Float16 *in = slurp_f16(argv[17], (size_t)d.ic * d.ih * d.iw);
+        size_t wn = d.depthwise ? (size_t)d.ic * d.kh * d.kw
+                                : (size_t)d.ic * d.oc * d.kh * d.kw;
+        _Float16 *w = slurp_f16(argv[18], wn);
+        size_t on = (size_t)d.oc * rocket_conv_transpose2d_oh(&d) *
+                    rocket_conv_transpose2d_ow(&d);
+        _Float16 *out = calloc(on, sizeof(_Float16));
+        if (!out) die("calloc");
+        rc = rocket_conv_transpose2d_fp16(fd, &d, in, w, out);
+        if (rc) die("conv_t op failed");
+        spit(argv[19], out, on * sizeof(_Float16));
+        free(in); free(w); free(out);
     } else {
         die("unknown family");
     }
