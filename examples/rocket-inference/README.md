@@ -37,7 +37,7 @@ measurements and verification results.
 | `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, CLI |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
-| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`) and the video parity check (`video_parity.py`) |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
 
 ## GGUF models (`-hf`)
 
@@ -210,6 +210,70 @@ INFO chat request endpoint=chat.completions model=gemma-4-E2B-it-qat-mobile prom
 ```
 
 Set `RUST_LOG=warn` to silence the per-request lines.
+
+### OpenTelemetry tracing
+
+`serve` can export distributed traces over OTLP/HTTP (protobuf) to an
+OpenTelemetry collector. Tracing is off by default; `OTEL_SDK_ENABLED` is the
+master switch and everything else is configured with the standard OpenTelemetry
+environment variables:
+
+| variable | meaning |
+|---|---|
+| `OTEL_SDK_ENABLED` | master switch (`true`/`1`/`yes`/`on`; unset or false = no exporter, no network) |
+| `OTEL_SDK_DISABLED` | standard kill switch; `true` wins over `OTEL_SDK_ENABLED` |
+| `OTEL_TRACES_EXPORTER` | `otlp` (default) or `none`; any other exporter disables tracing with a message |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | resource attributes; `service.name` defaults to `rocket-inference`, `service.version` to the crate version |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | collector base URL (default `http://localhost:4318`; a signal-specific endpoint is used verbatim) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | request headers (`key=value,...`) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | export timeout in milliseconds |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` (the default is none; zstd is not compiled in) |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` only; `grpc` disables tracing with an error, `http/json` falls back to protobuf |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `parentbased_always_on` (the SDK default), `always_on`, `always_off`, `traceidratio`, `parentbased_*` |
+| `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | batch span processor |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | span limits |
+| `OTEL_PROPAGATORS` | `tracecontext,baggage` (default), either one alone, or `none` |
+
+```sh
+OTEL_SDK_ENABLED=true \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+OTEL_SERVICE_NAME=rocket-inference \
+$B serve --model-dir ~/models/qwen3-embedding-0.6b --port 8383
+```
+
+Each request gets one server span (`http.request`, `otel.kind=server`, named
+after the method and matched route) carrying the method, path, route, response
+status, `server.address`/`port` and the loaded model; 5xx responses set the span
+status to error. The model call is a child `inference` span with `queue_s`,
+`compute_s` and (for media requests) `encode_s`, and the per-request log line is
+exported as a span event with its usual fields. An incoming W3C
+`traceparent`/`tracestate` (and baggage when enabled) becomes the parent of the
+request span. `/health` is not traced, and prompts, headers and embeddings are
+never exported.
+
+The exporter uses a blocking HTTP client on the SDK's batch-export thread, so
+there is no Tokio-runtime coupling. Initialization errors (bad endpoint,
+unsupported protocol/compression, a subscriber already installed) are printed to
+stderr and `serve` continues without traces; an unreachable collector only
+affects exports. `RUST_LOG` filters stdout alone: the trace layer exports spans
+at INFO even when the log lines are silenced. While tracing is enabled, stdout
+request lines gain the active span prefix (`http.request{...}:`), because the
+formatting layer prints span context; the disabled path is unchanged. SIGTERM
+and SIGINT drain in-flight requests and flush queued spans (Docker's own stop
+timeout still bounds a very long forward). Metrics and log exporters are not
+implemented (`OTEL_METRICS_EXPORTER`/`OTEL_LOGS_EXPORTER` are ignored).
+
+For a local capture without a collector, `tools/otel_capture.py` writes every
+OTLP/HTTP POST body to a directory and `protoc --decode_raw` prints the
+resource, spans and events:
+
+```sh
+python3 tools/otel_capture.py --port 4318 --out /tmp/otel-capture &
+OTEL_SDK_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  ./rocket-inference serve --model-dir ...
+# ... send a request, stop the server, then:
+protoc --decode_raw < /tmp/otel-capture/*.bin
+```
 
 ## Qwen3-Embedding-0.6B (`qwen3`)
 

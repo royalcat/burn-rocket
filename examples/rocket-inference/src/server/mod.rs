@@ -16,6 +16,7 @@ mod log;
 mod multimodal;
 mod ollama;
 mod openai;
+mod telemetry;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -24,6 +25,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
+    middleware,
     routing::{get, post},
 };
 
@@ -31,6 +33,7 @@ use crate::util::http::lock_or_recover;
 use engine::{Capabilities, Engine, Family};
 use error::{ApiError, blocking};
 use log::RequestTiming;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Immutable settings, kept outside the model lock so `/health`, `/v1/models`
 /// and request routing never block behind a running forward.
@@ -67,16 +70,32 @@ impl AppState {
     {
         let state = self.clone();
         let arrived = Instant::now();
+        // Only created when trace export is on: the disabled path keeps the
+        // pre-telemetry output (including the `ROCKET_MEM_LOG` lines, which
+        // otherwise gain a span prefix) and cost.
+        let inference = telemetry::enabled().then(|| tracing::info_span!("inference"));
         blocking(move || {
+            let _entered = inference.as_ref().map(|span| span.enter());
             let mut engine = state.lock();
             let queue_s = arrived.elapsed().as_secs_f64();
+            if let Some(span) = &inference {
+                span.set_attribute("queue_s", queue_s);
+            }
             let t0 = Instant::now();
             crate::gemma::vision::vision_stats_reset();
             let out = f(&mut engine)?;
+            let compute_s = t0.elapsed().as_secs_f64();
+            let encode_s = crate::gemma::vision::vision_stats().total_s;
+            if let Some(span) = &inference {
+                span.set_attribute("compute_s", compute_s);
+                if encode_s > 0.0 {
+                    span.set_attribute("encode_s", encode_s);
+                }
+            }
             let timing = RequestTiming {
                 queue_s,
-                compute_s: t0.elapsed().as_secs_f64(),
-                encode_s: crate::gemma::vision::vision_stats().total_s,
+                compute_s,
+                encode_s,
             };
             // Long requests leave their transient buffers in the allocator's
             // arenas; hand them back before the next request (`ROCKET_TRIM=0`
@@ -90,23 +109,12 @@ impl AppState {
     }
 }
 
-/// Install the `tracing` subscriber: level from `RUST_LOG` (default `info`),
-/// timestamps, no ANSI when stdout is not a terminal (docker/systemd logs).
-fn init_logging() {
-    use std::io::IsTerminal;
-
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(std::io::stdout().is_terminal())
-        .try_init();
-}
-
 /// Serve one loaded model on `addr` until the process is stopped.
 pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
-    init_logging();
+    // Installs the log subscriber; with `OTEL_SDK_ENABLED=true` it also builds
+    // the OTLP exporter and installs the trace layer. The guard flushes the
+    // queued spans on the way out.
+    let telemetry = telemetry::Telemetry::init();
     // Release what loading and tokenizing left in the allocator's arenas before
     // the first request (the loaders trim their own transients; the tokenizer
     // parse and the engine construction happen after those trims).
@@ -137,9 +145,17 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     }
     // Base64 images (data URIs) and multi-image batches exceed axum's 2 MiB
     // default JSON body limit.
-    let app = app
-        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .with_state(state);
+    let app = app.layer(DefaultBodyLimit::max(32 * 1024 * 1024));
+    // Outermost layer (added last), so every route and fallback is covered.
+    let app = if telemetry::enabled() {
+        app.layer(middleware::from_fn_with_state(
+            state.clone(),
+            telemetry::trace_http,
+        ))
+    } else {
+        app
+    };
+    let app = app.with_state(state);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -151,9 +167,44 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         tracing::info!(addr = %addr, model = %model_name, "listening");
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         Ok::<(), anyhow::Error>(())
-    })
+    })?;
+    // In-flight requests are drained above; export what is still queued.
+    drop(telemetry);
+    Ok(())
+}
+
+/// Resolve when the process is asked to stop. SIGTERM is what docker stop and
+/// systemd send; Ctrl+C covers interactive runs.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "failed to listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 async fn health() -> Json<serde_json::Value> {

@@ -6,6 +6,7 @@
 //! lock (the server is single-flight); compute time is the model call itself.
 
 use tracing::info;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::AppState;
 use super::engine::Completion;
@@ -37,6 +38,29 @@ pub(crate) fn embedding(
     tokens: usize,
     timing: &RequestTiming,
 ) {
+    // The span attributes keep the raw timings; the log line keeps its
+    // rounded presentation (and the exact field order).
+    let tok_s = round(tokens as f64 / timing.compute_s.max(1e-9), 10.0);
+    let encode_s = (timing.encode_s > 0.0).then(|| round(timing.encode_s, 1000.0));
+    let vision_attn =
+        (timing.encode_s > 0.0).then(|| crate::gemma::vision::vision_stats().attn_mode.name());
+    let rss = rss_mib();
+
+    let span = tracing::Span::current();
+    span.set_attribute("rocket.endpoint", endpoint);
+    span.set_attribute("inputs", as_i64(inputs));
+    span.set_attribute("tokens", as_i64(tokens));
+    span.set_attribute("queue_s", timing.queue_s);
+    span.set_attribute("compute_s", timing.compute_s);
+    span.set_attribute("tok_s", tok_s);
+    if timing.encode_s > 0.0 {
+        span.set_attribute("encode_s", timing.encode_s);
+    }
+    if let Some(vision_attn) = vision_attn {
+        span.set_attribute("vision_attn", vision_attn);
+    }
+    span.set_attribute("rss_mib", rss);
+
     info!(
         endpoint = %endpoint,
         model = %state.settings.model_name,
@@ -44,11 +68,10 @@ pub(crate) fn embedding(
         tokens,
         queue_s = round(timing.queue_s, 1000.0),
         compute_s = round(timing.compute_s, 1000.0),
-        tok_s = round(tokens as f64 / timing.compute_s.max(1e-9), 10.0),
-        encode_s = (timing.encode_s > 0.0).then(|| round(timing.encode_s, 1000.0)),
-        vision_attn = (timing.encode_s > 0.0)
-            .then(|| crate::gemma::vision::vision_stats().attn_mode.name()),
-        rss_mib = round(rss_mib(), 10.0),
+        tok_s,
+        encode_s,
+        vision_attn,
+        rss_mib = round(rss, 10.0),
         "embedding request"
     );
 }
@@ -61,20 +84,44 @@ pub(crate) fn chat(
     completion: &Completion,
     timing: &RequestTiming,
 ) {
-    let prefill_s = completion.prompt_eval_ms / 1000.0;
-    let decode_s = completion.eval_ms / 1000.0;
+    let prefill_raw = completion.prompt_eval_ms / 1000.0;
+    let decode_raw = completion.eval_ms / 1000.0;
+    let prefill_tok_s = round(
+        completion.prompt_tokens as f64 / prefill_raw.max(1e-9),
+        10.0,
+    );
+    let decode_tok_s = round(completion.eval_count as f64 / decode_raw.max(1e-9), 10.0);
+    let rss = rss_mib();
+
+    let span = tracing::Span::current();
+    span.set_attribute("rocket.endpoint", endpoint);
+    span.set_attribute("prompt_tokens", as_i64(completion.prompt_tokens));
+    span.set_attribute("prefill_s", prefill_raw);
+    span.set_attribute("prefill_tok_s", prefill_tok_s);
+    span.set_attribute("gen_tokens", as_i64(completion.eval_count));
+    span.set_attribute("decode_s", decode_raw);
+    span.set_attribute("decode_tok_s", decode_tok_s);
+    span.set_attribute("queue_s", timing.queue_s);
+    span.set_attribute("compute_s", timing.compute_s);
+    span.set_attribute("rss_mib", rss);
+
     info!(
         endpoint = %endpoint,
         model = %state.settings.model_name,
         prompt_tokens = completion.prompt_tokens,
-        prefill_s = round(prefill_s, 1000.0),
-        prefill_tok_s = round(completion.prompt_tokens as f64 / prefill_s.max(1e-9), 10.0),
+        prefill_s = round(prefill_raw, 1000.0),
+        prefill_tok_s,
         gen_tokens = completion.eval_count,
-        decode_s = round(decode_s, 1000.0),
-        decode_tok_s = round(completion.eval_count as f64 / decode_s.max(1e-9), 10.0),
+        decode_s = round(decode_raw, 1000.0),
+        decode_tok_s,
         queue_s = round(timing.queue_s, 1000.0),
         compute_s = round(timing.compute_s, 1000.0),
-        rss_mib = round(rss_mib(), 10.0),
+        rss_mib = round(rss, 10.0),
         "chat request"
     );
+}
+
+/// `tracing` has no `Value` impl for `usize`; saturate instead of wrapping.
+fn as_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }

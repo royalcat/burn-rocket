@@ -81,9 +81,29 @@ serde_json = { version = "1", features = ["preserve_order"] }
 libc = "0.2"
 anyhow = "1"
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Opt-in OpenTelemetry trace export for `serve` (`OTEL_SDK_ENABLED`). OTLP/HTTP +
+# protobuf over the blocking reqwest client: the SDK's batch processor exports
+# from its own thread, so no Tokio reactor is involved.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "gzip-http",
+    "internal-logs",
+] }
+opentelemetry-http = { version = "0.33", default-features = false }
+tracing-opentelemetry = { version = "0.34", default-features = false }
 base64 = "0.22"
 rustfft = "6"
 hound = "3"

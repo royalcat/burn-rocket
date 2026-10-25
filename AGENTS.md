@@ -167,6 +167,33 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   from the model's own timings. Errors and `/health`/`/v1/models` are not logged. The
   timing plumbing is `AppState::compute` (`src/server/mod.rs`), the line format
   `src/server/log.rs`; dev-verified for embeddings (qwen3 q8) and chat (Gemma 4 QAT).
+- **OpenTelemetry traces** (2026-10-26): `serve` can export OTLP/HTTP+protobuf
+  traces to a collector (`src/server/telemetry.rs`). `OTEL_SDK_ENABLED=true` is the
+  master switch and the standard variables configure the rest (resource, exporter
+  endpoint/headers/timeout/compression, `OTEL_TRACES_SAMPLER`, `OTEL_BSP_*`,
+  `OTEL_SPAN_*`, `OTEL_PROPAGATORS`); `OTEL_SDK_DISABLED=true`,
+  `OTEL_TRACES_EXPORTER=none` and `OTEL_PROPAGATORS=none` are honored too. The
+  0.33 SDK reads the sampler/BSP/span-limit/resource/exporter variables itself;
+  the master switch, `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER` and
+  `OTEL_PROPAGATORS` are parsed in `telemetry.rs` because the SDK does not. Deps:
+  `opentelemetry`/`opentelemetry_sdk`/`opentelemetry-otlp` 0.33 +
+  `tracing-opentelemetry` 0.34; the blocking reqwest client is deliberate (the
+  batch processor exports from a plain thread, not a Tokio runtime). One
+  `http.request` server span per request except `/health` (method/route/path/status,
+  `server.address`/`port`, model, W3C `traceparent` parent) with an `inference` child
+  span for the model-lock wait + forward (`queue_s`/`compute_s`/`encode_s`); the
+  existing per-request log line becomes a span event. `RUST_LOG` filters only the
+  fmt layer; the OTel layer exports INFO spans regardless. Off by default (no
+  exporter thread, no network, unchanged stdout and `ROCKET_MEM_LOG` lines); init
+  failures are reported and serving continues fmt-only. gRPC is not compiled in
+  (only `http/protobuf`), and SIGTERM/SIGINT drain in-flight requests and flush
+  queued spans.
+  Dev-verified with embeddinggemma-2 q8 against `tools/otel_capture.py`: env
+  service/resource override, an injected `traceparent`'s trace and parent ids,
+  200/400 status spans, `/embed` `encode_s`/`vision_attn`, a span queued <5 s before
+  SIGTERM flushed at exit 0, zero POSTs and no span prefix when the switch is off,
+  and an unreachable collector logging a warning while requests stay 200. The live
+  board service runs without the switch, so a redeploy needs no flag change.
 - **EmbeddingGemma 2 performance round** (2026-10-08, log §12): four changes,
   validated on the board (timings in log §12.5: canonical ~2x on short input,
   fused glue -12 %, int8 g32 readback-bound and 2.4x slower than fp16).
@@ -1220,7 +1247,7 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
-| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
+| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
@@ -1234,7 +1261,7 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
-| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`) and the video parity check (`video_parity.py`) |
+| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
@@ -2156,6 +2183,30 @@ curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
 # its text must use the same placeholder spacing as the server: one space)
 /mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/ref_embeddinggemma2.py \
     image --image data/cat.jpeg /tmp/cat_small.png --text '<|image|> <|image|>' --out /tmp/ref2.json
+```
+
+OpenTelemetry traces (`serve` only; off unless `OTEL_SDK_ENABLED=true`). The
+switch plus the standard OTEL envs; `tools/otel_capture.py` records every
+OTLP/HTTP protobuf POST so `protoc --decode_raw` can show the resource, spans
+and events without the OTLP proto files:
+
+```sh
+python3 examples/rocket-inference/tools/otel_capture.py --port 4318 --out /tmp/otel-capture &
+OTEL_SDK_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  OTEL_SERVICE_NAME=smoke-rocket OTEL_RESOURCE_ATTRIBUTES=deployment.environment=smoke \
+  OTEL_BSP_SCHEDULE_DELAY=500 RUST_LOG=info \
+  $CARGO_TARGET_DIR/release/rocket-inference serve \
+  --model-dir /mnt/hub/models/embeddinggemma-2 --quant q8 --port 8399 --max-tokens 512 --defer-towers &
+# one request with a W3C parent, then SIGTERM (drains and flushes; exit 0)
+curl -s localhost:8399/v1/embeddings -H 'Content-Type: application/json' \
+  -H 'traceparent: 00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01' \
+  -d '{"input":"trace me"}'
+protoc --decode_raw < /tmp/otel-capture/*.bin | head -100
+# expect: service.name=smoke-rocket, the "POST /v1/embeddings" server span with
+# http.response.status_code, its "inference" child, and the embedding-request
+# event. Disabled path: without OTEL_SDK_ENABLED there are no POSTs and stdout
+# has no `http.request{...}` prefix; OTEL_SDK_DISABLED=true and
+# OTEL_TRACES_EXPORTER=none also keep it off, and grpc prints a disable message.
 ```
 
 On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):
