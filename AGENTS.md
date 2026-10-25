@@ -119,8 +119,8 @@ same planners, register programs and numerics. The per-milestone write-up is in
   board even though every op fits.
 - **Still out** (deliberate; see `lib.rs`): RK3576 entries and the RK3576 graph
   runner, the C ABI, the `rocket_stream_*` aliases, `_planes`/transposed variants,
-  non-fp16 batch wrappers, the fused-FFN cube-residency mechanism,
-  `ROCKET_CONV_BATCH`, and resident bf16 (the C library has none).
+  non-fp16 batch wrappers, `ROCKET_CONV_BATCH`, and resident bf16 (the C library has
+  none).
 
 ## Status (2026-10-06, extended 2026-10-07/08)
 
@@ -718,12 +718,13 @@ same planners, register programs and numerics. The per-milestone write-up is in
   `mm_plan_init_pin` port: `Nt(projections) = Kt(down) = 256`, no `ROCKET_MM_*`
   override, the free dims shrink to fit the CBUF), the matched-tiling gate
   (`nNt == nKt && out_slot == in_slot && nM == nM && Mt == Mt && nMt*nNt <= 64`),
-  **KACC-only** for the projections (`matmul::run::one_shot_plan` with
+  **KACC-only** for the projections (`compute_kacc_cube` with
   `KaccPolicy::Only`: a `Tiling` refusal falls back to the whole host-handoff block,
-  as the C's `goto fb`) and **KACC-then-CPU** for the down/fc2 (`KaccPolicy::Forced`,
-  the C's `mm_compute_kacc` then `mm_compute`), the bias add in f32, and the 2-pass
-  GELU. The one thing *not* ported is the cube-residency mechanism (see the missing
-  surface below). `encoder_block` is the C's order exactly: LN1 over `T` rows →
+  as the C's `goto fb`) and **KACC-then-CPU** for the down/fc2 (`compute_kacc_from`,
+  `compute_cpu_from` on the sentinel, i.e. `KaccPolicy::Forced`'s routing — the C's
+  `mm_compute_kacc` then `mm_compute`), the bias add in f32, and the 2-pass
+  GELU. (The cube residency those entries originally left out is the M11 round
+  below.) `encoder_block` is the C's order exactly: LN1 over `T` rows →
   `attn::mha_self` (single fd, as the C) → EW residual → LN2 → zero-pad to
   `Tp = (T+3) & ~3` → `mlp_fused` over `Tp` (`ROCKET_ENCODER_NOFUSE` = the C's
   `GELU_GATE` + EW-mul host-handoff route) → the bf2 add over `T` → EW residual;
@@ -1064,16 +1065,60 @@ same planners, register programs and numerics. The per-milestone write-up is in
   and must not leak into a deployment environment by accident (unset = the host pass,
   the shipped behaviour, which is unchanged).
 
+  **M11 cross-op cube residency** (2026-10-25, the last matmul half): `ops::ffn`'s
+  fused entries now run the C's `RESIDENT-FUSION NOTE` flow instead of de-tiling the
+  `[M,I]` intermediates to row-major and re-packing them. The matmul side is
+  `matmul::run`'s cube API (all `pub(crate)`, no emitter change): `alloc_cube`
+  (`cube_elems` fp16 + one CBUF bank, **zeroed** — a ragged tile's pad lanes must be 0,
+  not NaN: the consumer's zeroed weight lanes cannot mute `0*NaN`), `compute_kacc_cube`
+  (`mm_compute_kacc_cube`: one batch, data-reuse mode 2 so `gi` *is* the canonical
+  `(mi*nNt+ni)` slot, ping-pong across the `nKt` jobs with the cube holding the final
+  parity, trailing `prep(0)` and **no de-tile**), `AOperand::of` (the C's
+  `b.in_all = cube_g`), `compute_kacc_from`/`compute_cpu_from` (`mm_compute_kacc` then
+  `mm_compute` on the tiny-M sentinel) and `layout::scatter_bias_cube`
+  (`mm_scatter_bias_cube`). `policy_config(KaccPolicy::{Only,Forced})` forces the KACC
+  scratch on regardless of `ROCKET_NO_KACC`, as the C's direct primitive calls do; the
+  scaffolding the row-major version needed (`one_shot_plan`, `KaccPolicy::Auto`) is
+  gone. Flow, in `ops/ffn.rs`: `projection_cube` = `pack_input` + `pack_weights` +
+  `compute_kacc_cube` per projection; `activation` then `ew_mul` over the cube's fp16
+  bytes (`bos::f16_words{,_ref}`), `store_cube` writes the product back (`prep(0)` +
+  `fini`, the C's prep-for-device pair); `consume_cube` runs down/fc2 with the product
+  cube as its A operand. `mlp_fused` inserts the C's cube bias: `scatter_bias_cube` +
+  `ew_add` over `cube_elems` (skipped when `b1` is `None`) before the activation.
+  Everything the C keys off the *matched-tiling gate* is unchanged, and so is the
+  `goto fb` fallback (pin refusal, unmatched tiling, more tiles than one batch, KACC
+  EW-stride refusal, any device error).
+  Gates: `ops_selftest` before/after on identical raw fixtures is **bit-identical for
+  every case** (`ffn`, `ffn_fused` and `mlp_fused` with/without the fc1 bias at
+  4x256x1024 and 64x512x2048, and both encoder blocks — `encoder_block` inherits the
+  win through `mlp_fused`), and `ab_compare.py --ops` still reports `ffn`,
+  `ffn_fused`, `mlp_fused` (both bias arms), the two fallback shapes and the norms/
+  geglu **bit-identical to C**, with the encoder block at the unchanged 198/512 and
+  2040/8192 (the `mha_self` host-softmax deviation). New device-free host test
+  `ops::ffn::tests::the_cube_bias_path_is_the_row_major_bias_add` (a ragged 384-wide
+  `Plan::pinned` cube: `feat_scatter_tile` -> `scatter_bias_cube` -> `ew_add_ref` ->
+  `detile_store` must equal `add_bias`), `cargo test -p rocket-npu` 252 pass.
+  Wall (busy board, load ~9, cores 0-3, medians of 6 interleaved rounds, `--reps 3`;
+  the identical-code arm scatters by ~10 %, so read the ratios): `ffn_fused`
+  19.0 vs 19.9 ms at 4x256x1024 and 64.8 vs 63.5 ms at 64x512x2048 (neutral, and
+  better *relative* to the unchanged `ffn` baseline: 0.81x vs 1.07x and 1.33x vs
+  1.44x), `mlp_fused` 14.9 vs 12.2 ms and 48.5 vs 43.6 ms, encoder 36.7 vs 35.4 /
+  60.5 vs 56.5 ms — the mlp pays 2-5 ms for the C's **on-NPU bias EW add** (5 EW tiles
+  at 32640 elements each, 5 fresh BOs per call) where the row-major route added the
+  bias on the host in f32; the removed work (de-tile 2 cubes + re-pack 1) is only
+  ~0.2 ms at these shapes. User CPU is unchanged (2.58 vs 2.66 s for the 64x512x2048
+  run). Verdict: keep the C mechanism (the win grows with the removed host traffic,
+  and it is what the C ships), the row-major `ffn`/`mlp` stay the fallback.
+  `ROCKET_FFN_DEBUG=1` prints the routing decision (`ffn_fused: ... cube-resident` /
+  `... not cube-matchable -> host-handoff` / `kacc-cube ... refused`), the C's knob.
+  New `log_info!` macro in `log.rs` for it.
+
   **Missing surface** (documented in `crates/rocket-npu/src/lib.rs`): resident bf16
   (the C library has no variant either — and neither has it for tf32, whose surface is
   therefore complete), the `*_ref_fp16` host references of the *remaining* non-matmul
   families, `_planes`/transposed variants, RK3576 entries (including
   `rocket_act_int8_rk3576`), the public `rocket_stream_*` aliases, the non-fp16 batch
-  wrappers, the cube-resident *mechanism* of the
-  fused FFN/MLP (the pinned tiling, the matched-tiling
-  gate and the KACC routing are bit-identical to the C; the intermediates still come
-  back to row-major between ops, so the C's `RESIDENT-FUSION NOTE` round-trip
-  optimization is what remains), the RK3576-specific convolution/pooling entries (the
+  wrappers, the RK3576-specific convolution/pooling entries (the
   part's own conv encoder, the packed-image datapath, the int8 pooling entry with its
   zero point and the prepacked/cube handles; `rocket_conv2d_int8_rk3576`,
   `rocket_conv2d_dw_int8_rk3576`, `rocket_pool_int8_rk3576*`,
@@ -1098,7 +1143,7 @@ same planners, register programs and numerics. The per-milestone write-up is in
 | path | contents |
 |---|---|
 | `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
-| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
+| `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan, layout, bos, run, context + the int8/int4/tf32 one-shots and the resident int4 `I4Context`; `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need, and `run`'s `alloc_cube`/`compute_kacc_cube`/`compute_kacc_from`/`compute_cpu_from` + `layout::scatter_bias_cube` are the cross-op cube path those entries drive), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the cube-resident fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
 | `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`, `attention_window`/`_block`, `attention_causal_window`, `attention_causal_block`/`_window`) |
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |

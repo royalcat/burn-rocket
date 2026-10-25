@@ -22,33 +22,48 @@
 //! re-tiles them: the two projections leave their full output cubes in resident BOs, the
 //! gated activation runs element-wise over the cube bytes (it commutes with the cube
 //! reindex — pad lanes stay 0 because `act(0)·0 = 0`), and the down matmul reads the
-//! product cube directly as its input.
+//! product cube directly as its A operand (the C's `b.in_all = cube_g`).
 //!
-//! This port keeps the **tiling contract** that makes those numerics what they are — the
-//! pinned tiles ([`crate::matmul::Plan::pinned`]: `Nt(projections)` = `Kt(down)` = 256,
-//! the C's `mm_plan_init_pin`), the matched-tiling/precondition gate, KACC-only for the
-//! projections with the host-handoff fallback, KACC-then-CPU for the down matmul — and
-//! **not** the cube residency: each intermediate comes back to row-major and is packed
-//! again. The element-wise ops commute with the cube reindex and de-tiling is lossless,
-//! so the result is bit-identical to the C's cube-resident path (the board A/B checks
-//! exactly that); what is left on the table is the host round-trip the C's
-//! `RESIDENT-FUSION NOTE` describes as the follow-on optimization. The C's documented
-//! *numeric* deviation between fused and unfused (the down matmul's K-tiling is pinned to
-//! the projections' `Nt` instead of the planner's own choice) is reproduced faithfully,
-//! so [`ffn_fused`] and [`ffn`] can differ in the last bits — see the module tests.
+//! This port reproduces that flow: `projection_cube` packs A/weights and leaves the
+//! projection in a full `[nMt][nNt]` cube (`compute_kacc_cube`, no de-tile), the
+//! element-wise passes run over the cube's fp16 bytes, and `consume_cube` runs the
+//! down/fc2 matmul with the product cube as its input tile for tile
+//! (`compute_kacc_from`, `compute_cpu_from` on the tiny-M sentinel — the C's
+//! `mm_compute_kacc` then `mm_compute`). The activation/EW ops still copy their operands
+//! through their own BOs, exactly as C does, so the win over the row-major form is the
+//! **de-tile + re-pack removal** the C's `RESIDENT-FUSION NOTE` describes, not the
+//! element-wise math: every pass is per-element, so the cube path is bit-identical to the
+//! de-tiled one (the board gate compares the two binaries).
+//!
+//! The **tiling contract** that makes those numerics what they are is unchanged
+//! ([`crate::matmul::Plan::pinned`]: `Nt(projections)` = `Kt(down)` = 256, the C's
+//! `mm_plan_init_pin`), as are the matched-tiling/precondition gate, KACC-only for the
+//! projections with the host-handoff fallback, and KACC-then-CPU for the down matmul. The
+//! C's documented *numeric* deviation between fused and unfused (the down matmul's
+//! K-tiling is pinned to the projections' `Nt` instead of the planner's own choice) is
+//! reproduced faithfully, so [`ffn_fused`] and [`ffn`] can differ in the last bits — see
+//! the module tests.
 //!
 //! Shapes the pinned tiling cannot express (or that the KACC EW stride floor refuses)
-//! fall back to the host-handoff block internally, exactly as the C does.
+//! fall back to the host-handoff block internally, exactly as the C does (`goto fb`).
 
 use std::f64::consts::FRAC_1_SQRT_2;
 
 use half::f16;
 
 use crate::Device;
+use crate::device::Bo;
 use crate::error::{Error, Result};
-use crate::matmul::Plan;
-use crate::matmul::run::{KaccPolicy, one_shot, one_shot_mt, one_shot_plan};
-use crate::ops::activation::{Activation, activation};
+use crate::knobs;
+use crate::log::log_info;
+use crate::matmul::bos::{f16_words, f16_words_ref};
+use crate::matmul::layout;
+use crate::matmul::run::{
+    AOperand, KaccPolicy, alloc_cube, compute_cpu_from, compute_kacc_cube, compute_kacc_from,
+    one_shot, one_shot_mt, policy_config,
+};
+use crate::matmul::{Bos, Plan};
+use crate::ops::activation::{Activation, activation, ew_add, ew_mul};
 use crate::regcmd::desc::BATCH;
 
 /// The C `FFN_BATCH`: one NPU batch's worth of tiles, the single-batch full-cube cap.
@@ -263,11 +278,67 @@ pub fn ffn(
     one_shot_mt(m, i, h, &prod, wd, out, NT)
 }
 
+// ── The cross-op cube mechanism (the C's `mm_compute_kacc_cube` flow) ─────────
+
+/// One projection of the cross-op block, left as a **full** `[nMt][nNt]` output cube in a
+/// fresh BO: `mm_pack_input` + `mm_pack_weights` + `mm_compute_kacc_cube`.
+///
+/// The cube is `plan.cube_elems()` fp16 plus the C's CBUF-bank slack, zeroed
+/// ([`alloc_cube`]) so a ragged last tile's pad lanes are 0 rather than stale — the
+/// consumer reads the whole cube slot, and its muting weight lanes cannot mute a NaN.
+/// On return the cube is CPU-visible (the producer's trailing `prep`), which is where the
+/// on-cube element-wise pass reads it.
+fn projection_cube(dev: &Device, plan: &Plan, x: &[f16], w: &[f16]) -> Result<Bo> {
+    // KACC only: a `Tiling` refusal means "not cube-resident" and goes back to the
+    // caller's row-major fallback (the C's `mm_compute_kacc_cube != 0 -> goto fb`).
+    let policy = KaccPolicy::Only;
+    let mut bos = Bos::new(dev, plan, policy_config(policy))?;
+    bos.pack_input(plan, x)?;
+    bos.pack_weights(plan, w)?;
+    let wt = bos.wt().mem_ref();
+    let input = AOperand::scratch(&bos);
+    let mut cube = alloc_cube(dev, plan)?;
+    compute_kacc_cube(plan, &mut bos, wt, input, &mut cube)?;
+    Ok(cube)
+}
+
+/// The consumer half: `c = cube · W^T` where `cube` is the producer's output cube read as
+/// this plan's input cube (the C's `bn.in_all = cube`, `mm_compute_kacc` then `mm_compute`
+/// on the tiny-M sentinel).
+///
+/// `plan` must be the matched-tiling partner of the producer (`out_slot == in_slot`,
+/// `nNt(producer) == nKt(consumer)`, same `nMt`/`Mt`), which is the caller's gate.
+fn consume_cube(dev: &Device, plan: &Plan, w: &[f16], cube: &Bo, out: &mut [f16]) -> Result<()> {
+    let policy = KaccPolicy::Forced;
+    let mut bos = Bos::new(dev, plan, policy_config(policy))?;
+    bos.pack_weights(plan, w)?;
+    let wt = bos.wt().mem_ref();
+    let input = AOperand::of(cube.mem_ref());
+    match compute_kacc_from(plan, &mut bos, wt, input, out) {
+        // The C's `if (rc == ROCKET_E_TILING) rc = mm_compute(...)`: the CPU-accumulation
+        // oracle over the same cube, which is its only tiny-M route.
+        Err(e) if e.status() == crate::Status::Tiling => {
+            compute_cpu_from(plan, &mut bos, wt, input, out)
+        }
+        r => r,
+    }
+}
+
+/// Write `src` into the cube's first `src.len()` fp16 lanes and hand it back to the
+/// device: `prep(0)` + CPU write + `fini` is this crate's spelling of the C's host write
+/// over `cube->ptr` followed by `rocket_bo_prep(dir=1)` + `rocket_bo_fini`.
+fn store_cube(cube: &mut Bo, src: &[f16]) -> Result<()> {
+    cube.prep(0)?;
+    f16_words(cube)[..src.len()].copy_from_slice(src);
+    cube.fini()
+}
+
 /// `rocket_ffn_fp16_fused`: the cross-op FFN, same math and signature as [`ffn`].
 ///
 /// The pinned tiles (`Nt(gate/up) = Kt(down) = 256`) and the matched-tiling gate are the
-/// C's `rocket_ffn_fp16_fused`; see the module docs for what this port keeps (the
-/// tiling contract and hence the numerics) and what it does not (cube residency).
+/// C's `rocket_ffn_fp16_fused`, and so is the cube residency: `gate`/`up` stay in their
+/// full output cubes, `act(gate) ⊙ up` runs over the cube bytes, and the down matmul
+/// reads the product cube directly as its input (see the module docs).
 ///
 /// Falls back to [`ffn`] whenever the pinned tiling cannot express the shape — a
 /// source-level shape the planner refuses, a tiling that does not match, more
@@ -290,6 +361,8 @@ pub fn ffn_fused(
     guard_elems("rocket_ffn_fp16_fused", m * i)?;
     let fallback = |dev: &Device, out: &mut [f16]| ffn(dev, m, h, i, x, wg, wu, wd, kind, out);
     let x = &x[..m * h];
+    let wg = &wg[..i * h];
+    let wu = &wu[..i * h];
     let wd = &wd[..h * i];
     let out = &mut out[..m * h];
 
@@ -313,26 +386,66 @@ pub fn ffn_fused(
         && plg.mt == pld.mt
         && plg.nmt * plg.nnt <= FFN_BATCH
         && cube_elems <= i32::MAX as usize;
+    let debug = knobs::present("ROCKET_FFN_DEBUG");
     if !matchable {
+        if debug {
+            log_info!("ffn_fused: shape M={m} H={h} I={i} not cube-matchable -> host-handoff");
+        }
         return fallback(dev, out);
     }
-
-    // gate/up left as full output cubes in C (no de-tile); here they come back to
-    // row-major, which the elementwise pass cannot tell apart. KACC only: a Tiling
-    // refusal means "not cube-resident" and sends the whole block to the fallback.
-    let mut gate = vec![f16::ZERO; m * i];
-    let mut up = vec![f16::ZERO; m * i];
-    if one_shot_plan(dev, &plg, KaccPolicy::Only, x, wg, &mut gate).is_err()
-        || one_shot_plan(dev, &plu, KaccPolicy::Only, x, wu, &mut up).is_err()
-    {
-        return fallback(dev, out);
+    if debug {
+        log_info!(
+            "ffn_fused: M={m} H={h} I={i} cube-resident (nMt={} nNt={} nKt[gate]={} Mt={})",
+            plg.nmt,
+            plg.nnt,
+            plg.nkt,
+            plg.mt
+        );
     }
-    let mut prod = vec![f16::ZERO; m * i];
-    geglu(dev, &gate, &up, kind, &mut prod)?;
 
-    // out = prod·Wd^T with the pinned K tiling; the C's down matmul is the KACC
-    // primitive with a CPU-accumulation fallback on its sentinel.
-    one_shot_plan(dev, &pld, KaccPolicy::Forced, &prod, wd, out)
+    // gate = x·Wg^T, up = x·Wu^T — each left as a FULL output cube (no de-tile). A
+    // refusal here is "not cube-resident" and sends the whole block to the fallback.
+    let mut gate_cube = match projection_cube(dev, &plg, x, wg) {
+        Ok(c) => c,
+        Err(e) => {
+            if debug {
+                log_info!(
+                    "ffn_fused: M={m} H={h} I={i} kacc-cube gate refused ({e}) -> host-handoff"
+                );
+            }
+            return fallback(dev, out);
+        }
+    };
+    let up_cube = match projection_cube(dev, &plu, x, wu) {
+        Ok(c) => c,
+        Err(e) => {
+            if debug {
+                log_info!(
+                    "ffn_fused: M={m} H={h} I={i} kacc-cube up refused ({e}) -> host-handoff"
+                );
+            }
+            return fallback(dev, out);
+        }
+    };
+
+    // prod = act(gate) ⊙ up, element-wise over the cube bytes (commutes with the cube
+    // reindex; pad lanes stay 0 because act(0)·0 = 0). The two passes still copy their
+    // operands through their own BOs, as the C entries do, so the result is written back
+    // into the gate cube afterwards.
+    let mut act = vec![f16::ZERO; cube_elems];
+    activation(
+        dev,
+        kind,
+        &f16_words_ref(&gate_cube)[..cube_elems],
+        &mut act,
+    )?;
+    let mut prod = vec![f16::ZERO; cube_elems];
+    ew_mul(dev, &act, &f16_words_ref(&up_cube)[..cube_elems], &mut prod)?;
+    drop(up_cube);
+    store_cube(&mut gate_cube, &prod)?;
+
+    // out = prod·Wd^T — the down matmul reads the product cube DIRECTLY as its input BO.
+    consume_cube(dev, &pld, wd, &gate_cube, out)
 }
 
 // ── The non-gated encoder MLP (fc1 -> +b1 -> act -> fc2) ──────────────────────
@@ -466,9 +579,14 @@ pub fn mlp(
 /// the matched-tiling gate, the bias add and the activation over the `[M,Dff]`
 /// intermediate, and the KACC/cube sentinel semantics. `b1` may be `None` (no bias).
 ///
+/// The intermediate stays in fc1's output cube: the bias is scattered into cube layout
+/// ([`layout::scatter_bias_cube`], the C's `mm_scatter_bias_cube`) and added with the EW
+/// add over the cube bytes, the activation runs over the same bytes (the accurate 2-pass
+/// for the gated kinds), and fc2 reads the activated cube directly as its input.
+///
 /// Alignment: `Din % 32`, `Dff % 32`, `Dout % 16`, `M % 4`; shapes the pinned tiling
-/// cannot match fall back to [`mlp`] (the C's `mlp_host_handoff`), as in
-/// [`ffn_fused`]. Shapes whose fc1 output exceeds one NPU batch do the same.
+/// cannot match fall back to [`mlp`] (the C's `mlp_host_handoff`), as in [`ffn_fused`].
+/// Shapes whose fc1 output exceeds one NPU batch do the same.
 #[allow(clippy::too_many_arguments)]
 pub fn mlp_fused(
     dev: &Device,
@@ -499,6 +617,9 @@ pub fn mlp_fused(
     let fallback =
         |dev: &Device, out: &mut [f16]| mlp(dev, m, din, dff, dout, x, w1, b1, w2, kind, out);
     let x = &x[..m * din];
+    let w1 = &w1[..dff * din];
+    let b1 = b1.map(|b| &b[..dff]);
+    let w2 = &w2[..dout * dff];
     let out = &mut out[..m * dout];
 
     let plans = (
@@ -510,6 +631,7 @@ pub fn mlp_fused(
         _ => return fallback(dev, out),
     };
     let cube_elems = p1.cube_elems();
+    let debug = knobs::present("ROCKET_FFN_DEBUG");
     if !(p1.nnt == p2.nkt
         && p1.out_slot == p2.in_slot
         && p1.nmt == p2.nmt
@@ -517,22 +639,57 @@ pub fn mlp_fused(
         && p1.nmt * p1.nnt <= FFN_BATCH
         && cube_elems <= i32::MAX as usize)
     {
+        if debug {
+            log_info!("mlp_fused: M={m} Din={din} Dff={dff} not cube-matchable -> host-handoff");
+        }
         return fallback(dev, out);
     }
-
-    // fc1, left as a full output cube in C; the bias and the activation then run
-    // element-wise over the cube bytes, which is per-element identical to this row-major
-    // pass (the C scatters the per-channel bias into the cube, then EW-adds).
-    let mut f1 = vec![f16::ZERO; m * dff];
-    if one_shot_plan(dev, &p1, KaccPolicy::Only, x, w1, &mut f1).is_err() {
-        return fallback(dev, out);
+    if debug {
+        log_info!(
+            "mlp_fused: M={m} Din={din} Dff={dff} Dout={dout} cube-resident \
+             (nMt={} nNt={} nKt[fc1]={})",
+            p1.nmt,
+            p1.nnt,
+            p1.nkt
+        );
     }
-    add_bias(&mut f1, b1, m, dff);
-    let mut act = vec![f16::ZERO; m * dff];
-    activation(dev, kind, &f1, &mut act)?;
 
-    // out = act·W2^T with the pinned K tiling (KACC, CPU accumulation on its sentinel).
-    one_shot_plan(dev, &p2, KaccPolicy::Forced, &act, w2, out)
+    // fc1 = x·W1^T, left as a FULL output cube (no de-tile).
+    let mut cube = match projection_cube(dev, &p1, x, w1) {
+        Ok(c) => c,
+        Err(e) => {
+            if debug {
+                log_info!(
+                    "mlp_fused: M={m} Din={din} Dff={dff} kacc-cube fc1 refused ({e}) -> host-handoff"
+                );
+            }
+            return fallback(dev, out);
+        }
+    };
+
+    // + b1 on the cube: the per-channel bias scattered into cube layout, then one flat
+    // EW add (the C's `mm_scatter_bias_cube` + `rocket_ew_add_fp16`). The scatter leaves
+    // every non-live lane 0, so a short last tile's padding adds nothing.
+    if let Some(b1) = b1 {
+        let mut bias_cube = vec![f16::ZERO; cube_elems];
+        layout::scatter_bias_cube(&p1, &mut bias_cube, b1);
+        let mut biased = vec![f16::ZERO; cube_elems];
+        ew_add(
+            dev,
+            &f16_words_ref(&cube)[..cube_elems],
+            &bias_cube,
+            &mut biased,
+        )?;
+        store_cube(&mut cube, &biased)?;
+    }
+
+    // act(.) on the cube, element-wise (the accurate 2-pass for the gated kinds).
+    let mut act = vec![f16::ZERO; cube_elems];
+    activation(dev, kind, &f16_words_ref(&cube)[..cube_elems], &mut act)?;
+    store_cube(&mut cube, &act)?;
+
+    // out = act·W2^T — fc2 reads the activated cube directly as its input BO.
+    consume_cube(dev, &p2, w2, &cube, out)
 }
 
 #[cfg(test)]
@@ -758,6 +915,75 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn the_cube_bias_path_is_the_row_major_bias_add() {
+        // `mlp_fused` adds `b1` on fc1's output cube: the bias is scattered into cube
+        // layout, EW-added over the cube bytes and fc2 then reads the cube slot by slot.
+        // Every step is per-element, so the composition has to reproduce the row-major
+        // `add_bias` exactly — that is what makes the cube path bit-identical to the
+        // host-handoff fallback. Device-free: the EW add is `ew_add_ref`, the host model
+        // of the same NPU entry, and the scatter/de-tile are the production helpers.
+        //
+        // A ragged N (384 = a full 256 tile plus a 128-wide one) is what exercises the
+        // pad lanes: they must stay 0 so the short last tile adds nothing.
+        let p = Plan::pinned(4, 64, 384, Some(TILE), None).unwrap();
+        let (m, dff) = (p.m, p.n);
+        assert!(p.nmt == 1 && p.nnt == 2 && p.n_tile(1) == 128);
+        assert!(p.n_tile(0) == TILE && p.out_slot == 4 * TILE);
+
+        let f1: Vec<f16> = (0..m * dff)
+            .map(|i| f16::from_f32((i % 89) as f32 * 0.125 - 5.0))
+            .collect();
+        let b1: Vec<f16> = (0..dff)
+            .map(|i| f16::from_f32(i as f32 * 0.03125 - 1.0))
+            .collect();
+
+        // Row-major: the host-handoff path.
+        let mut want = f1.clone();
+        add_bias(&mut want, Some(&b1), m, dff);
+
+        // Cube: fc1's canonical `[nMt][nNt]` output cube (the layout the projection
+        // writes, `feat_idx(mtile, ·)`, i.e. `feat_scatter_tile`), the scattered bias,
+        // one flat EW add, then the slot-by-slot read the consumer's de-tile does.
+        let mut cube = vec![f16::ZERO; p.cube_elems()];
+        for mi in 0..p.nmt {
+            for ni in 0..p.nnt {
+                let (mtile, ntile) = (p.m_tile(mi), p.n_tile(ni));
+                let off = (mi * p.nnt + ni) * p.out_slot;
+                layout::feat_scatter_tile(
+                    &mut cube[off..off + p.out_slot],
+                    &f1,
+                    dff,
+                    mi * p.mt,
+                    ni * p.nt,
+                    mtile,
+                    ntile,
+                );
+            }
+        }
+        let mut bias_cube = vec![f16::ZERO; p.cube_elems()];
+        layout::scatter_bias_cube(&p, &mut bias_cube, &b1);
+        let mut added = vec![f16::ZERO; p.cube_elems()];
+        crate::ops::activation::ew_add_ref(&cube, &bias_cube, &mut added);
+
+        let mut got = vec![f16::ZERO; m * dff];
+        for mi in 0..p.nmt {
+            for ni in 0..p.nnt {
+                let off = (mi * p.nnt + ni) * p.out_slot;
+                layout::detile_store(
+                    &mut got,
+                    dff,
+                    &added[off..off + p.out_slot],
+                    mi * p.mt,
+                    ni * p.nt,
+                    p.m_tile(mi),
+                    p.n_tile(ni),
+                );
+            }
+        }
+        assert_eq!(got, want, "the on-cube bias add must match `add_bias`");
     }
 
     #[test]

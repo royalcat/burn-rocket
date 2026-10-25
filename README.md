@@ -186,7 +186,8 @@ C's stacked `[x ; x²]` single-reduce job and the `x·A + B` affine fold), the v
 norms (`rocket_normvision.c`: inference BatchNorm from running stats, GroupNorm,
 InstanceNorm and L2-Normalize over the `[N,C,P]` channels-major layout), the gated FFN
 family (`rocket_ffn.c`: the GeGLU/SwiGLU core, the three-matmul block, the pinned-tile
-`ffn_fused` and `mlp_fused`, the host-handoff `mlp`) and the encoder block
+`ffn_fused` and `mlp_fused` — cube-resident, so `gate/up → act⊙up → down` never leaves
+the NPU cube layout — and the host-handoff `mlp`) and the encoder block
 (`rocket_encoder.c`: one pre-norm Whisper layer over the two norms, `mha_self`, the
 residual adds and the fused MLP), the fp16 convolution family (`rocket_conv.c`: the
 native CNA conv — direct, depthwise, 1D and the conv→activation fusion, with the OC /
@@ -254,6 +255,23 @@ noise. Its two MLP routes are bit-identical to each other on the measured shapes
 pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`. Board wall (cores
 0-3, busy board): a 257x1024 LayerNorm 69 ms, RMSNorm 44 ms,
 a 64x512x2048 FFN 36 ms and the encoder blocks 32 ms / 48 ms.
+
+The fused FFN/MLP are **cube-resident**, exactly as `rocket_ffn.c`: `gate`/`up` (or
+`fc1`) are left as their full `[nMt][nNt]` output cubes by `mm_compute_kacc_cube`, the
+gated product / bias / activation run element-wise over the cube's fp16 bytes (the
+C's `mm_scatter_bias_cube` + `rocket_ew_add_fp16` for the non-gated bias) and the
+down/fc2 matmul reads the product cube directly as its A operand
+(`compute_kacc_from`, with `compute_cpu_from` on the tiny-M sentinel), so no `[M,I]`
+intermediate is de-tiled and re-packed. An `A/B` against the previous binary on
+identical raw fixtures is **bit-identical for every case** (`ffn`, `ffn_fused`,
+`mlp_fused` with and without the fc1 bias at 4x256x1024 and 64x512x2048, and both
+encoder blocks), and the C A/B above stays bit-identical too. Wall is neutral for
+`ffn_fused` (19.0 vs 19.9 ms at 4x256x1024, 64.8 vs 63.5 ms at 64x512x2048, on a board
+whose load average was ~9 and whose identical-code arm scatters by ~10 %), and the
+`mlp_fused`/encoder path pays 2-5 ms for the C's on-NPU bias EW add (14.9 vs 12.2 ms
+and 48.5 vs 43.6 ms; the row-major route added the bias on the host in f32) — CPU time
+is unchanged (user 2.58 s vs 2.66 s for the 64x512x2048 run). `ROCKET_FFN_DEBUG=1`
+prints the routing decision, like the C's knob.
 
 The M8a convolution family is **bit-identical to the C library on the board across the
 whole measured matrix** (`ab_compare.py` again): direct convs over the kernel/stride/
@@ -437,8 +455,8 @@ and the exact host fallback, the feature-axis ones-matmul reduce, cumsum, row
 softmax/log-softmax/cross-entropy and the per-row scale, each with its `*_ref`), the
 transformer norms (`rmsnorm`/`layernorm` plus the shared `square_prescale_k` fp16-square
 guard), the vision norms (`batchnorm`/`groupnorm`/`instancenorm`/`l2norm`), the FFN
-family (`geglu`, `ffn`, the pinned-tile `ffn_fused`/`mlp_fused`, the host-handoff
-`mlp`, and `ffn_ref`/`geglu_ref`/`mlp_ref`), the encoder block
+family (`geglu`, `ffn`, the cube-resident pinned-tile `ffn_fused`/`mlp_fused`, the
+host-handoff `mlp`, and `ffn_ref`/`geglu_ref`/`mlp_ref`), the encoder block
 (`encoder_block`/`encoder_block_ref`), the fp16 convolution family
 (`conv2d`/`conv2d_act`/`conv1d`/`conv2d_ref` with `ConvContext`, `conv2d_plan`/
 `conv2d_plan_code`, the `conv2d_deconv`/`conv2d_deconv_fits` deconvolution route and
@@ -497,16 +515,16 @@ for tf32 either — that surface is complete), the `*_ref_fp16` host references 
 remaining non-matmul families, the
 `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
 activation), the public `rocket_stream_*`
-aliases, the non-fp16 batch wrappers, the cube-resident *mechanism* of the fused
-FFN/MLP (the pinned tiling, the matched-tiling gate and the KACC routing are
-bit-identical to the C; only the host round-trip is kept, so the C's resident-cube
-optimization is the remaining work), the RK3576-specific convolution and pooling
+aliases, the non-fp16 batch wrappers, the RK3576-specific convolution and pooling
 entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
 entry with its zero point and the prepacked/cube handles), the int8 convolution's
 opt-in `ROCKET_CONV_BATCH` batched submit (bit-identical to the per-tile path this
 port runs), and graph execution (the RK3576-only graph runner).
 The activation + elementwise, the reduce + softmax, the transformer and vision norms,
-the FFN/MLP, the encoder block, the fp16 and int8 convolution families (direct/
+the FFN/MLP (the fused entries are cube-resident: the projections leave their full
+output cubes, the bias/activation run over the cube bytes and the down/fc2 matmul reads
+the product cube directly, so no `[M,I]` intermediate is de-tiled and re-packed), the
+encoder block, the fp16 and int8 convolution families (direct/
 depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant), the
 PPU pooling family, the upsample and the two model encoders (SAM ViT-Det and
 SigLIP-B/16) are implemented. See the `rocket-npu` crate docs for the full list.

@@ -9,6 +9,8 @@
 
 use half::f16;
 
+use super::plan::Plan;
+
 /// Feature/output cube element index (1-based row/channel, as in the C helpers).
 #[inline]
 pub fn feat_idx(h: usize, ch: usize, row: usize) -> usize {
@@ -22,6 +24,9 @@ pub fn wt_idx(c: usize, k: usize, ch: usize) -> usize {
 }
 
 /// Scatter one row-major `A[m0.., k0..]` tile into a feature cube slot.
+///
+/// `slot` is the *plan's* input slot (`nMt*nKt*in_slot` region sliced per tile), so it is
+/// at least the live tile's requirement — the last K-tile can be shorter than `Kt`.
 pub fn feat_scatter_tile(
     slot: &mut [f16],
     a: &[f16],
@@ -31,7 +36,7 @@ pub fn feat_scatter_tile(
     mtile: usize,
     ktile: usize,
 ) {
-    debug_assert_eq!(slot.len(), mtile.div_ceil(4) * 4 * ktile.div_ceil(32) * 32);
+    debug_assert!(slot.len() >= mtile.div_ceil(4) * 4 * ktile.div_ceil(32) * 32);
     let h = mtile;
     for row in 0..mtile {
         let arow = &a[(m0 + row) * astride + k0..][..ktile];
@@ -66,6 +71,9 @@ pub fn wt_scatter_row(slot: &mut [f16], brow: &[f16], kk: usize, ktile: usize) {
 }
 
 /// Scatter a contiguous `B[n0.., k0..]` weight tile into a weight cube slot.
+///
+/// As [`feat_scatter_tile`]: `slot` is the plan's weight slot, so a ragged last N- or
+/// K-tile only needs *at most* that much room.
 pub fn wt_scatter_tile(
     slot: &mut [f16],
     b: &[f16],
@@ -75,9 +83,12 @@ pub fn wt_scatter_tile(
     ntile: usize,
     ktile: usize,
 ) {
-    debug_assert_eq!(
+    debug_assert!(
+        slot.len() >= ntile.div_ceil(16) * 16 * ktile.div_ceil(32) * 32,
+        "weight slot {} < live tile {}x{}",
         slot.len(),
-        ntile.div_ceil(16) * 16 * ktile.div_ceil(32) * 32
+        ntile,
+        ktile
     );
     for kk in 0..ntile {
         let brow = &b[(n0 + kk) * bstride + k0..][..ktile];
@@ -174,6 +185,42 @@ pub fn detile_store(
     }
 }
 
+/// Scatter a per-output-channel `bias[N]` into the canonical `[nMt][nNt]` output cube
+/// (the C `mm_scatter_bias_cube`): the bias is broadcast over the rows, so a flat
+/// element-wise add of a matmul output cube and this cube adds `bias[n]` to every
+/// `(m, n)` — the cross-op bias epilogue that stays cube-resident.
+///
+/// The slot index math is the same as [`detile_store`]'s, with `H = mtile` (the tile's
+/// real row count), so a ragged last m-tile still lands lane for lane. `dst` is fully
+/// zeroed first, so pad lanes stay zero and the consumer's muting weights see 0.
+pub fn scatter_bias_cube(plan: &Plan, dst: &mut [f16], bias: &[f16]) {
+    assert!(bias.len() >= plan.n, "bias shorter than N");
+    let cn = plan.cube_elems();
+    assert!(dst.len() >= cn, "cube shorter than cube_elems");
+    dst[..cn].fill(f16::ZERO);
+    for mi in 0..plan.nmt {
+        let mtile = plan.m_tile(mi);
+        for ni in 0..plan.nnt {
+            let n0 = ni * plan.nt;
+            let ntile = plan.n_tile(ni);
+            let slot = &mut dst[(mi * plan.nnt + ni) * plan.out_slot..][..plan.out_slot];
+            for row in 0..mtile {
+                let mut col = 0;
+                while col + 8 <= ntile {
+                    let g = col / 8;
+                    let d = &mut slot[g * mtile * 8 + 8 * row..][..8];
+                    d.copy_from_slice(&bias[n0 + col..n0 + col + 8]);
+                    col += 8;
+                }
+                while col < ntile {
+                    slot[feat_idx(mtile, col + 1, row + 1)] = bias[n0 + col];
+                    col += 1;
+                }
+            }
+        }
+    }
+}
+
 /// Narrow the fp32 accumulator into the caller's fp16 output.
 pub fn narrow_f32_to_f16(c: &mut [f16], acc: &[f32]) {
     debug_assert_eq!(c.len(), acc.len());
@@ -252,6 +299,57 @@ mod tests {
                 assert_eq!(slot[wt_idx(32, kk + 1, cc + 1)], b[(16 + kk) * k + 32 + cc]);
             }
         }
+    }
+
+    #[test]
+    fn bias_cube_broadcasts_over_rows_and_leaves_only_pad_lanes_zero() {
+        // Ragged on both axes: 264 rows (a 256-row tile plus 8) and 272 columns (128-wide
+        // tiles plus a 16-wide last one). The short last m-tile means the slot's `H` is
+        // the live tile height, not `Mt`, which is what the lane math must follow.
+        let p = Plan::new(264, 1024, 272).unwrap();
+        assert!(p.nmt > 1 && p.nnt > 1);
+        assert!(p.m_tile(p.nmt - 1) < p.mt && p.n_tile(p.nnt - 1) < p.nt);
+
+        let bias: Vec<f16> = (0..p.n).map(|i| value(i + 3)).collect();
+        let mut cube = vec![f16::from_f32(-3.0); p.cube_elems() + 4];
+        scatter_bias_cube(&p, &mut cube, &bias);
+
+        // Every live lane holds its channel's bias: de-tile each slot the way the
+        // consumer reads it and compare the whole `[M,N]` surface.
+        let mut live = vec![false; p.cube_elems()];
+        let mut out = vec![f16::ZERO; p.m * p.n];
+        for mi in 0..p.nmt {
+            let mtile = p.m_tile(mi);
+            for ni in 0..p.nnt {
+                let ntile = p.n_tile(ni);
+                for row in 0..mtile {
+                    for col in 0..ntile {
+                        let lane = feat_idx(mtile, col + 1, row + 1);
+                        live[(mi * p.nnt + ni) * p.out_slot + lane] = true;
+                    }
+                }
+                let off = (mi * p.nnt + ni) * p.out_slot;
+                let slot = &cube[off..off + p.out_slot];
+                detile_store(&mut out, p.n, slot, mi * p.mt, ni * p.nt, mtile, ntile);
+            }
+        }
+        for row in 0..p.m {
+            for col in 0..p.n {
+                assert_eq!(out[row * p.n + col], bias[col], "row={row} col={col}");
+            }
+        }
+        // The pad lanes are zero (the consumer's muting weights need 0, not garbage) and
+        // the CBUF slack past the cube is untouched.
+        for (i, is_live) in live.iter().enumerate() {
+            if !is_live {
+                assert_eq!(cube[i], f16::ZERO, "pad lane {i}");
+            }
+        }
+        assert!(
+            cube[p.cube_elems()..]
+                .iter()
+                .all(|v| *v == f16::from_f32(-3.0))
+        );
     }
 
     #[test]

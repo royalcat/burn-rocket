@@ -60,5 +60,10 @@ macro_rules! log_debug {
         $crate::log::log($crate::log::Level::Debug, format_args!($($arg)*))
     };
 }
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        $crate::log::log($crate::log::Level::Info, format_args!($($arg)*))
+    };
+}
 
-pub(crate) use {log_debug, log_error, log_warn};
+pub(crate) use {log_debug, log_error, log_info, log_warn};

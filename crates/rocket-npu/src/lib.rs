@@ -136,9 +136,13 @@
 //!   three-matmul block over the C's `NT = 3` `_mt` projections),
 //!   [`ops::ffn::ffn_fused`] and [`ops::ffn::mlp_fused`] (the pinned
 //!   `Nt = Kt = 256` cross-op tiling in [`crate::matmul::Plan::pinned`], the
-//!   matched-tiling gate, KACC-only projections with the host-handoff fallback
-//!   and KACC-then-CPU down/fc2), [`ops::ffn::mlp`] (the C's host-handoff MLP)
-//!   and the fp64 references;
+//!   matched-tiling gate, KACC-only projections with the host-handoff fallback,
+//!   KACC-then-CPU down/fc2, and the C's **cube residency**: the projections
+//!   leave their full `[nMt][nNt]` output cubes (`compute_kacc_cube`), the
+//!   bias/activation run over the cube bytes and the consumer matmul takes the
+//!   product cube as its A operand (`compute_kacc_from` / `compute_cpu_from`), so
+//!   no `[M,I]` intermediate is de-tiled and re-packed), [`ops::ffn::mlp`] (the C's
+//!   host-handoff MLP) and the fp64 references;
 //! - the encoder block ([`ops::encoder`], the port of `rocket_encoder.c`):
 //!   [`ops::encoder::encoder_block`], one pre-norm Whisper layer assembled from
 //!   the two LayerNorms, [`attn::mha_self`], the EW residual adds and the fused
@@ -256,22 +260,18 @@
 //!   (one group per K-tile from its own loop — the C library chains it, this port leaves
 //!   it on the gapped per-task layout for now) and every int8/int4 path;
 //! - the `rocket_ctx_nthreads` helper;
-//! - the cube-resident *mechanism* of the fused FFN/MLP: [`ops::ffn::ffn_fused`] and
-//!   [`ops::ffn::mlp_fused`] reproduce the pinned tiling, the matched-tiling gate and
-//!   the KACC routing bit for bit (verified against the C on the board), but the
-//!   intermediates come back to row-major between ops instead of staying in the
-//!   projection's output cube — the elementwise passes commute with the cube reindex, so
-//!   only the host round-trip the C's `RESIDENT-FUSION NOTE` describes is missing;
 //! - the RK3576-specific convolution and pooling entries (the part's own conv encoder,
 //!   the packed-image datapath, the int8 pooling entry with its own zero point and the
 //!   prepacked/cube handles), and the int8 convolution's batched (gapped multi-task)
 //!   submit — the C's opt-in `ROCKET_CONV_BATCH`, which is bit-identical to the per-tile
 //!   path this port runs;
 //! - graph execution (the RK3576-only graph runner). The activation + elementwise, the
-//!   reduce + softmax, the transformer/vision norms, the FFN/MLP, the encoder block,
-//!   the fp16 and int8 convolution families (direct/depthwise/1D, the conv→activation
-//!   fusion, the transposed conv and the int8 requant), the PPU pooling family, the
-//!   upsample and the SAM/SigLIP encoders are implemented above.
+//!   reduce + softmax, the transformer/vision norms, the FFN/MLP (including the fused
+//!   entries' cube residency: the projections' full output cubes feed the consumer
+//!   matmul directly, exactly as the C's `RESIDENT-FUSION NOTE` describes), the encoder
+//!   block, the fp16 and int8 convolution families (direct/depthwise/1D, the
+//!   conv→activation fusion, the transposed conv and the int8 requant), the PPU pooling
+//!   family, the upsample and the SAM/SigLIP encoders are implemented above.
 //!
 //! Env knobs belonging to the missing dtypes are not read; the fp16/int8/int4/bf16/tf32
 //! and attention knobs that are implemented keep their C names and semantics.
