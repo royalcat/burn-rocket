@@ -35,8 +35,11 @@
 //!
 //! # Surface covered and deliberately missing
 //!
-//! This is a focused port of the C library's matmul/attention/activation core, not a
-//! function-for-function replacement of the full 367-entry API. Implemented:
+//! This port covers the RK3588 functional surface of the C library (the 219
+//! RK3588-relevant entries of its 367-entry API; the remainder are RK3576-only). It is
+//! not a function-for-function C ABI replacement, and a few aliases, plane variants,
+//! performance mechanisms and all RK3576 entries stay out — see the list below.
+//! Implemented:
 //!
 //! - device/uAPI: open/caps, BO allocation (32-bit IOVA checked), prep/fini
 //!   (whole-object and ranged), one-job and multi-job submit (`submit`,

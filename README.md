@@ -410,8 +410,10 @@ differ by ~1e-3 as its header says, so the resident arm carries that delta on to
 
 ### Missing surface
 
-`rocket-npu` is a focused matmul/attention driver, not a full replacement of every
-`librocketnpu` entry. Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
+`rocket-npu` covers the RK3588 functional surface of `librocketnpu` (the 219
+RK3588-relevant entries; the remainder are RK3576-only). The C ABI, a few aliases and
+plane variants, performance mechanisms and every RK3576 entry are not reproduced.
+Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
 fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
 and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
 both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream,
