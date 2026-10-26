@@ -108,7 +108,8 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
-    match tokio::task::spawn_blocking(move || catch_compute(f)).await {
+    let parent_span = tracing::Span::current();
+    match tokio::task::spawn_blocking(move || parent_span.in_scope(|| catch_compute(f))).await {
         Ok(result) => result,
         Err(e) => Err(ApiError::internal(format!("worker: {e}"))),
     }

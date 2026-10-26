@@ -4,6 +4,7 @@ use burn::prelude::*;
 use burn::tensor::{DType, TensorData, s};
 
 /// Precomputed RoPE cos/sin tables, `[max_seq, head_dim / 2]`.
+#[derive(Debug)]
 pub struct RopeCache {
     cos: Tensor<2>,
     sin: Tensor<2>,

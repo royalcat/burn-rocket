@@ -11,6 +11,7 @@ use burn::module::Param;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
 use burn::tensor::{DType, Int, s};
+use tracing::instrument;
 
 use crate::gemma::audio::AudioTower;
 use crate::gemma::audio_frontend::{AudioFeatures, subsample_mask};
@@ -112,6 +113,7 @@ impl TextSpec {
 
 /// Precomputed RoPE cos/sin table `[max_seq, head_dim / 2]` (GPT-NeoX rotate-half
 /// layout: `cos = cat([f, f])`, pairs are the two halves of the head).
+#[derive(Debug)]
 pub struct RopeTable {
     cos: Tensor<2>,
     sin: Tensor<2>,
@@ -161,6 +163,7 @@ pub struct TextAttention {
 }
 
 impl TextAttention {
+    #[instrument]
     fn forward(
         &self,
         x: Tensor<3>,
@@ -677,6 +680,7 @@ impl TextModel {
 
     /// RoPE tables for the sequence length `max_seq`: sliding and full layers
     /// use different head dims and thetas.
+    #[instrument]
     pub fn rope_tables(&self, max_seq: usize, dtype: DType, device: &Device) -> TextRope {
         let mut sliding = None;
         let mut full = None;

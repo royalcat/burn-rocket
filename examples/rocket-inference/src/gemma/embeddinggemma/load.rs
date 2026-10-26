@@ -9,6 +9,7 @@ use burn::prelude::*;
 use burn::tensor::DType;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 use burn::tensor::TensorData;
+use tracing::instrument;
 
 use crate::gemma::config::Emb2Config;
 use crate::gemma::embeddinggemma::model::{Emb2Model, Towers};
@@ -139,6 +140,7 @@ fn towers_available(model_dir: &Path) -> bool {
 /// vision projections (pack-and-drop) into resident fp16 NPU weights after the
 /// store pass and the optional Q8 mapping; `ROCKET_NPU_TOWERS=0` disables it
 /// for A/Bs.
+#[instrument]
 pub fn load_towers(
     model: &mut Emb2Model,
     model_dir: &Path,

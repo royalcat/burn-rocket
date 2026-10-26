@@ -113,6 +113,7 @@ impl IntentTextConfig {
 
 /// Partial RoPE: applies the rotation to the first `rotary` dims and passes the
 /// rest through, using the shared [`RopeCache`] tables.
+#[derive(Debug)]
 pub struct PartialRope {
     inner: RopeCache,
     rotary: usize,
@@ -449,6 +450,7 @@ fn rms_norm_gated(x: Tensor<2>, gate: Tensor<2>, w: &Tensor<1>, eps: f64) -> Ten
 }
 
 /// One Gated DeltaNet layer.
+#[derive(Debug)]
 pub struct DeltaNet {
     pub in_proj_qkv: Proj, // [hidden, conv_dim]
     pub in_proj_z: Proj,   // [hidden, value_dim]
@@ -622,6 +624,7 @@ impl DeltaNet {
 // Gated full attention
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct GatedAttention {
     pub q_proj: Proj, // [hidden, n_heads*head_dim*2]
     pub k_proj: Proj,
@@ -771,6 +774,7 @@ impl GatedAttention {
 // MLP and layers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct Mlp {
     pub gate_proj: Proj,
     pub up_proj: Proj,
@@ -815,11 +819,13 @@ impl Mlp {
 // The per-layer mixer is stored by value in `Vec<Layer>`; boxing the large
 // variant would add indirection in the forward path for no memory win.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum Mixer {
     Linear(DeltaNet),
     Full(GatedAttention),
 }
 
+#[derive(Debug)]
 pub struct Layer {
     pub mixer: Mixer,
     pub input_norm_w: Tensor<1>,
@@ -857,6 +863,7 @@ impl Layer {
 // Model
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct IntentModel {
     pub cfg: IntentTextConfig,
     pub embed: Tensor<2>, // [vocab, hidden]

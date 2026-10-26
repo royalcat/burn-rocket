@@ -526,6 +526,7 @@ pub(crate) const MAX_FETCH_BYTES: u64 = 20 * 1024 * 1024;
 /// A media value resolved to a local file. Uploads (base64 data URIs) and
 /// downloaded URLs live in the temp dir and are removed when the guard drops,
 /// so the caller must keep it alive until the media has been decoded.
+#[derive(Debug)]
 pub(crate) struct ResolvedMedia {
     path: PathBuf,
     temp: bool,

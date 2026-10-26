@@ -21,6 +21,8 @@ mod telemetry;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
+use crate::util::http::lock_or_recover;
+
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
@@ -28,15 +30,14 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-
-use crate::util::http::lock_or_recover;
 use engine::{Capabilities, Engine, Family};
 use error::{ApiError, blocking};
 use log::RequestTiming;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing::instrument;
 
 /// Immutable settings, kept outside the model lock so `/health`, `/v1/models`
 /// and request routing never block behind a running forward.
+#[derive(Debug)]
 pub struct Settings {
     pub model_name: String,
     pub family: Family,
@@ -49,13 +50,14 @@ pub struct Settings {
     pub temperature: f32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct AppState {
     pub(crate) inner: Arc<Mutex<Engine>>,
     pub(crate) settings: Arc<Settings>,
 }
 
 impl AppState {
+    #[instrument]
     fn lock(&self) -> MutexGuard<'_, Engine> {
         lock_or_recover(&self.inner)
     }
@@ -63,6 +65,7 @@ impl AppState {
     /// Run one inference call: wait for the model lock, time the wait and the
     /// call itself, and contain panics (through [`blocking`]). Every inference
     /// endpoint goes through this so the request logs carry consistent timings.
+    #[tracing::instrument(skip(f))]
     pub(crate) async fn compute<T, F>(&self, f: F) -> Result<(T, RequestTiming), ApiError>
     where
         T: Send + 'static,
@@ -73,25 +76,17 @@ impl AppState {
         // Only created when trace export is on: the disabled path keeps the
         // pre-telemetry output (including the `ROCKET_MEM_LOG` lines, which
         // otherwise gain a span prefix) and cost.
-        let inference = telemetry::enabled().then(|| tracing::info_span!("inference"));
+        let span = tracing::Span::current();
         blocking(move || {
-            let _entered = inference.as_ref().map(|span| span.enter());
+            let _entered = span.enter();
             let mut engine = state.lock();
             let queue_s = arrived.elapsed().as_secs_f64();
-            if let Some(span) = &inference {
-                span.set_attribute("queue_s", queue_s);
-            }
+
             let t0 = Instant::now();
             crate::gemma::vision::vision_stats_reset();
             let out = f(&mut engine)?;
             let compute_s = t0.elapsed().as_secs_f64();
             let encode_s = crate::gemma::vision::vision_stats().total_s;
-            if let Some(span) = &inference {
-                span.set_attribute("compute_s", compute_s);
-                if encode_s > 0.0 {
-                    span.set_attribute("encode_s", encode_s);
-                }
-            }
             let timing = RequestTiming {
                 queue_s,
                 compute_s,
