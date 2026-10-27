@@ -44,8 +44,9 @@ APIs).
 OpenViking's embedding backend in production on a Rock 5B+ is EmbeddingGemma 2
 (`rocket-inference serve --dtype f32 --quant q8 --npu --npu-attn npu
 --defer-towers`): the text-only service idles at 605 MiB anon (2183 MiB before the
-idle-memory round; the vision/audio towers load only if a media request ever
-arrives). On a media request the towers' projections and the vision tower's
+idle-memory round; each tower half loads only when a request of its modality
+arrives, so image traffic never allocates the larger audio tower). On a media
+request the towers' projections and the vision tower's
 attention now run on the NPU (`--vision-attn` defaults to `npu`): a
 2394-patch image's tower is 10.6 s against 15.2 s with the CPU attention kernel,
 and a served image request takes 12.4 s instead of 13.5 s at +101 MiB anon. Its

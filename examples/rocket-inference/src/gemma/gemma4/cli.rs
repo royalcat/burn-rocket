@@ -48,7 +48,8 @@ struct Args {
     gen_f16: bool,
     /// `None` = the checkpoint's native dtype.
     dtype: Option<LoadDtype>,
-    /// Skip the vision/audio towers at load; they load on first media use.
+    /// Skip the vision/audio towers at load; each loads on first use of its
+    /// modality.
     defer_towers: bool,
 }
 
@@ -214,8 +215,17 @@ fn run_gen(args: &Args) -> Result<()> {
     // Media inputs expand their `<|image|>` / `<|audio|>` placeholders in the
     // rendered conversation and are encoded with the checkpoint's own towers.
     let (ids, soft) = if args.image.is_some() || args.audio.is_some() {
-        // Deferred towers (`--defer-towers`) load on first media use.
-        loader::load_towers(&mut model, &args.gen_model_dir, &device)?;
+        // Deferred towers (`--defer-towers`) load on first media use, only the
+        // half this run needs.
+        loader::load_towers(
+            &mut model,
+            &args.gen_model_dir,
+            &device,
+            crate::gemma::TowerSet {
+                vision: args.image.is_some(),
+                audio: args.audio.is_some(),
+            },
+        )?;
         let (img_soft, video_soft) = inputs::media_soft_tokens(&args.gen_model_dir);
         let req = inputs::MediaInputs {
             text: Some(rendered.clone()),

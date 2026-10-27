@@ -524,11 +524,13 @@ and cosine 1.000000000 in all three (log §21).
 
 Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
 1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
-Q8 vision/audio towers out of the process (they load on the first media request,
-~7.5 s, Q8), and `serve` returns its heap at startup and after every request
-(`ROCKET_TRIM=0` disables the latter), so a text-only q8 process idles at
-~754 MiB anon on the dev host (1694 before) and the board's deployed service at
-605 MiB (2183 before; log §14). The text backbone on the NPU packs 218
+Q8 vision/audio towers out of the process (each half loads on the first request
+that uses it — image/video loads the ~170 MiB vision half, audio the ~300 MiB
+audio half, ~2.5 s / ~4.8 s, Q8), and `serve` returns its heap at startup and
+after every request (`ROCKET_TRIM=0` disables the latter), so a text-only q8
+process idles at ~754 MiB anon on the dev host (1694 before) and the board's
+deployed service at 605 MiB (2183 before; log §14). An image request grows the
+q8 process by ~275 MiB instead of ~640 MiB (log §22). The text backbone on the NPU packs 218
 projections into 0.25 GiB of resident fp16 weights with windowed attention: on
 the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
 user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
@@ -675,10 +677,12 @@ cache instead of anonymous memory. The tables are stubbed to `[1, 1]` *without
 forcing the lazy initializer* before loading (the old stub ran the f32 table
 init — an 8.75 GiB write — which was the real load peak and ~30 s of load
 time; f16 load is now ~22 s). `--defer-towers` skips the vision/audio towers at
-load (~1.9 GiB f32) and installs them on the first media request (~4 s);
-`--f16 --defer-towers` is the low-memory serving configuration (4.7 GiB peak
-anon text-only, 6.5 GiB with towers). The towers always load f32 — the
-validated multimodal mode — while the text body keeps the selected dtype.
+load (~1.9 GiB f32) and installs each half on the first request that uses it
+(image loads the 0.64 GiB vision half, audio the 1.16 GiB audio half, each ~1.6-2.5 s
+f32; log §22); `--f16 --defer-towers` is the low-memory serving configuration
+(4.7 GiB peak anon text-only, 5.3 GiB with the vision half, 6.5 GiB with both).
+The towers always load f32 — the validated multimodal mode — while the text body
+keeps the selected dtype.
 
 The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
 2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the

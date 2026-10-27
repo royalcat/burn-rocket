@@ -25,7 +25,7 @@ use burn_store::{
 };
 
 use crate::gemma::config::Emb2Config;
-use crate::gemma::gemma4::model::{GenRoot, GenTextModel, Towers};
+use crate::gemma::gemma4::model::{AudioTowers, GenRoot, GenTextModel, VisionTowers};
 use crate::gemma::layers::ClipBounds;
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 
@@ -362,7 +362,14 @@ pub fn load_gen_model(
         model.text_mut().set_packed_embed(table, round);
     }
     if !defer_towers {
-        load_towers_with(&mut model, model_dir, &qat, &scales, device)?;
+        load_towers_with(
+            &mut model,
+            model_dir,
+            &qat,
+            &scales,
+            crate::gemma::TowerSet::ALL,
+            device,
+        )?;
     }
     if let Ok(want) = std::env::var("DUMP_PARAM") {
         dump_param(&model, &want)?;
@@ -456,7 +463,13 @@ fn load_gen_model_gguf(
     };
     crate::gemma::layers::set_model_dtype(dtype.tensor_dtype());
     if !defer_towers && let Some(mmproj) = find_mmproj(model_dir) {
-        load_towers_mmproj(&mut model, model_dir, &mmproj, device)?;
+        load_towers_mmproj(
+            &mut model,
+            model_dir,
+            &mmproj,
+            crate::gemma::TowerSet::ALL,
+            device,
+        )?;
     }
     Ok((model, cfg))
 }
@@ -478,57 +491,83 @@ fn find_mmproj(model_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     cands.into_iter().next()
 }
 
-/// Load the vision/audio towers from a Gemma 4 `mmproj-*.gguf`. The towers always
-/// run in f32 (matching the safetensors path); QAT does not apply to GGUF.
+/// Load the requested tower halves from a Gemma 4 `mmproj-*.gguf`. The towers
+/// always run in f32 (matching the safetensors path); QAT does not apply to GGUF.
 fn load_towers_mmproj(
     model: &mut GenRoot,
     model_dir: &std::path::Path,
     mmproj: &std::path::Path,
+    need: crate::gemma::TowerSet,
     device: &Device,
 ) -> Result<()> {
     let cfg =
         Emb2Config::from_value(crate::util::checkpoint::open_in_dir(model_dir)?.config_json()?)?;
-    let vision_cfg = cfg
-        .vision_config
-        .as_ref()
-        .context("checkpoint has no vision_config")?;
-    let audio_cfg = cfg
-        .audio_config
-        .as_ref()
-        .context("checkpoint has no audio_config")?;
     let mut ckpt = crate::util::checkpoint::AnyCheckpoint::Gguf(
         crate::util::checkpoint::GgufCheckpoint::open_mmproj_gemma4(mmproj)?,
     );
-    let vision_bounds = if vision_cfg.use_clipped_linears {
-        read_bounds_mmproj(&mut ckpt, "v", vision_cfg.num_hidden_layers, &VISION_PAIRS)?
-    } else {
-        Default::default()
-    };
-    let audio_bounds = if audio_cfg.use_clipped_linears {
-        read_bounds_mmproj(&mut ckpt, "a", audio_cfg.num_hidden_layers, &AUDIO_PAIRS)?
-    } else {
-        Default::default()
-    };
-    let t0 = std::time::Instant::now();
-    let mut root = TowerRoot {
-        model: Towers::new(
-            vision_cfg,
-            audio_cfg,
-            &vision_bounds,
-            &audio_bounds,
-            cfg.text_config.hidden_size,
-            device,
-        ),
-    };
-    let adapter = PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, LoadDtype::F32));
-    let result = ckpt.load_into_with(&mut root, Box::new(adapter))?;
-    crate::util::store::check_missing(&result, |_| false)?;
-    model.set_towers(root.model);
-    println!(
-        "towers: loaded from mmproj (f32) in {:.2}s (resident {:.0} MiB anon)",
-        t0.elapsed().as_secs_f64(),
-        rss_mib()
-    );
+    let tower_dtype = LoadDtype::F32;
+    if need.vision {
+        let vision_cfg = cfg
+            .vision_config
+            .as_ref()
+            .context("checkpoint has no vision_config")?;
+        let vision_bounds = if vision_cfg.use_clipped_linears {
+            read_bounds_mmproj(&mut ckpt, "v", vision_cfg.num_hidden_layers, &VISION_PAIRS)?
+        } else {
+            Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut root = VisionRoot {
+            model: VisionTowers::new(
+                vision_cfg,
+                &vision_bounds,
+                cfg.text_config.hidden_size,
+                device,
+            ),
+        };
+        let adapter = PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, tower_dtype));
+        let result = ckpt.load_into_with(&mut root, Box::new(adapter))?;
+        crate::util::store::check_missing(&result, |_| false)?;
+        println!(
+            "towers: loaded vision from mmproj (f32, {} tensors) in {:.2}s \
+             (resident {:.0} MiB anon)",
+            result.applied.len(),
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_vision_towers(root.model);
+    }
+    if need.audio {
+        let audio_cfg = cfg
+            .audio_config
+            .as_ref()
+            .context("checkpoint has no audio_config")?;
+        let audio_bounds = if audio_cfg.use_clipped_linears {
+            read_bounds_mmproj(&mut ckpt, "a", audio_cfg.num_hidden_layers, &AUDIO_PAIRS)?
+        } else {
+            Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut root = AudioRoot {
+            model: AudioTowers::new(
+                audio_cfg,
+                &audio_bounds,
+                cfg.text_config.hidden_size,
+                device,
+            ),
+        };
+        let adapter = PyTorchToBurnAdapter.chain(LoadDtypeAdapter::new(device, tower_dtype));
+        let result = ckpt.load_into_with(&mut root, Box::new(adapter))?;
+        crate::util::store::check_missing(&result, |_| false)?;
+        println!(
+            "towers: loaded audio from mmproj (f32, {} tensors) in {:.2}s \
+             (resident {:.0} MiB anon)",
+            result.applied.len(),
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_audio_towers(root.model);
+    }
     Ok(())
 }
 
@@ -616,19 +655,22 @@ fn with_load_adapters(
     }
 }
 
-/// Load the vision/audio towers and their embedders into `model` (a no-op once
-/// they are present). Deferred serving calls this on the first media request;
-/// it re-reads the QAT scales, which are not kept after the initial load.
+/// Load the requested tower halves into `model` (a no-op for halves already
+/// present). Deferred serving calls this on the first media request with only
+/// the halves that request needs; it re-reads the QAT scales, which are not kept
+/// after the initial load.
 pub fn load_towers(
     model: &mut GenRoot,
     model_dir: &std::path::Path,
     device: &Device,
+    need: crate::gemma::TowerSet,
 ) -> Result<()> {
-    if model.has_towers() {
+    let need = need.without(model.towers_loaded());
+    if need.is_empty() {
         return Ok(());
     }
     if let Some(mmproj) = find_mmproj(model_dir) {
-        return load_towers_mmproj(model, model_dir, &mmproj, device);
+        return load_towers_mmproj(model, model_dir, &mmproj, need, device);
     }
     let cfg_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
@@ -643,82 +685,131 @@ pub fn load_towers(
         }
         None => None,
     };
-    load_towers_with(model, model_dir, &qat, &scales, device)?;
+    load_towers_with(model, model_dir, &qat, &scales, need, device)?;
     Ok(())
 }
 
-/// Temporary root for the towers-only load: wrapping the towers in a `model`
+/// Temporary roots for the towers-only load: wrapping each half in a `model`
 /// field makes the file's `model.` prefix match the module tree without key
 /// remapping (the QAT scales are keyed by the full module path).
 #[derive(Module, Debug)]
-struct TowerRoot {
-    model: Towers,
+struct VisionRoot {
+    model: VisionTowers,
 }
 
-/// The shared towers pass (eager and deferred): build the `Towers` module, load
-/// it, and quantize it in Q8 mode.
+#[derive(Module, Debug)]
+struct AudioRoot {
+    model: AudioTowers,
+}
+
+/// The shared towers pass (eager and deferred): build each requested half, load
+/// it and register its QAT SRQ scales.
 fn load_towers_with(
     model: &mut GenRoot,
     model_dir: &std::path::Path,
     qat: &Option<crate::gemma::qat::QatConfig>,
     scales: &Option<std::sync::Arc<QatScales>>,
+    need: crate::gemma::TowerSet,
     device: &Device,
 ) -> Result<()> {
+    let need = need.without(model.towers_loaded());
+    if need.is_empty() {
+        return Ok(());
+    }
     let cfg = Emb2Config::from_file(&model_dir.join("config.json"))?;
-    let vision_cfg = cfg
-        .vision_config
-        .as_ref()
-        .context("checkpoint has no vision_config")?;
-    let audio_cfg = cfg
-        .audio_config
-        .as_ref()
-        .context("checkpoint has no audio_config")?;
-    // Only checkpoints trained with clipped linears carry the bound scalars
-    // (the QAT export sets `use_clipped_linears: false` and has none).
-    let vision_bounds = if vision_cfg.use_clipped_linears {
-        read_clip_bounds(
-            model_dir,
-            "model.vision_tower.encoder.layers",
-            &VISION_LINEAR_NAMES,
-            vision_cfg.num_hidden_layers,
-        )?
-    } else {
-        Default::default()
-    };
-    let audio_bounds = if audio_cfg.use_clipped_linears {
-        read_clip_bounds(
-            model_dir,
-            "model.audio_tower.layers",
-            &AUDIO_LINEAR_NAMES,
-            audio_cfg.num_hidden_layers,
-        )?
-    } else {
-        Default::default()
-    };
-    let t0 = std::time::Instant::now();
-    let mut root = TowerRoot {
-        model: Towers::new(
-            vision_cfg,
-            audio_cfg,
-            &vision_bounds,
-            &audio_bounds,
-            cfg.text_config.hidden_size,
-            device,
-        ),
-    };
-    // The towers compute with plain `Linear` forwards and were validated in
-    // f32; the text body's dtype (f16/bf16/q8) does not apply to them. Loading
-    // them in the model dtype made every media request panic on dtype-mixed
-    // ops, so they always load f32.
+    if need.vision {
+        let vision_cfg = cfg
+            .vision_config
+            .as_ref()
+            .context("checkpoint has no vision_config")?;
+        // Only checkpoints trained with clipped linears carry the bound scalars
+        // (the QAT export sets `use_clipped_linears: false` and has none).
+        let vision_bounds = if vision_cfg.use_clipped_linears {
+            read_clip_bounds(
+                model_dir,
+                "model.vision_tower.encoder.layers",
+                &VISION_LINEAR_NAMES,
+                vision_cfg.num_hidden_layers,
+            )?
+        } else {
+            Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut root = VisionRoot {
+            model: VisionTowers::new(
+                vision_cfg,
+                &vision_bounds,
+                cfg.text_config.hidden_size,
+                device,
+            ),
+        };
+        // The towers compute with plain `Linear` forwards and were validated in
+        // f32; the text body's dtype (f16/bf16/q8) does not apply to them.
+        // Loading them in the model dtype made every media request panic on
+        // dtype-mixed ops, so they always load f32.
+        let applied = load_tower_half(&mut root, "vision", model_dir, qat, scales, device)?;
+        println!(
+            "towers: loaded vision (f32, {applied} tensors) in {:.2}s \
+             (resident {:.0} MiB anon)",
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_vision_towers(root.model);
+    }
+    if need.audio {
+        let audio_cfg = cfg
+            .audio_config
+            .as_ref()
+            .context("checkpoint has no audio_config")?;
+        let audio_bounds = if audio_cfg.use_clipped_linears {
+            read_clip_bounds(
+                model_dir,
+                "model.audio_tower.layers",
+                &AUDIO_LINEAR_NAMES,
+                audio_cfg.num_hidden_layers,
+            )?
+        } else {
+            Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let mut root = AudioRoot {
+            model: AudioTowers::new(
+                audio_cfg,
+                &audio_bounds,
+                cfg.text_config.hidden_size,
+                device,
+            ),
+        };
+        let applied = load_tower_half(&mut root, "audio", model_dir, qat, scales, device)?;
+        println!(
+            "towers: loaded audio (f32, {applied} tensors) in {:.2}s \
+             (resident {:.0} MiB anon)",
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_audio_towers(root.model);
+    }
+    Ok(())
+}
+
+/// One tower half's store pass and SRQ registration. The pass sees the whole
+/// checkpoint; only this half's parameters are in the tree, so a missing one is
+/// an error and the other half's tensors report as unused.
+fn load_tower_half<M: ModuleSnapshot>(
+    root: &mut M,
+    part: &str,
+    model_dir: &std::path::Path,
+    qat: &Option<crate::gemma::qat::QatConfig>,
+    scales: &Option<std::sync::Arc<QatScales>>,
+    device: &Device,
+) -> Result<usize> {
     let tower_dtype = LoadDtype::F32;
     let store =
         SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
     let mut store = with_load_adapters(store, qat.as_ref(), scales.as_ref(), tower_dtype, device);
     let result = root
         .load_from(&mut store)
-        .with_context(|| format!("load towers from {}", model_dir.display()))?;
-    // The pass sees the whole checkpoint; only the towers' own parameters are
-    // in the tree, so a missing one is an error.
+        .with_context(|| format!("load {part} towers from {}", model_dir.display()))?;
     crate::util::store::check_missing(&result, |_| false)?;
     // The towers sit behind a `#[module(skip)]` field, so the main pass's
     // visitor cannot see them: their SRQ scales are registered here (through
@@ -726,16 +817,10 @@ fn load_towers_with(
     if let Some(scales) = scales
         && std::env::var("NO_SRQ").is_err()
     {
-        let n = register_srq_scales(&root, scales);
-        println!("QAT: SRQ activation rounding on {n} tower linears");
+        let n = register_srq_scales(root, scales);
+        println!("QAT: SRQ activation rounding on {n} {part} tower linears");
     }
-    model.set_towers(root.model);
-    println!(
-        "towers: loaded (f32) in {:.2}s (resident {:.0} MiB anon)",
-        t0.elapsed().as_secs_f64(),
-        rss_mib()
-    );
-    Ok(())
+    Ok(result.applied.len())
 }
 
 /// The projection module paths `--quant q8` keeps Q8-resident (text only; the

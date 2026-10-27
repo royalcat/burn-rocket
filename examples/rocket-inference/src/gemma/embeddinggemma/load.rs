@@ -12,7 +12,7 @@ use burn::tensor::TensorData;
 use tracing::instrument;
 
 use crate::gemma::config::Emb2Config;
-use crate::gemma::embeddinggemma::model::{Emb2Model, Towers};
+use crate::gemma::embeddinggemma::model::{AudioTowers, Emb2Model, VisionTowers};
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
@@ -78,7 +78,7 @@ pub fn load_model(
         rss_mib()
     );
     if defer_towers {
-        println!("towers: deferred (load on the first media request)");
+        println!("towers: deferred (each half loads on first use of its modality)");
     }
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if let Some(opts) = npu {
@@ -106,6 +106,7 @@ pub fn load_model(
                 dtype,
                 quant_q8 && !opts.int8,
                 true,
+                crate::gemma::TowerSet::ALL,
                 device,
             )?;
         }
@@ -116,7 +117,15 @@ pub fn load_model(
         model = quantize_low_ram(model)?;
     }
     if !defer_towers && towers_available(model_dir) {
-        load_towers(&mut model, model_dir, dtype, quant_q8, false, device)?;
+        load_towers(
+            &mut model,
+            model_dir,
+            dtype,
+            quant_q8,
+            false,
+            crate::gemma::TowerSet::ALL,
+            device,
+        )?;
     }
     Ok((model, cfg))
 }
@@ -127,19 +136,22 @@ fn towers_available(model_dir: &Path) -> bool {
     model_dir.join("model.safetensors").exists() || find_mmproj(model_dir).is_some()
 }
 
-/// Load the vision/audio towers into `model` (a no-op once they are present).
+/// Load the requested tower halves into `model` (a no-op for halves already
+/// present).
 ///
 /// Text-only loads never call this; `--defer-towers` serving calls it on the
-/// first media request. The towers of a `--quant q8` model are mapped to
-/// Q8-resident weights here, matching the eager configuration (`#[module(skip)]`
-/// keeps them out of the text model's quantization pass) — except the
-/// NPU-packed vision tower under `--npu`, which stays f32 so the pack starts
-/// from full-precision weights (see [`tower_quant_group`]).
+/// first media request with only the halves that request needs — an image or
+/// video loads the vision tower and `embed_vision`, audio loads the audio tower
+/// and `embed_audio`, a mixed batch both. The other half stays unallocated and
+/// loads on its own first use. A `--quant q8` model's halves are mapped to
+/// Q8-resident weights here, matching the eager configuration
+/// (`#[module(skip)]` keeps them out of the text model's quantization pass) —
+/// except the NPU-packed vision tower under `--npu`, which stays f32 so the
+/// pack starts from full-precision weights (see [`tower_quant_group`]).
 ///
-/// `npu_pack` (the `--npu` decision, NPU build only) packs the tower's
-/// vision projections (pack-and-drop) into resident fp16 NPU weights after the
-/// store pass and the optional Q8 mapping; `ROCKET_NPU_TOWERS=0` disables it
-/// for A/Bs.
+/// `npu_pack` (the `--npu` decision, NPU build only) packs the vision half's
+/// projections (pack-and-drop) into resident fp16 NPU weights after the store
+/// pass and the optional Q8 mapping; `ROCKET_NPU_TOWERS=0` disables it for A/Bs.
 #[instrument]
 pub fn load_towers(
     model: &mut Emb2Model,
@@ -147,13 +159,17 @@ pub fn load_towers(
     dtype: DType,
     quant_q8: bool,
     npu_pack: bool,
+    need: crate::gemma::TowerSet,
     device: &Device,
 ) -> Result<()> {
-    if model.has_towers() {
+    let need = need.without(model.towers_loaded());
+    if need.is_empty() {
         return Ok(());
     }
     if let Some(mmproj) = find_mmproj(model_dir) {
-        return load_towers_mmproj(model, model_dir, &mmproj, dtype, quant_q8, npu_pack, device);
+        return load_towers_mmproj(
+            model, model_dir, &mmproj, dtype, quant_q8, npu_pack, need, device,
+        );
     }
     let path = model_dir.join("model.safetensors");
     if !path.exists() {
@@ -164,47 +180,88 @@ pub fn load_towers(
     }
     let mut ckpt = crate::util::checkpoint::open(&path)?;
     let cfg = Emb2Config::from_value(ckpt.config_json()?)?;
-    let vision_cfg = cfg
-        .vision_config
-        .as_ref()
-        .context("checkpoint has no vision_config")?;
-    let audio_cfg = cfg
-        .audio_config
-        .as_ref()
-        .context("checkpoint has no audio_config")?;
-    let audio_bounds = read_audio_clip_bounds(&mut ckpt, audio_cfg)?;
-    let t0 = Instant::now();
-    let mut towers = Towers::new(
-        vision_cfg,
-        audio_cfg,
-        &audio_bounds,
-        cfg.text_config.hidden_size,
-        device,
-    );
-    let result = ckpt
-        .load_into(&mut towers, dtype)
-        .with_context(|| format!("load towers from {}", model_dir.display()))?;
-    // The pass sees the whole checkpoint; only the towers' own parameters are in
-    // the tree, so a missing one is an error and the rest report as unused.
-    crate::util::store::check_missing(&result, |_| false)?;
     let npu_towers = npu_towers_enabled(npu_pack);
-    if quant_q8 {
+    if need.vision {
+        let vision_cfg = cfg
+            .vision_config
+            .as_ref()
+            .context("checkpoint has no vision_config")?;
+        let t0 = Instant::now();
+        let part = VisionTowers::new(vision_cfg, cfg.text_config.hidden_size, device);
+        let (mut part, applied) =
+            load_half(&mut ckpt, part, "vision", dtype, quant_q8, npu_towers)?;
+        let packed = pack_vision_npu(&mut part, device, npu_pack);
+        println!(
+            "towers: loaded vision ({:?}{}, {applied} tensors) in {:.2}s (resident {:.0} MiB anon){}",
+            dtype,
+            vision_policy_suffix(quant_q8, npu_towers),
+            t0.elapsed().as_secs_f64(),
+            rss_mib(),
+            packed
+        );
+        model.set_vision_towers(part);
+    }
+    if need.audio {
+        let audio_cfg = cfg
+            .audio_config
+            .as_ref()
+            .context("checkpoint has no audio_config")?;
+        let audio_bounds = read_audio_clip_bounds(&mut ckpt, audio_cfg)?;
+        let t0 = Instant::now();
+        let part = AudioTowers::new(
+            audio_cfg,
+            &audio_bounds,
+            cfg.text_config.hidden_size,
+            device,
+        );
+        let (part, applied) = load_half(&mut ckpt, part, "audio", dtype, quant_q8, npu_towers)?;
+        println!(
+            "towers: loaded audio ({:?}{}, {applied} tensors) in {:.2}s (resident {:.0} MiB anon)",
+            dtype,
+            audio_policy_suffix(quant_q8),
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_audio_towers(part);
+    }
+    Ok(())
+}
+
+/// One tower half's store pass plus the optional `--quant q8` mapping. Returns
+/// the mapped module and the number of applied tensors.
+///
+/// The pass sees the whole checkpoint; only the half's own parameters are in the
+/// tree, so a missing one is an error (`check_missing`) and the other half's
+/// tensors report as unused. The NPU-packed vision half stays f32 because
+/// [`tower_quant_group`] excludes it.
+fn load_half<C, M>(
+    ckpt: &mut C,
+    part: M,
+    name: &str,
+    dtype: DType,
+    quant_q8: bool,
+    npu_towers: bool,
+) -> Result<(M, usize)>
+where
+    C: crate::util::checkpoint::Checkpoint,
+    M: burn_store::ModuleSnapshot,
+{
+    let mut part = part;
+    let result = ckpt
+        .load_into(&mut part, dtype)
+        .with_context(|| format!("load {name} tower"))?;
+    crate::util::store::check_missing(&result, |_| false)?;
+    let applied = result.applied.len();
+    let part = if quant_q8 {
         use crate::util::quant::LowRam;
         let mut mapper = LowRam::new(vec![tower_quant_group(npu_towers)?], Vec::new(), None);
-        towers = towers.map(&mut mapper);
+        let part = part.map(&mut mapper);
         crate::util::trim_heap();
-    }
-    let packed = pack_towers_npu(&mut towers, device, npu_pack);
-    model.set_towers(towers);
-    println!(
-        "towers: loaded ({:?}{}) in {:.2}s (resident {:.0} MiB anon){}",
-        dtype,
-        tower_policy_suffix(quant_q8, npu_towers),
-        t0.elapsed().as_secs_f64(),
-        rss_mib(),
-        packed
-    );
-    Ok(())
+        part
+    } else {
+        part
+    };
+    Ok((part, applied))
 }
 
 /// Find a `mmproj-*.gguf` (or plain `mmproj.gguf`) in `model_dir`.
@@ -224,7 +281,9 @@ fn find_mmproj(model_dir: &Path) -> Option<std::path::PathBuf> {
     cands.into_iter().next()
 }
 
-/// Load the vision/audio towers from a `clip` `mmproj-*.gguf` (GGUF checkpoints).
+/// Load the requested tower halves from a `clip` `mmproj-*.gguf` (GGUF
+/// checkpoints).
+#[allow(clippy::too_many_arguments)]
 fn load_towers_mmproj(
     model: &mut Emb2Model,
     model_dir: &Path,
@@ -232,53 +291,64 @@ fn load_towers_mmproj(
     dtype: DType,
     quant_q8: bool,
     npu_pack: bool,
+    need: crate::gemma::TowerSet,
     device: &Device,
 ) -> Result<()> {
     let cfg =
         Emb2Config::from_value(crate::util::checkpoint::open_in_dir(model_dir)?.config_json()?)?;
-    let vision_cfg = cfg
-        .vision_config
-        .as_ref()
-        .context("config has no vision_config")?;
-    let audio_cfg = cfg
-        .audio_config
-        .as_ref()
-        .context("config has no audio_config")?;
     let mut ckpt = crate::util::checkpoint::GgufCheckpoint::open_mmproj(mmproj_path)?;
-    let audio_bounds = read_audio_clip_bounds_mmproj(&mut ckpt, audio_cfg)?;
-    let t0 = Instant::now();
-    let mut towers = Towers::new(
-        vision_cfg,
-        audio_cfg,
-        &audio_bounds,
-        cfg.text_config.hidden_size,
-        device,
-    );
-    let result = ckpt.load_into(&mut towers, dtype)?;
-    crate::util::store::check_missing(&result, |_| false)?;
     let npu_towers = npu_towers_enabled(npu_pack);
-    if quant_q8 {
-        use crate::util::quant::LowRam;
-        let mut mapper = LowRam::new(vec![tower_quant_group(npu_towers)?], Vec::new(), None);
-        towers = towers.map(&mut mapper);
-        crate::util::trim_heap();
+    if need.vision {
+        let vision_cfg = cfg
+            .vision_config
+            .as_ref()
+            .context("config has no vision_config")?;
+        let t0 = Instant::now();
+        let part = VisionTowers::new(vision_cfg, cfg.text_config.hidden_size, device);
+        let (mut part, applied) =
+            load_half(&mut ckpt, part, "vision", dtype, quant_q8, npu_towers)?;
+        let packed = pack_vision_npu(&mut part, device, npu_pack);
+        println!(
+            "towers: loaded vision from mmproj ({:?}{}, {applied} tensors) in {:.2}s \
+             (resident {:.0} MiB anon){}",
+            dtype,
+            vision_policy_suffix(quant_q8, npu_towers),
+            t0.elapsed().as_secs_f64(),
+            rss_mib(),
+            packed
+        );
+        model.set_vision_towers(part);
     }
-    let packed = pack_towers_npu(&mut towers, device, npu_pack);
-    model.set_towers(towers);
-    println!(
-        "towers: loaded from mmproj ({:?}{}) in {:.2}s (resident {:.0} MiB anon){}",
-        dtype,
-        tower_policy_suffix(quant_q8, npu_towers),
-        t0.elapsed().as_secs_f64(),
-        rss_mib(),
-        packed
-    );
+    if need.audio {
+        let audio_cfg = cfg
+            .audio_config
+            .as_ref()
+            .context("config has no audio_config")?;
+        let audio_bounds = read_audio_clip_bounds_mmproj(&mut ckpt, audio_cfg)?;
+        let t0 = Instant::now();
+        let part = AudioTowers::new(
+            audio_cfg,
+            &audio_bounds,
+            cfg.text_config.hidden_size,
+            device,
+        );
+        let (part, applied) = load_half(&mut ckpt, part, "audio", dtype, quant_q8, npu_towers)?;
+        println!(
+            "towers: loaded audio from mmproj ({:?}{}, {applied} tensors) in {:.2}s \
+             (resident {:.0} MiB anon)",
+            dtype,
+            audio_policy_suffix(quant_q8),
+            t0.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+        model.set_audio_towers(part);
+    }
     Ok(())
 }
 
 /// Whether the towers will actually be NPU-packed: `--npu` on an NPU build with
 /// the `ROCKET_NPU_TOWERS=0` A/B switch not set. The pack decision drives the
-/// tower load policy below (a packed tower is loaded in f32, not Q8).
+/// vision half's load policy below (a packed tower is loaded in f32, not Q8).
 fn npu_towers_enabled(npu_pack: bool) -> bool {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     {
@@ -291,24 +361,28 @@ fn npu_towers_enabled(npu_pack: bool) -> bool {
     }
 }
 
-/// The `towers: loaded` policy suffix.
-fn tower_policy_suffix(quant_q8: bool, npu_towers: bool) -> &'static str {
+/// The vision half's `towers: loaded` policy suffix.
+fn vision_policy_suffix(quant_q8: bool, npu_towers: bool) -> &'static str {
     match (quant_q8, npu_towers) {
-        // The vision tower is packed from f32 weights, so the q8 pass only sees
-        // the audio tower (see `tower_quant_group`).
-        (true, true) => ", q8 audio, f32 vision",
+        // The packed vision half is loaded in f32 by construction.
+        (_, true) => ", f32 for the NPU pack",
         (true, false) => ", q8-resident",
-        (false, _) => "",
+        (false, false) => "",
     }
 }
 
-/// Pack the loaded towers' vision projections into resident NPU memory when
+/// The audio half's `towers: loaded` policy suffix.
+fn audio_policy_suffix(quant_q8: bool) -> &'static str {
+    if quant_q8 { ", q8-resident" } else { "" }
+}
+
+/// Pack the loaded vision half's projections into resident NPU memory when
 /// `--npu` is on; returns the `towers: loaded` line suffix (empty when the pack
 /// is off, or on builds without NPU support).
 ///
 /// `ROCKET_NPU_TOWERS=0` is the A/B off-switch (default on under `--npu`): with
 /// it the tower keeps its Q8/f32 CPU weights and `lin` runs on flex.
-fn pack_towers_npu(towers: &mut Towers, device: &Device, npu_pack: bool) -> String {
+fn pack_vision_npu(towers: &mut VisionTowers, device: &Device, npu_pack: bool) -> String {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     {
         if npu_towers_enabled(npu_pack) {

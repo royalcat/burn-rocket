@@ -441,47 +441,60 @@ pub struct TextModel {
 #[derive(Module, Debug)]
 pub struct Emb2Model {
     language_model: TextModel,
-    /// Vision/audio towers plus their embedders. `None` until loaded: text-only
-    /// runs never allocate them, and `--defer-towers` loads them on the first
-    /// media request.
+    /// Vision tower plus its embedder. `None` until loaded: text-only runs
+    /// never allocate it, and `--defer-towers` loads it on the first image or
+    /// video request (an audio-only request does not).
     #[module(skip)]
-    towers: Option<Towers>,
+    vision_towers: Option<VisionTowers>,
+    /// Audio tower plus its embedder (same deferred policy as the vision half).
+    #[module(skip)]
+    audio_towers: Option<AudioTowers>,
 }
 
-/// Gemma 4 vision and audio towers and the embedders projecting their outputs
-/// into the text hidden size. A separate module behind the text model's
-/// `#[module(skip)]` field, so text-only loads never allocate it and a deferred
-/// load can fill it in one pass; the fields keep their checkpoint names so a
-/// towers-only store pass matches the file keys without remapping.
+/// The vision half of the multimodal set (`vision_tower.*`, `embed_vision.*`).
+///
+/// A separate module behind the text model's `#[module(skip)]` field, with its
+/// fields keeping their checkpoint names so a focused store pass matches the
+/// file keys without remapping. Splitting it from [`AudioTowers`] lets a
+/// deferred load install only the half a request uses: the audio tower is the
+/// larger one (~1.16 GiB f32, ~0.30 GiB in Q8), so image and video requests no
+/// longer pay for it.
 #[derive(Module, Debug)]
-pub struct Towers {
+pub struct VisionTowers {
     vision_tower: VisionTower,
     embed_vision: MultimodalEmbedder,
-    audio_tower: AudioTower,
-    embed_audio: MultimodalEmbedder,
 }
 
-impl Towers {
-    pub fn new(
-        vision_cfg: &VisionConfig,
-        audio_cfg: &AudioConfig,
-        audio_bounds: &HashMap<String, ClipBounds>,
-        text_hidden: usize,
-        device: &Device,
-    ) -> Self {
+impl VisionTowers {
+    pub fn new(vision_cfg: &VisionConfig, text_hidden: usize, device: &Device) -> Self {
         Self {
             vision_tower: VisionTower::new(vision_cfg, device),
             embed_vision: MultimodalEmbedder::new(vision_cfg.hidden_size, text_hidden, device),
-            audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
-            embed_audio: MultimodalEmbedder::new(audio_cfg.output_proj_dims, text_hidden, device),
         }
+    }
+
+    pub fn spec(&self) -> &crate::gemma::vision::VisionSpec {
+        self.vision_tower.spec()
+    }
+
+    /// Image (or video frame) soft tokens: the tower forward followed by the
+    /// embedding projection.
+    pub fn forward(
+        &self,
+        img: &PreparedImage,
+        chunk: usize,
+        attn: VisionAttn,
+        layers: Option<&std::path::Path>,
+    ) -> Tensor<2> {
+        let pooled = self.vision_tower.forward(img, chunk, attn, layers);
+        self.embed_vision
+            .forward(pooled, self.vision_tower.spec().eps)
     }
 
     /// Pack the vision tower's projections (q/k/v/o + gate/up/down per layer)
     /// and `embed_vision` into resident NPU memory, dropping the CPU copies:
     /// 65 weights with the fused groups (q|k|v and gate|up), 113 without
-    /// (`ROCKET_NPU_FUSED=0`). The audio tower and the norms stay on the CPU.
-    /// Returns `(weights, resident bytes)`.
+    /// (`ROCKET_NPU_FUSED=0`). Returns `(weights, resident bytes)`.
     ///
     /// EmbeddingGemma 2's tower has no clip bounds; a tower with clipped linears
     /// (Gemma 4 E2B) would pack only the unclipped ones, so the loader calls
@@ -496,28 +509,82 @@ impl Towers {
     }
 }
 
+/// The audio half of the multimodal set (`audio_tower.*`, `embed_audio.*`): the
+/// CPU-only tower and its embedding projection.
+#[derive(Module, Debug)]
+pub struct AudioTowers {
+    audio_tower: AudioTower,
+    embed_audio: MultimodalEmbedder,
+}
+
+impl AudioTowers {
+    pub fn new(
+        audio_cfg: &AudioConfig,
+        audio_bounds: &HashMap<String, ClipBounds>,
+        text_hidden: usize,
+        device: &Device,
+    ) -> Self {
+        Self {
+            audio_tower: AudioTower::new(audio_cfg, audio_bounds, device),
+            embed_audio: MultimodalEmbedder::new(audio_cfg.output_proj_dims, text_hidden, device),
+        }
+    }
+
+    /// Audio soft tokens (valid frames only).
+    pub fn forward(&self, feats: &AudioFeatures, debug_dir: Option<&std::path::Path>) -> Tensor<2> {
+        let h = self.audio_tower.forward_debug(feats, debug_dir);
+        let device = h.device();
+        let (m1, _) = subsample_mask(&feats.mask);
+        let (m2, _) = subsample_mask(&m1);
+        let keep: Vec<i64> = m2
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v)
+            .map(|(i, _)| i as i64)
+            .collect();
+        let n = keep.len();
+        let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
+        let h = h.select(0, idx);
+        self.embed_audio.forward(h, self.audio_tower.spec().eps)
+    }
+}
+
 impl Emb2Model {
     pub fn new(text_cfg: &TextConfig, device: &Device) -> Self {
         Self {
             language_model: TextModel::new(text_cfg, device),
-            towers: None,
+            vision_towers: None,
+            audio_towers: None,
         }
     }
 
-    /// Whether the vision/audio towers are loaded (`--defer-towers` skips them
-    /// at startup; the loader installs them on the first media request).
-    pub fn has_towers(&self) -> bool {
-        self.towers.is_some()
+    /// Which tower halves are loaded (`--defer-towers` starts with none and the
+    /// loader installs each half on the first request that needs it).
+    pub fn towers_loaded(&self) -> crate::gemma::TowerSet {
+        crate::gemma::TowerSet {
+            vision: self.vision_towers.is_some(),
+            audio: self.audio_towers.is_some(),
+        }
     }
 
-    pub fn set_towers(&mut self, towers: Towers) {
-        self.towers = Some(towers);
+    pub fn set_vision_towers(&mut self, towers: VisionTowers) {
+        self.vision_towers = Some(towers);
     }
 
-    fn towers(&self) -> &Towers {
-        self.towers
+    pub fn set_audio_towers(&mut self, towers: AudioTowers) {
+        self.audio_towers = Some(towers);
+    }
+
+    pub fn vision_towers(&self) -> &VisionTowers {
+        self.vision_towers
             .as_ref()
-            .expect("vision/audio towers not loaded (see --defer-towers)")
+            .expect("vision tower not loaded (see --defer-towers)")
+    }
+
+    pub fn audio_towers(&self) -> &AudioTowers {
+        self.audio_towers
+            .as_ref()
+            .expect("audio tower not loaded (see --defer-towers)")
     }
 
     pub fn text(&self) -> &TextModel {
@@ -536,11 +603,7 @@ impl Emb2Model {
         chunk: usize,
         attn: VisionAttn,
     ) -> Tensor<2> {
-        let towers = self.towers();
-        let pooled = towers.vision_tower.forward(img, chunk, attn, None);
-        towers
-            .embed_vision
-            .forward(pooled, towers.vision_tower.spec().eps)
+        self.vision_towers().forward(img, chunk, attn, None)
     }
 
     pub fn audio_soft_tokens_debug(
@@ -548,21 +611,7 @@ impl Emb2Model {
         feats: &AudioFeatures,
         debug_dir: Option<&std::path::Path>,
     ) -> Tensor<2> {
-        let towers = self.towers();
-        let h = towers.audio_tower.forward_debug(feats, debug_dir);
-        let device = h.device();
-        let (m1, _) = subsample_mask(&feats.mask);
-        let (m2, _) = subsample_mask(&m1);
-        let keep: Vec<i64> = m2
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| **v)
-            .map(|(i, _)| i as i64)
-            .collect();
-        let n = keep.len();
-        let idx = Tensor::<1, Int>::from_data(TensorData::new(keep, [n]), &device);
-        let h = h.select(0, idx);
-        towers.embed_audio.forward(h, towers.audio_tower.spec().eps)
+        self.audio_towers().forward(feats, debug_dir)
     }
 
     /// Mean-pooled embedding of `input_ids`, with optional image soft tokens
@@ -604,7 +653,7 @@ impl Emb2Model {
 
 impl crate::gemma::inputs::MediaModel for Emb2Model {
     fn vision_spec(&self) -> &crate::gemma::vision::VisionSpec {
-        self.towers().vision_tower.spec()
+        self.vision_towers().spec()
     }
 
     fn encode_image(
@@ -616,7 +665,7 @@ impl crate::gemma::inputs::MediaModel for Emb2Model {
         layers: Option<&std::path::Path>,
     ) -> Tensor<2> {
         if debug_dir.is_some() {
-            let _ = self.towers().vision_tower.forward(img, chunk, attn, layers);
+            let _ = self.vision_towers().forward(img, chunk, attn, layers);
         }
         self.image_soft_tokens(img, chunk, attn)
     }

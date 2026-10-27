@@ -20,6 +20,45 @@ use burn::prelude::*;
 use burn::tensor::activation::softmax;
 use burn::tensor::{DType, s};
 
+/// Which tower halves a media request needs (and a deferred load must install).
+///
+/// The vision and audio towers are independent halves of the multimodal set:
+/// `vision_tower` + `embed_vision`, and `audio_tower` + `embed_audio`. Deferred
+/// loading installs only the half a request uses, so an image/video request no
+/// longer allocates the (larger) audio tower. Eager loads pass
+/// [`TowerSet::ALL`], keeping the startup behaviour of runs without
+/// `--defer-towers`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TowerSet {
+    pub vision: bool,
+    pub audio: bool,
+}
+
+impl TowerSet {
+    /// No tower (text-only input).
+    pub const NONE: Self = Self {
+        vision: false,
+        audio: false,
+    };
+    /// Both halves (eager loads).
+    pub const ALL: Self = Self {
+        vision: true,
+        audio: true,
+    };
+
+    pub fn is_empty(self) -> bool {
+        !self.vision && !self.audio
+    }
+
+    /// The parts of `self` that are not already in `loaded`.
+    pub fn without(self, loaded: Self) -> Self {
+        Self {
+            vision: self.vision && !loaded.vision,
+            audio: self.audio && !loaded.audio,
+        }
+    }
+}
+
 /// Bias-free linear (all projections in this checkpoint family have no bias).
 pub(crate) fn linear_cfg(in_features: usize, out_features: usize) -> LinearConfig {
     LinearConfig::new(in_features, out_features).with_bias(false)

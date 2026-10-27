@@ -68,7 +68,7 @@ struct Args {
     npu_int8: bool,
     npu_int8_group: usize,
     /// `--defer-towers`: skip the vision/audio towers at load; a media run
-    /// loads them before input assembly.
+    /// loads only the half it uses on first use.
     defer_towers: bool,
 }
 
@@ -344,16 +344,19 @@ fn build_inputs(
     ))
 }
 
-/// `--defer-towers`: a run that includes media must load the towers before
-/// input assembly; text-only runs never touch them.
+/// `--defer-towers`: a run that includes media must load the halves it uses
+/// before input assembly; text-only runs never touch them.
 fn maybe_load_towers(
     args: &Args,
     model: &mut Emb2Model,
     dtype: DType,
     device: &Device,
 ) -> Result<()> {
-    let has_media = args.image.is_some() || args.video.is_some() || args.audio.is_some();
-    if args.defer_towers && has_media {
+    let need = crate::gemma::TowerSet {
+        vision: args.image.is_some() || args.video.is_some(),
+        audio: args.audio.is_some(),
+    };
+    if args.defer_towers && !need.is_empty() {
         // The same quantization policy as an eager load: `--quant q8` applies
         // unless `--npu-int8` replaces it (`q8` is ignored there).
         load_towers(
@@ -362,6 +365,7 @@ fn maybe_load_towers(
             dtype,
             args.quant_q8 && !args.npu_int8,
             args.npu,
+            need,
             device,
         )?;
     }

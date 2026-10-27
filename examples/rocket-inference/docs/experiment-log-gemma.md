@@ -2134,3 +2134,93 @@ cargo build --release -p rocket-inference --no-default-features
 docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:video .
 docker run --rm --entrypoint ffprobe rocket-inference:video -version
 ```
+
+## 22. Split deferred tower load (2026-10-27)
+
+`--defer-towers` used to install the whole multimodal set on the first media
+request: one `Option<Towers>` holding vision and audio, one store pass, one Q8
+mapping, then the vision NPU pack. An image or video request therefore allocated
+and kept the audio tower too — the larger half — and paid its f32 transient
+before the Q8 mapping (or kept it resident in f32 on Gemma 4).
+
+| half | checkpoint (bf16) | f32 | Q8 (`--quant q8`) | tensors |
+|---|---|---|---|---|
+| vision + `embed_vision` | 320 MiB | 638 MiB | ~170 MiB (0.28 GiB NPU-packed under `--npu`) | 211 |
+| audio + `embed_audio` | 583 MiB | 1163 MiB | ~300 MiB | 272 |
+
+### 22.1 Structure
+
+The set is now two independent halves per family, each behind a
+`#[module(skip)]` field:
+
+- EmbeddingGemma 2: `Emb2Model.vision_towers: Option<VisionTowers>`
+  (`vision_tower`, `embed_vision`) and `.audio_towers: Option<AudioTowers>`
+  (`audio_tower`, `embed_audio`); `VisionTowers::pack_npu` keeps the NPU pack.
+- Gemma 4: the same pair on `GenInner` (`model.vision_tower.*`,
+  `model.audio_tower.*`), with `VisionTower::new_with_clip` and the per-half
+  SRQ registration inside the towers pass.
+
+`gemma::TowerSet { vision, audio }` carries the need. The server derives it from
+the request (image/video -> vision, audio -> audio; a mixed `/v1/embeddings`
+batch or `/embed` body sets both), the CLIs from their media flags, and eager
+runs pass `TowerSet::ALL`. `load_towers(..., need)` first subtracts
+`towers_loaded()`, so a later request for the other modality loads only the
+missing half. Each half is loaded directly into its part struct (the fields keep
+the checkpoint names, so the file keys match without remapping); the other
+half's tensors report as unused, which the focused-pass checks already allow.
+The `mmproj-*.gguf` path is split the same way (only the needed clip scalars are
+read).
+
+### 22.2 Measurements (dev host, 32 threads)
+
+EmbeddingGemma 2, safetensors, `--quant q8 --defer-towers`, one media request
+per fresh process (idle text-only process 510 MiB `RssAnon`):
+
+| first request | before | after |
+|---|---|---|
+| image (`/embed`, 266 soft tokens) | **+640 MiB**, tower load 7.2 s | **+275 MiB**, 2.5 s (vision only) |
+| audio (`speech5s.wav`, 125 soft tokens) | **+569 MiB**, 7.2 s | **+373 MiB**, 4.8 s (audio only) |
+
+The deltas include the request's own activations; the tower halves are ~170 MiB
+(vision) and ~300 MiB (audio) of Q8 weights. A second image request adds no
+`towers: loaded` line, a following audio request loads only the audio half
+(272 tensors), and the reverse order loads audio first and then vision.
+
+Gemma 4 E2B QAT mobile, `--f16 --defer-towers` (`gemma gen`, 12 tokens):
+
+| first media | before | after |
+|---|---|---|
+| image | 6543 MiB `RssAnon`, towers 4.1 s | **5286 MiB**, 1.6 s (vision, 211 tensors; 112 SRQ linears) |
+| audio | 6543 MiB, 4.1 s | **5865 MiB**, 2.5 s (audio, 272 tensors; 120 SRQ linears) |
+
+Eager runs (no `--defer-towers`) still load both halves at startup, one store
+pass per half; the logs show two `towers: loaded` lines
+(`..., 211 tensors` / `..., 272 tensors`).
+
+### 22.3 Parity
+
+Every arm is bit-identical to the pre-split binary (vectors/ids, not just
+cosine): emb2 text (eager), image and audio (deferred safetensors), and image
+and audio through the production-style GGUF path
+(`-hf unsloth/embeddinggemma-2-GGUF:Q8_0`, `mmproj-Q8_0.gguf`); Gemma 4 QAT
+mobile text, image and audio, deferred and eager. The GGUF server log shows
+`towers: loaded vision from mmproj (...)` followed by
+`towers: loaded audio from mmproj (...)` only when the audio request arrives.
+
+### 22.4 Reproduce
+
+```sh
+cargo build --release -p rocket-inference --no-default-features
+# image first, then audio (each on its own line; audio does not load with the image)
+$CARGO_TARGET_DIR/release/rocket-inference serve --model-dir /mnt/hub/models/embeddinggemma-2 \
+    --quant q8 --port 8399 --max-tokens 512 --defer-towers
+curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"image":"data/cat.jpeg"}'
+curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"audio":"data/speech5s.wav"}'
+# the production checkpoint format (downloads Q8_0 + mmproj)
+$CARGO_TARGET_DIR/release/rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 \
+    --dtype f32 --quant q8 --port 8399 --max-tokens 512 --defer-towers
+# Gemma 4 (placeholders are the CLI's, unlike the OpenAI content parts)
+$CARGO_TARGET_DIR/release/rocket-inference gemma gen \
+    --gen-model-dir /mnt/hub/models/gemma-4-E2B-it-qat-mobile --f16 --defer-towers \
+    --image data/cat.jpeg --text "Describe this image briefly. <|image|>" --max-new-tokens 12
+```

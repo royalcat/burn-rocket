@@ -222,19 +222,49 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   on/off equivalent vs HF; `ROCKET_GLUE=0/1` is the A/B switch.
 - **Idle-memory round** (2026-10-09, log-gemma §14): the emb2 server's towers load
   lazily and the process returns its heap. `--defer-towers` (serve + gemma CLI)
-  moves the vision/audio towers into `Emb2Model.towers: Option<Towers>` behind
-  `#[module(skip)]`; a towers-only store pass loads them on the first media request
-  with the same dtype/Q8 policy (eager loads use the same pass; a text-only load
-  applies 413 tensors in ~1 s, was 896 in ~4 s). `util::mem::{trim_heap,
-  trim_after_request}` release the allocator's free pages at serve startup and after
-  every request (`ROCKET_TRIM=0` disables the latter). Dev host q8+f32 steady
-  1694 -> 754 MiB deferred (1306 eager) and flat under long requests. Board
-  `openviking-embed-1` (`b4634c9` + `--defer-towers`): idle 2183 -> 605 MiB anon
-  (`docker stats` 3.205 -> 1.552 GiB); a 3767-token request steps to ~1.18 GiB
-  (glibc arena high-water) and the next request's trim returns it to ~0.78 GiB.
-  Text and media outputs are bit-identical deferred vs eager;
+  moves the vision/audio towers behind `#[module(skip)]` fields (split into two
+  halves on 2026-10-27, see the next bullet); a towers-only store pass loads them
+  on the first media request with the same dtype/Q8 policy (eager loads use the
+  same pass; a text-only load applies 413 tensors in ~1 s, was 896 in ~4 s).
+  `util::mem::{trim_heap, trim_after_request}` release the allocator's free pages
+  at serve startup and after every request (`ROCKET_TRIM=0` disables the latter).
+  Dev host q8+f32 steady 1694 -> 754 MiB deferred (1306 eager) and flat under
+  long requests. Board `openviking-embed-1` (`b4634c9` + `--defer-towers`): idle
+  2183 -> 605 MiB anon (`docker stats` 3.205 -> 1.552 GiB); a 3767-token request
+  steps to ~1.18 GiB (glibc arena high-water) and the next request's trim returns
+  it to ~0.78 GiB. Text and media outputs are bit-identical deferred vs eager;
   `MALLOC_MMAP_THRESHOLD_=131072` was tried and rejected (no memory gain, +60 %
   wall, log-gemma §14).
+- **Split deferred tower load** (2026-10-27, log-gemma §22): `--defer-towers` now
+  loads each tower half on the first request that uses it. The multimodal set is
+  two `#[module(skip)]` fields — `Emb2Model.vision_towers: Option<VisionTowers>`
+  (`vision_tower` + `embed_vision`) and `.audio_towers: Option<AudioTowers>`
+  (`audio_tower` + `embed_audio`); `GenInner` has the same pair for Gemma 4. A
+  `gemma::TowerSet { vision, audio }` flows from the request (images/video ->
+  vision, audio -> audio, a mixed batch both) into `load_towers(..., need)`,
+  which normalizes against `towers_loaded()`, so a later request for the other
+  modality loads only the missing half. Eager runs (no `--defer-towers`) pass
+  `TowerSet::ALL` and still preload both, now one store pass per half. The audio
+  tower is the larger half (1.16 GiB f32 / ~0.30 GiB q8, 272 tensors) vs vision
+  (0.64 GiB f32 / ~0.17 GiB q8, 211 tensors; 0.28 GiB NPU-packed under `--npu`).
+  API: both roots expose `towers_loaded() -> TowerSet`,
+  `set_vision_towers`/`set_audio_towers` and panicking
+  `vision_towers()`/`audio_towers()`; the loaders are
+  `embeddinggemma::load::load_towers(model, dir, dtype, quant_q8, npu_pack, need, device)`
+  and `gemma4::loader::load_towers(model, dir, device, need)` (both idempotent
+  against the loaded halves). Log lines: the startup line is now
+  `towers: deferred (each half loads on first use of its modality)`, and a load
+  prints one `towers: loaded vision (...)` / `towers: loaded audio (...)`
+  (yielding `... from mmproj (...)` on the GGUF path); the count is the half's
+  applied tensors, 211/272 for EmbeddingGemma 2 and Gemma 4 E2B.
+  Dev host (emb2 `--quant q8`, safetensors, one media request per fresh process):
+  image request RssAnon +640 -> **+275 MiB**, audio +569 -> **+373 MiB**; tower
+  load 7.2 s -> 2.5 s (vision-only) / 4.8 s (audio-only). Gemma 4 QAT mobile
+  (`--f16`): image chat 6543 -> **5286 MiB** RssAnon (tower load 4.1 -> 1.6 s),
+  audio 6543 -> **5865 MiB** (4.1 -> 2.5 s). Text/image/audio output is
+  bit-identical to the pre-split binary (emb2 vectors and Gemma 4 ids), including
+  the `mmproj-*.gguf` path; the QAT SRQ pass registers per half (112 vision + 120
+  audio of the 232 tower linears).
 - **Scratch-memory round** (2026-10-21, log-gemma §15): the 8k footprint is now
   one request's working set. Emb2's **full layers use the chunked attention path**
   (query chunks against all keys, `MaskMode::NoneBlock`; no `[s, s]` materialization),
@@ -1251,7 +1281,7 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
-| `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs` |
+| `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs`, and the `TowerSet` selector the deferred vision/audio half loads use |
 | `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, loaders, CLI |
 | `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`), CLI |
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
@@ -1311,17 +1341,18 @@ head is built once (the only full-size table copy). The table stubs replace the
 parameter directly (`Param::from_tensor`) — `Param::map` forced the lazy f32
 initializer and wrote an 8.75 GiB table before dropping it, which was the real
 load-time peak and ~30 s of the load. `--defer-towers` skips the
-vision/audio towers at load and installs them (always f32, the validated
-multimodal mode) on the first media request; `lin()` checks the weight dtype
-before the f16/bf16 cast path, and the towers' SRQ scales are registered in the
-towers pass (they sit behind a `#[module(skip)]` field). Weights are bit-exact
+vision/audio towers at load and installs each half (always f32, the validated
+multimodal mode) on the first request of its modality; `lin()` checks the weight
+dtype before the f16/bf16 cast path, and the towers' SRQ scales are registered in
+the towers pass (they sit behind a `#[module(skip)]` field). Weights are bit-exact
 vs HF; short prompts are token-identical, the 631-token prompt is 16/16 with
 `--f16` vs the HF bf16 reference. Text-only profile (dev host, peak `RssAnon`
 over the whole run): `--f16 --defer-towers` 4.7 GiB / 5.2 tok/s (loader-end 3.7
-GiB, load 22 s; was 6630 MiB at loader end), +1.9 GiB once towers load; f32
-9.2 GiB; q8 3.7 GiB (memory-only). SRQ makes long-context near-ties
-sensitive (a full-quantum activation jump from f32 accumulation order);
-`NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks. `ROCKET_NPU_DECODE=1` routes
+GiB, load 22 s; was 6630 MiB at loader end), +0.64 GiB for the vision half /
++1.16 GiB for audio (log-gemma §22); f32 9.2 GiB; q8 3.7 GiB (memory-only).
+SRQ makes long-context near-ties sensitive (a full-quantum activation jump from
+f32 accumulation order); `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug hooks.
+`ROCKET_NPU_DECODE=1` routes
 decode matmuls to the packed NPU weights (pre-gate for the pack-and-drop
 config). Board attempt: deployed at
 `/root/models/gemma-4-E2B-it-qat-mobile/`, OOM-killed at 7.6 GB (board busy);
@@ -2170,6 +2201,19 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 # robustness: a panicking forward (invalid token id) must 500 and leave the server alive
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"still alive"}'
+# deferred tower halves: an image request must load the vision half only, a later
+# audio request the audio half only (log: one `towers: loaded vision/audio` line
+# each, 211/272 tensors); a text request never prints either
+./rocket-inference serve --model-dir /mnt/hub/models/embeddinggemma-2 --quant q8 \
+    --port 8399 --max-tokens 512 --defer-towers &
+curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"image":"data/cat.jpeg"}'
+curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"audio":"data/speech5s.wav"}'
+# ... and the GGUF mmproj path the production service uses (downloads Q8_0 + mmproj)
+./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --dtype f32 --quant q8 \
+    --port 8399 --max-tokens 512 --defer-towers &
+# RssAnon of the q8 text-only process is ~510 MiB; the image request grows it by
+# ~275 MiB (vision) and the audio request by ~373 MiB more (log-gemma §22)
+awk '/RssAnon/{print $2}' /proc/$(pgrep -x rocket-inferenc | head -1)/status
 # OpenRouter multimodal /v1/embeddings (embeddinggemma): one embedding per
 # block, N images per block, URLs/data URIs/paths, audio+video one each
 curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
@@ -2363,7 +2407,7 @@ ROCKET_CTX_CANONICAL=0 ./rocket-inference gemma embed --model-dir /root/models/e
 ./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --npu --npu-int8 --prompt query --text-file data/one_long.txt --out /tmp/i8.json
 ROCKET_GLUE=0 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --text-file data/one_long.txt --reps 1
 ./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it --text "What is the capital of France?" --max-new-tokens 16
-# QAT mobile, busy-board low-memory config (add --defer-towers; towers load on media)
+# QAT mobile, busy-board low-memory config (add --defer-towers; each tower half loads on demand)
 ./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it-qat-mobile --f16 --defer-towers --text "What is the capital of France?" --max-new-tokens 16
 # servers (detected per model; ports are examples)
 ./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --quant q8 --npu --port 8383 --max-tokens 8192

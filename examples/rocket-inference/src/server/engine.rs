@@ -540,7 +540,7 @@ impl Emb2Engine {
             Block(AssembledBlock),
         }
         let mut items = Vec::with_capacity(req.inputs.len());
-        let mut needs_towers = false;
+        let mut need = crate::gemma::TowerSet::NONE;
         for input in req.inputs {
             match input {
                 EmbedInput::Text(text) => items.push(Item::Text(text)),
@@ -554,8 +554,8 @@ impl Emb2Engine {
                         return Err(ApiError::bad_request("empty content block"));
                     }
                     let block = assemble_block(parts)?;
-                    needs_towers |=
-                        !block.images.is_empty() || block.video.is_some() || block.audio.is_some();
+                    need.vision |= !block.images.is_empty() || block.video.is_some();
+                    need.audio |= block.audio.is_some();
                     items.push(Item::Block(block));
                 }
             }
@@ -563,14 +563,16 @@ impl Emb2Engine {
         if items.is_empty() {
             return Err(ApiError::bad_request("empty input"));
         }
-        if needs_towers {
-            // Deferred towers (`--defer-towers`) load once for the whole batch.
+        if !need.is_empty() {
+            // Deferred towers (`--defer-towers`) load once for the whole batch,
+            // and only the halves the batch needs.
             crate::gemma::embeddinggemma::load::load_towers(
                 &mut self.model,
                 &self.model_dir,
                 self.dtype,
                 self.quant_q8,
                 self.npu_pack,
+                need,
                 &self.device,
             )
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
@@ -602,14 +604,20 @@ impl Emb2Engine {
     #[instrument]
     fn embed_media(&mut self, req: EmbedMediaRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
-        if req.image.is_some() || req.video.is_some() || req.audio.is_some() {
-            // Deferred towers (`--defer-towers`) load on the first media request.
+        let need = crate::gemma::TowerSet {
+            vision: req.image.is_some() || req.video.is_some(),
+            audio: req.audio.is_some(),
+        };
+        if !need.is_empty() {
+            // Deferred towers (`--defer-towers`) load on the first media
+            // request, only the halves the request uses.
             crate::gemma::embeddinggemma::load::load_towers(
                 &mut self.model,
                 &self.model_dir,
                 self.dtype,
                 self.quant_q8,
                 self.npu_pack,
+                need,
                 &self.device,
             )
             .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
@@ -857,9 +865,18 @@ impl Gemma4Engine {
                 .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
             return Ok((ids, None));
         }
-        // Deferred towers (`--defer-towers`) load on the first media request.
-        load_towers(&mut self.model, &self.model_dir, &self.device)
-            .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
+        // Deferred towers (`--defer-towers`) load on the first media request,
+        // only the half this input uses.
+        load_towers(
+            &mut self.model,
+            &self.model_dir,
+            &self.device,
+            crate::gemma::TowerSet {
+                vision: image.is_some(),
+                audio: audio.is_some(),
+            },
+        )
+        .map_err(|e| ApiError::internal(format!("load towers: {e:#}")))?;
         let req = MediaInputs {
             text: Some(rendered),
             images: image.into_iter().collect(),
