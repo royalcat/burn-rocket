@@ -33,7 +33,6 @@ use axum::{
 use engine::{Capabilities, Engine, Family};
 use error::{ApiError, blocking};
 use log::RequestTiming;
-use tracing::instrument;
 
 /// Immutable settings, kept outside the model lock so `/health`, `/v1/models`
 /// and request routing never block behind a running forward.
@@ -57,7 +56,6 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    #[instrument]
     fn lock(&self) -> MutexGuard<'_, Engine> {
         lock_or_recover(&self.inner)
     }
@@ -65,7 +63,6 @@ impl AppState {
     /// Run one inference call: wait for the model lock, time the wait and the
     /// call itself, and contain panics (through [`blocking`]). Every inference
     /// endpoint goes through this so the request logs carry consistent timings.
-    #[tracing::instrument(skip(f))]
     pub(crate) async fn compute<T, F>(&self, f: F) -> Result<(T, RequestTiming), ApiError>
     where
         T: Send + 'static,

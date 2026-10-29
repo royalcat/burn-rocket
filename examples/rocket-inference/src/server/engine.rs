@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
-use tracing::instrument;
 
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
@@ -438,7 +437,6 @@ impl Engine {
 }
 
 impl Qwen3Engine {
-    #[instrument]
     fn embed_texts(&mut self, req: EmbedBatchRequest) -> Result<EmbedResult, ApiError> {
         if req.prompt.is_some() || req.dim.is_some() {
             return Err(ApiError::bad_request(
@@ -499,7 +497,6 @@ impl Qwen3Engine {
 
     /// Runs the embedding model on one token sequence (Qwen3-Embedding pools the
     /// last token itself and returns the embedding vector directly).
-    #[instrument]
     fn embed_tokens(&self, ids: Vec<i64>) -> Vec<f32> {
         let n = ids.len();
         let input = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, n]), &self.device);
@@ -532,7 +529,6 @@ impl Emb2Engine {
         }
     }
 
-    #[instrument]
     fn embed_texts(&mut self, req: EmbedBatchRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
         enum Item {
@@ -601,7 +597,6 @@ impl Emb2Engine {
         Ok(EmbedResult { vectors, tokens })
     }
 
-    #[instrument]
     fn embed_media(&mut self, req: EmbedMediaRequest) -> Result<EmbedResult, ApiError> {
         let prefix = self.prompt_prefix(req.prompt.as_deref())?;
         let need = crate::gemma::TowerSet {
@@ -638,7 +633,6 @@ impl Emb2Engine {
 
     /// One embedding forward (text and/or media inputs), L2-normalized.
     #[allow(clippy::too_many_arguments)]
-    #[instrument]
     fn embed_one(
         &mut self,
         text: Option<String>,
@@ -783,7 +777,6 @@ impl IntentEngine {
 }
 
 impl Gemma4Engine {
-    #[instrument]
     fn chat(&mut self, turn: ChatTurn) -> Result<Completion, ApiError> {
         if turn.format_json {
             return Err(ApiError::bad_request(
