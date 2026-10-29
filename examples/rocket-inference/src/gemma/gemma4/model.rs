@@ -35,6 +35,7 @@ use crate::gemma::layers::lin;
 use crate::gemma::media::PreparedImage;
 use crate::gemma::vision::{MultimodalEmbedder, VisionAttn, VisionSpec, VisionTower};
 use crate::gemma::{linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::server::telemetry;
 
 // Stage wall-time instrumentation (microseconds) for the generation path.
 static T_ATTN_US: AtomicU64 = AtomicU64::new(0);
@@ -1006,6 +1007,17 @@ impl GenRoot {
 
     /// Prefill over `ids` with optional media soft tokens scattered into the
     /// placeholder positions; returns the soft-capped logits of the last position.
+    #[telemetry::instrument(
+        name = "prefill",
+        skip_all,
+        fields(
+            prompt_tokens = ids.len(),
+            attn_s = tracing::field::Empty,
+            mlp_s = tracing::field::Empty,
+            ple_s = tracing::field::Empty,
+            norms_s = tracing::field::Empty,
+        )
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
@@ -1017,6 +1029,7 @@ impl GenRoot {
         chunk: usize,
         pad_id: u32,
     ) -> Tensor<2> {
+        let stages_before = gen_stage_stats();
         let device = self.model.language_model.embed_table().val().device();
         let mut llm_ids = ids.to_vec();
         if let Some((positions, _)) = &soft {
@@ -1047,6 +1060,12 @@ impl GenRoot {
             x = Tensor::<3>::from_data(TensorData::new(data, [1, n, d]), &device).cast(dtype);
         }
         let h = text.forward_embeds(ids_t, x, ropes, kv, 0, chunk);
+        let (attn_s, mlp_s, ple_s, norms_s) = gen_stage_stats();
+        let span = tracing::Span::current();
+        span.record("attn_s", attn_s - stages_before.0);
+        span.record("mlp_s", mlp_s - stages_before.1);
+        span.record("ple_s", ple_s - stages_before.2);
+        span.record("norms_s", norms_s - stages_before.3);
         text.logits(h, lm_head)
     }
 }

@@ -17,6 +17,8 @@ use base64::Engine;
 use image::RgbImage;
 use reqwest::header::CONTENT_TYPE;
 
+use crate::server::telemetry;
+
 /// One preprocessed image, ready for the vision tower.
 pub struct PreparedImage {
     /// Patch pixels, `[num_patches, 3 * patch_size^2]`, channel-last within each patch.
@@ -177,6 +179,7 @@ pub fn sample_frame_indices(info: &VideoInfo, fps: f64, max_frames: usize) -> Ve
 /// sampler clamps, so a duration that overestimates the frame count can repeat
 /// the last index) are requested once and replicated afterwards — the reference
 /// indexes the decoded array (`video[indices]`) and keeps every repeat.
+#[telemetry::instrument(name = "video.frames", skip_all, fields(frames = indices.len()))]
 pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Result<Vec<RgbImage>> {
     let mut unique = indices.to_vec();
     unique.sort_unstable();
@@ -244,6 +247,7 @@ pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Resul
 /// JPEGs go through mozjpeg (libjpeg-turbo), matching PIL's decoder; the Rust
 /// `image` crate's zune-jpeg decoder differs by up to ±4 LSB, which is the only
 /// remaining gap versus the HF reference on JPEG inputs.
+#[telemetry::instrument(name = "image.decode", skip_all)]
 pub fn load_image(path: &Path) -> Result<RgbImage> {
     let is_jpeg = path
         .extension()
@@ -437,6 +441,7 @@ pub fn resize_bicubic_aa(img: &RgbImage, out_w: usize, out_h: usize) -> RgbImage
 }
 
 /// Aspect-ratio-preserving resize (BICUBIC) to the patch-budget target size.
+#[telemetry::instrument(name = "image.resize", skip_all)]
 pub fn resize_rgb(
     img: &RgbImage,
     patch_size: usize,
@@ -573,6 +578,7 @@ pub(crate) fn resolve_media(value: &str, ext: &str) -> Result<ResolvedMedia, Str
 /// Like [`resolve_media`], but also downloads `http(s)` URLs. Blocking: call
 /// this from a blocking thread (the server's compute path), never from an async
 /// handler. `ROCKET_MEDIA_FETCH=0` disables the download.
+#[telemetry::instrument(name = "media.fetch", skip_all)]
 pub(crate) fn resolve_media_remote(value: &str, ext: &str) -> Result<ResolvedMedia, String> {
     if !value.starts_with("http://") && !value.starts_with("https://") {
         return resolve_media(value, ext);

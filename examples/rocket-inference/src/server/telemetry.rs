@@ -17,6 +17,33 @@
 //! The switch is off by default: no exporter thread, no network, no span, and
 //! the log output is unchanged. A configuration or startup error is reported
 //! and serving continues without telemetry.
+//!
+//! # Span tree
+//!
+//! `http.request` (the middleware below) is the server span; inside it,
+//! `AppState::compute` opens the `inference` span that carries the queue and
+//! compute timings of one request. The request's major time consumers are
+//! children of `inference`: `prepare` with its media children
+//! (`image.decode`, `image.resize`, `video.frames`, `media.fetch`,
+//! `audio.features`), `vision`/`audio` tower forwards, `towers.load` (deferred
+//! tower halves), the text `forward` (embedding models) and `prefill`/`decode`
+//! (chat models). Model spans additionally record the per-stage durations the
+//! model already keeps (`attn_s`/`mlp_s`/`norms_s`/`ple_s`).
+//!
+//! # Declaring spans
+//!
+//! [`instrument`] (tracing's attribute, re-exported here) is the one way this
+//! crate declares a span: `#[telemetry::instrument(name = "...", skip_all,
+//! fields(...))]`. Always `skip_all` — the arguments are tensors, tokenizers
+//! and paths, none of which belong in a span — and declare the fields the span
+//! records explicitly. Durations and counts are `tracing::field::Empty` at the
+//! declaration and recorded on the span afterwards. The only exception is the
+//! `http.request` span below, which must set its W3C parent and `otel.kind`
+//! before it is entered.
+//!
+//! Spans are only created while trace export is on: the stdout layer keeps
+//! events only ([`events_only`]), so with `OTEL_SDK_ENABLED` unset no span is
+//! created at all and the log output is unchanged.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,12 +68,19 @@ use opentelemetry_sdk::{
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
-    EnvFilter, Layer, filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt,
+    EnvFilter, Layer,
+    filter::{FilterExt, LevelFilter, filter_fn},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
 };
 
 use super::AppState;
 
 const SERVICE_NAME: &str = "rocket-inference";
+
+/// The span declaration this crate uses everywhere (see the module docs):
+/// tracing's attribute macro, re-exported so call sites spell the origin.
+pub(crate) use tracing::instrument;
 
 /// Whether the OpenTelemetry layer is installed. The middleware and the
 /// `inference` span are skipped entirely when it is off, so the disabled path
@@ -55,6 +89,17 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// The stdout layer's share of the record stream: events yes, span records no.
+///
+/// Span creation is driven by the trace exporter; keeping the span records out
+/// of the stdout filter means a span exists only while the exporter wants it.
+/// The log output of a request is therefore exactly the same whether trace
+/// export is on or off (no span scope prefixes), and with tracing off nothing
+/// is created at all.
+fn events_only(meta: &tracing::Metadata<'_>) -> bool {
+    !meta.is_span()
 }
 
 /// Keeps the tracer provider alive for the process lifetime and flushes the
@@ -73,7 +118,7 @@ impl Telemetry {
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(false)
             .with_ansi(std::io::stdout().is_terminal())
-            .with_filter(filter);
+            .with_filter(filter.and(filter_fn(events_only)));
 
         let Some(settings) = Settings::from_env() else {
             let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
@@ -469,6 +514,27 @@ mod tests {
             parse_propagators(Some("tracecontext,none")),
             Propagators::NONE
         );
+    }
+
+    #[test]
+    fn the_stdout_filter_keeps_events_and_hides_spans() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::sink)
+                .with_filter(EnvFilter::new("info").and(filter_fn(events_only))),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                tracing::enabled!(tracing::Level::INFO),
+                "events stay enabled for the log layer"
+            );
+            assert!(
+                tracing::info_span!("hidden").is_disabled(),
+                "span records are left to the trace exporter"
+            );
+        });
     }
 
     #[test]

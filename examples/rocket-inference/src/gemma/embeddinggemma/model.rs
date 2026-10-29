@@ -19,6 +19,7 @@ use crate::gemma::layers::{ClipBounds, lin};
 use crate::gemma::media::PreparedImage;
 use crate::gemma::vision::{MultimodalEmbedder, VisionAttn, VisionTower};
 use crate::gemma::{chunked_attention, linear_cfg, repeat_kv};
+use crate::server::telemetry;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -614,6 +615,17 @@ impl Emb2Model {
 
     /// Mean-pooled embedding of `input_ids`, with optional image soft tokens
     /// scattered into the positions listed in `soft`.
+    #[telemetry::instrument(
+        name = "forward",
+        skip_all,
+        fields(
+            tokens = input_ids.dims()[1],
+            attn_s = tracing::field::Empty,
+            mlp_s = tracing::field::Empty,
+            norms_s = tracing::field::Empty,
+            ple_s = tracing::field::Empty,
+        )
+    )]
     pub fn embed_ids(
         &self,
         input_ids: Tensor<2, Int>,
@@ -625,6 +637,7 @@ impl Emb2Model {
         let d = self.language_model.spec().hidden_size;
         let dim = self.language_model.embedding_dim();
         let device = input_ids.device();
+        let stages_before = stage_stats();
         let mut x = self.language_model.embed_tokens_scaled(input_ids);
         if let Some((positions, tokens)) = soft {
             let dtype = x.dtype();
@@ -645,6 +658,12 @@ impl Emb2Model {
             x = Tensor::<3>::from_data(TensorData::new(data, [b, s, d]), &device).cast(dtype);
         }
         let h = self.language_model.forward_embeds(x, rope, chunk);
+        let (attn_s, mlp_s, norms_s, ple_s) = stage_stats();
+        let span = tracing::Span::current();
+        span.record("attn_s", attn_s - stages_before.0);
+        span.record("mlp_s", mlp_s - stages_before.1);
+        span.record("norms_s", norms_s - stages_before.2);
+        span.record("ple_s", ple_s - stages_before.3);
         h.mean_dim(1).reshape([b, dim])
     }
 }

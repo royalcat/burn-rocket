@@ -20,6 +20,7 @@ use burn::tensor::activation::{relu, sigmoid, silu, softplus};
 use crate::gemma::audio_frontend::{AudioFeatures, MEL_BINS, subsample_mask};
 use crate::gemma::config::AudioConfig;
 use crate::gemma::layers::{ClipBounds, ClippableLinear};
+use crate::server::telemetry;
 
 /// Zero padding in the same dtype as `like` (the tower runs in the checkpoint
 /// dtype, and a bare `Tensor::zeros` is always f32).
@@ -571,6 +572,11 @@ impl AudioTower {
 
     /// `[frames, MEL_BINS]` log-mel features -> `[T/4, out_dims]` soft tokens
     /// (all frames; callers keep only the valid ones).
+    #[telemetry::instrument(
+        name = "audio",
+        skip_all,
+        fields(frames = feats.frames, tokens = tracing::field::Empty)
+    )]
     pub fn forward_debug(
         &self,
         feats: &AudioFeatures,
@@ -583,6 +589,7 @@ impl AudioTower {
             .cast(dtype);
         let mut h = self.subsample_conv_projection.forward(x);
         let t2 = h.dims()[0];
+        tracing::Span::current().record("tokens", t2);
         if let Some(dir) = debug_dir {
             dump_tensor(dir, "audio_subsample", &h);
         }

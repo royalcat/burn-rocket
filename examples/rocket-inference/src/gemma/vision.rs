@@ -25,6 +25,7 @@ use crate::gemma::layers::gelu_mul;
 use crate::gemma::layers::lin;
 use crate::gemma::media::PreparedImage;
 use crate::gemma::{chunked_attention, linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::server::telemetry;
 
 /// How the tower computes its bidirectional self-attention.
 ///
@@ -219,6 +220,21 @@ struct ForwardTiming {
 
 impl ForwardTiming {
     fn record(&self) {
+        // The per-forward numbers become the `vision` span's attributes; with
+        // tracing off the current span is the `none` span and this is a no-op.
+        let span = tracing::Span::current();
+        span.record("patches", self.patches);
+        span.record("soft_tokens", self.soft_tokens);
+        span.record("patch_s", self.patch.as_secs_f64());
+        span.record("attn_s", self.attn.as_secs_f64());
+        span.record("kernel_s", self.kernel.as_secs_f64());
+        span.record("mlp_s", self.mlp.as_secs_f64());
+        span.record("pool_s", self.pool.as_secs_f64());
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if self.npu.0 > 0 {
+            span.record("npu_s", self.npu.2);
+            span.record("convert_s", self.npu.1);
+        }
         V_FORWARDS.fetch_add(1, Ordering::Relaxed);
         V_PATCHES.fetch_add(self.patches as u64, Ordering::Relaxed);
         V_SOFT_TOKENS.fetch_add(self.soft_tokens as u64, Ordering::Relaxed);
@@ -935,6 +951,21 @@ impl VisionTower {
     /// Pixel patches `[P, 3 * patch^2]` -> pooled soft tokens `[S, hidden]`
     /// (f32, scaled by `sqrt(hidden)`). With `debug_dir` set, the patch
     /// embeddings and every layer output are dumped as raw f32 for comparison.
+    #[telemetry::instrument(
+        name = "vision",
+        skip_all,
+        fields(
+            patches = tracing::field::Empty,
+            soft_tokens = tracing::field::Empty,
+            patch_s = tracing::field::Empty,
+            attn_s = tracing::field::Empty,
+            kernel_s = tracing::field::Empty,
+            mlp_s = tracing::field::Empty,
+            pool_s = tracing::field::Empty,
+            npu_s = tracing::field::Empty,
+            convert_s = tracing::field::Empty,
+        )
+    )]
     pub fn forward(
         &self,
         img: &PreparedImage,

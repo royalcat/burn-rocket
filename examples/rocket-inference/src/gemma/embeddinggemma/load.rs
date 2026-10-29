@@ -12,6 +12,7 @@ use burn::tensor::TensorData;
 
 use crate::gemma::config::Emb2Config;
 use crate::gemma::embeddinggemma::model::{AudioTowers, Emb2Model, VisionTowers};
+use crate::server::telemetry;
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
@@ -151,6 +152,11 @@ fn towers_available(model_dir: &Path) -> bool {
 /// `npu_pack` (the `--npu` decision, NPU build only) packs the vision half's
 /// projections (pack-and-drop) into resident fp16 NPU weights after the store
 /// pass and the optional Q8 mapping; `ROCKET_NPU_TOWERS=0` disables it for A/Bs.
+#[telemetry::instrument(
+    name = "towers.load",
+    skip_all,
+    fields(vision = need.vision, audio = need.audio)
+)]
 pub fn load_towers(
     model: &mut Emb2Model,
     model_dir: &Path,
@@ -232,6 +238,11 @@ pub fn load_towers(
 /// tree, so a missing one is an error (`check_missing`) and the other half's
 /// tensors report as unused. The NPU-packed vision half stays f32 because
 /// [`tower_quant_group`] excludes it.
+#[telemetry::instrument(
+    name = "towers.half",
+    skip_all,
+    fields(half = name, tensors = tracing::field::Empty)
+)]
 fn load_half<C, M>(
     ckpt: &mut C,
     part: M,
@@ -259,6 +270,7 @@ where
     } else {
         part
     };
+    tracing::Span::current().record("tensors", applied);
     Ok((part, applied))
 }
 

@@ -16,7 +16,7 @@ mod log;
 mod multimodal;
 mod ollama;
 mod openai;
-mod telemetry;
+pub(crate) mod telemetry;
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -63,6 +63,21 @@ impl AppState {
     /// Run one inference call: wait for the model lock, time the wait and the
     /// call itself, and contain panics (through [`blocking`]). Every inference
     /// endpoint goes through this so the request logs carry consistent timings.
+    ///
+    /// The `inference` span and its children (`prepare`, `towers.load`,
+    /// `forward`/`prefill`/`decode`, ...) are only created while trace export
+    /// is on: the stdout layer keeps events only, so the disabled path costs a
+    /// metadata check and leaves the log output unchanged.
+    #[telemetry::instrument(
+        name = "inference",
+        skip_all,
+        fields(
+            model = %self.settings.model_name,
+            queue_s = tracing::field::Empty,
+            compute_s = tracing::field::Empty,
+            encode_s = tracing::field::Empty,
+        )
+    )]
     pub(crate) async fn compute<T, F>(&self, f: F) -> Result<(T, RequestTiming), ApiError>
     where
         T: Send + 'static,
@@ -70,20 +85,22 @@ impl AppState {
     {
         let state = self.clone();
         let arrived = Instant::now();
-        // Only created when trace export is on: the disabled path keeps the
-        // pre-telemetry output (including the `ROCKET_MEM_LOG` lines, which
-        // otherwise gain a span prefix) and cost.
-        let span = tracing::Span::current();
+        // `blocking` carries the current span (this one) onto the worker thread.
         blocking(move || {
-            let _entered = span.enter();
             let mut engine = state.lock();
             let queue_s = arrived.elapsed().as_secs_f64();
+            let span = tracing::Span::current();
+            span.record("queue_s", queue_s);
 
             let t0 = Instant::now();
             crate::gemma::vision::vision_stats_reset();
             let out = f(&mut engine)?;
             let compute_s = t0.elapsed().as_secs_f64();
             let encode_s = crate::gemma::vision::vision_stats().total_s;
+            span.record("compute_s", compute_s);
+            if encode_s > 0.0 {
+                span.record("encode_s", encode_s);
+            }
             let timing = RequestTiming {
                 queue_s,
                 compute_s,

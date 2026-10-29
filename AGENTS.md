@@ -182,18 +182,60 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   `http.request` server span per request except `/health` (method/route/path/status,
   `server.address`/`port`, model, W3C `traceparent` parent) with an `inference` child
   span for the model-lock wait + forward (`queue_s`/`compute_s`/`encode_s`); the
-  existing per-request log line becomes a span event. `RUST_LOG` filters only the
-  fmt layer; the OTel layer exports INFO spans regardless. Off by default (no
-  exporter thread, no network, unchanged stdout and `ROCKET_MEM_LOG` lines); init
-  failures are reported and serving continues fmt-only. gRPC is not compiled in
-  (only `http/protobuf`), and SIGTERM/SIGINT drain in-flight requests and flush
-  queued spans.
+  existing per-request log line becomes a span event. The request's major time
+  consumers are `inference` children, all declared with
+  `#[telemetry::instrument(...)]` (`instrument` is tracing's attribute re-exported
+  by `server::telemetry`; `skip_all` plus explicit fields is the convention, and
+  only `trace_http` builds its span by hand because it must `set_parent` before
+  entering): `prepare` (`images`/`video`/`audio`/`tokens`) with its media children
+  `image.decode`, `image.resize`, `video.frames`, `media.fetch` and
+  `audio.decode`/`audio.features`; `vision` per image/frame tower forward
+  (`patches`/`soft_tokens` plus `patch_s`/`attn_s`/`kernel_s`/`mlp_s`/`pool_s`,
+  `npu_s`/`convert_s` on the NPU, recorded from `ForwardTiming::record`); `audio`;
+  `towers.load` -> `towers.half` (`half`/`tensors`); `forward` for the embedding
+  backbones (`tokens` plus `attn_s`/`mlp_s`/`norms_s`[/`ple_s`] as per-call deltas
+  of the model's stage counters); `prefill`/`decode` for chat (the gemma4 decode
+  loop and the intent model's phases are extracted helpers so each can carry a
+  span, `gen_tokens`/`tok_s` + stage deltas). The fmt layer filters span records
+  out (`EnvFilter::and(filter_fn(|m| !m.is_span()))`), so spans exist only while
+  the OTel layer is installed: with the switch off nothing is created, and the
+  request log lines look the same either way (no span prefixes, `ROCKET_MEM_LOG`
+  unchanged; the tree exists only in the export). `RUST_LOG`
+  filters only the fmt layer; the OTel layer exports INFO spans regardless. Off by
+  default (no exporter thread, no network); init failures are reported and
+  serving continues fmt-only. gRPC is not compiled in (only `http/protobuf`), and
+  SIGTERM/SIGINT drain in-flight requests and flush queued spans.
   Dev-verified with embeddinggemma-2 q8 against `tools/otel_capture.py`: env
   service/resource override, an injected `traceparent`'s trace and parent ids,
   200/400 status spans, `/embed` `encode_s`/`vision_attn`, a span queued <5 s before
   SIGTERM flushed at exit 0, zero POSTs and no span prefix when the switch is off,
   and an unreachable collector logging a warning while requests stay 200. The live
   board service runs without the switch, so a redeploy needs no flag change.
+  Round (2026-10-29): the sub-span tree above is in place and
+  `server::telemetry` is `pub(crate)` so model modules reach the macro with
+  `use crate::server::telemetry;`. Wiring facts: `AppState::compute`'s
+  `inference` span reaches the blocking worker because `error.rs::blocking`
+  copies `Span::current()` and runs the closure in `in_scope` (do not re-add an
+  `enter()` in `compute`); the per-request log line still attaches to
+  `http.request` because `compute` has returned by then (`log.rs` uses
+  `Span::current()`); the stage/duration attributes are per-call deltas of the
+  process-wide `stage_stats`/`gen_stage_stats` atomics, correct because forwards
+  serialize under the model mutex — never reset those counters in `serve`. The
+  fmt layer's events-only filter is pinned by
+  `telemetry::tests::the_stdout_filter_keeps_events_and_hides_spans`; removing it
+  would make `serve` create the spans (and allocate) even with the switch off
+  and prefix the request log lines. Dev-host capture (emb2 q8
+  `--defer-towers`, gemma-4-E2B-it-qat-mobile `--f16 --defer-towers`):
+  text = `inference -> prepare(tokens) + forward`; image = `inference ->
+  towers.load -> towers.half(vision, 211)` then `prepare -> image.decode 3.4 ms,
+  image.resize 21 ms, vision (2394 patches, attn 2.35 s, kernel 0.74 s,
+  mlp 5.27 s)`; audio (272 tensors, 499 mel frames); video (4 frames, 1170
+  patches each, `forward tokens=530`); chat = `inference -> prefill(12) +
+  decode(3 tokens, 5.33 tok/s)`. Not runtime-checked: the intent model's
+  `prefill`/`decode` (its checkpoint is board-only) and `media.fetch` (needs a
+  remote URL); both compile and mirror the verified paths. CLI commands install
+  no subscriber, so the attributes are no-ops there (verified: `gemma embed`
+  output unchanged).
 - **EmbeddingGemma 2 performance round** (2026-10-08, log §12): four changes,
   validated on the board (timings in log §12.5: canonical ~2x on short input,
   fused glue -12 %, int8 g32 readback-bound and 2.4x slower than fp16).
@@ -2247,10 +2289,13 @@ curl -s localhost:8399/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input":"trace me"}'
 protoc --decode_raw < /tmp/otel-capture/*.bin | head -100
 # expect: service.name=smoke-rocket, the "POST /v1/embeddings" server span with
-# http.response.status_code, its "inference" child, and the embedding-request
-# event. Disabled path: without OTEL_SDK_ENABLED there are no POSTs and stdout
-# has no `http.request{...}` prefix; OTEL_SDK_DISABLED=true and
-# OTEL_TRACES_EXPORTER=none also keep it off, and grpc prints a disable message.
+# http.response.status_code, its "inference" child and its sub-spans ("prepare",
+# "forward" with tokens/attn_s/..., "towers.load" -> "towers.half",
+# "image.decode"/"image.resize"/"vision" for media requests), and the
+# embedding-request event. Disabled path: without OTEL_SDK_ENABLED there are no
+# POSTs; stdout looks the same with tracing on or off (no span prefix either
+# way); OTEL_SDK_DISABLED=true and OTEL_TRACES_EXPORTER=none also keep it off,
+# and grpc prints a disable message.
 ```
 
 On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-for-bit):

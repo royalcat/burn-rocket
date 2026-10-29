@@ -22,6 +22,7 @@ use burn::tensor::module::attention;
 use burn::tensor::ops::{AttentionModuleOptions, PadMode};
 use burn::tensor::{Bool, DType, Int, TensorData, s};
 
+use crate::server::telemetry;
 use crate::util::proj::Proj;
 use crate::util::rope::RopeCache;
 
@@ -1019,16 +1020,49 @@ impl IntentModel {
     ) -> (Vec<u32>, StageStats) {
         self.cache.reset();
         let t0 = Instant::now();
-        let mut logits = self.forward_logits(prompt);
+        let logits = self.prefill(prompt);
         let prefill_s = t0.elapsed().as_secs_f64();
         let mut rng = rng_seed | 1;
+        let t1 = Instant::now();
+        let (out, stopped) = self.decode(logits, max_new, stop_ids, temperature, &mut rng);
+        let decode_s = t1.elapsed().as_secs_f64();
+        let stats = StageStats {
+            prefill_s,
+            decode_s,
+            steps: out.len(),
+            stopped,
+        };
+        self.stage = stats;
+        (out, stats)
+    }
+
+    /// Prefill the prompt and return the last position's logits `[1, vocab]`.
+    #[telemetry::instrument(name = "prefill", skip_all, fields(prompt_tokens = prompt.len()))]
+    fn prefill(&mut self, prompt: &[u32]) -> Tensor<2> {
+        self.forward_logits(prompt)
+    }
+
+    /// Decode up to `max_new` tokens from the prefill logits. Returns the
+    /// generated ids (stop ids excluded) and whether a stop id ended generation.
+    #[telemetry::instrument(
+        name = "decode",
+        skip_all,
+        fields(gen_tokens = tracing::field::Empty, tok_s = tracing::field::Empty)
+    )]
+    fn decode(
+        &mut self,
+        mut logits: Tensor<2>,
+        max_new: usize,
+        stop_ids: &[u32],
+        temperature: f32,
+        rng: &mut u64,
+    ) -> (Vec<u32>, bool) {
+        let started = Instant::now();
         let mut out = Vec::with_capacity(max_new);
-        let mut decode_s = 0.0;
         let mut stopped = false;
         for _ in 0..max_new {
-            let t = Instant::now();
             let logits_vec: Vec<f32> = logits.clone().to_data().try_to_vec().unwrap_or_default();
-            let next = pick_token(&logits_vec, temperature, &mut rng);
+            let next = pick_token(&logits_vec, temperature, rng);
             if stop_ids.contains(&next) {
                 stopped = true;
                 break;
@@ -1038,16 +1072,12 @@ impl IntentModel {
                 break;
             }
             logits = self.forward_logits(&[next]);
-            decode_s += t.elapsed().as_secs_f64();
         }
-        let stats = StageStats {
-            prefill_s,
-            decode_s,
-            steps: out.len(),
-            stopped,
-        };
-        self.stage = stats;
-        (out, stats)
+        let decode_s = started.elapsed().as_secs_f64();
+        let span = tracing::Span::current();
+        span.record("gen_tokens", out.len());
+        span.record("tok_s", out.len() as f64 / decode_s.max(1e-9));
+        (out, stopped)
     }
 }
 

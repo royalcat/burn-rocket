@@ -7,7 +7,8 @@ use burn::prelude::*;
 use burn::tensor::DType;
 use tokenizers::Tokenizer;
 
-use crate::gemma::gemma4::model::{GenKv, GenRoot, GenRopes};
+use crate::gemma::gemma4::model::{GenKv, GenRoot, GenRopes, gen_stage_stats};
+use crate::server::telemetry;
 
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -257,12 +258,60 @@ pub fn generate_with_media(
     if opts.collect_top8 {
         stats.top8.push(top_k(&logits, 8));
     }
-    let mut next = sample(&logits, opts, &mut rng)?;
+    let next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
 
+    let t1 = std::time::Instant::now();
+    let (out, stopped) = decode_loop(
+        model,
+        lm_head,
+        &ropes,
+        &mut kv,
+        opts,
+        next,
+        chunk,
+        device,
+        &mut rng,
+        &mut stats.top8,
+    )?;
+    stats.decode_s = t1.elapsed().as_secs_f64();
+    stats.generated = out.len();
+    stats.stopped = stopped;
+    Ok((out, stats))
+}
+
+/// The token-by-token decode loop: one cached forward, logits and a sample per
+/// generated token. Returns the generated ids and whether an EOS id stopped it.
+#[telemetry::instrument(
+    name = "decode",
+    skip_all,
+    fields(
+        gen_tokens = tracing::field::Empty,
+        tok_s = tracing::field::Empty,
+        attn_s = tracing::field::Empty,
+        mlp_s = tracing::field::Empty,
+        ple_s = tracing::field::Empty,
+        norms_s = tracing::field::Empty,
+    )
+)]
+#[allow(clippy::too_many_arguments)]
+fn decode_loop(
+    model: &GenRoot,
+    lm_head: &Tensor<2>,
+    ropes: &GenRopes,
+    kv: &mut GenKv,
+    opts: &GenOptions,
+    first: u32,
+    chunk: usize,
+    device: &Device,
+    rng: &mut SplitMix64,
+    top8: &mut Vec<Vec<(u32, f32)>>,
+) -> Result<(Vec<u32>, bool)> {
+    let stages_before = gen_stage_stats();
+    let started = std::time::Instant::now();
     let mut out: Vec<u32> = Vec::new();
     let mut stopped = false;
-    let t1 = std::time::Instant::now();
+    let mut next = first;
     for _ in 0..opts.max_new_tokens {
         out.push(next);
         if opts.eos.contains(&next) {
@@ -271,19 +320,23 @@ pub fn generate_with_media(
         }
         let input = crate::gemma::inputs::make_input(&[next], device);
         let seq_start = kv.len;
-        let h = model
-            .text()
-            .forward(input, &ropes, &mut kv, seq_start, chunk);
+        let h = model.text().forward(input, ropes, kv, seq_start, chunk);
         let logits = model.text().logits(h, lm_head);
         if opts.collect_top8 {
-            stats.top8.push(top_k(&logits, 8));
+            top8.push(top_k(&logits, 8));
         }
-        next = sample(&logits, opts, &mut rng)?;
+        next = sample(&logits, opts, rng)?;
     }
-    stats.decode_s = t1.elapsed().as_secs_f64();
-    stats.generated = out.len();
-    stats.stopped = stopped;
-    Ok((out, stats))
+    let decode_s = started.elapsed().as_secs_f64();
+    let (attn_s, mlp_s, ple_s, norms_s) = gen_stage_stats();
+    let span = tracing::Span::current();
+    span.record("gen_tokens", out.len());
+    span.record("tok_s", out.len() as f64 / decode_s.max(1e-9));
+    span.record("attn_s", attn_s - stages_before.0);
+    span.record("mlp_s", mlp_s - stages_before.1);
+    span.record("ple_s", ple_s - stages_before.2);
+    span.record("norms_s", norms_s - stages_before.3);
+    Ok((out, stopped))
 }
 
 /// EOS ids from the checkpoint's `generation_config.json` (fallback: 1, 106, 50).

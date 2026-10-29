@@ -13,6 +13,7 @@ use tokenizers::Tokenizer;
 use crate::gemma::audio_frontend::{self, AudioFeatures};
 use crate::gemma::media::{self, PreparedImage};
 use crate::gemma::vision::{VisionAttn, VisionSpec};
+use crate::server::telemetry;
 
 /// Soft-token budgets from `processor_config.json` (image and video processor
 /// sections), matching the saved checkpoint configuration.
@@ -128,6 +129,16 @@ fn dump_f32(path: &Path, values: &[f32]) -> Result<()> {
 /// towers), tokenizes `prompt + text`, and encodes the media. Placeholders must
 /// appear in the text in image-then-video-then-audio order (the default text
 /// does).
+#[telemetry::instrument(
+    name = "prepare",
+    skip_all,
+    fields(
+        images = req.images.len(),
+        video = req.video.is_some(),
+        audio = req.audio.is_some(),
+        tokens = tracing::field::Empty,
+    )
+)]
 pub fn prepare<M: MediaModel>(
     model: &M,
     tokenizer: &Tokenizer,
@@ -347,6 +358,7 @@ pub fn prepare<M: MediaModel>(
     } else {
         Some((positions, Tensor::cat(token_rows, 0)))
     };
+    tracing::Span::current().record("tokens", ids.len());
     Ok(Prepared { ids, soft })
 }
 

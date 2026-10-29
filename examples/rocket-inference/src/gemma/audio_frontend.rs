@@ -14,6 +14,8 @@ use anyhow::{Context, Result, bail};
 use rustfft::num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 
+use crate::server::telemetry;
+
 pub const SAMPLE_RATE: usize = 16_000;
 pub const FRAME_LENGTH: usize = 320;
 pub const HOP_LENGTH: usize = 160;
@@ -61,6 +63,7 @@ pub fn subsample_mask(mask: &[bool]) -> (Vec<bool>, usize) {
 
 /// Decode an audio file to 16 kHz mono f32 samples. WAV goes through `hound`
 /// (16 kHz mono only); anything else is piped through `ffmpeg`.
+#[telemetry::instrument(name = "audio.decode", skip_all)]
 pub fn load_waveform(path: &Path) -> Result<Vec<f32>> {
     let is_wav = path
         .extension()
@@ -177,6 +180,11 @@ fn mel_filter_bank() -> &'static [f64] {
 }
 
 /// Extract log-mel features from a 16 kHz mono waveform.
+#[telemetry::instrument(
+    name = "audio.features",
+    skip_all,
+    fields(samples = waveform.len(), frames = tracing::field::Empty)
+)]
 pub fn mel_features(waveform: &[f32]) -> AudioFeatures {
     let real = waveform.len().min(MAX_SAMPLES);
     let padded_len = real.div_ceil(PAD_TO_MULTIPLE) * PAD_TO_MULTIPLE;
@@ -222,6 +230,7 @@ pub fn mel_features(waveform: &[f32]) -> AudioFeatures {
         }
     }
 
+    tracing::Span::current().record("frames", frames);
     AudioFeatures {
         mel,
         mask,

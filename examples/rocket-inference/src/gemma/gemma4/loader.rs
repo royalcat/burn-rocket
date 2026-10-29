@@ -27,6 +27,7 @@ use burn_store::{
 use crate::gemma::config::Emb2Config;
 use crate::gemma::gemma4::model::{AudioTowers, GenRoot, GenTextModel, VisionTowers};
 use crate::gemma::layers::ClipBounds;
+use crate::server::telemetry;
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 
 /// Pack the generation model's text projections into resident fp16 NPU weights
@@ -659,6 +660,11 @@ fn with_load_adapters(
 /// present). Deferred serving calls this on the first media request with only
 /// the halves that request needs; it re-reads the QAT scales, which are not kept
 /// after the initial load.
+#[telemetry::instrument(
+    name = "towers.load",
+    skip_all,
+    fields(vision = need.vision, audio = need.audio)
+)]
 pub fn load_towers(
     model: &mut GenRoot,
     model_dir: &std::path::Path,
@@ -795,6 +801,11 @@ fn load_towers_with(
 /// One tower half's store pass and SRQ registration. The pass sees the whole
 /// checkpoint; only this half's parameters are in the tree, so a missing one is
 /// an error and the other half's tensors report as unused.
+#[telemetry::instrument(
+    name = "towers.half",
+    skip_all,
+    fields(half = part, tensors = tracing::field::Empty)
+)]
 fn load_tower_half<M: ModuleSnapshot>(
     root: &mut M,
     part: &str,
@@ -820,7 +831,9 @@ fn load_tower_half<M: ModuleSnapshot>(
         let n = register_srq_scales(root, scales);
         println!("QAT: SRQ activation rounding on {n} {part} tower linears");
     }
-    Ok(result.applied.len())
+    let applied = result.applied.len();
+    tracing::Span::current().record("tensors", applied);
+    Ok(applied)
 }
 
 /// The projection module paths `--quant q8` keeps Q8-resident (text only; the

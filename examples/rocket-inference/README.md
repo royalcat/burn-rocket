@@ -244,21 +244,40 @@ $B serve --model-dir ~/models/qwen3-embedding-0.6b --port 8383
 Each request gets one server span (`http.request`, `otel.kind=server`, named
 after the method and matched route) carrying the method, path, route, response
 status, `server.address`/`port` and the loaded model; 5xx responses set the span
-status to error. The model call is a child `inference` span with `queue_s`,
+status to error. The model call is the child `inference` span with `queue_s`,
 `compute_s` and (for media requests) `encode_s`, and the per-request log line is
 exported as a span event with its usual fields. An incoming W3C
 `traceparent`/`tracestate` (and baggage when enabled) becomes the parent of the
 request span. `/health` is not traced, and prompts, headers and embeddings are
 never exported.
 
+The major time consumers of a request are children of `inference`:
+
+| span | covers | attributes |
+|---|---|---|
+| `prepare` | input assembly (media decode, placeholder expansion, tokenization) | `images`, `video`, `audio`, `tokens` |
+| `image.decode`, `image.resize` | one per image (mozjpeg decode, bicubic resize) | — |
+| `video.frames` | ffmpeg frame extraction | `frames` |
+| `media.fetch` | a remote (`http(s)`) media input | — |
+| `audio.decode`, `audio.features` | waveform decode, log-mel extraction | `samples`, `frames` |
+| `vision` | one vision-tower forward per image/frame | `patches`, `soft_tokens`, `patch_s`, `attn_s`, `kernel_s`, `mlp_s`, `pool_s` (plus `npu_s`/`convert_s` on the NPU) |
+| `audio` | one audio-tower forward | `frames`, `tokens` |
+| `towers.load` → `towers.half` | deferred vision/audio tower halves on the first media request | `vision`/`audio`; `half`, `tensors` |
+| `forward` | the text backbone of an embedding request | `tokens`, `attn_s`, `mlp_s`, `norms_s` (`ple_s` on the Gemma families) |
+| `prefill`, `decode` | chat prefill and the token-by-token loop | `prompt_tokens`; `gen_tokens`, `tok_s`, plus the stage durations |
+
+Spans are declared with `#[telemetry::instrument(...)]` (the crate re-exports
+tracing's attribute under `server::telemetry`) and exist only while trace export
+is enabled: the stdout layer keeps events only, so with `OTEL_SDK_ENABLED` unset
+nothing is created. The request log lines look the same either way (no span
+scope prefixes); the tree exists only in the exported spans.
+
 The exporter uses a blocking HTTP client on the SDK's batch-export thread, so
 there is no Tokio-runtime coupling. Initialization errors (bad endpoint,
 unsupported protocol/compression, a subscriber already installed) are printed to
 stderr and `serve` continues without traces; an unreachable collector only
 affects exports. `RUST_LOG` filters stdout alone: the trace layer exports spans
-at INFO even when the log lines are silenced. While tracing is enabled, stdout
-request lines gain the active span prefix (`http.request{...}:`), because the
-formatting layer prints span context; the disabled path is unchanged. SIGTERM
+at INFO even when the log lines are silenced. SIGTERM
 and SIGINT drain in-flight requests and flush queued spans (Docker's own stop
 timeout still bounds a very long forward). Metrics and log exporters are not
 implemented (`OTEL_METRICS_EXPORTER`/`OTEL_LOGS_EXPORTER` are ignored).

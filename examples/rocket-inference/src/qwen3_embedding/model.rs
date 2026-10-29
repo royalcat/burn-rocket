@@ -14,6 +14,7 @@ use burn::tensor::{DType, Int, s};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::server::telemetry;
 use crate::util::proj::Proj;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 use crate::util::proj::{FusedGroup, ProjKind};
@@ -193,6 +194,16 @@ impl Qwen3Embedding {
     /// (not L2-normalized). With `fused` the backend attention kernel is used; otherwise
     /// queries/keys are processed in `attn_chunk`/`key_block`-sized blocks with a
     /// tensor-op online softmax.
+    #[telemetry::instrument(
+        name = "forward",
+        skip_all,
+        fields(
+            tokens = input_ids.dims()[1],
+            attn_s = tracing::field::Empty,
+            mlp_s = tracing::field::Empty,
+            norms_s = tracing::field::Empty,
+        )
+    )]
     pub fn forward(
         &self,
         input_ids: Tensor<2, Int>,
@@ -203,6 +214,7 @@ impl Qwen3Embedding {
     ) -> Tensor<2> {
         let [b, s] = input_ids.dims();
         let d = self.hidden_size();
+        let stages_before = stage_stats();
         // The embedding table may be kept in a 16-bit dtype while the model body
         // computes in another; the cast is exact (the source safetensors are bf16)
         // and costs one [B, S, D] pass.
@@ -215,6 +227,11 @@ impl Qwen3Embedding {
         }
         let x = fused_rms_norm(&self.norm, x);
         // Last-token pooling.
+        let (attn_s, mlp_s, norms_s) = stage_stats();
+        let span = tracing::Span::current();
+        span.record("attn_s", attn_s - stages_before.0);
+        span.record("mlp_s", mlp_s - stages_before.1);
+        span.record("norms_s", norms_s - stages_before.2);
         x.slice(s![.., s - 1..s, ..]).reshape([b, d])
     }
 }
