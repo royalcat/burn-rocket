@@ -40,13 +40,10 @@ pub fn pack_text_for_prefill(
     threads: usize,
     device: &Device,
     keep_cpu: bool,
+    npu_decode: bool,
 ) -> Result<()> {
     use crate::gemma::layers;
     burn_rocket::init(threads).map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
-    // `ROCKET_NPU_DECODE=1` also routes decode matmuls to the packed weights
-    // (the pre-gate for the pack-and-drop config): with `keep_cpu=true` nothing
-    // else changes, so the decode speed can be measured before any memory work.
-    let npu_decode = std::env::var("ROCKET_NPU_DECODE").is_ok_and(|v| v != "0");
     layers::set_npu_prefill_only(keep_cpu && !npu_decode);
     let t0 = std::time::Instant::now();
     let mut count = 0usize;

@@ -16,25 +16,35 @@ use crate::server::telemetry;
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
-/// NPU offload options (`--npu` and its sub-flags).
-///
-/// The fields are read only by the aarch64 `npu` build; other builds still
-/// parse the flags and reject `--npu` with a clear message.
+/// NPU stages for EmbeddingGemma 2. The text backbone, the attention and the
+/// vision tower are independent; the audio tower always runs on the CPU.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
 pub struct NpuOpts {
     pub threads: usize,
-    /// Attention on the NPU (`--npu-attn npu`, default) vs CPU.
+    /// Pack the text-backbone projections into resident NPU weights.
+    pub text: bool,
+    /// Run the text-backbone attention on the NPU.
     pub attn: bool,
+    /// Pack the vision tower's projections into resident NPU weights.
+    pub vision: bool,
+    /// Run the vision tower's attention on the NPU.
+    pub vision_attn: bool,
     /// Pack the text projections as resident group-wise int8 (W8A8) instead of fp16.
     pub int8: bool,
-    /// K-group width for the resident int8 weights (`--npu-int8-group`).
+    /// K-group width for the resident int8 weights (`--int8-group`).
     ///
     /// The library pins the group-wise K-tile to a divisor of this group and
     /// reads every K-tile's `M x N` int32 partial back to the host, so the
     /// readback (and thus the speed) scales with `K / group`. 32 is the most
     /// accurate; wider groups trade accuracy for speed.
     pub i8_group: usize,
+}
+
+impl NpuOpts {
+    pub fn any(&self) -> bool {
+        self.text || self.attn || self.vision || self.vision_attn
+    }
 }
 
 pub fn load_model(
@@ -47,9 +57,10 @@ pub fn load_model(
 ) -> Result<(Emb2Model, Emb2Config)> {
     let mut ckpt = crate::util::checkpoint::open_in_dir(model_dir)?;
     let cfg = Emb2Config::from_value(ckpt.config_json()?)?;
+    let npu = npu.filter(NpuOpts::any);
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     if npu.is_some() {
-        bail!("--npu requires an aarch64 build with --features npu");
+        bail!("an NPU placement requires an aarch64 build with `--features npu`");
     }
     if dtype == DType::F16 {
         bail!(
@@ -86,31 +97,50 @@ pub fn load_model(
         // pack below (the text pack re-inits idempotently).
         burn_rocket::init(opts.threads)
             .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
-        // int8 packs straight from the model weights (one quantization step, no
-        // dequant round trip); the q8 low-RAM mapper only feeds the fp16 pack.
-        if quant_q8 && opts.int8 {
-            eprintln!(
-                "note: --quant q8 is ignored with --npu-int8 \
-                 (the int8 resident path quantizes the model weights directly)"
-            );
-        }
-        if quant_q8 && !opts.int8 {
-            model = quantize_low_ram(model)?;
+        // `--quant q8` keeps the CPU-resident weights in the low-RAM format; the
+        // NPU-packed text projections are packed from the full-precision model
+        // weights instead (quantizing them first would only lose numerics).
+        if quant_q8 {
+            if opts.int8 {
+                eprintln!(
+                    "note: --quant q8 is ignored with --npu-dtype int8 \
+                     (the int8 resident path quantizes the model weights directly)"
+                );
+            } else if opts.text {
+                // Packed from the full-precision weights; q8 still governs the
+                // CPU-resident towers.
+                crate::gemma::layers::set_quantized(true);
+                eprintln!(
+                    "note: --quant q8 applies to CPU-resident weights only; the text \
+                     projections are packed from {dtype:?}"
+                );
+            } else {
+                // The text projections stay on the CPU: quantize them as usual.
+                model = quantize_low_ram(model)?;
+            }
         }
         if !defer_towers && towers_available(model_dir) {
-            // Towers pack into resident fp16 from the f32/Q8 weights and drop
+            // Towers pack into resident fp16 from the model weights and drop
             // their CPU copies (the audio tower stays on the CPU).
             load_towers(
                 &mut model,
                 model_dir,
                 dtype,
                 quant_q8 && !opts.int8,
-                true,
+                opts.vision,
                 crate::gemma::TowerSet::ALL,
                 device,
             )?;
         }
-        return load_npu_text(model, cfg, opts, device);
+        if opts.text {
+            return load_npu_text(model, cfg, opts, device);
+        }
+        if opts.attn {
+            model.text_mut().set_npu_attn(true);
+            println!("NPU: text attention offload enabled");
+        }
+        crate::gemma::layers::set_npu_glue(true);
+        return Ok((model, cfg));
     }
     let _ = npu;
     if quant_q8 {

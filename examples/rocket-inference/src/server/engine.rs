@@ -1,12 +1,14 @@
 //! The loaded model: family detection, capabilities, and the compute entry
 //! points the HTTP handlers call (one resident model per process).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
+
+pub use crate::family::Family;
 
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
@@ -23,101 +25,6 @@ use super::error::ApiError;
 
 /// `(input ids, optional media soft tokens)` for one generation pass.
 type EncodedInput = (Vec<u32>, Option<(Vec<usize>, Tensor<2>)>);
-
-/// The model family loaded in this process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    Qwen3Embed,
-    Emb2,
-    Intent,
-    Gemma4,
-}
-
-impl Family {
-    /// Name for the `--family` flag and the `/v1/models` capability listing.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Qwen3Embed => "qwen3",
-            Self::Emb2 => "embeddinggemma",
-            Self::Intent => "intent",
-            Self::Gemma4 => "gemma4",
-        }
-    }
-
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "qwen3" => Ok(Self::Qwen3Embed),
-            "embeddinggemma" => Ok(Self::Emb2),
-            "intent" => Ok(Self::Intent),
-            "gemma4" => Ok(Self::Gemma4),
-            other => {
-                bail!("unknown family '{other}' (expected auto|qwen3|embeddinggemma|intent|gemma4)")
-            }
-        }
-    }
-
-    /// Ollama's `general.architecture` for this family (chat families only).
-    pub fn ollama_architecture(self) -> &'static str {
-        match self {
-            Self::Qwen3Embed => "qwen3",
-            Self::Emb2 => "embedding_gemma2",
-            Self::Intent => "qwen3_5",
-            Self::Gemma4 => "gemma4",
-        }
-    }
-}
-
-/// Detect the model family from a checkpoint's `config.json` (`model_type`), or
-/// from a GGUF file's `general.architecture`.
-pub fn detect_family(model_dir: &Path) -> Result<Family> {
-    let path = model_dir.join("config.json");
-    if path.exists() {
-        let text =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        return detect_from_value(&json)
-            .with_context(|| format!("detect the model family in {}", model_dir.display()));
-    }
-    // No config.json: assume a GGUF directory and read the architecture.
-    let ck = crate::util::checkpoint::open_in_dir(model_dir)?;
-    detect_from_arch(ck.arch()).with_context(|| {
-        format!(
-            "detect the model family in {} (GGUF architecture)",
-            model_dir.display()
-        )
-    })
-}
-
-fn detect_from_arch(arch: Option<&str>) -> Result<Family> {
-    match arch {
-        Some("qwen3") => Ok(Family::Qwen3Embed),
-        Some("gemma-embedding2") => Ok(Family::Emb2),
-        Some("qwen35") => Ok(Family::Intent),
-        Some("gemma4") => Ok(Family::Gemma4),
-        Some(other) => bail!(
-            "unsupported GGUF architecture '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4)"
-        ),
-        None => bail!("checkpoint is neither config.json nor GGUF"),
-    }
-}
-
-fn detect_from_value(json: &serde_json::Value) -> Result<Family> {
-    match json.get("model_type").and_then(|v| v.as_str()) {
-        Some("qwen3") => Ok(Family::Qwen3Embed),
-        Some("embedding_gemma2") => Ok(Family::Emb2),
-        Some("qwen3_5") => Ok(Family::Intent),
-        Some("gemma4") => Ok(Family::Gemma4),
-        Some(other) => bail!(
-            "unsupported model_type '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4)"
-        ),
-        None => bail!(
-            "config.json has no model_type (pass --family qwen3|embeddinggemma|intent|gemma4)"
-        ),
-    }
-}
 
 /// What the loaded model can serve; the router registers only these routes.
 #[derive(Debug, Clone, Copy, Default)]
@@ -950,27 +857,28 @@ mod tests {
     #[test]
     fn detect_known_families() {
         assert_eq!(
-            detect_from_value(&config(r#"{"model_type": "qwen3"}"#)).unwrap(),
+            crate::family::detect_from_value(&config(r#"{"model_type": "qwen3"}"#)).unwrap(),
             Family::Qwen3Embed
         );
         assert_eq!(
-            detect_from_value(&config(r#"{"model_type": "embedding_gemma2"}"#)).unwrap(),
+            crate::family::detect_from_value(&config(r#"{"model_type": "embedding_gemma2"}"#))
+                .unwrap(),
             Family::Emb2
         );
         assert_eq!(
-            detect_from_value(&config(r#"{"model_type": "qwen3_5"}"#)).unwrap(),
+            crate::family::detect_from_value(&config(r#"{"model_type": "qwen3_5"}"#)).unwrap(),
             Family::Intent
         );
         assert_eq!(
-            detect_from_value(&config(r#"{"model_type": "gemma4"}"#)).unwrap(),
+            crate::family::detect_from_value(&config(r#"{"model_type": "gemma4"}"#)).unwrap(),
             Family::Gemma4
         );
     }
 
     #[test]
     fn detect_rejects_unknown_or_missing() {
-        assert!(detect_from_value(&config(r#"{"model_type": "llama"}"#)).is_err());
-        assert!(detect_from_value(&config(r#"{}"#)).is_err());
+        assert!(crate::family::detect_from_value(&config(r#"{"model_type": "llama"}"#)).is_err());
+        assert!(crate::family::detect_from_value(&config(r#"{}"#)).is_err());
     }
 
     #[test]

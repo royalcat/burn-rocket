@@ -6,7 +6,7 @@
 //! tower uses:
 //!
 //! * `fused-f32` — `burn::tensor::module::attention` on `[1, 12, p, 64]` f32 (the
-//!   deployed `--vision-attn fused` path);
+//!   deployed `--vision-attn-device cpu --vision-attn-kernel fused` path);
 //! * `fused-f16` / `fused-bf16` — the same call with 16-bit operands, i.e. the
 //!   question of whether feeding the kernel the model dtype is faster (flex
 //!   dispatches by dtype but casts f16/bf16 to f32 for the computation);

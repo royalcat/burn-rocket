@@ -1,40 +1,55 @@
 # rocket-inference
 
 Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](../..)
-library: one binary, four model families, `flex` CPU backend by default with
-RK3588 NPU offload (`--npu`, the default for `serve` on the NPU build).
+library: one binary, family-agnostic commands, `flex` CPU backend by default
+with per-stage RK3588 NPU offload. The model family is detected from the
+checkpoint (`config.json` `model_type`, or the GGUF architecture) and
+`--family` overrides it.
 
-| family | model | CLI commands | served endpoints |
+| model | checkpoint | commands | served endpoints |
 |---|---|---|---|
-| `qwen3` | Qwen3-Embedding-0.6B | `bench`, `embed`, `gemm`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
-| `intent` | Qwen3.5-0.8B intent/query-planner (`guoxuter/ov_intent_analysis_sft:v7_q8`) | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
-| `gemma` | EmbeddingGemma 2 (text/image/video/audio) | `embed`, `bench`, `tokenize` | OpenAI `/v1/embeddings` + native multimodal `/embed` |
-| `gemma` | Gemma 4 E2B-it chat (text/image/audio) | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| EmbeddingGemma 2 (text/image/video/audio) | `google/embeddinggemma-2` | `embed`, `bench`, `tokenize` | OpenAI/OpenRouter `/v1/embeddings` + native multimodal `/embed` |
+| Qwen3-Embedding-0.6B | `Qwen/Qwen3-Embedding-0.6B` | `embed`, `bench`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
+| Qwen3.5-0.8B intent/query-planner | `guoxuter/ov_intent_analysis_sft:v7_q8` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| Gemma 4 E2B-it chat (text/image/audio) | `google/gemma-4-E2B-it` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
 
 ```
-usage: rocket-inference <family> <command> [flags]
+usage: rocket-inference <command> [flags]
+
+  serve      HTTP server for the detected checkpoint
+  embed      one embedding for text and/or media (embedding models)
+  bench      embedding throughput over repeated forwards (embedding models)
+  gen        one chat completion (chat models)
+  tokenize   tokenize text with the checkpoint's tokenizer
+  gemm       flex matmul microbenchmark (no model)
+  help       this text; `help <command>` for one command
 ```
 
-Serving is one command for every model: `rocket-inference serve --model-dir <dir>`
-detects the checkpoint's family and exposes exactly the endpoints it supports
-(see [Serving](#serving)). The families are separate model architectures and
-share only generic infrastructure; every command's flags are documented below. See
-`docs/experiment-log.md` (Qwen3-Embedding + intent) and
-`docs/experiment-log-gemma.md` (EmbeddingGemma 2 + Gemma 4) for the full
-measurements and verification results.
+`--model-dir <dir>` is required (or `-hf <owner>/<name>:<quant>`, below).
+EmbeddingGemma 2 is the first-class model; the other families keep their full
+support but are maintained best-effort.
+
+Deployment profiles (balanced / full offload / speed) with measured commands
+for every model live in [`docs/recipes/`](docs/recipes/). The model-level
+measurements are in `docs/experiment-log.md` (Qwen3-Embedding + intent) and
+`docs/experiment-log-gemma.md` (EmbeddingGemma 2 + Gemma 4); those logs predate
+the CLI refactor and keep their historical flag names (the recipes README has
+the mapping).
 
 ## Layout
 
 | path | contents |
 |---|---|
-| `src/main.rs`, `src/cli.rs` | dispatch (`serve` + the four families), shared flag parser, usage |
-| `src/server/` | the one server: model detection, capability routing, OpenAI + multimodal + Ollama endpoints |
+| `src/main.rs`, `src/cli.rs` | dispatch, shared flag parser, per-stage placement resolution, usage/help |
+| `src/family.rs` | the four families, checkpoint detection (`config.json` / GGUF architecture) and per-family stage support |
+| `src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `tokenize`, `gemm`) and the shared embedding input assembly |
+| `src/server/` | the one server: capability routing, OpenAI + multimodal + Ollama endpoints |
 | `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache`, the shared checkpoint trait + GGUF access + tokenizer, `hf-hub` resolution |
-| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loaders (f32/Q8/NPU), CLI |
-| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, loader (safetensors/GGUF) + NPU pack-and-drop, CLI |
+| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loader (f32/f16/bf16/Q8/NPU) |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, loader (safetensors/GGUF) + NPU pack-and-drop |
 | `src/gemma/` | shared Gemma 4 building blocks: config schemas, low-RAM/NPU linear helpers (`layers`), QAT (`qat`), media decoding, USM audio frontend, vision/audio towers, input assembly |
-| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders, CLI |
-| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling, CLI |
+| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders |
+| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
 | `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
@@ -46,10 +61,10 @@ Every family also loads **GGUF** checkpoints, locally or straight from the Hub:
 ```sh
 # llama.cpp-style <owner>/<name>:<quant> (quant required). Downloads the main GGUF
 # plus a matching mmproj-<quant>.gguf for the multimodal families, then runs.
-./rocket-inference qwen3 embed -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 --quant q8 --text "Hello"
-./rocket-inference gemma embed -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --quant q8 --image data/cat.jpeg
-./rocket-inference gemma gen   -hf unsloth/gemma-4-E2B-it-GGUF:Q8_0 --text "Hi"
-./rocket-inference intent gen  -hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0 --text "Hello!"
+./rocket-inference embed -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 --quant q8 --text "Hello"
+./rocket-inference embed -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --quant q8 --image data/cat.jpeg
+./rocket-inference gen   -hf unsloth/gemma-4-E2B-it-GGUF:Q8_0 --text "Hi"
+./rocket-inference gen   -hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0 --text "Hello!"
 
 # a local directory with a *.gguf (and optionally mmproj-*.gguf) works the same
 ./rocket-inference serve --model-dir /path/to/gguf-dir --port 8383
@@ -75,10 +90,11 @@ cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 ```
 
 The aarch64 binaries and models on the board live under `/root/rocket-inference/`
-(binary) and `/root/models/`; run from the deploy dir (the qwen bench uses the
-relative `data/bench_text.txt`). The NPU build is self-contained
-(the pure-Rust driver is statically linked) and needs `/dev/accel/accel0` at run time for
-`--npu`, which `serve` turns on by default on that build (see [Serving](#serving)).
+(binary) and `/root/models/`; run from the deploy dir when passing relative
+fixtures such as `data/one_long.txt`. The NPU build is self-contained
+(the pure-Rust driver is statically linked) and needs `/dev/accel/accel0` at run
+time for any stage placed on the NPU. `--device auto` (the default) is
+NPU-first on that build; `--device cpu` is the explicit CPU path.
 
 The container image builds both architectures from the same Dockerfile, chosen by the
 build platform; on x86-64 the same command produces the x86-64-v3 (AVX2) flex CPU
@@ -102,7 +118,7 @@ CLI f32 vector at cosine 1.000000000000 (log §21.3).
 One command serves every model:
 
 ```sh
-rocket-inference serve [--model-dir <dir>] [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
+rocket-inference serve --model-dir <dir> [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
 ```
 
 `--family auto` (the default) reads `config.json` `model_type` and picks the
@@ -122,12 +138,13 @@ The routes follow the loaded model — incompatible paths are not registered
 
 ```sh
 # embedding server (OpenAI): /v1/embeddings
-$B serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 --max-tokens 30000
+$B serve --model-dir ~/models/qwen3-embedding-0.6b --cpu-backend flex --dtype f32 \
+    --device npu --port 8383 --max-tokens 30000
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input":"Hello world","encoding_format":"float"}'
 
 # multimodal embedding server (OpenAI + native /embed)
-$B serve --model-dir ~/models/embeddinggemma-2 --quant q8 --port 8390
+$B serve --model-dir ~/models/embeddinggemma-2 --device npu --defer-towers --port 8390
 curl -s localhost:8390/embed -H 'Content-Type: application/json' -d '{"image":"/path/to/cat.jpeg"}'
 
 # OpenRouter-style image input: one embedding per input block, images and text
@@ -143,7 +160,7 @@ curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
 }'
 
 # query-planner server (OpenAI chat + Ollama, litellm/OpenViking-compatible)
-$B serve --model-dir ~/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 \
+$B serve --model-dir ~/models/ov-intent-analysis-sft --device auto --npu-threads 3 --port 11434 \
     --model-name guoxuter/ov_intent_analysis_sft:v7_q8 --max-tokens 4096 --max-new-tokens 256
 curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
@@ -151,29 +168,54 @@ curl -s localhost:11434/v1/chat/completions -H 'Content-Type: application/json' 
   -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
 
 # generation server (OpenAI chat + Ollama)
-$B serve --model-dir ~/models/gemma-4-E2B-it --port 8391
+$B serve --model-dir ~/models/gemma-4-E2B-it --device auto --defer-towers --port 8391
 curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
 ```
 
-Serving flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`),
-`--family`, `--backend`, `--port` (default 8383), `--model-name` (default: the
-model directory name), `--max-tokens` (prompt/context cap), `--max-new-tokens`
-(default generation cap), `--temperature`, plus the loading flags of the
-detected family (e.g. `--dtype`/`--quant`/`--npu`/`--npu-attn`/`--chunk`/
-`--key-block`/`--attn` for qwen3; `--quant`/`--npu`/`--npu-attn`/`--attn-chunk`/
-`--vision-attn`/`--video-fps`/`--video-max-frames`/`--defer-towers` for
-EmbeddingGemma 2; `--npu`/`--npu-threads`/
-`--delta-chunk`/`--embed-f16`/`--pure-npu`/`--npu-decode` for the intent model;
-`--f16`/`--quant`/`--npu`/`--attn-chunk`/`--defer-towers` for Gemma 4). A flag
-that does not apply to the detected model is rejected.
+Serving flags: `--model-dir` (required; or `-hf`),
+`--family auto|qwen3|embeddinggemma|intent|gemma4`, `--cpu-backend flex|cpu`,
+`--port` (default
+8383), `--model-name` (default: the model directory name), `--max-tokens`
+(prompt/context cap), `--max-new-tokens` (default generation cap),
+`--temperature`, `--video-fps`/`--video-max-frames`, plus the shared load flags
+below. `rocket-inference help serve` lists all of them. A flag that does not
+apply to the detected model is rejected.
 
-`serve` defaults to NPU offload on builds that have it (aarch64 + `--features npu`);
-`--no-npu` forces the flex CPU path, and `--quant q8` (the CPU low-RAM mode) keeps
-the CPU path unless `--npu` is explicit. The standalone `qwen3`/`gemma`/`intent`
-commands keep `--npu` opt-in. On EmbeddingGemma 2 the vision tower's attention
-follows the same rule: `npu` whenever the NPU path is active, `fused` otherwise
-(`--vision-attn fused` forces the CPU kernel, `blocked` is the parity fallback).
+### Device placement
+
+Every stage runs on the CPU unless it is placed on the NPU. The base flag is
+`--device auto|cpu|npu`; the per-stage flags override it:
+
+| flag | stage | families |
+|---|---|---|
+| `--text-device` | text-backbone projections | all |
+| `--text-attn-device` | text-backbone attention | qwen3, embeddinggemma |
+| `--vision-device` | vision-tower projections | embeddinggemma |
+| `--vision-attn-device` | vision-tower attention | embeddinggemma |
+| `--decode-device` | single-token decode projections | intent, gemma4 |
+
+`auto` (the default) places a stage on the NPU when the build has it (aarch64 +
+the `npu` feature) and on the CPU otherwise; under `auto`, decode stays on the
+CPU because NPU single-token matmuls pay the `M >= 256` padding. `--device cpu`
+is the explicit CPU path; `--device npu` sets every stage (including decode) on
+the NPU. The audio tower is CPU-only. Each run prints the resolved split before
+loading:
+
+```
+placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=CPU
+```
+
+Related flags: `--npu-threads` (default 5), `--npu-dtype fp16|int8` and
+`--int8-group` (EmbeddingGemma 2 text projections; int8 is a memory/fidelity
+option, not a speed one), `--keep-cpu-weights auto|yes|no` (intent/gemma4:
+whether the packed projections keep their CPU copies; `auto` keeps them exactly
+when a stage runs on the CPU, so `--decode-device npu` alone drops them),
+`--attn-kernel fused|blocked` and `--vision-attn-kernel fused|blocked` (the CPU
+attention kernels used when that attention stage is not offloaded),
+`--chunk`/`--key-block` (qwen3 blocked tiles), `--attn-chunk` (chunked attention
+width, default 1024), `--dtype`, `--quant none|q8` (Q8-resident CPU weights;
+`--quant q8` does not touch NPU-packed weights) and `--defer-towers`.
 
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final
@@ -294,7 +336,7 @@ OTEL_SDK_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 protoc --decode_raw < /tmp/otel-capture/*.bin
 ```
 
-## Qwen3-Embedding-0.6B (`qwen3`)
+## Qwen3-Embedding-0.6B
 
 Embedding-only Qwen3 (no `lm_head`): 28 layers, hidden 1024, GQA 16/8 heads,
 head_dim 128, QK-RMSNorm, RoPE θ=1e6, SwiGLU, final RMSNorm, last-token
@@ -304,25 +346,24 @@ pooling. Reference: production `ik_llama.cpp` Q8_0 (`--pooling last`).
 M=~/models/qwen3-embedding-0.6b
 B=target/release/rocket-inference
 
-# single-core benchmark on a fixed text
-taskset -c 2 $B qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
+# single-core benchmark on a fixed text (CPU path)
+taskset -c 2 $B bench --model-dir $M --device cpu --cpu-backend flex --dtype f32 \
+    --tokens 3633 --reps 2 --attn-kernel blocked --chunk 256 --key-block 256
 
 # embed one text (writes a JSON float array)
-$B qwen3 embed --backend flex --dtype f32 --quant q8 --text "Hello world" --out out.json
+$B embed --model-dir $M --device cpu --dtype f32 --quant q8 --text "Hello world" --out out.json
 ```
 
-Flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--backend cpu|flex`,
-`--dtype f32|f16|bf16` (default: the checkpoint's native dtype, bf16; `--dtype f32`
-is the parity/speed mode on CPU), `--quant none|q8` (q8 = Q8-resident
-low-RAM mode; its dequant follows the model dtype), `--attn fused|blocked`, `--chunk`, `--key-block` (blocked
-attention only), `--tokens`, `--text`, `--text-file`, `--out`; `gemm` adds
-`--m/--n/--k/--transb`. Serving uses the flags of the [Serving](#serving)
-section.
+`embed`/`bench`/`tokenize` detect the family; the Qwen3 flags are the shared
+load flags plus `--tokens`, `--text`, `--text-file`, `--out`. Placement:
+`--device npu` for text + attention on the NPU, or `--device cpu --text-device
+npu` for NPU projections with CPU attention. `gemm` takes `--m/--n/--k/--transb`
+and no model. See [`docs/recipes/qwen3.md`](docs/recipes/qwen3.md).
 
 Two attention paths, both causal and numerically identical: `fused` (default,
 flex's tiled flash-attention kernel; best for long inputs and multi-thread) and
 `blocked` (portable blocked online softmax; best single-threaded). Single-core
-runs are fastest with `--attn blocked --chunk 256 --key-block 256`.
+runs are fastest with `--attn-kernel blocked --chunk 256 --key-block 256`.
 
 ### Dev-host results
 
@@ -374,16 +415,16 @@ are each one segmented weight) and keeps only an f16 embedding table on the CPU
 | Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
 |---|---|---|---|
 | CPU-only (f32) | 100.1 s | 36.3 tok/s | 622 |
-| `--npu --npu-attn cpu` | 86.9 s | 41.8 tok/s | 409 (-34%) |
-| `--npu` (NPU attention, default) | 80.8 s | 45.0 tok/s | **302 (-51%)** |
+| `--device cpu --text-device npu` (CPU attention) | 86.9 s | 41.8 tok/s | 409 (-34%) |
+| `--device npu` (NPU attention) | 80.8 s | 45.0 tok/s | **302 (-51%)** |
 
 Numerics: cosine 0.999365 vs the production Q8_0 reference; the NPU attention
 run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
-`rocket` module on the board (contained; reboot reverts). Native-bf16 `--npu`
-(the default) packs the same resident fp16 weights via an exact bf16->f16
-conversion: 2026-10-09 board A/B (log §17) 54.4 vs 57.8 tok/s (`--dtype f32`) at
-cosine 0.999845 vs f32 — a 6 % gap, down from 26 % when bf16 used the library's
-stream; `--npu` excludes `--quant q8`.
+``rocket` module on the board (contained; reboot reverts). Native-bf16
+`--device npu` (the default dtype) packs the same resident fp16 weights via an
+exact bf16->f16 conversion: 2026-10-09 board A/B (log §17) 54.4 vs 57.8 tok/s
+(`--dtype f32`) at cosine 0.999845 vs f32 — a 6 % gap, down from 26 % when bf16
+used the library's stream; `--quant q8` applies to CPU-resident weights only.
 
 A Q8_0 checkpoint does not get an int8 projection path: Q8_0's 32-value blocks are
 layout-identical to the driver's resident W8A8 group-wise weight at `group = 32`, but
@@ -393,26 +434,29 @@ probe (`crates/rocket-npu/src/bin/q8_bench.rs`, log §20) measures it 1.64x slow
 (numerics were fine, 0.9999929) — packing Q8_0 to resident fp16 at load stays the
 route (log §20).
 
-## Qwen3.5-0.8B intent (`intent`)
+## Qwen3.5-0.8B intent
 
 `guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder
 (18 Gated DeltaNet linear-attention layers + 6 gated full-attention layers) —
 a different family from Qwen3. It serves OpenViking's query-planner role (both the
 Ollama API and OpenAI chat; see [Serving](#serving)). The HF safetensors (`model.language_model.*`; the
-vision tower is skipped) load through the family's loader; `--npu` packs the
-projection groups into resident NPU weights for prefill and keeps f16 CPU copies
-for single-token decode.
+vision tower is skipped) load through the family's loader; `--text-device npu`
+packs the projection groups into resident NPU weights for prefill and keeps f16
+CPU copies for single-token decode.
 
 ```sh
 M=~/models/ov-intent-analysis-sft
 # one-shot greedy generation (raw prompt; drop --raw to wrap in the ChatML template)
-$B intent gen --model-dir $M --text "Hello!" --raw --max-new-tokens 32
+$B gen --model-dir $M --device auto --text "Hello!" --raw --max-new-tokens 32
 ```
 
-Flags: `--model-dir` (default `~/models/ov-intent-analysis-sft`), `--backend`,
-`--text`, `--text-file`, `--raw`, `--max-tokens`, `--max-new-tokens`,
-`--temperature`, `--delta-chunk`, `--npu`, `--npu-threads`, `--embed-f16`,
-`--pure-npu`, `--npu-decode`, `--dump-hidden`, `--dump-steps`.
+Flags: the shared load flags plus `--text`, `--text-file`, `--raw`,
+`--max-tokens`, `--max-new-tokens`, `--temperature`, `--delta-chunk`,
+`--embed-f16`, `--dump-hidden`, `--dump-steps`. Placement: `--device auto`
+(prefill on the NPU, decode on the CPU) keeps the CPU copies; `--device npu`
+also places decode on the NPU and drops them (CPU relief, not speed); `--device
+auto --decode-device npu --keep-cpu-weights yes` is the old `--npu-decode`.
+See [`docs/recipes/intent.md`](docs/recipes/intent.md).
 
 The Ollama endpoints accept any request `Content-Type` (like Ollama itself):
 litellm's Ollama client posts its bodies as `application/octet-stream` (litellm
@@ -425,16 +469,16 @@ On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
 | Mode | Prefill | Decode | Total | Anon RSS |
 |---|---|---|---|---|
 | CPU f32 | 7.91 s | 82.05 s (0.4 tok/s) | 89.96 s | ~2.4 GB |
-| `--npu --npu-threads 3` | 2.94 s | 8.71 s (3.7 tok/s) | **11.65 s** | 2.06 GB |
-| `--npu --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
+| `--device auto --npu-threads 3` | 2.94 s | 8.71 s (3.7 tok/s) | **11.65 s** | 2.06 GB |
+| `--device auto --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
 
 The CPU f32 and NPU f32-table outputs are token-identical to the HF transformers
 reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0).
 `--embed-f16` is faster and smaller but its f16 LM head flips near-ties.
-`--pure-npu` drops the CPU copies entirely and runs decode on the NPU too
+`--device npu` drops the CPU copies entirely and runs decode on the NPU too
 (1.5 tok/s), useful only when CPU should be left alone.
 
-## EmbeddingGemma 2 (`gemma embed|bench|tokenize|serve`)
+## EmbeddingGemma 2
 
 [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) is a
 multimodal embedding model built from the Gemma 4 family: a 270M-parameter
@@ -448,43 +492,44 @@ video and audio — is implemented, reproducing the HF reference numerics
 M=~/models/embeddinggemma-2
 
 # text embedding (768-d, L2-normalized; --dim for MRL truncation, --prompt for task prefixes)
-$B gemma embed --model-dir $M --text "what is the capital of france?" --out out.json
-$B gemma embed --model-dir $M --prompt query --dim 256 --text-file data/one_long.txt --out out.json
+$B embed --model-dir $M --device npu --text "what is the capital of france?" --out out.json
+$B embed --model-dir $M --device npu --prompt query --dim 256 --text-file data/one_long.txt --out out.json
 
-# low-RAM mode: Q8-resident projections, dequantized per call (1216 MiB vs 2845 MiB)
-$B gemma embed --model-dir $M --quant q8 --text-file data/one_long.txt --out out.json
+# low-RAM CPU mode: Q8-resident projections, dequantized per call
+$B embed --model-dir $M --device cpu --quant q8 --text-file data/one_long.txt --out out.json
 
 # image (the placeholder <|image|> is expanded to BOI + soft tokens + EOI)
-$B gemma embed --model-dir $M --image data/cat.jpeg --out img.json
+$B embed --model-dir $M --device npu --image data/cat.jpeg --out img.json
 # video (1 fps, max 32 frames; each frame expands to BOI + <|video|>*140 + EOI in
 # the shared context) and audio (16 kHz mono WAV; else ffmpeg)
-$B gemma embed --model-dir $M --video data/test.mp4 --out vid.json
-$B gemma embed --model-dir $M --audio data/speech5s.wav --out audio.json
+$B embed --model-dir $M --device npu --video data/test.mp4 --out vid.json
+$B embed --model-dir $M --device npu --audio data/speech5s.wav --out audio.json
 
 # timings and token ids
-$B gemma bench --model-dir $M --text-file data/one_long.txt --reps 2
-$B gemma tokenize --model-dir $M --text "hello"
+$B bench --model-dir $M --device npu --text-file data/one_long.txt --reps 2
+$B tokenize --model-dir $M --text "hello"
 ```
+
+The three deployment profiles with measured board numbers are in
+[`docs/recipes/embeddinggemma2.md`](docs/recipes/embeddinggemma2.md).
 
 Video decoding and non-WAV audio shell out to `ffmpeg`/`ffprobe`; the container
 image installs both (the Dockerfile gates the build on `-version`), so a bare
 host needs the packages (`apt-get install ffmpeg`).
 
-Flags: `--model-dir` (default `~/models/embeddinggemma-2`), `--backend`,
-`--dtype f32|bf16` (default: native bf16; f16 is rejected — RMSNorm/softmax/PLE
-need f32/bf16 range), `--text`,
-`--text-file`, `--image`, `--video`, `--video-fps`, `--video-max-frames`,
-`--audio`, `--max-soft-tokens`, `--video-soft-tokens`, `--prompt`, `--dim`,
-`--no-normalize`, `--tokens`, `--reps`, `--out`, `--attn-chunk`,
-`--vision-attn npu|fused|blocked` (vision tower attention: `npu` = the NPU
-attention op, the default under `--npu`; `fused` = the backend's fused flash
-kernel, the CPU default since log §18.3 and the explicit CPU fallback; `blocked`
-= the tensor-op chunked parity fallback. `npu` requires `--npu` on an aarch64
-`npu` build; Gemma 4 keeps `blocked` and rejects the flag),
-`--quant none|q8`,
-`--npu`, `--npu-threads`, `--npu-attn npu|cpu`, `--npu-int8`,
-`--npu-int8-group` (default 32), `--defer-towers`, plus `--dump-*`
-debug hooks. On the NPU build, `ROCKET_CTX_CANONICAL=0` restores the legacy
+Flags: the shared load flags plus `--text`, `--text-file`, `--image`,
+`--video`, `--video-fps`, `--video-max-frames`, `--audio`, `--max-soft-tokens`,
+`--video-soft-tokens`, `--prompt`, `--dim`, `--no-normalize`, `--tokens`,
+`--reps`, `--out`, `--attn-chunk`, `--vision-attn-kernel fused|blocked` (the
+CPU vision-attention kernel, used when `--vision-attn-device cpu`) and the
+`--dump-*` debug hooks. `--dtype auto|f32|bf16` defaults to native bf16 (`f16`
+is rejected: RMSNorm/softmax/PLE need the f32/bf16 range). Placement:
+`--text-device`, `--text-attn-device`, `--vision-device` and
+`--vision-attn-device`; the vision attention is on the NPU exactly when that
+stage is offloaded, otherwise `--vision-attn-kernel` picks the CPU kernel.
+`--npu-dtype int8` + `--int8-group` pack the text projections as resident
+W8A8. `--defer-towers` loads each tower half on first use. On the NPU build,
+`ROCKET_CTX_CANONICAL=0` restores the legacy
 pad-to-256 tiling, `ROCKET_GLUE=0/1` toggles the fused host kernels
 (`--npu` enables them; `=1` forces them in CPU modes),
 `ROCKET_NPU_TOWERS=0` keeps the vision tower's projections on the CPU instead of
@@ -516,6 +561,11 @@ Server examples (and the `/embed` request shapes) are in
 truncation before normalization.
 
 ### Verification and memory
+
+> The measurements in this section were taken with the flags of their date
+> (`--npu`, `--npu-attn`, `--npu-int8`, `--vision-attn`, ...). They remain valid
+> for the equivalent placement; [`docs/recipes/README.md`](docs/recipes/README.md)
+> maps the old names to the current per-stage flags.
 
 Summary against the HF f32 reference (transformers 5.19; full table in the log):
 
@@ -560,7 +610,7 @@ weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) v
 0.999939 vs f32. Against the deployed `--quant q8` arm, though, bf16 loses
 ~20–25 % on the quiet board (log §18: 843 tok 4.5–5.0 s vs 3.6–4.0 s; 4203 tok
 29.3–30.8 s vs 24.5–26.5 s), so the production service keeps
-`--dtype f32 --quant q8 --npu --npu-attn npu --attn-chunk 1024 --defer-towers`.
+`--dtype f32 --quant q8 --device npu --attn-chunk 1024 --defer-towers`.
 The vision tower's projections are packed into resident NPU weights as well
 (§18.3); the audio tower, norms, RoPE and the embedding table stay on the CPU.
 
@@ -622,7 +672,7 @@ Known limits: audio resampling is exact for 16 kHz mono WAV (other rates go
 through ffmpeg, ~0.994 cosine vs librosa/soxr); batch inputs are processed one
 at a time.
 
-## Gemma 4 E2B-it (`gemma gen`)
+## Gemma 4 E2B-it
 
 `google/gemma-4-E2B-it` (10.25 GB BF16 checkpoint): the causal Gemma 4 decoder
 with KV sharing (layers 15-34 reuse the K/V of layer 13/14 and use double-wide
@@ -634,24 +684,25 @@ to the HF 5.19 reference (see the log).
 G=/mnt/hub/models/gemma-4-E2B-it   # dev host; ~/models/gemma-4-E2B-it elsewhere
 
 # greedy generation (f32 parity mode)
-$B gemma gen --gen-model-dir $G --text "What is the capital of France?" --max-new-tokens 64
+$B gen --model-dir $G --device auto --defer-towers --text "What is the capital of France?" --max-new-tokens 64
 # chat-style messages and sampling
-$B gemma gen --gen-model-dir $G \
+$B gen --model-dir $G --device auto --defer-towers \
     --messages '[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}]' \
     --sample --temperature 0.7 --top-k 64 --top-p 0.95
 # image / audio input (the placeholder expands to the tower's soft tokens)
-$B gemma gen --gen-model-dir $G --text "What is in this image? <|image|>" --image data/cat.jpeg
-$B gemma gen --gen-model-dir $G --text "What do you hear? <|audio|>" --audio data/speech5s.wav
+$B gen --model-dir $G --device auto --defer-towers --text "What is in this image? <|image|>" --image data/cat.jpeg
+$B gen --model-dir $G --device auto --defer-towers --text "What do you hear? <|audio|>" --audio data/speech5s.wav
 ```
 
-Flags: `--gen-model-dir` (default `/mnt/hub/models/gemma-4-E2B-it`), `--backend`,
-`--text`, `--text-file`, `--image`, `--audio`, `--max-soft-tokens`,
-`--video-fps`, `--video-max-frames`, `--messages`, `--max-new-tokens`,
-`--sample`, `--temperature`, `--top-k`, `--top-p`, `--enable-thinking`,
-`--dtype f32|f16|bf16`, `--f16`, `--quant none|q8`, `--defer-towers`,
-`--npu`, `--npu-threads`, `--attn-chunk`, `--dump-logits`,
-`--out`. Serving uses `--model-dir` and the flags of the [Serving](#serving)
-section.
+Flags: the shared load flags plus `--text`, `--text-file`, `--image`,
+`--audio`, `--max-soft-tokens`, `--video-fps`, `--video-max-frames`,
+`--messages`, `--max-new-tokens`, `--sample`, `--temperature`, `--top-k`,
+`--top-p`, `--enable-thinking`, `--dump-logits`, `--out`. Placement:
+`--device auto` packs the text projections and runs prefill on the NPU with
+decode on the CPU; `--device npu` also places decode on the NPU and drops the
+CPU copies (`--keep-cpu-weights yes` keeps them); `--defer-towers` loads each
+tower half on first use. The vision/audio towers are not NPU-packed for this
+family. See [`docs/recipes/gemma4.md`](docs/recipes/gemma4.md).
 
 Precision modes (`gen` and serving), measured on the dev host (32 threads,
 16-token prompt / 9-token answer):
@@ -660,7 +711,7 @@ Precision modes (`gen` and serving), measured on the dev host (32 threads,
 |---|---|---|---|---|
 | f32 | `--dtype f32` | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
 | bf16 (default) | - | 9889 MiB | 0.54 tok/s | native bf16 weights with the f32 body; 9/9 tokens identical to HF on the short prompt; **decode is 6.6x slower than f32** (flex's per-call bf16->f32 GEMM conversion) |
-| f16 | `--f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
+| f16 | `--dtype f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
 | Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call |
 
 The served chat endpoints are non-streaming (OpenAI) / single-line NDJSON
@@ -674,18 +725,18 @@ in the text part.
 `google/gemma-4-E2B-it-qat-mobile-transformers` (2.46 GB) is supported natively
 — no conversion step. Weights are packed INT2/INT4/INT8 with per-output-channel
 scales (per-row block scales for the token tables) and the checkpoint's SRQ
-activation rounding is applied around the affected linears. `--f16` is the
-useful configuration:
+activation rounding is applied around the affected linears. `--dtype f16` is
+the useful configuration:
 
 ```sh
-$B gemma gen --gen-model-dir ~/models/gemma-4-E2B-it-qat-mobile --f16 \
-    --text "What is the capital of France?" --max-new-tokens 16
+$B gen --model-dir ~/models/gemma-4-E2B-it-qat-mobile --dtype f16 --defer-towers \
+    --device auto --text "What is the capital of France?" --max-new-tokens 16
 ```
 
 | mode (text-only, `--defer-towers`) | peak anon | short decode | notes |
 |---|---|---|---|
 | f32 | 9.2 GiB | 3.9 tok/s | parity mode (f32 projections) |
-| `--f16` | 4.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
+| `--dtype f16` | 4.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
 | `--quant q8` | 3.7 GiB | 0.07 tok/s | memory-only |
 
 Both token tables stay packed in memory: the PLE table (as before) and the
@@ -698,22 +749,23 @@ init — an 8.75 GiB write — which was the real load peak and ~30 s of load
 time; f16 load is now ~22 s). `--defer-towers` skips the vision/audio towers at
 load (~1.9 GiB f32) and installs each half on the first request that uses it
 (image loads the 0.64 GiB vision half, audio the 1.16 GiB audio half, each ~1.6-2.5 s
-f32; log §22); `--f16 --defer-towers` is the low-memory serving configuration
+f32; log §22); `--dtype f16 --defer-towers` is the low-memory serving configuration
 (4.7 GiB peak anon text-only, 5.3 GiB with the vision half, 6.5 GiB with both).
 The towers always load f32 — the validated multimodal mode — while the text body
 keeps the selected dtype.
 
 The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
 2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the
-631-token prompt matched 16/16 with `--f16` (HF bf16 reference). SRQ makes
+631-token prompt matched 16/16 with `--dtype f16` (HF bf16 reference). SRQ makes
 long-context near-ties sensitive; `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug
 hooks.
 
 ### NPU prefill
 
-`--npu` packs the used text projections into resident fp16 NPU weights and runs
-prefill matmuls + `attention_causal_window` on the NPU, while decode keeps the
-CPU f32 copies. Board measurement pending an idle board (the model needs
+`--text-device npu` packs the used text projections into resident fp16 NPU
+weights and runs prefill matmuls + `attention_causal_window` on the NPU, while
+decode keeps the CPU f32 copies. `--device npu` also routes decode through the
+packed weights and drops the copies. Board measurement pending an idle board (the model needs
 ~9.5 GB host + 2.1 GiB NPU; the 2026-10-07 attempt was OOM-killed on a busy
 board). Not yet done: streaming, video input.
 

@@ -1,17 +1,16 @@
-//! `serve`: load one model (auto-detected from the checkpoint's `config.json`
-//! or selected with `--family`) and serve every endpoint compatible with it.
+//! `serve`: load one model for the detected/overridden family and serve every
+//! endpoint compatible with it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, bail};
-use burn::tensor::DType;
 use tokenizers::Tokenizer;
 
-use crate::cli::FlagArgs;
+use crate::cli::{FlagArgs, LoadArgs, ResolvedLoad};
+use crate::commands::{gemma4_load_dtype, resolve};
 use crate::gemma::embeddinggemma::load as emb2_load;
-use crate::gemma::gemma4::loader::{self as gen_loader, LoadDtype};
+use crate::gemma::gemma4::loader as gen_loader;
 use crate::gemma::inputs;
-use crate::gemma::vision::VisionAttn;
 use crate::qwen3_embedding::load as qwen3_load;
 use crate::qwen35_intent::loader as intent_loader;
 use crate::qwen35_intent::loader::IntentLoadOptions;
@@ -25,14 +24,23 @@ use super::engine::{
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let args = Args::parse(FlagArgs::new(it))?;
-    let model_dir = args.model_dir();
-    let family = match args.family {
-        Some(family) => family,
-        None => super::engine::detect_family(&model_dir)?,
-    };
-    args.validate(family)?;
+    let Args {
+        load,
+        port,
+        model_name,
+        max_tokens,
+        max_new_tokens,
+        temperature,
+        video_fps,
+        video_max_frames,
+        delta_chunk,
+    } = args;
+    let load = resolve(load)?;
+    validate(&load, video_fps, video_max_frames, delta_chunk)?;
+    let model_dir = load.model_dir.clone();
+    let family = load.family;
 
-    let device = device(&args.backend())?;
+    let device = device(&load.cpu_backend)?;
     let tokenizer = || -> Result<Tokenizer> {
         crate::util::checkpoint::open_in_dir(&model_dir)?
             .tokenizer()
@@ -46,50 +54,20 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         Family::Intent => (30000, 256),
         Family::Gemma4 => (30000, 64),
     };
-    let max_tokens = args.max_tokens.unwrap_or(default_max_tokens);
-    let max_new_tokens = args.max_new_tokens.unwrap_or(default_max_new);
-    let temperature = args.temperature.unwrap_or(0.0);
+    let max_tokens = max_tokens.unwrap_or(default_max_tokens);
+    let max_new_tokens = max_new_tokens.unwrap_or(default_max_new);
+    let temperature = temperature.unwrap_or(0.0);
 
-    // NPU offload is `serve`'s default on builds that have it (aarch64 + the
-    // `npu` feature); `--no-npu` forces the flex CPU path, and `--quant q8`
-    // (the CPU low-RAM mode) keeps the CPU path unless `--npu` is explicit.
-    let npu = resolve_npu(
-        cfg!(all(feature = "npu", target_arch = "aarch64")),
-        args.npu,
-        args.no_npu.unwrap_or(false),
-        args.quant.unwrap_or(false),
-    );
-
-    // The model dtype: the checkpoint's native float dtype unless --dtype says
-    // otherwise (families without a dtype flag handle their native dtype in their
-    // own loader).
-    let dtype = args
-        .dtype
-        .unwrap_or_else(|| crate::util::checkpoint::default_dtype_in_dir(&model_dir));
-    // The EmbeddingGemma 2 tower's attention: resolved before loading so a bad
-    // `--vision-attn npu` fails fast (the flag is rejected for other families
-    // by `validate`).
-    let vision_attn = (family == Family::Emb2)
-        .then(|| {
-            resolve_vision_attn(
-                cfg!(all(feature = "npu", target_arch = "aarch64")),
-                args.vision_attn,
-                npu,
-            )
-        })
-        .transpose()?;
     let (engine, capabilities) = match family {
         Family::Qwen3Embed => {
             let mut ckpt = crate::util::checkpoint::open_in_dir(&model_dir)?;
-            let (model, cfg) = qwen3_load::load_model(
-                &mut ckpt,
-                dtype,
-                args.quant.unwrap_or(false),
-                npu,
-                args.npu_threads.unwrap_or(5),
-                args.npu_attn.unwrap_or(true),
-                &device,
-            )?;
+            let npu = load.placement.any_npu().then_some(qwen3_load::NpuOpts {
+                threads: load.npu_threads,
+                text: load.placement.text,
+                attn: load.placement.text_attn,
+            });
+            let (model, cfg) =
+                qwen3_load::load_model(&mut ckpt, load.dtype, load.quant_q8, npu, &device)?;
             let tokenizer = ckpt.tokenizer()?;
             (
                 Engine::Qwen3(Box::new(Qwen3Engine {
@@ -97,10 +75,10 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     cfg,
                     tokenizer,
                     device,
-                    dtype,
-                    chunk: args.chunk.unwrap_or(256),
-                    key_block: args.key_block.unwrap_or(256),
-                    attn_fused: args.attn.unwrap_or(true),
+                    dtype: load.dtype,
+                    chunk: load.chunk,
+                    key_block: load.key_block,
+                    attn_fused: crate::cli::AttnKernel::Fused == load.attn_kernel,
                     max_tokens,
                 })),
                 Capabilities {
@@ -111,39 +89,41 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )
         }
         Family::Emb2 => {
-            let quant_q8 = args.quant.unwrap_or(false);
+            let npu = load.placement.any_npu().then_some(emb2_load::NpuOpts {
+                threads: load.npu_threads,
+                text: load.placement.text,
+                attn: load.placement.text_attn,
+                vision: load.placement.vision,
+                vision_attn: load.placement.vision_attn,
+                int8: load.npu_dtype == crate::cli::NpuDtype::Int8,
+                i8_group: load.int8_group,
+            });
             let (model, _cfg) = emb2_load::load_model(
                 &model_dir,
-                dtype,
-                quant_q8,
-                npu.then_some(emb2_load::NpuOpts {
-                    threads: args.npu_threads.unwrap_or(5),
-                    attn: args.npu_attn.unwrap_or(true),
-                    int8: false,
-                    i8_group: 32,
-                }),
-                args.defer_towers.unwrap_or(false),
+                load.dtype,
+                load.quant_q8,
+                npu,
+                load.defer_towers,
                 &device,
             )?;
             let tokenizer = tokenizer()?;
             let (image_soft_tokens, video_soft_tokens) = inputs::media_soft_tokens(&model_dir);
-            let vision_attn = vision_attn.expect("resolved for EmbeddingGemma 2");
             (
                 Engine::Emb2(Box::new(Emb2Engine {
                     model,
                     tokenizer,
                     device,
-                    dtype,
+                    dtype: load.dtype,
                     model_dir: model_dir.clone(),
-                    quant_q8,
-                    npu_pack: npu,
+                    quant_q8: load.quant_q8,
+                    npu_pack: load.placement.vision,
                     max_tokens,
-                    attn_chunk: args.attn_chunk.unwrap_or(1024),
-                    vision_attn,
+                    attn_chunk: load.attn_chunk,
+                    vision_attn: load.placement.vision_attn(load.vision_attn_kernel),
                     image_soft_tokens,
                     video_soft_tokens,
-                    video_fps: args.video_fps.unwrap_or(1.0),
-                    video_max_frames: args.video_max_frames.unwrap_or(32),
+                    video_fps: video_fps.unwrap_or(1.0),
+                    video_max_frames: video_max_frames.unwrap_or(32),
                     prompts: inputs::task_prompts(&model_dir),
                 })),
                 Capabilities {
@@ -155,18 +135,18 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
         Family::Intent => {
             let opts = IntentLoadOptions {
-                npu,
-                npu_threads: args.npu_threads.unwrap_or(5),
-                embed_f16: args.embed_f16.unwrap_or(false),
-                pure_npu: args.pure_npu.unwrap_or(false),
+                npu: load.placement.text,
+                text: load.placement.text,
+                decode: load.placement.decode,
+                keep_cpu_weights: load.keep_cpu_weights,
+                npu_threads: load.npu_threads,
+                embed_f16: load.embed_f16,
             };
             let loaded = intent_loader::load_for_serving(
                 &model_dir,
                 &device,
                 &opts,
-                args.delta_chunk.unwrap_or(64),
-                opts.pure_npu,
-                args.npu_decode.unwrap_or(false),
+                delta_chunk.unwrap_or(64),
             )?;
             (
                 Engine::Intent(Box::new(IntentEngine {
@@ -183,40 +163,23 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )
         }
         Family::Gemma4 => {
-            // Flags win; otherwise load the checkpoint's native dtype.
-            let dtype = if args.quant.unwrap_or(false) {
-                LoadDtype::Q8
-            } else if let Some(dt) = args.dtype {
-                match dt {
-                    DType::F32 => LoadDtype::F32,
-                    DType::F16 => LoadDtype::F16,
-                    DType::BF16 => LoadDtype::Bf16,
-                    other => bail!("unsupported dtype {other:?} for Gemma 4"),
-                }
-            } else if args.gen_f16.unwrap_or(false) {
-                LoadDtype::F16
-            } else {
-                LoadDtype::from_native(&model_dir)
-            };
+            let dtype = gemma4_load_dtype(&load);
             #[allow(unused_mut)]
-            let (mut model, cfg) = gen_loader::load_gen_model(
-                &model_dir,
-                dtype,
-                &device,
-                args.defer_towers.unwrap_or(false),
-            )?;
+            let (mut model, cfg) =
+                gen_loader::load_gen_model(&model_dir, dtype, &device, load.defer_towers)?;
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            if npu {
+            if load.placement.text {
                 gen_loader::pack_text_for_prefill(
                     &mut model,
-                    args.npu_threads.unwrap_or(5),
+                    load.npu_threads,
                     &device,
-                    true,
+                    load.keep_cpu_weights,
+                    load.placement.decode,
                 )?;
             }
             #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-            if npu {
-                bail!("--npu requires an aarch64 build with --features npu");
+            if load.placement.any_npu() {
+                bail!("an NPU placement requires an aarch64 build with `--features npu`");
             }
             let lm_head = gen_loader::build_lm_head(model.text(), dtype.tensor_dtype(), &device);
             let tokenizer = tokenizer()?;
@@ -230,7 +193,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     model_dir: model_dir.clone(),
                     pad_id: cfg.text_config.pad_token_id.unwrap_or(0),
                     eos: crate::gemma::gemma4::chat::gen_eos(&model_dir),
-                    attn_chunk: args.attn_chunk.unwrap_or(1024),
+                    attn_chunk: load.attn_chunk,
                     image_soft_tokens,
                     video_soft_tokens,
                 })),
@@ -243,10 +206,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
     };
 
-    let model_name = args
-        .model_name
-        .clone()
-        .unwrap_or_else(|| dir_name(&model_dir));
+    let model_name = model_name.unwrap_or_else(|| dir_name(&model_dir));
     let settings = Settings {
         model_name,
         family,
@@ -256,7 +216,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         temperature,
     };
     super::serve(
-        &format!("0.0.0.0:{}", args.port.unwrap_or(8383)),
+        &format!("0.0.0.0:{}", port.unwrap_or(8383)),
         engine,
         settings,
     )
@@ -271,51 +231,24 @@ fn dir_name(dir: &Path) -> String {
 /// Flags as given (unset = use the family default).
 #[derive(Default)]
 struct Args {
-    model_dir: Option<PathBuf>,
-    family: Option<Family>,
-    backend: Option<String>,
+    load: LoadArgs,
     port: Option<u16>,
     model_name: Option<String>,
     max_tokens: Option<usize>,
     max_new_tokens: Option<usize>,
     temperature: Option<f32>,
-    dtype: Option<DType>,
-    quant: Option<bool>,
-    npu: Option<bool>,
-    no_npu: Option<bool>,
-    npu_threads: Option<usize>,
-    npu_attn: Option<bool>,
-    chunk: Option<usize>,
-    key_block: Option<usize>,
-    attn: Option<bool>,
-    attn_chunk: Option<usize>,
-    vision_attn: Option<VisionAttn>,
     video_fps: Option<f64>,
     video_max_frames: Option<usize>,
     delta_chunk: Option<usize>,
-    embed_f16: Option<bool>,
-    pure_npu: Option<bool>,
-    npu_decode: Option<bool>,
-    gen_f16: Option<bool>,
-    defer_towers: Option<bool>,
 }
 
 impl Args {
     fn parse(mut f: FlagArgs) -> Result<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let mut args = Args::default();
-        if let Some(v) = f.take("--model-dir")? {
-            args.model_dir = Some(PathBuf::from(v));
-        }
-        if let Some(v) = f.take("--family")? {
-            args.family = match v.as_str() {
-                "auto" => None,
-                other => Some(Family::parse(other)?),
-            };
-        }
-        if let Some(v) = f.take("--backend")? {
-            args.backend = Some(v);
-        }
+        let load = LoadArgs::parse(&mut f)?;
+        let mut args = Args {
+            load,
+            ..Default::default()
+        };
         if let Some(v) = f.take_parsed("--port")? {
             args.port = Some(v);
         }
@@ -331,40 +264,6 @@ impl Args {
         if let Some(v) = f.take_parsed("--temperature")? {
             args.temperature = Some(v);
         }
-        if let Some(v) = f.take("--dtype")? {
-            args.dtype = Some(match v.as_str() {
-                "f32" => DType::F32,
-                "f16" => DType::F16,
-                "bf16" => DType::BF16,
-                other => bail!("unsupported dtype '{other}' (expected f32|f16|bf16)"),
-            });
-        }
-        if let Some(v) = f.take_choice("--quant", &["none", "q8"])? {
-            args.quant = Some(v == "q8");
-        }
-        args.npu = f.take_flag("--npu");
-        args.no_npu = f.take_flag("--no-npu");
-        if let Some(v) = f.take_parsed("--npu-threads")? {
-            args.npu_threads = Some(v);
-        }
-        if let Some(v) = f.take_choice("--npu-attn", &["npu", "cpu"])? {
-            args.npu_attn = Some(v == "npu");
-        }
-        if let Some(v) = f.take_parsed("--chunk")? {
-            args.chunk = Some(v);
-        }
-        if let Some(v) = f.take_parsed("--key-block")? {
-            args.key_block = Some(v);
-        }
-        if let Some(v) = f.take_choice("--attn", &["fused", "blocked"])? {
-            args.attn = Some(v == "fused");
-        }
-        if let Some(v) = f.take_parsed("--attn-chunk")? {
-            args.attn_chunk = Some(v);
-        }
-        if let Some(v) = f.take_choice("--vision-attn", &["npu", "fused", "blocked"])? {
-            args.vision_attn = Some(VisionAttn::parse(&v).expect("validated by take_choice"));
-        }
         if let Some(v) = f.take_parsed("--video-fps")? {
             args.video_fps = Some(v);
         }
@@ -374,238 +273,34 @@ impl Args {
         if let Some(v) = f.take_parsed("--delta-chunk")? {
             args.delta_chunk = Some(v);
         }
-        args.embed_f16 = f.take_flag("--embed-f16");
-        args.pure_npu = f.take_flag("--pure-npu");
-        args.npu_decode = f.take_flag("--npu-decode");
-        args.gen_f16 = f.take_flag("--f16");
-        args.defer_towers = f.take_flag("--defer-towers");
         f.finish("serve")?;
-        // Defaults that are not family-specific.
-        if args.model_dir.is_none() {
-            args.model_dir = Some(PathBuf::from(format!("{home}/models/qwen3-embedding-0.6b")));
-        }
         Ok(args)
     }
-
-    fn model_dir(&self) -> PathBuf {
-        self.model_dir
-            .clone()
-            .expect("model-dir defaulted in parse")
-    }
-
-    fn backend(&self) -> String {
-        self.backend
-            .clone()
-            .unwrap_or_else(|| if cfg!(feature = "cpu") { "cpu" } else { "flex" }.to_string())
-    }
-
-    /// Reject flags that do not apply to the detected model.
-    fn validate(&self, family: Family) -> Result<()> {
-        let allowed: &[&str] = match family {
-            Family::Qwen3Embed => &[
-                "model-dir",
-                "family",
-                "backend",
-                "port",
-                "model-name",
-                "max-tokens",
-                "max-new-tokens",
-                "temperature",
-                "dtype",
-                "quant",
-                "npu",
-                "no-npu",
-                "npu-threads",
-                "npu-attn",
-                "chunk",
-                "key-block",
-                "attn",
-            ],
-            Family::Emb2 => &[
-                "model-dir",
-                "family",
-                "backend",
-                "port",
-                "model-name",
-                "max-tokens",
-                "max-new-tokens",
-                "temperature",
-                "dtype",
-                "quant",
-                "npu",
-                "no-npu",
-                "npu-threads",
-                "npu-attn",
-                "attn-chunk",
-                "vision-attn",
-                "video-fps",
-                "video-max-frames",
-                "defer-towers",
-            ],
-            Family::Intent => &[
-                "model-dir",
-                "family",
-                "backend",
-                "port",
-                "model-name",
-                "max-tokens",
-                "max-new-tokens",
-                "temperature",
-                "npu",
-                "no-npu",
-                "npu-threads",
-                "delta-chunk",
-                "embed-f16",
-                "pure-npu",
-                "npu-decode",
-            ],
-            Family::Gemma4 => &[
-                "model-dir",
-                "family",
-                "backend",
-                "port",
-                "model-name",
-                "max-tokens",
-                "max-new-tokens",
-                "temperature",
-                "quant",
-                "npu",
-                "no-npu",
-                "npu-threads",
-                "f16",
-                "attn-chunk",
-                "defer-towers",
-            ],
-        };
-        let set: [(&str, bool); 27] = [
-            ("model-dir", self.model_dir.is_some()),
-            ("family", self.family.is_some()),
-            ("backend", self.backend.is_some()),
-            ("port", self.port.is_some()),
-            ("model-name", self.model_name.is_some()),
-            ("max-tokens", self.max_tokens.is_some()),
-            ("max-new-tokens", self.max_new_tokens.is_some()),
-            ("temperature", self.temperature.is_some()),
-            ("dtype", self.dtype.is_some()),
-            ("quant", self.quant.is_some()),
-            ("npu", self.npu.is_some()),
-            ("no-npu", self.no_npu.is_some()),
-            ("npu-threads", self.npu_threads.is_some()),
-            ("npu-attn", self.npu_attn.is_some()),
-            ("chunk", self.chunk.is_some()),
-            ("key-block", self.key_block.is_some()),
-            ("attn", self.attn.is_some()),
-            ("attn-chunk", self.attn_chunk.is_some()),
-            ("vision-attn", self.vision_attn.is_some()),
-            ("video-fps", self.video_fps.is_some()),
-            ("video-max-frames", self.video_max_frames.is_some()),
-            ("delta-chunk", self.delta_chunk.is_some()),
-            ("embed-f16", self.embed_f16.is_some()),
-            ("pure-npu", self.pure_npu.is_some()),
-            ("npu-decode", self.npu_decode.is_some()),
-            ("f16", self.gen_f16.is_some()),
-            ("defer-towers", self.defer_towers.is_some()),
-        ];
-        for (name, present) in set {
-            if present && !allowed.contains(&name) {
-                bail!("--{name} does not apply to the {} model", family.name());
-            }
-        }
-        if self.gen_f16.is_some() && !allowed.contains(&"f16") {
-            bail!("--f16 does not apply to the {} model", family.name());
-        }
-        Ok(())
-    }
 }
 
-/// `serve`'s NPU decision. Offload is on by default on builds that have it
-/// (aarch64 + the `npu` feature); `--no-npu` forces the flex CPU path, and
-/// `--quant q8` — the CPU low-RAM mode — keeps the CPU path unless `--npu` is
-/// explicit (the qwen3 NPU loader packs its own weights and rejects q8).
-fn resolve_npu(available: bool, npu_flag: Option<bool>, no_npu: bool, quant_q8: bool) -> bool {
-    npu_flag.unwrap_or(available && !quant_q8) && !no_npu
-}
-
-/// `--vision-attn` for the EmbeddingGemma 2 tower: an explicit value, else the
-/// NPU kernel when the NPU path is in use (`--npu` on an aarch64 `npu` build)
-/// and the fused CPU kernel otherwise. `npu` is rejected without that path
-/// (there is no off-device implementation to fall back to).
-fn resolve_vision_attn(
-    available: bool,
-    requested: Option<VisionAttn>,
-    npu: bool,
-) -> Result<VisionAttn> {
-    if requested == Some(VisionAttn::Npu) {
-        if !available {
-            bail!("--vision-attn npu requires an aarch64 build with --features npu");
-        }
-        if !npu {
-            bail!(
-                "--vision-attn npu requires --npu (the vision tower's attention runs on the NPU)"
-            );
-        }
-    }
-    Ok(match requested {
-        Some(mode) => mode,
-        None if npu && available => VisionAttn::Npu,
-        None => VisionAttn::Fused,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{resolve_npu, resolve_vision_attn};
-    use crate::gemma::vision::VisionAttn;
-
-    #[test]
-    fn npu_defaults_on_only_when_available() {
-        assert!(resolve_npu(true, None, false, false));
-        assert!(!resolve_npu(false, None, false, false));
-    }
-
-    #[test]
-    fn quant_q8_keeps_the_cpu_path_unless_npu_is_explicit() {
-        assert!(!resolve_npu(true, None, false, true));
-        assert!(resolve_npu(true, Some(true), false, true));
-    }
-
-    #[test]
-    fn no_npu_forces_the_cpu_path() {
-        assert!(!resolve_npu(true, None, true, false));
-        assert!(!resolve_npu(true, Some(true), true, false));
-        assert!(!resolve_npu(false, Some(true), true, false));
-    }
-
-    #[test]
-    fn explicit_npu_reaches_the_loader() {
-        assert!(resolve_npu(true, Some(true), false, false));
-        assert!(resolve_npu(false, Some(true), false, false));
-    }
-
-    #[test]
-    fn vision_attn_defaults_to_npu_only_with_the_npu_path() {
-        assert_eq!(
-            resolve_vision_attn(true, None, true).unwrap(),
-            VisionAttn::Npu
-        );
-        assert_eq!(
-            resolve_vision_attn(true, None, false).unwrap(),
-            VisionAttn::Fused
-        );
-        assert_eq!(
-            resolve_vision_attn(false, None, false).unwrap(),
-            VisionAttn::Fused
-        );
-        // An explicit CPU mode wins even when the NPU path is active.
-        for mode in [VisionAttn::Fused, VisionAttn::Blocked] {
-            assert_eq!(resolve_vision_attn(true, Some(mode), true).unwrap(), mode);
-        }
-        // `npu` is scoped to the NPU path.
-        assert!(resolve_vision_attn(false, Some(VisionAttn::Npu), false).is_err());
-        assert!(resolve_vision_attn(true, Some(VisionAttn::Npu), false).is_err());
-        assert_eq!(
-            resolve_vision_attn(true, Some(VisionAttn::Npu), true).unwrap(),
-            VisionAttn::Npu
+/// Serve-only flags that depend on the detected family.
+fn validate(
+    load: &ResolvedLoad,
+    video_fps: Option<f64>,
+    video_max_frames: Option<usize>,
+    delta_chunk: Option<usize>,
+) -> Result<()> {
+    if video_fps.is_some() && load.family != Family::Emb2 {
+        bail!(
+            "--video-fps only applies to the embeddinggemma video input \
+             (the {} model has no video path)",
+            load.family.name()
         );
     }
+    if video_max_frames.is_some() && load.family != Family::Emb2 {
+        bail!(
+            "--video-max-frames only applies to the embeddinggemma video input \
+             (the {} model has no video path)",
+            load.family.name()
+        );
+    }
+    if delta_chunk.is_some() && load.family != Family::Intent {
+        bail!("--delta-chunk only applies to the intent model");
+    }
+    Ok(())
 }

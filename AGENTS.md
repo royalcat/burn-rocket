@@ -51,22 +51,27 @@ command (`src/server/`): it detects the checkpoint family from `config.json`
 Ollama API for chat models; `/health` + `/v1/models` always). The old commands
 `qwen3 serve`, `intent serve-ollama`, `gemma serve` and `gemma serve-chat` are gone;
 the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API.
-`serve` flags: `--model-dir` (default `~/models/qwen3-embedding-0.6b`), `--family`,
-`--backend`, `--port` (default 8383), `--model-name` (default: the model directory
-name), `--max-tokens`, `--max-new-tokens`, `--temperature`, plus the detected
-family's loading flags:
+**CLI refactor (2026-10-31)**: the family command tree is gone. Commands are
+`serve`, `embed`, `bench`, `gen`, `tokenize`, `gemm`; the family is detected from
+the checkpoint (`config.json` / GGUF arch) and `--family auto|qwen3|embeddinggemma|
+intent|gemma4` overrides it. `--model-dir` is required (or `-hf`). The commands
+are documented in `examples/rocket-inference/README.md`, with per-model
+balanced/full-offload/speed command lines in `examples/rocket-inference/docs/recipes/`
+(which also maps the old flag names used by the dated bullets below).
 
-- qwen3: `--dtype`, `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--chunk`, `--key-block`, `--attn`
-- EmbeddingGemma 2: `--quant`, `--npu`, `--npu-threads`, `--npu-attn`, `--npu-int8`, `--npu-int8-group`, `--attn-chunk`, `--video-fps`, `--video-max-frames`, `--defer-towers`
-- intent: `--npu`, `--npu-threads`, `--delta-chunk`, `--embed-f16`, `--pure-npu`, `--npu-decode`
-- Gemma 4: `--f16`, `--quant`, `--npu`, `--npu-threads`, `--attn-chunk`
-
-A flag that does not apply to the detected model is rejected.
-
-`serve` defaults to NPU offload on builds that have it (aarch64 + `--features npu`);
-`--no-npu` forces the flex CPU path, and `--quant q8` (the CPU low-RAM mode) keeps the
-CPU path unless `--npu` is explicit. The standalone `qwen3`/`gemma`/`intent` commands
-keep `--npu` opt-in.
+Placement is per stage: `--device auto|cpu|npu` sets the base, and
+`--text-device`, `--text-attn-device`, `--vision-device`,
+`--vision-attn-device`, `--decode-device` override individual stages. `auto` is
+NPU-first on aarch64 + the `npu` feature (decode stays on the CPU); `--device cpu`
+is the CPU path; `--device npu` includes decode. Other load flags:
+`--npu-threads`, `--npu-dtype fp16|int8` + `--int8-group` (emb2 text),
+`--keep-cpu-weights auto|yes|no` (intent/gemma4), `--dtype`, `--quant q8`
+(CPU-resident weights only), `--defer-towers`, `--attn-kernel`,
+`--vision-attn-kernel`, `--chunk`/`--key-block`, `--attn-chunk`.
+`serve` adds `--port` (default 8383), `--model-name`, `--max-tokens`,
+`--max-new-tokens`, `--temperature`, `--video-fps`, `--video-max-frames`. A flag
+that does not apply to the detected model is rejected, and every run prints the
+resolved `placement:` line before loading.
 
 Cleanup + formatting (2026-10-08): commit `2301d3b` removed the dead code across
 the Gemma modules, cfg-gated the NPU-only helpers, annotated the checkpoint-config
@@ -1305,6 +1310,115 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   observed 2026-10-24), which predates the S1/S2 softmax/vision round and needs a
   rebuild + redeploy (see "Board deployment").
 
+## rocket-inference CLI (2026-10-31 refactor)
+
+The example's CLI is family-agnostic. Commands are `serve`, `embed`, `bench`,
+`gen`, `tokenize`, `gemm`, `help`; there is no family command tree. The family is
+detected from `--model-dir` (`config.json` `model_type`, or a local GGUF's
+`general.architecture`) and `--family auto|qwen3|embeddinggemma|intent|gemma4`
+overrides it. `--model-dir` is required (or `-hf`, which injects it).
+`src/family.rs` owns detection and the per-family stage-support predicates;
+`src/commands/` owns the commands; `src/cli.rs` owns `FlagArgs`, `LoadArgs`, the
+device enums and the usage texts. The old family CLI modules are deleted, so any
+doc line showing `qwen3 embed`/`gemma bench`/`intent gen` predates the refactor
+(the experiment logs keep their historical flags; the recipes README maps them).
+
+### Placement
+
+`--device auto|cpu|npu` sets the base; `--text-device`, `--text-attn-device`,
+`--vision-device`, `--vision-attn-device`, `--decode-device` override stages.
+Resolution per stage: explicit stage flag, else base, else `auto`. `auto` =
+NPU when `cfg!(all(feature = "npu", target_arch = "aarch64"))`, else CPU;
+`decode`'s auto default is CPU. `--device npu` sets **every** stage including
+decode; `--device cpu` is the pure-CPU path; explicit `npu` on a CPU build is an
+error. An explicit stage flag for a stage the family does not have is an error.
+
+Family stages:
+
+- qwen3: `text`, `text-attn`.
+- embeddinggemma: `text`, `text-attn`, `vision`, `vision-attn` (audio is
+  CPU-only; it is not an NPU stage).
+- intent: `text` (prefill projections), `decode`; its mixer attention is
+  CPU-only.
+- gemma4: `text` (prefill projections + prefill attention), `decode`; the
+  vision/audio towers are not NPU-packed, so `--vision-device` is rejected.
+
+`--keep-cpu-weights auto|yes|no` (intent/gemma4): `auto` keeps the f16 CPU
+copies exactly when decode is on the CPU; `no` requires `--decode-device npu`
+(and text on the NPU) and drops them (`npu_only` / `keep_cpu=false`); `yes`
+keeps them with NPU decode (the old `--npu-decode`). `--decode-device npu`
+without `--text-device npu` is rejected: decode needs the packed weights.
+
+Every model command prints one `placement:` line before loading (`tokenize`
+suppresses it because it loads no model), e.g.
+`text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=CPU`.
+`(lazy)` = `--defer-towers`; `int8` replaces `fp16` under `--npu-dtype int8`.
+
+### Precision and CPU kernels
+
+- `--dtype auto|f32|f16|bf16` (auto = checkpoint native; emb2 rejects f16).
+  gemma4 maps `None` through `LoadDtype::from_native` (GGUF -> F16), an explicit
+  value through the matching `LoadDtype`.
+- `--quant q8`: Q8-resident **CPU** weights. It no longer quantizes text
+  projections before the NPU pack: with `--text-device npu` the packed weights
+  come from the model dtype (the old q8+npu path quantized first and was lossy).
+  q8 still applies to the audio tower, where it is ~2.4x slower for audio
+  (dequant per call) — do not use it for media-heavy services. With text on the
+  CPU it is the usual low-RAM mode.
+- `--npu-dtype fp16|int8` + `--int8-group` (emb2 text only; requires
+  `--text-device npu`). int8 g32 is 2.9x slower than fp16 at 2587 tokens (the
+  group-wise kernel reads back an int32 partial per K-group); g512 ties fp16 on
+  wall but costs accuracy (text cosine 0.9983 vs CPU f32 at 512 tokens). It is
+  a memory/fidelity option, not a speed one.
+- `--attn-kernel fused|blocked` and `--vision-attn-kernel fused|blocked` are
+  CPU kernels used when that attention stage is not offloaded (vision attention
+  is on the NPU iff `--vision-attn-device npu`). `--chunk`/`--key-block` only
+  apply to qwen3's blocked kernel; `--attn-chunk` (default 1024) is the chunked
+  attention width (emb2/gemma4).
+- `--defer-towers` (emb2/gemma4): each tower half loads on the first request of
+  its modality.
+
+### Board measurement round (2026-10-31, EmbeddingGemma 2)
+
+Run with `home-llm-gateway-embed-1` stopped (restored afterwards, healthy),
+`taskset -c 4-7`, 600 MHz `rocket` module, safetensors native-bf16 checkpoint at
+`/root/models/embeddinggemma-2`, 2 interleaved reps (medians below), 2587-token
+text (`data/one_long.txt`), image `data/cat.jpeg` (2394 patches), audio
+`data/speech5s.wav`; board load ~7.5 from the other services (+-10-20 %).
+`user` is process CPU-seconds; `forward` is the model's own text pass.
+
+| config | text forward | user | peak anon | image encode/forward | audio encode/forward |
+|---|---|---|---|---|---|
+| `--device cpu --dtype f32` | 27.4 s | 72.2 | 1457 MiB | 23.7 / 2.2 s | 4.0 / 1.16 s |
+| `--device cpu --quant q8` | 34.6 s | 83.8 | 908 MiB | 28.4 / 5.5 s | 9.7 / 3.9 s |
+| `--device npu --dtype bf16 --defer-towers` | 15.2 s | 28.8 | 723 MiB | 14.6 / 1.37 s | 4.8 / 0.70 s |
+| `--device npu --dtype f32 --defer-towers` | 13.3 s | 27.5 | 1330 MiB | 13.6 / 1.32 s | 4.0 / 0.64 s |
+| `--device npu --dtype f32` (eager towers) | 13.6 s | 41.9 | 2605 MiB | — | — |
+| `--device cpu --text-device npu --text-attn-device npu --dtype f32` | 13.2 s | 27.3 | 1324 MiB | — | — |
+| `--device npu --dtype f32 --text-attn-device cpu` | 18.9 s | 51.1 | 1244 MiB | — | — |
+| `--device npu --dtype f32 --npu-dtype int8` (g32) | 38.6 s | 79.0 | 1443 MiB | — | — |
+| `--device npu --dtype f32 --npu-dtype int8 --int8-group 512` | 12.7 s | 28.3 | 1435 MiB | — | — |
+
+Numerics vs the same binary's CPU f32 (text 512 tok / image 2394 patches):
+NPU f32 0.9999994 / 0.9999899, NPU bf16 0.9999590 / 0.9998737, int8 g512
+0.9982989 / 0.9996419, CPU q8 0.9993961 / —. Short 9-token text is
+load-dominated: CPU f32 wall 6.4 s (forward 0.74 s) vs NPU f32 wall 10.1 s
+(forward 0.26 s), so serve once rather than one-shot for short inputs.
+
+Artifacts on the board: `/root/rocket-inference/rocket-inference-cli` (the
+refactor build) and `/root/rocket-bench/` (scripts, per-run stdout/time/peak
+files). The live container still runs the old image with the old flags; a
+redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
+(the recipes use the same flags).
+
+### Tests
+
+`cargo test -p rocket-inference --no-default-features` = 53 tests; the new ones
+cover flag parsing, the auto/CPU/NPU stage resolution including the NPU-build
+case, family-scoped flag rejection, int8 dependencies and `--keep-cpu-weights`
+rules. `cargo clippy -p rocket-inference --no-default-features` and the
+aarch64+`npu` clippy are clean; `cargo fmt --all -- --check` is clean.
+
 ## Repo layout
 
 | path | contents |
@@ -1318,14 +1432,16 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 | `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve` + `qwen3`/`intent`/`gemma`), shared flag parser and usage text |
-| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (family detection, capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
+| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
+| `examples/rocket-inference/src/family.rs` | the four families, checkpoint detection (`config.json` `model_type` / GGUF arch) and the per-family stage-support predicates |
+| `examples/rocket-inference/src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `tokenize`, `gemm`) and the shared embedding input assembly (`embed_input`) |
+| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
-| `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loaders (f32 / `--quant q8` / `--npu` pack-and-drop + `load_cpu_projections`), CLI |
-| `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`), CLI |
+| `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loader (f32/f16/bf16, `--quant q8`, per-stage NPU pack-and-drop + `load_cpu_projections`) |
+| `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`) |
 | `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs`, and the `TowerSet` selector the deferred vision/audio half loads use |
-| `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, loaders, CLI |
-| `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`), CLI |
+| `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, per-stage NPU loaders |
+| `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`) |
 | `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
 | `examples/rocket-inference/src/bin/vision_attn_bench.rs` | vision-tower attention/softmax microbenchmark (`fused-f16/bf16`, `npu`, `npu-chunk`, `matmul`, `attn-batch`, `softmax`; `npu` feature, log-gemma §18.4/§19/§20) |
 | `examples/rocket-inference/src/bin/causal_attn_bench.rs` | causal block attention probe (P2a): the chunked NPU path (`util/causal.rs` compiled from the same source) vs the dense masked op and `attn::flash_attn_ref`, `--window`/`--ref`/`--reps` (`npu` feature) |
@@ -1333,6 +1449,7 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
+| `examples/rocket-inference/docs/recipes/` | the deployment recipes: `README.md` (profile definitions, placement matrix, board protocol, old→new flag map) + `embeddinggemma2.md` (measured 2026-10-31), `qwen3.md`, `intent.md`, `gemma4.md` (derived from the logs) |
 | `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
@@ -1502,8 +1619,8 @@ scp /mnt/hub/models/embeddinggemma-2/{model.safetensors,config.json,tokenizer.js
 tokenizer_config.json,preprocessor_config.json,processor_config.json,config_sentence_transformers.json} \
     root@rock-5b-plus.lan:/root/models/embeddinggemma-2/
 # board run (lowest-memory config; the board must be idle for meaningful A/B numbers)
-taskset -c 4-7 /root/rocket-inference/rocket-inference gemma bench \
-    --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
+taskset -c 4-7 /root/rocket-inference/rocket-inference bench \
+    --model-dir /root/models/embeddinggemma-2 --device npu --text-file data/one_long.txt --reps 1
 ```
 
 The binary is self-contained (the driver is statically linked Rust); the model lives at
@@ -1528,7 +1645,8 @@ cross/QEMU) and pushes
 `ghcr.io/royalcat/rocket-inference` with `docker/metadata-action` tags: aarch64 =
 `<sha>` + `latest` (primary), amd64 = `<sha>-amd64` + `latest-amd64`; PRs build
 without pushing. The image CMD is the unified server, identical on both architectures
-(the NPU flags are inert on amd64): `serve --backend flex --dtype f32 --npu-attn cpu
+(the NPU placement is inert on amd64 because `auto` resolves to CPU):
+`serve --cpu-backend flex --dtype f32 --device auto --text-attn-device cpu
 --port 8383 --max-tokens 8192 --model-dir /models/qwen3-embedding-0.6b
 --model-name qwen3-embedding`.
 
@@ -1570,7 +1688,10 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   2026-10-24 it runs `ghcr.io/royalcat/rocket-inference:latest` (= `94f99bd`,
   2026-10-22, which includes the 2026-10-21 scratch-memory round, log-gemma §15)
   with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024 --port 8383
-  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`,
+  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`
+  (the pre-refactor flags; the equivalent current command is
+  `serve --cpu-backend flex --device npu --attn-chunk 1024 --port 8383
+  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`),
   CPUs 4-7, NPU, `mem_limit` 8g. It predates the S1/S2 round (log-gemma §19/§20):
   a redeploy from `main` brings the fast host softmax to the text path
   (qwen3 2777-token −11 % wall / −26 % CPU; emb2 2594-token attention −17 %) and
@@ -1713,11 +1834,12 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - `--npu` = pack-and-drop: projections offload in the model's dtype — f32/f16 pack
   resident fp16 BOs (0.82 GiB for qwen3) and bf16 packs the same way via an exact
   bf16->f16 conversion (log §17); the embedding table keeps the model dtype (f16 for
-  an f32 body), 298 MiB CPU-resident for qwen3 f32. `--npu-attn npu` (default) also
-  offloads attention via `rocket_flash_attn_fp16_ctx`; `cpu` keeps flex attention
-  (within ~1 s on wall, ~40% more CPU). `--npu` accepts `--dtype f32|f16|bf16` and
-  excludes `--quant q8`. `serve` defaults `--npu` on for this build (`--no-npu`
-  opts out; `--quant q8` also keeps the CPU path unless `--npu` is explicit).
+  an f32 body), 298 MiB CPU-resident for qwen3 f32. `--text-attn-device npu`
+  (the `auto` default) also offloads attention via `rocket_flash_attn_fp16_ctx`;
+  `cpu` keeps flex attention (within ~1 s on wall, ~40% more CPU). `--dtype
+  f32|f16|bf16` selects the CPU/model dtype; `--quant q8` applies to CPU-resident
+  weights only. On the NPU build `--device auto` is NPU-first (`--device cpu` is
+  the explicit CPU path).
   EmbeddingGemma 2's **vision tower** packs its linears the same way — fused
   q|k|v and gate|up groups plus o/down, **65** resident weights (113 with
   `ROCKET_NPU_FUSED=0`), 0.28 GiB fp16 — from the emb2 loader, `ROCKET_NPU_TOWERS=0`
@@ -2195,12 +2317,12 @@ cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
 ./causal_attn_bench 1024 1024 --kv 30000 1       # one 30k-context chunk: 898 MiB, 3.78 s
 # ... and the model-level A/B (only when the board has >= 5 GB free; the dense arm's
 # [n, n] mask does not fit at 30k, and a memory cgroup does not contain the NPU BOs):
-ROCKET_CAUSAL_CHUNK=0 ./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b \
-    --dtype f32 --npu --text-file data/long30k.txt --tokens 8000 --out /tmp/dense8k.json
-./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b --dtype f32 --npu \
+ROCKET_CAUSAL_CHUNK=0 ./rocket-inference embed --model-dir /root/models/qwen3-embedding-0.6b \
+    --dtype f32 --device npu --text-file data/long30k.txt --tokens 8000 --out /tmp/dense8k.json
+./rocket-inference embed --model-dir /root/models/qwen3-embedding-0.6b --dtype f32 --device npu \
     --text-file data/long30k.txt --tokens 8000 --out /tmp/chunk8k.json
-ROCKET_CAUSAL_CHUNK=512 ./rocket-inference qwen3 embed --model-dir /root/models/qwen3-embedding-0.6b \
-    --dtype f32 --npu --text-file data/long30k.txt --tokens 30000 --out /tmp/chunk30k.json
+ROCKET_CAUSAL_CHUNK=512 ./rocket-inference embed --model-dir /root/models/qwen3-embedding-0.6b \
+    --dtype f32 --device npu --text-file data/long30k.txt --tokens 30000 --out /tmp/chunk30k.json
 # RoPE probe (P2c, log §21): fused host kernel vs composite vs the NPU EW composition;
 # ~7 min for the full matrix on a busy board, the NPU arm is 18.8-19.2x the fused one
 cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
@@ -2222,11 +2344,11 @@ docker run --rm rocket-inference:local --help
 docker run --rm -v "$PWD":/repo -w /repo rhysd/actionlint:latest -color
 # single-core speed gate (blocked path is the single-core record); run from
 # examples/rocket-inference
-taskset -c 2 cargo run --release -- qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 2 --attn blocked --chunk 256 --key-block 256
+taskset -c 2 cargo run --release -- bench --model-dir ~/models/qwen3-embedding-0.6b --device cpu --cpu-backend flex --dtype f32 --tokens 3633 --reps 2 --attn-kernel blocked --chunk 256 --key-block 256
 # multi-threaded / long-input (fused default)
-cargo run --release -- qwen3 bench --backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
+cargo run --release -- bench --model-dir ~/models/qwen3-embedding-0.6b --device cpu --cpu-backend flex --dtype f32 --text-file /tmp/opencode/long30k.txt --tokens 30000 --reps 0
 # embedding + cosine against a reference JSON
-cargo run --release -- qwen3 embed --backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
+cargo run --release -- embed --model-dir ~/models/qwen3-embedding-0.6b --device cpu --cpu-backend flex --dtype f32 --quant q8 --text-file /tmp/opencode/one_64.txt --out /tmp/opencode/our.json
 # GGUF tokenizer parity: our `<family> tokenize` == the reference tokenizer.json ==
 # llama-tokenize (built-in German regression words; --text/--text-file extend it);
 # needs a python with `tokenizers` (the emb2 venv on this host)
@@ -2246,12 +2368,12 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 # deferred tower halves: an image request must load the vision half only, a later
 # audio request the audio half only (log: one `towers: loaded vision/audio` line
 # each, 211/272 tensors); a text request never prints either
-./rocket-inference serve --model-dir /mnt/hub/models/embeddinggemma-2 --quant q8 \
+./rocket-inference serve --model-dir /mnt/hub/models/embeddinggemma-2 --device npu \
     --port 8399 --max-tokens 512 --defer-towers &
 curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"image":"data/cat.jpeg"}'
 curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"audio":"data/speech5s.wav"}'
 # ... and the GGUF mmproj path the production service uses (downloads Q8_0 + mmproj)
-./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --dtype f32 --quant q8 \
+./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu \
     --port 8399 --max-tokens 512 --defer-towers &
 # RssAnon of the q8 text-only process is ~510 MiB; the image request grows it by
 # ~275 MiB (vision) and the audio request by ~373 MiB more (log-gemma §22)
@@ -2302,10 +2424,12 @@ On the board, chunked-matmul numerics (forced chunks vs disabled must match bit-
 
 ```sh
 cd /root/rocket-inference
-ROCKET_MATMUL_CHUNK_M=0 ./rocket-inference qwen3 embed --backend flex --dtype f32 --npu \
-  --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e0.json
-ROCKET_MATMUL_CHUNK_M=1024 ./rocket-inference qwen3 embed --backend flex --dtype f32 --npu \
-  --npu-attn cpu --text-file data/one_3633.txt --tokens 1300 --out /tmp/e1.json
+ROCKET_MATMUL_CHUNK_M=0 ./rocket-inference embed --model-dir /root/models/qwen3-embedding-0.6b \
+  --cpu-backend flex --dtype f32 --device cpu --text-device npu \
+  --text-file data/one_3633.txt --tokens 1300 --out /tmp/e0.json
+ROCKET_MATMUL_CHUNK_M=1024 ./rocket-inference embed --model-dir /root/models/qwen3-embedding-0.6b \
+  --cpu-backend flex --dtype f32 --device cpu --text-device npu \
+  --text-file data/one_3633.txt --tokens 1300 --out /tmp/e1.json
 python3 -c "import json,math;a=json.load(open('/tmp/e0.json'));b=json.load(open('/tmp/e1.json'));d=sum(x*y for x,y in zip(a,b));na=math.sqrt(sum(x*x for x in a));nb=math.sqrt(sum(x*x for x in b));print('cosine',d/(na*nb))"
 ```
 
@@ -2425,43 +2549,44 @@ taskset -c 0-3 ./q8_bench --reps 3                    # the five qwen3 shapes, g
 taskset -c 0-3 ./q8_bench --reps 3 --rows 128 --groups 32,128,512,1024 2777 1024 3072 2777 4096 1024
 # speed / CPU-relief A/B (1 warmup + 1 measured run; watch the stages + npu breakdown
 # lines and `time`). Only meaningful on an idle board.
-taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --npu --tokens 3633 --reps 1
-taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --npu --npu-attn cpu --tokens 3633 --reps 1
-taskset -c 4-7 ./rocket-inference qwen3 bench --backend flex --dtype f32 --tokens 3633 --reps 1
+Q3=/root/models/qwen3-embedding-0.6b
+taskset -c 4-7 ./rocket-inference bench --model-dir $Q3 --cpu-backend flex --dtype f32 --device npu --tokens 3633 --reps 1
+taskset -c 4-7 ./rocket-inference bench --model-dir $Q3 --cpu-backend flex --dtype f32 --device cpu --text-device npu --tokens 3633 --reps 1
+taskset -c 4-7 ./rocket-inference bench --model-dir $Q3 --cpu-backend flex --dtype f32 --device cpu --tokens 3633 --reps 1
 # numerics vs the production reference (copy the JSON back and compare cosines)
-./rocket-inference qwen3 embed --backend flex --dtype f32 --npu --text-file data/one_64.txt --out /tmp/npu_64.json
+./rocket-inference embed --model-dir $Q3 --cpu-backend flex --dtype f32 --device npu --text-file data/one_64.txt --out /tmp/npu_64.json
 # CPU modes of the same NPU binary (projections are loaded explicitly there)
-./rocket-inference qwen3 embed --backend flex --dtype f32 --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
-./rocket-inference qwen3 embed --backend flex --dtype f32 --text-file data/one_64.txt --out /tmp/f32_64.json
+./rocket-inference embed --model-dir $Q3 --cpu-backend flex --dtype f32 --device cpu --quant q8 --text-file data/one_64.txt --out /tmp/q8_64.json
+./rocket-inference embed --model-dir $Q3 --cpu-backend flex --dtype f32 --device cpu --text-file data/one_64.txt --out /tmp/f32_64.json
 # tiled long-context attention on the model path (env knob, no flag): compare the
 # embedding and the wall against the default materialized run (log §19: parity at
 # 3.6k, cosine 0.999994) and watch ROCKET_MEM_LOG's attention BO/host
-ROCKET_FA_TILE_KV=2048 ROCKET_FA_TILE_MIN_KV=0 ./rocket-inference qwen3 embed --backend flex \
-  --dtype f32 --npu --text-file data/long8k.txt --tokens 3600 --out /tmp/tile_3633.json
+ROCKET_FA_TILE_KV=2048 ROCKET_FA_TILE_MIN_KV=0 ./rocket-inference embed --model-dir $Q3 \
+  --cpu-backend flex --dtype f32 --device npu --text-file data/long8k.txt --tokens 3600 --out /tmp/tile_3633.json
 # intent model (model at /root/models/ov-intent-analysis-sft)
-./rocket-inference intent gen --model-dir /root/models/ov-intent-analysis-sft --text "Hello!" --raw --max-new-tokens 32
+./rocket-inference gen --model-dir /root/models/ov-intent-analysis-sft --device auto --text "Hello!" --raw --max-new-tokens 32
 # Gemma family (models at /root/models/embeddinggemma-2, /root/models/gemma-4-E2B-it)
-./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --text-file data/one_long.txt --reps 1
+./rocket-inference bench --model-dir /root/models/embeddinggemma-2 --device npu --text-file data/one_long.txt --reps 1
 # vision attention: NPU default vs the CPU fallback (emb2, --npu)
-./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --quant q8 --npu \
+./rocket-inference embed --model-dir /root/models/embeddinggemma-2 --device npu \
     --image data/cat.jpeg --out /tmp/vnpu.json
-./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --quant q8 --npu \
-    --vision-attn fused --image data/cat.jpeg --out /tmp/vfused.json
+./rocket-inference embed --model-dir /root/models/embeddinggemma-2 --device npu \
+    --vision-attn-device cpu --vision-attn-kernel fused --image data/cat.jpeg --out /tmp/vfused.json
 # performance-round A/Bs (log §12; validate.sh runs the whole set)
-ROCKET_CTX_CANONICAL=0 ./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --prompt query --text-file data/one_long.txt --out /tmp/off.json
-./rocket-inference gemma embed --model-dir /root/models/embeddinggemma-2 --npu --npu-int8 --prompt query --text-file data/one_long.txt --out /tmp/i8.json
-ROCKET_GLUE=0 ./rocket-inference gemma bench --model-dir /root/models/embeddinggemma-2 --quant q8 --text-file data/one_long.txt --reps 1
-./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it --text "What is the capital of France?" --max-new-tokens 16
+ROCKET_CTX_CANONICAL=0 ./rocket-inference embed --model-dir /root/models/embeddinggemma-2 --device npu --prompt query --text-file data/one_long.txt --out /tmp/off.json
+./rocket-inference embed --model-dir /root/models/embeddinggemma-2 --device npu --npu-dtype int8 --prompt query --text-file data/one_long.txt --out /tmp/i8.json
+ROCKET_GLUE=0 ./rocket-inference bench --model-dir /root/models/embeddinggemma-2 --device cpu --quant q8 --text-file data/one_long.txt --reps 1
+./rocket-inference gen --model-dir /root/models/gemma-4-E2B-it --device auto --defer-towers --text "What is the capital of France?" --max-new-tokens 16
 # QAT mobile, busy-board low-memory config (add --defer-towers; each tower half loads on demand)
-./rocket-inference gemma gen --gen-model-dir /root/models/gemma-4-E2B-it-qat-mobile --f16 --defer-towers --text "What is the capital of France?" --max-new-tokens 16
+./rocket-inference gen --model-dir /root/models/gemma-4-E2B-it-qat-mobile --dtype f16 --defer-towers --device auto --text "What is the capital of France?" --max-new-tokens 16
 # servers (detected per model; ports are examples)
-./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --quant q8 --npu --port 8383 --max-tokens 8192
-./rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --npu --npu-threads 3 --port 11434 --max-new-tokens 256
-./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --port 8390
-./rocket-inference serve --model-dir /root/models/gemma-4-E2B-it --port 8391
+./rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --device npu --port 8383 --max-tokens 8192
+./rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --device auto --npu-threads 3 --port 11434 --max-new-tokens 256
+./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --device npu --port 8390 --defer-towers
+./rocket-inference serve --model-dir /root/models/gemma-4-E2B-it --device auto --defer-towers --port 8391
 # scratch attribution / policy: one `npu scratch` line per request; a 3-token
 # request after an 8k one should drop the matmul/attention BOs to ~12 MiB
-ROCKET_MEM_LOG=1 ROCKET_SCRATCH_MB=1024 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --quant q8 --npu --port 8399
+ROCKET_MEM_LOG=1 ROCKET_SCRATCH_MB=1024 ./rocket-inference serve --model-dir /root/models/embeddinggemma-2 --device npu --port 8399 --defer-towers
 ```
 
 Vulkan/wgpu GPU probe (separate binary; built with

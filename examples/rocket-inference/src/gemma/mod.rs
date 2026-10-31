@@ -5,7 +5,6 @@
 
 pub mod audio;
 pub mod audio_frontend;
-pub mod cli;
 pub mod config;
 pub mod embeddinggemma;
 pub mod gemma4;

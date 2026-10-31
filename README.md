@@ -42,25 +42,25 @@ registers exactly the endpoints that model supports (embedding models get
 APIs).
 
 OpenViking's embedding backend in production on a Rock 5B+ is EmbeddingGemma 2
-(`rocket-inference serve --dtype f32 --quant q8 --npu --npu-attn npu
+(`rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu
 --defer-towers`): the text-only service idles at 605 MiB anon (2183 MiB before the
 idle-memory round; each tower half loads only when a request of its modality
 arrives, so image traffic never allocates the larger audio tower). On a media
-request the towers' projections and the vision tower's
-attention now run on the NPU (`--vision-attn` defaults to `npu`): a
-2394-patch image's tower is 10.6 s against 15.2 s with the CPU attention kernel,
-and a served image request takes 12.4 s instead of 13.5 s at +101 MiB anon. Its
-3,633-token predecessor configuration (Qwen3-Embedding-0.6B on the
-NPU, `--npu --npu-attn cpu --max-tokens 8192`) ran a 3,633-token input in ~87 s
+request the towers' projections and the vision tower's attention run on the NPU
+(`--vision-attn-device` defaults to `npu`): a 2394-patch image's tower is 10.6 s
+against 15.2 s with the CPU attention kernel, and a served image request takes
+12.4 s instead of 13.5 s at +101 MiB anon. Its 3,633-token predecessor
+configuration (Qwen3-Embedding-0.6B on the NPU, `--device npu
+--text-attn-device cpu --max-tokens 8192`) ran a 3,633-token input in ~87 s
 (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds than the CPU-only flex path
 (the default NPU attention is slightly faster: ~45 tok/s, -51% CPU). The intent
-model answers the 166-token v7 planner prompt in 11.7 s with `--npu` (89.9 s
-CPU-only). Flags, endpoints and deployment:
+model answers the 166-token v7 planner prompt in 11.7 s with `--device auto`
+(89.9 s CPU-only). Flags, endpoints, recipes and deployment:
 [examples/rocket-inference/README.md](examples/rocket-inference/README.md).
 
 Container images for both architectures are built and published to GHCR on every
 push to `main`: `ghcr.io/royalcat/rocket-inference:<sha>` / `:latest` is the aarch64
-RK3588 image (NPU offload is `serve`'s default there; `--no-npu` forces the flex CPU
+RK3588 image (`--device auto` is NPU-first there; `--device cpu` forces the flex CPU
 path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
 (`.github/workflows/build-images.yml`).
 
@@ -119,7 +119,7 @@ path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
   chunk's absolute positions, so one call covers a query chunk against just its key
   prefix and the additive mask and score matrix stay `[n_q, n_kv]`. That is what lets
   a causal model run 30k-token prompts without the dense `[n, n]` f16 mask
-  (~1.8 GiB at 30k) — see the example's `--npu` path, which chunks at
+  (~1.8 GiB at 30k) — see the example's NPU causal path, which chunks at
   `ROCKET_CAUSAL_CHUNK` (default 1024, `0` = dense).
 
 - **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
@@ -580,27 +580,31 @@ reverts on reboot. Everything works at the stock clock.
 ## Example
 
 [`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
-built on this library: one binary, four model families, selected by the first argument
-(`serve`, `qwen3`, `intent`, `gemma`). One `serve` command loads any of the models and
-exposes its compatible endpoints; the Qwen3-Embedding-0.6B embedding model (CLI
-`qwen3 bench|embed|gemm|tokenize`), the Qwen3.5-0.8B intent/query-planner model
-(`intent gen`), the multimodal EmbeddingGemma 2 (`gemma embed|bench|tokenize`) and
-Gemma 4 E2B-it generation (`gemma gen`) are one-shot CLI paths, with measurements from the Rock 5B+ in
-`docs/experiment-log.md` and `docs/experiment-log-gemma.md` there.
+built on this library: one binary with family-agnostic commands
+(`serve`, `embed`, `bench`, `gen`, `tokenize`, `gemm`); the model family is detected
+from the checkpoint and `--family` overrides it. One `serve` command loads any of the
+models and exposes its compatible endpoints; the Qwen3-Embedding-0.6B and multimodal
+EmbeddingGemma 2 embedding models (`embed`/`bench`/`tokenize`), the Qwen3.5-0.8B
+intent/query-planner model and Gemma 4 E2B-it generation (`gen`) are one-shot CLI
+paths. Per-stage NPU placement is selected with `--device` and the
+`--text-device`/`--text-attn-device`/`--vision-device`/`--vision-attn-device`/
+`--decode-device` flags; balanced/full-offload/speed recipes and measurements from the
+Rock 5B+ are in `examples/rocket-inference/docs/recipes/`, `.../docs/experiment-log.md`
+and `.../docs/experiment-log-gemma.md`.
 
 On the board the Qwen3 embedding NPU path runs the 3,633-token input at 45 tok/s while
 using ~51% fewer CPU-seconds than the CPU-only flex path (the CPU path remains ~2.3×
 slower than the production `ik_llama.cpp` Q8_0 server); the intent model is
 token-identical to the HF reference and runs a 166-token v7 planner prompt in 11.7 s
-with `--npu` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 reference
+with `--device auto` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 reference
 on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident,
 605 MiB anon idle in the deployed text-only `--defer-towers` configuration)
 and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
 fp16 weights plus chunked sliding **and full** attention, for 1.61x wall and -33 %
 user CPU vs the CPU baseline (2587-token text). Its vision tower packs 65 resident
-projections and runs its attention on the NPU too (`--vision-attn npu`, the
-`--npu` default): a 2394-patch image's tower is 10.6 s (15.2 s with the CPU
-attention kernel) at cosine 0.99999 vs the HF f32 reference in the f32 arm and
+projections and runs its attention on the NPU too (`--vision-attn-device
+npu`, the `--text-device npu` default): a 2394-patch image's tower is 10.6 s
+(15.2 s with the CPU attention kernel) at cosine 0.99999 vs the HF f32 reference in the f32 arm and
 0.99988 with the deployed q8 text backbone. Gemma 4 E2B-it greedily reproduces
 the HF reference token-for-token, and its QAT mobile checkpoints load bit-exactly.
 Long causal prompts run in query chunks on the NPU (`ROCKET_CAUSAL_CHUNK`, default

@@ -60,9 +60,9 @@ impl VisionAttn {
         }
     }
 
-    /// Parse `npu|fused|blocked` (the `--vision-attn` flag value). `npu` still
-    /// needs the NPU attention path itself (`--npu` on an aarch64 `npu` build);
-    /// the CLIs reject it otherwise.
+    /// Parse `npu|fused|blocked` (the old `--vision-attn` flag value; the CLI
+    /// now selects the device and the CPU kernel separately).
+    #[allow(dead_code)]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "npu" => Some(Self::Npu),
@@ -572,7 +572,7 @@ impl VisionAttention {
     }
 }
 
-/// NPU attention (`--vision-attn npu`): bidirectional, no mask, whole patch
+/// NPU attention (`--vision-attn-device npu`): bidirectional, no mask, whole patch
 /// sequence through `burn_rocket::attention_window` (the S1 fast host softmax,
 /// log-gemma §19).
 ///
@@ -600,11 +600,11 @@ fn npu_attention(q: Tensor<3>, k: Tensor<3>, v: Tensor<3>, spec: &VisionSpec) ->
     o.reshape([p, h * d])
 }
 
-/// Off-device `--vision-attn npu` is rejected by both CLIs before a forward
+/// Off-device `--vision-attn-device npu` is rejected before a forward
 /// runs (`requires an aarch64 build with --features npu and --npu`).
 #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
 fn npu_attention(_q: Tensor<3>, _k: Tensor<3>, _v: Tensor<3>, _spec: &VisionSpec) -> Tensor<2> {
-    unreachable!("--vision-attn npu requires an aarch64 build with --features npu")
+    unreachable!("--vision-attn-device npu requires an aarch64 build with --features npu")
 }
 
 /// Bidirectional non-causal attention through the backend's fused kernel
@@ -1110,7 +1110,7 @@ mod tests {
             assert_eq!(VisionAttn::parse(mode.name()), Some(mode));
             assert_eq!(VisionAttn::from_code(mode.code()), mode);
         }
-        // The enum default is fused (non-NPU builds); `--vision-attn npu`
+        // The enum default is fused (non-NPU builds); `--vision-attn-device npu`
         // defaults on separately, from the CLI's resolved `--npu`.
         assert_eq!(VisionAttn::default(), VisionAttn::Fused);
     }

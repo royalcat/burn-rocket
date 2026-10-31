@@ -225,10 +225,8 @@ pub type NpuId = Option<()>;
 /// a handle exists, else the CPU copy.
 fn proj_sel(cpu: &Proj, id: &NpuId, x: Tensor<3>, npu: bool) -> Tensor<3> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if npu {
-        if let Some(id) = id {
-            return burn_rocket::matmul(x, id);
-        }
+    if npu && let Some(id) = id {
+        return burn_rocket::matmul(x, id);
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     let _ = (id, npu);
@@ -240,10 +238,8 @@ fn proj_sel(cpu: &Proj, id: &NpuId, x: Tensor<3>, npu: bool) -> Tensor<3> {
 /// `M >= 256` padding.
 fn proj3(p: &Proj, x: Tensor<3>, npu: bool) -> Tensor<3> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if npu {
-        if let Proj::Npu(id) = p {
-            return burn_rocket::matmul(x, id);
-        }
+    if npu && let Proj::Npu(id) = p {
+        return burn_rocket::matmul(x, id);
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
     let _ = npu;
@@ -802,13 +798,11 @@ impl Mlp {
     fn forward(&self, x: Tensor<3>, npu: bool) -> Tensor<3> {
         let n = self.intermediate;
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if npu {
-            if let Some(id) = &self.gateup_fused {
-                let gu = burn_rocket::matmul(x, id);
-                let gate = gu.clone().slice(s![.., .., 0..n]);
-                let up = gu.slice(s![.., .., n..2 * n]);
-                return proj_sel(&self.down_proj, &self.down_fused, silu(gate) * up, npu);
-            }
+        if npu && let Some(id) = &self.gateup_fused {
+            let gu = burn_rocket::matmul(x, id);
+            let gate = gu.clone().slice(s![.., .., 0..n]);
+            let up = gu.slice(s![.., .., n..2 * n]);
+            return proj_sel(&self.down_proj, &self.down_fused, silu(gate) * up, npu);
         }
         let _ = n;
         let gate = proj3(&self.gate_proj, x.clone(), npu);

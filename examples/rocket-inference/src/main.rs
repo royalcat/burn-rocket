@@ -1,16 +1,22 @@
-//! Burn inference for the RK3588 (flex CPU backend, optional NPU offload).
+//! Burn inference for the RK3588 (flex CPU backend, per-stage NPU offload).
 //!
-//! One binary, four model families:
+//! One binary, family-agnostic commands: the model family is detected from the
+//! checkpoint (`config.json` `model_type` or the GGUF architecture) and
+//! `--family` overrides it.
 //!
-//! | family | models |
+//! | command | models |
 //! |---|---|
-//! | `qwen3` | Qwen3-Embedding-0.6B (OpenAI-compatible embedding server) |
-//! | `intent` | Qwen3.5-0.8B intent/query planner (Ollama-compatible server) |
-//! | `gemma` | EmbeddingGemma 2 (multimodal embeddings) and Gemma 4 E2B-it (chat) |
+//! | `serve` | any detected family (embedding and/or chat routes) |
+//! | `embed`, `bench` | qwen3 (Qwen3-Embedding-0.6B), embeddinggemma |
+//! | `gen` | intent (Qwen3.5-0.8B), gemma4 (Gemma 4 E2B-it) |
+//! | `tokenize` | any detected family |
+//! | `gemm` | no model (flex matmul microbenchmark) |
 //!
-//! See `README.md` for commands and flags.
+//! See `README.md` and `docs/recipes/` for commands and flags.
 
 mod cli;
+mod commands;
+mod family;
 mod gemma;
 mod qwen35_intent;
 mod qwen3_embedding;
@@ -21,24 +27,52 @@ use anyhow::{Result, bail};
 
 fn main() -> Result<()> {
     let mut it = std::env::args().skip(1);
-    let Some(family) = it.next() else {
+    let Some(cmd) = it.next() else {
         eprintln!("{}", cli::USAGE);
         std::process::exit(2);
     };
-    let rest = util::hub::resolve_args(it)?;
-    let it = rest.into_iter();
-    match family.as_str() {
-        "serve" => server::cli::run(it),
-        "qwen3" => qwen3_embedding::cli::run(it),
-        "intent" => qwen35_intent::cli::run(it),
-        "gemma" => gemma::cli::run(it),
-        "help" | "--help" | "-h" => {
-            println!("{}", cli::USAGE);
-            Ok(())
+    if matches!(cmd.as_str(), "help" | "--help" | "-h") {
+        let sub = it.next();
+        match sub {
+            None => println!("{}", cli::USAGE),
+            Some(name) => match cli::command_usage(&name) {
+                Some(text) => println!("{text}"),
+                None => {
+                    bail!("no help for '{name}' (commands: serve|embed|bench|gen|tokenize|gemm)")
+                }
+            },
         }
-        other => bail!(
-            "unknown family '{other}' (expected serve|qwen3|intent|gemma)\n\n{}",
+        return Ok(());
+    }
+    if !matches!(
+        cmd.as_str(),
+        "serve" | "embed" | "bench" | "gen" | "tokenize" | "gemm"
+    ) {
+        bail!(
+            "unknown command '{cmd}' (expected serve|embed|bench|gen|tokenize|gemm)\n\n{}",
             cli::USAGE
-        ),
+        );
+    }
+    // `<command> --help` prints the command's flags without resolving `-hf`
+    // or touching the model. Only the leading argument is treated as help so a
+    // flag value that happens to be `--help` is not swallowed.
+    let rest: Vec<String> = it.collect();
+    if rest.first().is_some_and(|a| a == "--help" || a == "-h") {
+        println!(
+            "{}",
+            cli::command_usage(&cmd).expect("known command has usage text")
+        );
+        return Ok(());
+    }
+    let rest = util::hub::resolve_args(rest.into_iter())?;
+    let it = rest.into_iter();
+    match cmd.as_str() {
+        "serve" => server::cli::run(it),
+        "embed" => commands::embed::run(it),
+        "bench" => commands::bench::run(it),
+        "gen" => commands::generate::run(it),
+        "tokenize" => commands::tokenize::run(it),
+        "gemm" => commands::gemm::run(it),
+        _ => unreachable!("validated above"),
     }
 }

@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use burn::prelude::*;
 use burn::tensor::DType;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -15,17 +15,23 @@ use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::rss_mib;
 
+/// NPU stages for qwen3: the projections and the attention are independent.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+pub struct NpuOpts {
+    pub threads: usize,
+    pub text: bool,
+    pub attn: bool,
+}
+
 pub fn load_model(
     ckpt: &mut AnyCheckpoint,
     dtype: DType,
     quant_q8: bool,
-    npu: bool,
-    npu_threads: usize,
-    npu_attn: bool,
+    npu: Option<NpuOpts>,
     device: &Device,
 ) -> Result<(Qwen3Embedding, Qwen3Config)> {
     let cfg = Qwen3Config::from_value(ckpt.config_json()?)?;
-    let _ = (npu_threads, npu_attn); // only used by the aarch64+npu build
     let mut model = Qwen3Embedding::new(&cfg, device);
     let t0 = Instant::now();
     let result = ckpt
@@ -39,17 +45,40 @@ pub fn load_model(
         ckpt.format(),
         t0.elapsed().as_secs_f64()
     );
+    #[allow(unused_mut)]
+    let mut npu_attn = false;
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if npu {
-        if quant_q8 {
-            bail!("--npu packs its own weights; --quant q8 is not applicable");
+    if let Some(opts) = npu {
+        if opts.text {
+            if quant_q8 {
+                eprintln!(
+                    "note: --quant q8 applies to CPU-resident weights only; the qwen3 \
+                     text projections are packed from {dtype:?}"
+                );
+            }
+            return load_npu_projections(
+                ckpt,
+                model,
+                cfg,
+                dtype,
+                opts.threads,
+                opts.attn,
+                device,
+                t0,
+            );
         }
-        return load_npu_projections(ckpt, model, cfg, dtype, npu_threads, npu_attn, device, t0);
+        // Attention only (or an empty set): the projections stay on the CPU.
+        burn_rocket::init(opts.threads)
+            .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+        crate::util::glue::set_glue(true);
+        npu_attn = opts.attn;
     }
     #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
-    if npu {
-        bail!("--npu requires an aarch64 build with --features npu");
+    if npu.is_some() {
+        anyhow::bail!("an NPU placement requires an aarch64 build with `--features npu`");
     }
+    let _ = &npu;
+    let _ = npu_attn;
     // NPU builds skip the projection fields in the module tree (the NPU loader
     // packs them straight from the checkpoint); load them here for the CPU paths.
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -74,6 +103,11 @@ pub fn load_model(
             t0.elapsed().as_secs_f64(),
             rss_mib()
         );
+    }
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_attn {
+        model.set_npu_attn(true);
+        println!("NPU: attention offload enabled (n_head=16, n_kv=8, head_dim=128)");
     }
     Ok((model, cfg))
 }
@@ -119,7 +153,7 @@ fn load_cpu_projections(
         for kind in ProjKind::ALL {
             let (_, _, data) = read_projection(ckpt, layer, kind, dtype)?;
             // The checkpoint holds HF `[out, in]`; Burn's `Linear` wants `[in, out]`.
-            let t = Tensor::<2>::from_data(data, (&*device, dtype)).swap_dims(0, 1);
+            let t = Tensor::<2>::from_data(data, (device, dtype)).swap_dims(0, 1);
             let t = if quant_q8 {
                 let t = t.cast(DType::F32);
                 let range = compute_range(&scheme, &t, &Calibration::MinMax);
@@ -182,7 +216,7 @@ fn load_npu_projections(
         for kind in [ProjKind::O, ProjKind::Down] {
             let (k, n, data) = read_projection(ckpt, layer, kind, dtype)?;
             bytes += k * n * 2;
-            let id = burn_rocket::pack(Tensor::<2>::from_data(data, (&*device, dtype)));
+            let id = burn_rocket::pack(Tensor::<2>::from_data(data, (device, dtype)));
             *model.projection_mut(layer, kind) = Proj::Npu(id);
         }
         let groups: [(FusedGroup, &[ProjKind]); 2] = [
@@ -199,7 +233,7 @@ fn load_npu_projections(
                 }
                 assert_eq!(k, kk, "fused group members must share K");
                 bytes += kk * n * 2;
-                parts.push(Tensor::<2>::from_data(data, (&*device, dtype)));
+                parts.push(Tensor::<2>::from_data(data, (device, dtype)));
             }
             model.set_fused_handle(layer, group, pack_group(parts));
         }

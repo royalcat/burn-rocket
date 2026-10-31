@@ -156,7 +156,7 @@ pub struct TextAttention {
     o_proj: Linear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
-    /// Set in `--npu --npu-attn npu` mode: attention runs on the RK3588 NPU.
+    /// Set when the text attention is placed on the NPU: runs on the RK3588 NPU.
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     #[module(skip)]
     npu_attn: bool,
@@ -736,7 +736,7 @@ impl TextModel {
         f(&mut self.embedding_projection);
     }
 
-    /// Enable/disable NPU attention on every layer (`--npu-attn`).
+    /// Enable/disable NPU attention on every layer (`--text-attn-device npu`).
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     pub fn set_npu_attn(&mut self, on: bool) {
         for layer in &mut self.layers {

@@ -2,6 +2,5 @@
 //! the OpenAI-compatible `/v1/chat/completions` server, and its CLI.
 
 pub mod chat;
-pub mod cli;
 pub mod loader;
 pub mod model;

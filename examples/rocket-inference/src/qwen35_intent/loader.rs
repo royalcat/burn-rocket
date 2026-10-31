@@ -17,25 +17,32 @@ use crate::util::proj::Proj;
 use tokenizers::Tokenizer;
 
 pub struct IntentLoadOptions {
-    /// Pack projections into resident NPU weights (aarch64 + `npu` feature only).
+    /// Any stage runs on the NPU (creates the engine).
     pub npu: bool,
+    /// Pack the prefill projections into resident NPU weights
+    /// (aarch64 + `npu` feature only).
+    pub text: bool,
+    /// Run single-token decode matmuls on the NPU too.
+    pub decode: bool,
+    /// Keep the f16 CPU projection copies (decode on the CPU needs them; with
+    /// decode offloaded they are only a debug/fallback copy).
+    pub keep_cpu_weights: bool,
     /// NPU worker threads; read by the aarch64 + `npu` build only.
     #[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
     pub npu_threads: usize,
     /// Keep only an f16 copy of the tied embedding/LM-head table (saves ~0.5 GB).
     pub embed_f16: bool,
-    /// With `npu`: do not retain f16 CPU projection copies. Every projection then
-    /// runs on the NPU (single-token decode pays the `M >= 256` padding).
-    pub pure_npu: bool,
 }
 
 impl Default for IntentLoadOptions {
     fn default() -> Self {
         Self {
             npu: false,
+            text: false,
+            decode: false,
+            keep_cpu_weights: true,
             npu_threads: 5,
             embed_f16: false,
-            pure_npu: false,
         }
     }
 }
@@ -167,7 +174,7 @@ pub fn load_intent_model(
 
         // MLP (every layer). In NPU mode gate|up is one resident weight.
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-        if opts.npu {
+        if opts.text {
             let gateup = npu_pack2(
                 ckpt,
                 &p("mlp.gate_proj.weight"),
@@ -180,7 +187,7 @@ pub fn load_intent_model(
             packed += 2;
         }
         if opts.npu {
-            if !opts.pure_npu {
+            if opts.keep_cpu_weights {
                 layer.mlp.gate_proj = cpu_proj_f16(ckpt, &p("mlp.gate_proj.weight"), device)?;
                 layer.mlp.up_proj = cpu_proj_f16(ckpt, &p("mlp.up_proj.weight"), device)?;
                 layer.mlp.down_proj = cpu_proj_f16(ckpt, &p("mlp.down_proj.weight"), device)?;
@@ -247,7 +254,7 @@ fn load_linear(
     dn.in_proj_b = cpu_proj(ckpt, &p("linear_attn.in_proj_b.weight"), device)?;
 
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if opts.npu {
+    if opts.text {
         // in_proj_qkv|z share one input: one resident weight, one matmul.
         let qkvz = npu_pack2(
             ckpt,
@@ -261,7 +268,7 @@ fn load_linear(
         *packed += 2;
     }
     if opts.npu {
-        if !opts.pure_npu {
+        if opts.keep_cpu_weights {
             dn.in_proj_qkv = cpu_proj_f16(ckpt, &p("linear_attn.in_proj_qkv.weight"), device)?;
             dn.in_proj_z = cpu_proj_f16(ckpt, &p("linear_attn.in_proj_z.weight"), device)?;
             dn.out_proj = cpu_proj_f16(ckpt, &p("linear_attn.out_proj.weight"), device)?;
@@ -288,7 +295,7 @@ fn load_full(
     fa.k_norm_w = read_norm1(ckpt, &p("self_attn.k_norm.weight"), device)?;
 
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-    if opts.npu {
+    if opts.text {
         let qkv = npu_pack3(
             ckpt,
             &p("self_attn.q_proj.weight"),
@@ -302,7 +309,7 @@ fn load_full(
         *packed += 2;
     }
     if opts.npu {
-        if !opts.pure_npu {
+        if opts.keep_cpu_weights {
             fa.q_proj = cpu_proj_f16(ckpt, &p("self_attn.q_proj.weight"), device)?;
             fa.k_proj = cpu_proj_f16(ckpt, &p("self_attn.k_proj.weight"), device)?;
             fa.v_proj = cpu_proj_f16(ckpt, &p("self_attn.v_proj.weight"), device)?;
@@ -358,15 +365,13 @@ pub fn load_for_serving(
     device: &Device,
     opts: &IntentLoadOptions,
     delta_chunk: usize,
-    pure_npu: bool,
-    npu_decode: bool,
 ) -> Result<LoadedIntent> {
     let mut ckpt = crate::util::checkpoint::open_in_dir(model_dir)?;
     let cfg = IntentTextConfig::from_value(ckpt.config_json()?)?;
     let mut model = load_intent_model(&mut ckpt, device, opts)?;
     model.chunk = delta_chunk.max(1);
-    model.npu_only = pure_npu;
-    model.npu_decode = npu_decode;
+    model.npu_only = opts.text && !opts.keep_cpu_weights;
+    model.npu_decode = opts.decode;
     let tokenizer = ckpt.tokenizer()?;
     let stop_ids = stop_ids(&ckpt, &tokenizer, &cfg);
     Ok(LoadedIntent {

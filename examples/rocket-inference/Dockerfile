@@ -66,13 +66,12 @@ COPY --from=build /src/out/rocket-inference /usr/local/bin/rocket-inference
 
 EXPOSE 8383
 ENTRYPOINT ["rocket-inference"]
-# Production defaults (openviking stack on rock-5b-plus): NPU projections are
-# `serve`'s default on aarch64 builds that have them (`--no-npu` forces the flex
-# CPU path), with CPU flash attention (NPU attention is memory-hungry on this
-# board — deployment finding, 2026-10-05) and an 8192-token cap (OpenViking's
-# client times out at 600 s). Mount the weights at /models/qwen3-embedding-0.6b
-# and pass --device /dev/accel/accel0. On amd64 the NPU flags are inert and the
-# same command runs the flex CPU path.
-CMD ["serve", "--backend", "flex", "--dtype", "f32", "--npu-attn", "cpu", "--port", "8383", \
-     "--max-tokens", "8192", "--model-dir", "/models/qwen3-embedding-0.6b", \
-     "--model-name", "qwen3-embedding"]
+# Production defaults: `--device auto` places every stage on the NPU on an
+# aarch64 build with the `npu` feature and on the CPU elsewhere, so the same
+# command runs on both images. `--text-attn-device cpu` keeps the text attention
+# on the CPU (NPU attention is memory-hungry on this board — deployment finding,
+# 2026-10-05) and the 8192-token cap matches OpenViking's 600 s client timeout.
+# Mount the weights at /models/<model> and pass --device /dev/accel/accel0.
+CMD ["serve", "--cpu-backend", "flex", "--dtype", "f32", "--device", "auto", \
+     "--text-attn-device", "cpu", "--port", "8383", "--max-tokens", "8192", \
+     "--model-dir", "/models/qwen3-embedding-0.6b", "--model-name", "qwen3-embedding"]
