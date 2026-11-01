@@ -30,15 +30,17 @@
 //! enough to move the pooled output by 1.3e-3 and the cosine off 1.
 //!
 //! Every norm is `nn.LayerNorm(..., eps=1e-6)` (see [`LAYER_NORM_EPS`]). The
-//! tower runs in f32: a d3 checkpoint stores bf16 weights, and Phase 2a's gate is
-//! an f32 reference.
+//! arithmetic is f32: a d3 checkpoint stores bf16 weights, the tower keeps its
+//! 2-D matmul weights in that dtype (half the resident bytes) and widens each one
+//! per linear — exact, and the widening is arranged so the f32 matmul sees the
+//! same operand layout an f32 checkpoint produces (see [`weight_f32`]).
 
 use anyhow::{Result, bail};
 use burn::prelude::*;
 use burn::tensor::activation::{gelu, gelu_approximate};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{Int, TensorData, s};
+use burn::tensor::{DType, Int, TensorData, s};
 
 use super::config::{LAYER_NORM_EPS, VisionConfig};
 use super::processor::{PreparedImage, PreparedVideo};
@@ -181,9 +183,31 @@ fn apply_axial_rope(x: Tensor<3>, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<3>
 }
 
 /// `y = x @ W + b` with `W` stored `[in, out]`.
+///
+/// `W` may be the checkpoint's native 16-bit dtype (see [`weight_f32`]).
 fn linear(x: Tensor<2>, weight: &Tensor<2>, bias: &Tensor<1>) -> Tensor<2> {
     let [_, out] = weight.dims();
-    x.matmul(weight.clone()) + bias.clone().reshape([1, out])
+    x.matmul(weight_f32(weight)) + bias.clone().reshape([1, out])
+}
+
+/// A stored weight as the f32 `[in, out]` matmul operand.
+///
+/// An f32 weight is used as it is (a swapped view of the checkpoint's `[out, in]`
+/// buffer). A 16-bit weight — the dtype a d3 checkpoint actually stores — is
+/// widened per call, which is exact; the two swaps matter: widening the `[in, out]`
+/// view would materialize a row-major f32 tensor, and flex's gemm reorders the K
+/// accumulation against the f32 path's transposed view (1 ULP measured), so the
+/// product is widened in its stored `[out, in]` orientation and swapped afterwards.
+/// That reproduces the f32 operand bit for bit, at half the resident bytes.
+fn weight_f32(weight: &Tensor<2>) -> Tensor<2> {
+    match weight.dtype() {
+        DType::F32 => weight.clone(),
+        _ => weight
+            .clone()
+            .swap_dims(0, 1)
+            .cast(DType::F32)
+            .swap_dims(0, 1),
+    }
 }
 
 /// `nn.LayerNorm(hidden, eps=1e-6)`: f32 mean/variance over the last dim.
@@ -198,10 +222,11 @@ fn layer_norm(x: Tensor<2>, weight: &Tensor<1>, bias: &Tensor<1>) -> Tensor<2> {
 
 #[derive(Debug)]
 struct VisionBlock {
-    /// `[hidden]`, `[hidden]`.
+    /// `[hidden]`, `[hidden]` (f32: the norm path is f32).
     norm1_w: Tensor<1>,
     norm1_b: Tensor<1>,
-    /// `[hidden, 3 * hidden]`, `[3 * hidden]`.
+    /// `[hidden, 3 * hidden]`, `[3 * hidden]`. The `*_w` weights are f32 or the
+    /// checkpoint's 16-bit dtype (see [`weight_f32`]).
     qkv_w: Tensor<2>,
     qkv_b: Tensor<1>,
     /// `[hidden, hidden]`, `[hidden]`.
@@ -233,10 +258,12 @@ struct PatchMerger {
 #[derive(Debug)]
 pub struct VisionTower {
     pub config: VisionConfig,
-    /// `[patch_dim, hidden]`, `[hidden]`.
+    /// `[patch_dim, hidden]`, `[hidden]` (the weight in the checkpoint's dtype:
+    /// bf16 for every shipped d3 package, f32 for an f32 export).
     patch_w: Tensor<2>,
     patch_b: Tensor<1>,
-    /// `[num_position_embeddings, hidden]`.
+    /// `[num_position_embeddings, hidden]`, f32 (read at the native dtype and
+    /// widened once at load: it is small and every forward gathers from it).
     position_table: Tensor<2>,
     blocks: Vec<VisionBlock>,
     merger: PatchMerger,
@@ -544,6 +571,26 @@ impl VisionTower {
         Ok(linear(h, &self.merger.fc2_w, &self.merger.fc2_b))
     }
 
+    /// The dtype each stored matmul weight is in (patch, per block `qkv`/`proj`/
+    /// `fc1`/`fc2`, merger `fc1`/`fc2`).
+    ///
+    /// Test-only: it is how `load`'s tests see that a 16-bit checkpoint keeps its
+    /// weights 16-bit (the arithmetic is f32 either way).
+    #[cfg(test)]
+    pub(crate) fn weight_dtypes(&self) -> Vec<DType> {
+        let mut dtypes = vec![self.patch_w.dtype()];
+        for block in &self.blocks {
+            dtypes.extend([
+                block.qkv_w.dtype(),
+                block.proj_w.dtype(),
+                block.fc1_w.dtype(),
+                block.fc2_w.dtype(),
+            ]);
+        }
+        dtypes.extend([self.merger.fc1_w.dtype(), self.merger.fc2_w.dtype()]);
+        dtypes
+    }
+
     /// Encode several images, concatenating their merged tokens in image order
     /// (the reference's `pixel_values`/`pooler_output` contract).
     pub fn encode_all(&self, images: &[PreparedImage]) -> Result<Tensor<2>> {
@@ -784,6 +831,37 @@ mod tests {
                 80.0
             ]
         );
+    }
+
+    /// A 16-bit weight must multiply exactly like the f32 checkpoint's: the
+    /// tower stores it as a swapped view of the checkpoint's `[out, in]` buffer,
+    /// and widening `[out, in]` and swapping afterwards reproduces the f32
+    /// operand's layout (and therefore its accumulation order).
+    #[test]
+    fn a_16_bit_weight_multiplies_like_an_f32_one() {
+        let device = Device::default();
+        let (rows, cols) = (6usize, 8usize);
+        let values: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.37).sin()).collect();
+        // The same values, stored bf16 (so the exact reference is the widened one).
+        let narrow = TensorData::new(values.clone(), [rows, cols]).convert_dtype(DType::BF16);
+        let wide = narrow.clone().convert_dtype(DType::F32);
+        let exact: Vec<f32> = wide.clone().try_to_vec().unwrap();
+        assert_ne!(values, exact, "the fixture must actually round");
+        let f32_weight = Tensor::<2>::from_data(wide, &device).swap_dims(0, 1);
+        let bf16_weight = Tensor::<2>::from_data(narrow, &device).swap_dims(0, 1);
+        let x = Tensor::<2>::from_data([[0.5f32, -1.0, 2.0, 0.25, 0.75, -0.5, 1.5, -2.0]], &device);
+        let bias = Tensor::<1>::from_data([0.125f32, -0.25, 0.5, 1.0, -1.5, 0.0], &device);
+        let a: Vec<f32> = linear(x.clone(), &f32_weight, &bias)
+            .to_data()
+            .try_to_vec()
+            .unwrap();
+        let b: Vec<f32> = linear(x, &bf16_weight, &bias)
+            .to_data()
+            .try_to_vec()
+            .unwrap();
+        for (index, (a, b)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "element {index}: {a} vs {b}");
+        }
     }
 
     #[test]

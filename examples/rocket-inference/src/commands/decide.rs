@@ -135,6 +135,7 @@ fn load_model(load: &ResolvedLoad, args: &Args) -> Result<DecisionModel> {
         &device,
         &opts,
         args.max_state_tokens.unwrap_or(MAX_STATE_TOKENS),
+        load.defer_towers,
     )?;
     println!("decision model resident {:.0} MiB anon", rss_mib());
     Ok(model)

@@ -226,7 +226,8 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 embed_f16: load.embed_f16,
                 ..IntentLoadOptions::default()
             };
-            let model = load_decision_model(&model_dir, &device, &opts, max_tokens)?;
+            let model =
+                load_decision_model(&model_dir, &device, &opts, max_tokens, load.defer_towers)?;
             (
                 Engine::Decision(Box::new(DecisionEngine { model, max_tokens })),
                 Capabilities {

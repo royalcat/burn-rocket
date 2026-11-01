@@ -108,8 +108,11 @@ impl Family {
         self.is_chat()
     }
 
+    /// Whether the model has vision (and/or audio) towers that can load on first
+    /// use: the EmbeddingGemma 2 / Gemma 4 tower halves, and a d3 package's vision
+    /// tower (a CPU stage loaded with the backbone unless the flag defers it).
     pub fn supports_defer_towers(self) -> bool {
-        matches!(self, Self::Emb2 | Self::Gemma4)
+        matches!(self, Self::Emb2 | Self::Gemma4 | Self::Decision)
     }
 
     pub fn supports_attn_kernel(self) -> bool {
@@ -229,7 +232,9 @@ mod tests {
         assert!(!d.supports_quant());
         assert!(!d.supports_int8());
         assert!(!d.supports_keep_cpu_weights());
-        assert!(!d.supports_defer_towers());
+        // The vision tower is a CPU stage that loads with the backbone; the flag
+        // moves that load to the first media request.
+        assert!(d.supports_defer_towers());
         assert!(!d.supports_attn_kernel());
         assert!(!d.supports_attn_tiles());
         assert!(!d.supports_vision_attn_kernel());

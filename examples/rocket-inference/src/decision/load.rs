@@ -2,6 +2,7 @@
 //! intent family), the 255-code readout head and the tokenizer.
 
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
@@ -30,14 +31,26 @@ pub fn manifest_model_name(model_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The vision tower's `visual.*` tensors, f32, from a d3 checkpoint.
+/// The vision tower's `visual.*` tensors, in the dtype the checkpoint stores.
 ///
 /// `super::vision::VisionTower::load` only needs these reads, so the tower stays
-/// independent of the app's checkpoint abstraction (the standalone vision probe
-/// reads the same keys from a safetensors file directly).
+/// independent of the app's checkpoint abstraction (the standalone vision probes
+/// read the same keys from a safetensors file directly). The dtype is passed
+/// through instead of widening everything to f32: a d3 package stores bf16 and the
+/// tower keeps its matmul weights bf16 (half the resident bytes, exact).
 impl TensorSource for AnyCheckpoint {
-    fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>> {
-        self.get(key, DType::F32)
+    fn vision_tensor(&mut self, key: &str) -> Result<Option<(DType, TensorData)>> {
+        match self {
+            AnyCheckpoint::Safetensors(checkpoint) => {
+                Ok(checkpoint.get_stored(key)?.map(|data| (data.dtype(), data)))
+            }
+            // The decision loader refuses a GGUF checkpoint before the tower is
+            // read; a GGUF dequantizes to its native float dtype anyway.
+            AnyCheckpoint::Gguf(checkpoint) => {
+                let dtype = checkpoint.native_dtype();
+                Ok(checkpoint.get(key, dtype)?.map(|data| (data.dtype(), data)))
+            }
+        }
     }
 }
 
@@ -47,14 +60,17 @@ impl TensorSource for AnyCheckpoint {
 /// the prefix, the label and the rotary-table cap are set here, the full-attention
 /// layers are switched to the checkpoint's bidirectional mode, and the placement
 /// invariants are applied exactly as the intent server applies them. An
-/// image-capable package (`config.json` `vision_config`) also loads its
-/// `visual.*` vision tower.
+/// image-capable package (`config.json` `vision_config`) also has its `visual.*`
+/// vision tower — loaded here, unless `defer_towers` leaves it to the first media
+/// request (`DecisionModel::ensure_vision`).
 pub fn load_decision_model(
     model_dir: &Path,
     device: &Device,
     opts: &IntentLoadOptions,
     max_tokens: usize,
+    defer_towers: bool,
 ) -> Result<DecisionModel> {
+    let started = Instant::now();
     let config = DecisionConfig::load(model_dir)?;
     let config_json = read_config_json(model_dir)?;
     let mut ckpt = checkpoint::open_in_dir(model_dir)
@@ -86,20 +102,36 @@ pub fn load_decision_model(
     let readout = config::load_readout(model_dir, hidden, device)?;
     // `vision_config` makes the package image-capable (`visual.*` beside the
     // backbone); a text-only package has no tower and refuses images.
-    let vision = if config_json.get("vision_config").is_some() {
-        Some(
-            load_tower(&mut ckpt, &config_json, device)
-                .context("load the vision tower of the d3 checkpoint")?,
-        )
+    let vision_declared = config_json.get("vision_config").is_some();
+    let vision = if vision_declared && !defer_towers {
+        let tower = load_tower(&mut ckpt, &config_json, device)
+            .context("load the vision tower of the d3 checkpoint")?;
+        // The tower's tensors are widened per linear, so the load leaves the
+        // checkpoint's 16-bit bytes and the per-tensor copies in glibc's arenas:
+        // return them, or the smaller resident tower is hidden behind them.
+        crate::util::trim_heap();
+        Some(tower)
     } else {
         None
     };
+    println!(
+        "decision model ready in {:.1}s ({})",
+        started.elapsed().as_secs_f64(),
+        match (&vision, vision_declared) {
+            (Some(tower), _) => format!("vision tower: {} blocks", tower.config.depth),
+            (None, true) => "vision tower deferred to the first media request".to_string(),
+            (None, false) => "text-only, no vision tower".to_string(),
+        }
+    );
     Ok(DecisionModel {
         backbone,
         readout,
         config,
         tokenizer,
         vision,
+        model_dir: model_dir.to_path_buf(),
+        defer_towers,
+        vision_declared,
         image_token_id,
         video_token_id,
     })
@@ -107,7 +139,7 @@ pub fn load_decision_model(
 
 /// `<dir>/config.json` as a value (the checkpoint's own config, beside
 /// `decision_config.json`).
-fn read_config_json(model_dir: &Path) -> Result<serde_json::Value> {
+pub(crate) fn read_config_json(model_dir: &Path) -> Result<serde_json::Value> {
     let path = model_dir.join("config.json");
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -379,6 +411,7 @@ mod tests {
             &Device::default(),
             &IntentLoadOptions::default(),
             8192,
+            false,
         )
         .unwrap_err();
         let message = format!("{err:#}");

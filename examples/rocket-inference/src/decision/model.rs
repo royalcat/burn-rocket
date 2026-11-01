@@ -22,8 +22,10 @@
 //! takes the unchanged `forward_last_normed` path.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use burn::prelude::*;
 use image::RgbImage;
 use serde_json::{Map, Value};
@@ -31,12 +33,14 @@ use tokenizers::Tokenizer;
 
 use super::config::{DecisionConfig, MAX_OPTIONS};
 use super::format::{self, Question};
+use super::load::read_config_json;
 use super::mrope;
 use super::request::{DecisionRequest, MediaMode};
 use super::vision::processor::{VIDEO_MAX_TOKENS, planned_video_tokens, prepare_video};
 use super::vision::video::{DecodedVideo, thousands, video_replacement};
-use super::vision::{PreparedImage, VisionTower, prepare_from_rgb};
+use super::vision::{PreparedImage, VisionTower, load_tower, prepare_from_rgb};
 use crate::qwen35_intent::model::IntentModel;
+use crate::util::checkpoint;
 
 /// Why a text-only d3 package refuses images: the reference's own
 /// `image_unavailable` text, verbatim.
@@ -108,8 +112,18 @@ pub struct DecisionModel {
     pub config: DecisionConfig,
     pub tokenizer: Tokenizer,
     /// The vision tower of an image/video-capable checkpoint (`config.json`
-    /// `vision_config` + `visual.*`); `None` for a text-only package.
+    /// `vision_config` + `visual.*`); `None` for a text-only package, and also
+    /// `None` until the first media request under `--defer-towers`.
     pub vision: Option<VisionTower>,
+    /// The checkpoint directory, kept so a deferred tower can be loaded on the
+    /// first media request.
+    pub model_dir: PathBuf,
+    /// `--defer-towers`: the tower is not loaded until a media request needs it.
+    /// The text path never touches it.
+    pub defer_towers: bool,
+    /// `config.json` declares a `vision_config`, i.e. the package *is*
+    /// image-capable whether or not the tower is loaded yet (`has_vision`).
+    pub vision_declared: bool,
     /// `config.json` `image_token_id`: the id one `<|image_pad|>` expands from.
     pub image_token_id: u32,
     /// `config.json` `video_token_id`: the id of one `<|video_pad|>`.
@@ -256,8 +270,45 @@ impl DecisionModel {
     }
 
     /// Whether the checkpoint carries a vision tower (a media request needs one).
+    ///
+    /// The **declaration**, not the load: a `--defer-towers` package answers
+    /// `true` before its tower exists, so the server does not refuse its media.
     pub fn has_vision(&self) -> bool {
-        self.vision.is_some()
+        self.vision_declared
+    }
+
+    /// Whether the tower still waits for its first media request
+    /// (`--defer-towers` on an image-capable package).
+    pub fn towers_pending(&self) -> bool {
+        self.defer_towers && self.vision_declared && self.vision.is_none()
+    }
+
+    /// Load a deferred tower (`--defer-towers`) on the first media request.
+    ///
+    /// Idempotent, and a no-op for a text-only package (its media are refused by
+    /// the caller, [`DecisionModel::prepare_media`]) and for the eager load.
+    /// Re-opens the checkpoint exactly like [`crate::decision::load_decision_model`]
+    /// does and prints one line with the wall time and the block count.
+    pub fn ensure_vision(&mut self) -> Result<()> {
+        if !self.towers_pending() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let config_json = read_config_json(&self.model_dir)?;
+        let mut ckpt = checkpoint::open_in_dir(&self.model_dir)
+            .with_context(|| format!("re-open the checkpoint in {}", self.model_dir.display()))?;
+        let tower = load_tower(&mut ckpt, &config_json, &self.backbone.device)
+            .context("load the vision tower of the d3 checkpoint")?;
+        // Same as the eager load: release the load's freed pages before the
+        // request's forward allocates its scratch.
+        crate::util::trim_heap();
+        println!(
+            "decision: loaded vision tower in {:.1}s ({} blocks)",
+            started.elapsed().as_secs_f64(),
+            tower.config.depth
+        );
+        self.vision = Some(tower);
+        Ok(())
     }
 
     /// Preprocess and encode the request's images and videos once.
@@ -266,19 +317,27 @@ impl DecisionModel {
     /// [`DecisionRequest::decode_images`]/[`DecisionRequest::decode_videos`]);
     /// this runs the Qwen2-VL/Qwen3-VL processors, the per-request video token
     /// budget and the vision tower. Returns the images and videos with their
-    /// merged features, in list order.
+    /// merged features, in list order. A deferred tower is loaded here.
     pub fn prepare_media(
-        &self,
+        &mut self,
         images: &[RgbImage],
         videos: &[DecodedVideo],
     ) -> Result<(Vec<PreparedVision>, Vec<PreparedVideo>), PrepareError> {
         if images.is_empty() && videos.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let Some(vision) = self.vision.as_ref() else {
+        if !self.vision_declared {
             let reason = unavailable_media(images.len(), videos.len())
                 .expect("media was checked to be nonempty");
             return Err(PrepareError::media(reason));
+        }
+        // `--defer-towers`: the first media request pays the tower load (a
+        // checkpoint failure here is a server fault, not the client's).
+        self.ensure_vision().map_err(PrepareError::Internal)?;
+        let Some(vision) = self.vision.as_ref() else {
+            return Err(PrepareError::Internal(anyhow!(
+                "the vision tower is declared but was not loaded"
+            )));
         };
         let config = &vision.config;
         let device = &self.backbone.device;
@@ -390,7 +449,7 @@ impl DecisionModel {
     /// [`DecisionModel::prepare_media`]). A question that cannot be answered ends
     /// up in [`Prepared::errors`] and the rest still runs.
     pub fn prepare(
-        &self,
+        &mut self,
         req: &DecisionRequest,
         images: &[RgbImage],
         videos: &[DecodedVideo],
@@ -1318,5 +1377,101 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("runs past"), "{error}");
+    }
+
+    /// A `DecisionModel` over a real d3 package's config and tokenizer with a stub
+    /// backbone and **no** tower: enough to exercise `prepare`/`ensure_vision`
+    /// without loading the backbone (the tower reads its own `visual.*` tensors).
+    fn deferred_model(dir: &std::path::Path, vision_declared: bool) -> Option<DecisionModel> {
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: {} is not available", dir.display());
+            return None;
+        }
+        let device = Device::default();
+        let config_json = read_config_json(dir).ok()?;
+        let text =
+            crate::qwen35_intent::model::IntentTextConfig::from_value(config_json.clone()).ok()?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).ok()?;
+        let id = |name: &str| {
+            config_json
+                .get(name)
+                .and_then(Value::as_u64)
+                .map(|v| v as u32)
+                .unwrap_or(u32::MAX)
+        };
+        Some(DecisionModel {
+            backbone: IntentModel::new_stub(&text, 64, &device),
+            readout: Tensor::zeros([MAX_OPTIONS, text.hidden_size], &device),
+            config: DecisionConfig::load(dir).ok()?,
+            tokenizer,
+            vision: None,
+            model_dir: dir.to_path_buf(),
+            defer_towers: true,
+            vision_declared,
+            image_token_id: id("image_token_id"),
+            video_token_id: id("video_token_id"),
+        })
+    }
+
+    /// `--defer-towers` on an image-capable package: the tower is absent but
+    /// **declared** (so the server keeps accepting media), a text request never
+    /// builds it, and the first media request does.
+    #[test]
+    fn a_deferred_tower_loads_on_the_first_media_request() {
+        let dir = std::path::Path::new("/tmp/opencode/d3/models/d3-lite");
+        let Some(mut model) = deferred_model(dir, true) else {
+            return;
+        };
+        assert!(
+            model.has_vision(),
+            "media is accepted before the tower exists"
+        );
+        assert!(model.vision.is_none());
+        assert!(model.towers_pending());
+
+        // A text request: `prepare_media` sees no media and returns before the
+        // tower would be needed, so the questions prepare without it.
+        let request = DecisionRequest::from_value(serde_json::json!({
+            "state": "Customer asks for a refund of a duplicate card charge.",
+            "questions": {"route": {"type": "noul"}},
+        }))
+        .unwrap();
+        let prepared = model.prepare(&request, &[], &[], 4096).unwrap();
+        assert_eq!(prepared.sequences.len(), 1);
+        assert!(
+            model.vision.is_none(),
+            "a text prepare must not load the tower"
+        );
+        assert!(model.towers_pending());
+
+        // The first media request loads it (one `decision: loaded vision tower`
+        // line), and a second one is a no-op.
+        model.ensure_vision().unwrap();
+        assert!(model.vision.is_some());
+        assert!(!model.towers_pending());
+        model.ensure_vision().unwrap();
+        assert!(
+            model.has_vision(),
+            "a loaded tower still reports vision after the load"
+        );
+    }
+
+    /// A text-only package has nothing to defer: `has_vision` stays `false` and a
+    /// media request is the reference's 422 detail.
+    #[test]
+    fn a_text_only_package_keeps_refusing_media() {
+        let dir = std::path::Path::new("/tmp/opencode/d3/models/d3-lite-text");
+        let Some(mut model) = deferred_model(dir, false) else {
+            return;
+        };
+        assert!(!model.has_vision());
+        assert!(!model.towers_pending());
+        model.ensure_vision().unwrap();
+        assert!(model.vision.is_none());
+        let err = model
+            .prepare_media(&[RgbImage::new(4, 4)], &[])
+            .unwrap_err();
+        assert!(matches!(err, PrepareError::InvalidMedia(ref m) if m == NO_VISION_TOWER));
+        assert!(model.vision.is_none());
     }
 }

@@ -280,6 +280,15 @@ impl SafetensorsCheckpoint {
             .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
         Ok(model.load_from(&mut store)?)
     }
+
+    /// One tensor in the dtype the file stores it in (**no** conversion), in the
+    /// HF/PyTorch convention. The d3 vision tower keeps a bf16 weight bf16.
+    pub fn get_stored(&mut self, hf_key: &str) -> Result<Option<TensorData>> {
+        let Some(tensor) = self.store.get_tensor(hf_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(bridge::to_data(tensor)?))
+    }
 }
 
 impl Checkpoint for SafetensorsCheckpoint {
@@ -318,11 +327,9 @@ impl Checkpoint for SafetensorsCheckpoint {
     }
 
     fn get(&mut self, hf_key: &str, dtype: DType) -> Result<Option<TensorData>> {
-        let Some(tensor) = self.store.get_tensor(hf_key)? else {
-            return Ok(None);
-        };
-        let data = bridge::to_data(tensor)?;
-        Ok(Some(data.convert_dtype(dtype)))
+        Ok(self
+            .get_stored(hf_key)?
+            .map(|data| data.convert_dtype(dtype)))
     }
 
     fn load_into<M: ModuleSnapshot>(&mut self, model: &mut M, dtype: DType) -> Result<ApplyResult> {

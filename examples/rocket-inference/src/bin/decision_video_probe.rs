@@ -4,8 +4,9 @@
 //! Loads **only** `config.json` and the `visual.*` tensors of a d3 checkpoint (no
 //! text backbone, no tokenizer, no readout), decodes the given videos exactly as
 //! the app does (ffprobe/ffmpeg, 2 fps, 4-32 frames, temporal pairs), preprocesses
-//! them as `Qwen3VLVideoProcessor` does and runs the tower in f32. It writes the
-//! raw tensors `tools/vision_parity.py` scores:
+//! them as `Qwen3VLVideoProcessor` does and runs the tower in f32 (the weights are
+//! read in the checkpoint's own dtype and widened per linear, exactly like the
+//! app's loader). It writes the raw tensors `tools/vision_parity.py` scores:
 //!
 //! * `frames.{i}.raw` — every sampled frame of video `i`, as
 //!   `u32 frames | u32 height | u32 width | rgb bytes` (the decoder's own RGB8,
@@ -294,12 +295,14 @@ impl Shard {
 }
 
 impl TensorSource for Shard {
-    fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>> {
+    fn vision_tensor(&mut self, key: &str) -> Result<Option<(DType, TensorData)>> {
         let Some(tensor) = self.store.get_tensor(key)? else {
             return Ok(None);
         };
         let data = burn_store::bridge::to_data(tensor)?;
-        Ok(Some(data.convert_dtype(DType::F32)))
+        // The stored dtype, unchanged (see `decision_vision_probe`).
+        let dtype = data.dtype();
+        Ok(Some((dtype, data)))
     }
 }
 

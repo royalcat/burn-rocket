@@ -3,8 +3,9 @@
 //!
 //! Loads **only** `config.json` and the `visual.*` tensors of a d3 checkpoint
 //! (no text backbone, no tokenizer, no readout), preprocesses one or more images
-//! exactly as `Qwen2VLImageProcessorFast` does, runs the tower in f32, and writes
-//! the raw tensors `tools/vision_parity.py` scores:
+//! exactly as `Qwen2VLImageProcessorFast` does, runs the tower in f32 (the weights
+//! are read in the checkpoint's own dtype and widened per linear, exactly like the
+//! app's loader), and writes the raw tensors `tools/vision_parity.py` scores:
 //!
 //! * `pixel_values.f32` — `[patches, 1536]` f32, patches of every `--image` in
 //!   order (the processor's `pixel_values`);
@@ -245,12 +246,15 @@ impl Shard {
 }
 
 impl TensorSource for Shard {
-    fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>> {
+    fn vision_tensor(&mut self, key: &str) -> Result<Option<(DType, TensorData)>> {
         let Some(tensor) = self.store.get_tensor(key)? else {
             return Ok(None);
         };
         let data = burn_store::bridge::to_data(tensor)?;
-        Ok(Some(data.convert_dtype(DType::F32)))
+        // The stored dtype, unchanged: the tower keeps a bf16 weight bf16 and
+        // widens it per linear (exact), exactly like the app's loader.
+        let dtype = data.dtype();
+        Ok(Some((dtype, data)))
     }
 }
 

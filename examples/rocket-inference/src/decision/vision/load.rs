@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
-use burn::tensor::TensorData;
+use burn::tensor::{DType, TensorData};
 
 use super::config::VisionConfig;
 use super::model::VisionTower;
@@ -23,12 +23,25 @@ use super::model::VisionTower;
 /// The checkpoint key prefix of the vision tower.
 pub const VISION_PREFIX: &str = "visual.";
 
-/// One tensor by its HF key, or `None` when the checkpoint does not have it.
+/// One tensor by its HF key, **in the dtype the checkpoint stores it in**.
 ///
 /// Implemented for [`crate::util::checkpoint::AnyCheckpoint`] in `decision/load.rs`
 /// (the app) and by the standalone probe for its own safetensors reader.
 pub trait TensorSource {
-    fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>>;
+    /// The tensor and its stored dtype, or `None` when the checkpoint does not
+    /// have it. No conversion: the tower keeps its matmul weights in the
+    /// checkpoint's own dtype, so the reading side must not widen them first.
+    fn vision_tensor(&mut self, key: &str) -> Result<Option<(DType, TensorData)>>;
+}
+
+/// Which dtype one `visual.*` tensor is read in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// A 2-D matmul weight: keep the checkpoint's 16-bit dtype (widening it per
+    /// linear is exact), f32 for an f32 export.
+    Weight,
+    /// f32: biases, the norm weights and the position table.
+    F32,
 }
 
 impl VisionTower {
@@ -37,6 +50,12 @@ impl VisionTower {
     /// Reads exactly `python -c "visual"`'s tensor set: 153 tensors for d3-lite
     /// (12 blocks), `12 + 8` more per extra layer for d3-nano. A missing tensor is
     /// an error; the tower's own shape checks reject a mismatched geometry.
+    ///
+    /// The weights (`patch_embed.proj.weight`, each block's `qkv`/`proj`/`fc1`/
+    /// `fc2` and the merger's two) keep the checkpoint's dtype — bf16 for every
+    /// shipped d3 package, i.e. half the resident bytes of an f32 load — and are
+    /// widened per linear. Everything else (biases, norms, the position table) is
+    /// read as f32.
     pub fn load(
         source: &mut impl TensorSource,
         config: &VisionConfig,
@@ -45,16 +64,23 @@ impl VisionTower {
         config.validate()?;
         let mut tower = VisionTower::new_stub(config.clone(), device);
         let mut applied = 0usize;
-        let mut read = |key: String| -> Result<TensorData> {
-            source
+        let mut read = |key: String, how: Read| -> Result<TensorData> {
+            let (dtype, data) = source
                 .vision_tensor(&key)?
-                .ok_or_else(|| anyhow::anyhow!("the checkpoint has no {key}"))
+                .ok_or_else(|| anyhow::anyhow!("the checkpoint has no {key}"))?;
+            Ok(match how {
+                Read::Weight if matches!(dtype, DType::BF16 | DType::F16) => data,
+                _ => data.convert_dtype(DType::F32),
+            })
         };
 
         tower.set(
             "patch_embed.proj.weight",
             patch_weight(
-                &read(format!("{VISION_PREFIX}patch_embed.proj.weight"))?,
+                &read(
+                    format!("{VISION_PREFIX}patch_embed.proj.weight"),
+                    Read::Weight,
+                )?,
                 config,
                 device,
             )?,
@@ -63,25 +89,26 @@ impl VisionTower {
         tower.set(
             "patch_embed.proj.bias",
             vector(
-                &read(format!("{VISION_PREFIX}patch_embed.proj.bias"))?,
+                &read(format!("{VISION_PREFIX}patch_embed.proj.bias"), Read::F32)?,
                 device,
             )?,
         )?;
         applied += 1;
         tower.set(
             "pos_embed.weight",
-            matrix(&read(format!("{VISION_PREFIX}pos_embed.weight"))?, device)?,
+            matrix(
+                &read(format!("{VISION_PREFIX}pos_embed.weight"), Read::F32)?,
+                device,
+            )?,
         )?;
         applied += 1;
 
         for index in 0..config.depth {
             for suffix in BLOCK_SUFFIXES {
                 let key = format!("{VISION_PREFIX}blocks.{index}.{suffix}");
-                let data = read(key)?;
-                let tensor = if suffix.ends_with("weight") && !suffix.starts_with("norm") {
-                    transpose(matrix(&data, device)?)
-                } else {
-                    vector(&data, device)?
+                let tensor = match weight_mode(suffix) {
+                    Read::Weight => transpose(matrix(&read(key, Read::Weight)?, device)?),
+                    Read::F32 => vector(&read(key, Read::F32)?, device)?,
                 };
                 tower.set(&format!("blocks.{index}.{suffix}"), tensor)?;
                 applied += 1;
@@ -90,11 +117,9 @@ impl VisionTower {
 
         for suffix in MERGER_SUFFIXES {
             let key = format!("{VISION_PREFIX}merger.{suffix}");
-            let data = read(key)?;
-            let tensor = if suffix.ends_with("weight") && !suffix.starts_with("norm") {
-                transpose(matrix(&data, device)?)
-            } else {
-                vector(&data, device)?
+            let tensor = match weight_mode(suffix) {
+                Read::Weight => transpose(matrix(&read(key, Read::Weight)?, device)?),
+                Read::F32 => vector(&read(key, Read::F32)?, device)?,
             };
             tower.set(&format!("merger.{suffix}"), tensor)?;
             applied += 1;
@@ -105,6 +130,15 @@ impl VisionTower {
             bail!("loaded {applied} vision tensors, expected {expected}");
         }
         Ok(tower)
+    }
+}
+
+/// A block/merger suffix is a matmul weight unless it is a norm's or a bias.
+fn weight_mode(suffix: &str) -> Read {
+    if suffix.ends_with("weight") && !suffix.starts_with("norm") {
+        Read::Weight
+    } else {
+        Read::F32
     }
 }
 
@@ -145,25 +179,30 @@ fn transpose(tensor: Tensor<2>) -> Tensor<2> {
     tensor.swap_dims(0, 1)
 }
 
-/// A 2-D tensor in the checkpoint's orientation.
+/// A 2-D tensor in the checkpoint's orientation, in its stored dtype.
+///
+/// Every `Tensor::from_data` here passes the dtype explicitly: with a bare device
+/// it resolves to the *device's* default float dtype (f32) and would silently
+/// widen a bf16 weight.
 fn matrix(data: &TensorData, device: &Device) -> Result<Tensor<2>> {
     if data.shape().num_dims() != 2 {
         bail!("expected a 2-D tensor, got {:?}", data.shape());
     }
-    Ok(Tensor::<2>::from_data(data.clone(), device))
+    Ok(Tensor::<2>::from_data(data.clone(), (device, data.dtype())))
 }
 
 /// A bias as `[1, n]`: `[n]` from safetensors, `[n, 1]` from a reversed store.
 fn vector(data: &TensorData, device: &Device) -> Result<Tensor<2>> {
     let shape = data.shape();
+    let options = (device, data.dtype());
     Ok(match shape.num_dims() {
-        1 => Tensor::<1>::from_data(data.clone(), device).reshape([1, shape.dims::<1>()[0]]),
+        1 => Tensor::<1>::from_data(data.clone(), options).reshape([1, shape.dims::<1>()[0]]),
         2 => {
             let [a, b] = shape.dims::<2>();
             if a != 1 && b != 1 {
                 bail!("expected a bias vector, got {a}x{b}");
             }
-            Tensor::<2>::from_data(data.clone(), device).reshape([1, a * b])
+            Tensor::<2>::from_data(data.clone(), options).reshape([1, a * b])
         }
         n => bail!("expected a 1-D bias, got {n} dimensions"),
     })
@@ -195,12 +234,13 @@ fn patch_weight(data: &TensorData, config: &VisionConfig, device: &Device) -> Re
             if out != hidden {
                 bail!("patch_embed.proj.weight has {out} output channels, expected {hidden}");
             }
-            let flat = Tensor::<5>::from_data(data.clone(), device).reshape([hidden, patch_dim]);
+            let flat = Tensor::<5>::from_data(data.clone(), (device, data.dtype()))
+                .reshape([hidden, patch_dim]);
             Ok(transpose(flat))
         }
         2 => {
             let [a, b] = shape.dims::<2>();
-            let flat = Tensor::<2>::from_data(data.clone(), device);
+            let flat = Tensor::<2>::from_data(data.clone(), (device, data.dtype()));
             if (a, b) == (hidden, patch_dim) {
                 Ok(transpose(flat))
             } else if (a, b) == (patch_dim, hidden) {
@@ -233,7 +273,7 @@ mod tests {
     use super::*;
 
     /// An in-memory source: key -> (shape, values).
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct Map {
         tensors: std::collections::HashMap<String, TensorData>,
     }
@@ -245,11 +285,39 @@ mod tests {
                 .insert(key.into(), TensorData::new(vec![0.0f32; n], shape));
             self
         }
+
+        /// Replace every value by a deterministic pseudo-random one, so a forward
+        /// exercises the weights instead of multiplying by zero.
+        fn filled(mut self) -> Self {
+            for (index, (_, data)) in self.tensors.iter_mut().enumerate() {
+                let n = data.shape().num_elements();
+                let values: Vec<f32> = (0..n)
+                    .map(|i| (((i + index * 7919) as f32) * 0.173).sin() * 0.5)
+                    .collect();
+                *data = TensorData::new(values, data.shape().clone());
+            }
+            self
+        }
+
+        /// Every tensor cast to `dtype`.
+        fn convert(self, dtype: DType) -> Self {
+            Self {
+                tensors: self
+                    .tensors
+                    .into_iter()
+                    .map(|(key, data)| (key, data.convert_dtype(dtype)))
+                    .collect(),
+            }
+        }
     }
 
     impl TensorSource for Map {
-        fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>> {
-            Ok(self.tensors.get(key).cloned())
+        fn vision_tensor(&mut self, key: &str) -> Result<Option<(DType, TensorData)>> {
+            Ok(self
+                .tensors
+                .get(key)
+                .cloned()
+                .map(|data| (data.dtype(), data)))
         }
     }
 
@@ -322,6 +390,8 @@ mod tests {
         let tower = VisionTower::load(&mut source, &cfg, &device).unwrap();
         assert_eq!(tensor_count(&cfg), 3 + 2 * 12 + 6);
         assert_eq!(tower.config, cfg);
+        // An f32 source stays f32 (the in-memory `Map` is f32 throughout).
+        assert!(tower.weight_dtypes().iter().all(|d| *d == DType::F32));
         // The tower runs with the loaded (zero) weights: a 2x2 patch grid
         // merges into one token of the output width.
         let image = PreparedImage {
@@ -335,6 +405,59 @@ mod tests {
             tower.encode(&image).unwrap().dims(),
             [1, cfg.out_hidden_size]
         );
+    }
+
+    /// The stored dtype decides the tower's storage, not its arithmetic: the same
+    /// weights loaded bf16 (a d3 checkpoint's own dtype) and as the f32 values they
+    /// widen to produce a **bit-identical** forward. bf16 -> f32 is exact, and
+    /// `linear` widens each weight into the operand layout the f32 path uses.
+    #[test]
+    fn a_bf16_tower_encodes_like_an_f32_one() {
+        let cfg = config();
+        let device = Device::default();
+        // The f32 arm holds exactly the values the bf16 arm stores.
+        let narrow = lite_source(&cfg).filled().convert(DType::BF16);
+        // The fixture must actually be 16-bit storage, or the test proves nothing.
+        assert_eq!(
+            narrow.tensors["visual.blocks.0.attn.qkv.weight"].dtype(),
+            DType::BF16
+        );
+        let wide = narrow.clone().convert(DType::F32);
+        let mut bare = narrow;
+        let mut exact = wide;
+        let bf16 = VisionTower::load(&mut bare, &cfg, &device).unwrap();
+        let f32 = VisionTower::load(&mut exact, &cfg, &device).unwrap();
+        // Only the matmul weights may stay 16-bit; the position table and every
+        // norm/bias is f32 in both arms (a 16-bit one would fail the dtype checks
+        // of the f32 forward).
+        assert!(
+            bf16.weight_dtypes().iter().all(|d| *d == DType::BF16),
+            "{:?}",
+            bf16.weight_dtypes()
+        );
+        assert!(f32.weight_dtypes().iter().all(|d| *d == DType::F32));
+
+        let image = PreparedImage {
+            pixel_values: Tensor::<2>::from_data(
+                TensorData::new(
+                    (0..cfg.merge_unit() * cfg.patch_dim())
+                        .map(|i| ((i as f32) * 0.31).cos())
+                        .collect::<Vec<f32>>(),
+                    [cfg.merge_unit(), cfg.patch_dim()],
+                ),
+                &device,
+            ),
+            grid: [1, 2, 2],
+            tokens: 1,
+            source: (4, 4),
+            resized: (4, 4),
+        };
+        let a: Vec<f32> = bf16.encode(&image).unwrap().to_data().try_to_vec().unwrap();
+        let b: Vec<f32> = f32.encode(&image).unwrap().to_data().try_to_vec().unwrap();
+        assert_eq!(a.len(), cfg.out_hidden_size);
+        for (index, (a, b)) in a.iter().zip(&b).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "element {index}: {a} vs {b}");
+        }
     }
 
     #[test]

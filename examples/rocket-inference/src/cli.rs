@@ -572,9 +572,9 @@ impl LoadArgs {
             bail!("--quant does not apply to the {} model", family.name());
         }
         if self.defer_towers.is_some() && !family.supports_defer_towers() {
-            // A decision checkpoint *has* a vision tower, it just loads it with the
-            // backbone instead of on first use, so name the deferred halves rather
-            // than claiming there are no towers.
+            // The embedding and intent models have no tower to defer; a d3 package
+            // has one and accepts the flag (the loader leaves `visual.*` to the
+            // first media request).
             bail!(
                 "--defer-towers does not apply to the {} model (it has no tower halves to \
                  load on first use)",
