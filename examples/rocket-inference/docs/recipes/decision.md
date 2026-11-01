@@ -74,7 +74,9 @@ this table — so it cannot meet the phase's 2e-3 **probe** gate; the approved
 deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, which it passes. Use
 `--embed-f16` where the probabilities themselves must match the f32 reference: it
 restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
-(nano).
+(nano). On the board the bar is tight once the NPU pack is added: the text arm
+reads 4.15e-3 but the image arm lands at 1.03e-2 (table 8.36e-3 + NPU 1.95e-3),
+marginally over — see the Board section for the measured matrix.
 
 ### Prefill memory
 
@@ -159,6 +161,9 @@ into two configurations:
 The vision tower, the backbone attention and the readout head run on the CPU in
 both configurations: d3 has no `--text-attn-device`, `--vision-device`,
 `--vision-attn-device` or `--decode-device` stage, and no decode at all.
+`--npu-dtype int8` (resident int8 projections, half the weights BO) is measured
+and **rejected** for this family: it costs ~7 % wall and misses the 1e-2
+probability bar by 3-4.5x — see the int8 table in the Board section.
 
 ## Caps
 
@@ -222,6 +227,9 @@ the live embedding service `home-llm-gateway-embed-1` was stopped for the runs
 service was restored); outputs are bit-identical between repeats. The deployed
 copy is `/root/rocket-inference-decision/` (binary, fixtures and run outputs).
 The video CPU `user` column has one valid sample (see the note below the table).
+This table is the **2026-11-01** window; the memory/int8 round of **2026-11-02**
+ran beside the live service on a busier board and is the subsection at the end
+of this section.
 
 Fixtures (board paths):
 
@@ -299,8 +307,9 @@ Reading the table:
   board numbers predate the bf16 text-body storage (§ Text body storage): the CPU
   arm's resident figure is now about 1.0 GiB lower (dev-host −949 MiB for lite),
   and its wall carries the per-prefill widen (+2-4 % on a 1k-token question whose
-  prefill is ~40 s on the board). The NPU arm is unchanged — it packs f16 and
-  drops the CPU copy.
+  prefill is ~40 s on the board). The NPU arm's anon side drops the same way
+  (**943.6 -> 317 MiB**, the bf16 body plus the streamed int8 table) while its
+  weights BO stays ~1 GiB — the 2026-11-02 round below has the current numbers.
 - **Board noise**: the other services keep the load at ~8-10, so wall/CPU spread
   by ±20-30 % between samples. The runs in the table were taken with the
   embedding service stopped; the two samples of each config are the pre-restore
@@ -335,3 +344,139 @@ Notes:
 - Video parity is decoder-version sensitive; compare board outputs against a
   reference produced with the same `ffmpeg`, or accept the top-1-only gate for
   cross-host video checks. Text and image are stable at the 2e-3 gate.
+
+### Memory, int8 and tower round (2026-11-02)
+
+The binary now carries the bf16 text-body storage, the streamed int8 token table
+and the deferred tower halves (see `### Prefill memory`, `### Token table` and
+`### Text body storage`), so this round re-measured the same named fixtures. It
+ran **beside the live service** — `home-llm-gateway-embed-1` stayed `running
+healthy` the whole time (available memory 5.5-7.2 GiB, `free` 1.3-2.5 GiB, swap
+flat at 2.3-2.4 GiB used, no OOM), so no stop/restore was needed. Board load was
+15.6-21.0 during the runs (13.2 at the end) against 7.8-10.7 for the 2026-11-01
+table: **every wall/CPU number below is contended and only comparable within
+this window** (the 2026-11-01 CPU/NPU ratio is the useful historical reference).
+Same fixtures, same `taskset -c 4-7`, one process per run, `RssAnon` sampled
+every 50 ms; the CLI prints `decision model resident … anon` after load and
+`decided … (N anon)` after the requests. Command shape:
+
+```sh
+taskset -c 4-7 ./rocket-inference decide --model-dir /root/models/d3-lite \
+    --requests board-text.json --out runs6/<tag>-out.json --max-state-tokens 8192 \
+    --device npu --defer-towers [--npu-dtype int8 --int8-group 512|128] [--embed-f16]
+```
+
+Text, 5 questions / 6,546 prompt tokens (`--defer-towers`, so text-only):
+
+| NPU weights / token table | compute | wall | user CPU | peak anon | anon after | resident after load | weights BO |
+|---|---|---|---|---|---|---|---|
+| fp16 / int8 table (default) | 147.3 s (144.8, 149.8) | 160.2 s (159.9, 160.5) | 153.8 s | 1,014-1,025 MiB | 564 / 618 MiB | **317 MiB** | **966.0 MiB** |
+| int8 g512 / int8 table | 157.2 s (156.1, 158.3) | 169.9 s (167.1, 172.7) | 182.2 s | 1,012-1,046 MiB | 760 MiB | 321 MiB | ~474 MiB |
+| int8 g128 / int8 table | 201.9 s | 216.3 s | 266.7 s | 1,054.5 MiB | 446 MiB | 332 MiB | ~474 MiB |
+| fp16 / f16 table (`--embed-f16`) | 147.4 s | 164.8 s | 160.2 s | 1,523.6 MiB | 783 MiB | 559 MiB | 966.0 MiB |
+| CPU f32 / int8 table (`--device cpu`) | 265.6 s | 270.1 s | 426.0 s | 1,548.6 MiB | 1,300 MiB | 1,265 MiB | — |
+
+The fp16 and int8-g512 rows are medians with both samples in parentheses; the
+g128, `--embed-f16` and CPU rows are one sample each. `weights BO` is the
+`npu scratch weights_mib` value from `serve`; the prepare/ready line's own
+figure is 948.0 MiB for fp16 (the pack's payload, 1.9 % below the BO) and the
+int8 context's BOs are **not** counted by `mem_stats`, so its 474.0 MiB is the
+ready-line number only (fp16's own ratio suggests ~483 MiB of actual BO).
+
+Memory headline: text-only resident `RssAnon` **943.6 -> 317 MiB** (−66 %) while
+the weights BO only moved 1,006.7 -> 966.0 MiB (f16 table -> int8 table and
+bf16 body do not touch the f16 pack). The NPU-side total is therefore
+**1.25 GiB against 1.90 GiB**, and the peak (prefill transient, not weights)
+drops 2,505 -> 1,014-1,025 MiB. Image (1,029 tokens) and video (1,720 tokens,
+2 questions) at the same config:
+
+| input | arm | compute | wall | user CPU | peak anon | anon after |
+|---|---|---|---|---|---|---|
+| image | NPU fp16 | 58.2 s | 69.7 s | 100.2 s | 1,057.8 MiB | 749 MiB |
+| image | NPU int8 g512 | 62.5 s | 77.4 s | 105.4 s | 1,061.5 MiB | 810 MiB |
+| image | NPU fp16, f16 table | 63.3 s | 77.1 s | 99.8 s | 1,539.1 MiB | 992 MiB |
+| image | CPU f32 | 79.9 s | 86.7 s | 147.0 s | 1,739.1 MiB | 1,703 MiB |
+| video | NPU fp16 | 54.0 s | 61.7 s | 74.2 s | 1,029.0 MiB | 737 MiB |
+| video | NPU int8 g512 | 59.4 s | 73.8 s | 80.8 s | 1,059.8 MiB | 551 MiB |
+| video | CPU f32 | 91.7 s | 96.8 s | 146.9 s | 1,741.8 MiB | 1,660 MiB |
+
+Same-window NPU gain over CPU: text 1.7x wall and 2.8x less user CPU, image
+1.24x / 1.5x, video 1.57x / 2.0x (the 2026-11-01 window had 1.7x / 3.1x,
+1.2x / 1.3x, 1.5x / 1.9x, so the direction and rough size reproduce; the walls
+here are 25-35 % higher for every arm, contended). Peak anon is 1.0-1.1 GiB on
+every NPU input class against 1.55-1.74 GiB CPU.
+
+**Tower deferral** (serve, `--defer-towers`): after load `RssAnon` 317.2 MiB,
+`decision: vision tower deferred to the first media request`; the first media
+request prints `decision: loaded vision tower in 1.5s (12 blocks, bf16 weights)`
+and takes the process to 573.4 MiB. The clean attribution is the eager arm:
+`serve` without `--defer-towers` loads at **512.8 MiB**, i.e. the tower costs
+**+195.6 MiB** resident (not +384; the bf16 storage halves it), and the tower
+load is 1.0-1.7 s. `embed I8, text body bf16` is in the ready line of every
+run, e.g.
+`decision model ready in 11.7s (24 layers, embed I8, text body bf16, 96 resident NPU weights (fp16, 948.0 MiB))`.
+
+Serve scratch after a request (`ROCKET_MEM_LOG=1`): weights BO 966.0, matmul
+BO 107.6 MiB + 0 host right after load, trimmed to **25.7 BO + 7.6 host** after
+the 128-token request (`ROCKET_KEEP_MB=64`), `RssAnon` 317.2 -> 354.1 MiB; the
+1,029-token image request leaves 50.3 BO + 10.9 host and 573.4 MiB. Attention
+BO/host stays **0** (d3 has no NPU attention stage). The 128-token request
+computed in 2.54-2.77 s (46-50 tok/s) with the model resident; int8 g512
+measured 2.69 s on the same request but its scratch line reports
+`weights_mib=0.0 matmul_bo_mib=0.0` (the int8 context's BOs are outside
+`mem_stats`), with `RssAnon` 321.0 -> 358.4 -> 643.8 MiB.
+
+**int8 NPU weights are rejected for d3.** Halving the weights BO (474 vs 948
+MiB) costs +6.5 % wall and +18 % user CPU at g512, does not move the resident
+or peak anon, and leaves ~+70 MiB more anon after a media request. The parity
+is the blocker:
+
+| input | arm | top-1 | max \|Δp\| vs f32 ref | same-board CPU-vs-NPU |
+|---|---|---|---|---|
+| text | CPU f32 | 5/5 | 3.77e-03 | — |
+| text | NPU fp16 (default) | 5/5 | 4.15e-03 | 3.85e-04 |
+| text | NPU fp16, `--embed-f16` | 5/5 | **3.54e-04** | 4.06e-03 (table) |
+| text | NPU int8 g512 | 5/5 | 3.39e-02 | 3.77e-02 |
+| text | NPU int8 g128 | 5/5 | 4.52e-02 | 4.63e-02 |
+| image | CPU f32 | 1/1 | 8.36e-03 | — |
+| image | NPU fp16 (default) | 1/1 | 1.03e-02 | 1.95e-03 |
+| image | NPU fp16, `--embed-f16` | 1/1 | **5.24e-04** | — |
+| image | NPU int8 g512 | 1/1 | 4.41e-02 | 3.57e-02 |
+| video | CPU f32 | 2/2 | 1.51e-02 (decoder) | — |
+| video | NPU fp16 (default) | 2/2 | 1.55e-02 | 4.16e-04 |
+| video | NPU int8 g512 | 2/2 | 4.95e-02 | 3.44e-02 |
+
+Top-1 is 100 % everywhere; the gate that fails is the probability one. At
+g512 the weights push text to 3.4e-2 and image to 4.4e-2, both far over the
+M2 deployment bar (**max |Δp| ≤ 1e-2**), so the default stays fp16. g128 was
+measured because g512 failed: it is **both slower and less accurate** here
+(4.5e-2, 216 s wall). That ordering is the opposite of the emb2 finding
+(where finer groups are monotone better) and was not chased — the config is
+rejected either way and the arm is one sample. The two models differ in weight
+provenance (bf16-stored projections here against emb2's Q8_0 GGUF), which may
+interact with the group size; nothing was changed on that basis.
+
+**The int8 table, not the NPU pack, is the dominant error term.** With the
+same int8 table on the CPU these five cases read 3.77e-03 (text; 6.96e-3 over
+the full 67-case text set in `### Token table`) and 8.36e-03 (image, the same
+case as there), i.e. the NPU's own contribution is 3.9e-04 / 1.95e-03 — the
+same as the 2026-11-01 window (3.4e-04 / 1.63e-03) and independent of the
+table. So the default *image* arm lands at 1.03e-02, marginally over the 1e-2
+bar, while `--embed-f16` returns 3.54e-04 / 5.24e-04 for **+242 MiB resident**
+(559 vs 317) and +~0.5 GiB of load peak (1,524 vs 1,024). Text at the default
+is fine (4.15e-03). Video misses only through the board's `ffmpeg` decode
+(1.51e-2 on the CPU arm too); the same-board NPU delta is 4.2e-4.
+
+Reference note: the 2026-11-01 `ref_*_lite_f32.json` files and the modelling
+venv were gone from `/tmp`, so the reference was regenerated for exactly these
+five fixtures with `tools/decision_reference.py --backbone-dtype f32` in a
+reproduced venv (`torch 2.15.0+cpu`, `transformers 5.17.0`, `torchvision
+0.29.2`, `opencv-python-headless` 5.0.0; 473 tensors, 25 s for the five cases).
+It is the same reference: the board CPU f32 arm reproduces the historical
+1.409e-06 (text), 7.949e-06 (image) and 1.399e-02 (video, the decoder drift)
+exactly. The current `main` build (`--features npu`) replaced
+`/root/rocket-inference-decision/rocket-inference` (the 2026-11-01 binary is kept
+as `rocket-inference.2026-11-01`); run outputs and metrics are in
+`/root/rocket-inference-decision/runs6/` (`*.json` = wall/RSS samples,
+`*-out.json` = answers, `serve-*.log` = the scratch lines).
+
