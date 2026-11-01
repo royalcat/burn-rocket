@@ -55,8 +55,10 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         Family::Emb2 => (8192, 64),
         Family::Intent => (30000, 256),
         Family::Gemma4 => (30000, 64),
-        // One prompt per question; the readout generates nothing.
-        Family::Decision => (8192, 64),
+        // One prompt per question; the readout generates nothing. The decision
+        // cap is the family's own default (images spend ~900 tokens each; see
+        // `commands::decide::MAX_STATE_TOKENS`).
+        Family::Decision => (crate::commands::decide::MAX_STATE_TOKENS, 64),
     };
     let max_tokens = max_tokens.unwrap_or(default_max_tokens);
     let max_new_tokens = max_new_tokens.unwrap_or(default_max_new);

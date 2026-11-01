@@ -9,6 +9,11 @@
 //! Unlike `/v1/systemone`, the CLI keeps the runtime's per-question errors in the
 //! answer (a `--requests` batch reports every question); the HTTP server refuses
 //! a request that carries an `invalid_question` with a 422.
+//!
+//! `images` entries are local paths here (the parity fixtures point at the
+//! checkpoint's own assets): the HTTP server takes data URLs only, like the
+//! reference `d3_server.py`, so the fixture files could not be sent over the wire
+//! unchanged.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -19,11 +24,21 @@ use serde_json::Value;
 use crate::cli::{FlagArgs, LoadArgs, ResolvedLoad};
 use crate::commands::{require_decision, resolve};
 use crate::decision::load::manifest_model_name;
-use crate::decision::request::{CaseInput, DecisionRequest};
+use crate::decision::request::{CaseInput, DecisionRequest, MediaMode};
 use crate::decision::{DecisionModel, load_decision_model};
 use crate::qwen35_intent::loader::IntentLoadOptions;
 use crate::util::device;
 use crate::util::rss_mib;
+
+/// The default per-question prompt cap (`--max-state-tokens`).
+///
+/// 32768 rather than the intent server's 8192: a d3 package declares its own
+/// `max_length` (the shipped one is `null`, i.e. the model's 262144), an image
+/// question spends one token per merged image token (868 for a receipt page), and
+/// the RoPE table this cap sizes is only ~16 MiB. Multi-image requests that the
+/// reference answers would otherwise be refused. A deployment with a small memory
+/// budget passes the flag (the board recipe uses 8192).
+pub const MAX_STATE_TOKENS: usize = 32768;
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut args = Args::parse(FlagArgs::new(it))?;
@@ -35,7 +50,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         .clone()
         .or_else(|| manifest_model_name(&load.model_dir))
         .unwrap_or_else(|| dir_name(&load.model_dir));
-    let max_tokens = args.max_state_tokens.unwrap_or(8192);
+    let max_tokens = args.max_state_tokens.unwrap_or(MAX_STATE_TOKENS);
 
     let started = Instant::now();
     let output = match (&args.requests, &args.request) {
@@ -60,7 +75,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     dump_prompts(&mut model, dir, &name, &case.request, max_tokens)?;
                 }
                 let (response, case_tokens, case_answered) =
-                    model.system_one(&model_name, case.request, max_tokens)?;
+                    model.system_one(&model_name, case.request, max_tokens, MediaMode::Paths)?;
                 tokens += case_tokens;
                 answered += case_answered;
                 println!(
@@ -88,7 +103,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 dump_prompts(&mut model, dir, "case-1", &request, max_tokens)?;
             }
             let (response, tokens, answered) =
-                model.system_one(&model_name, request, max_tokens)?;
+                model.system_one(&model_name, request, max_tokens, MediaMode::Paths)?;
             println!(
                 "decided {answered} question(s), {tokens} prompt tokens in {:.2}s ({:.0} MiB anon)",
                 started.elapsed().as_secs_f64(),
@@ -118,7 +133,7 @@ fn load_model(load: &ResolvedLoad, args: &Args) -> Result<DecisionModel> {
         &load.model_dir,
         &device,
         &opts,
-        args.max_state_tokens.unwrap_or(8192),
+        args.max_state_tokens.unwrap_or(MAX_STATE_TOKENS),
     )?;
     println!("decision model resident {:.0} MiB anon", rss_mib());
     Ok(model)
@@ -134,8 +149,12 @@ fn dump_prompts(
     max_tokens: usize,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let prepared = model.prepare(request, max_tokens)?;
-    for (id, ids) in &prepared.sequences {
+    let images = request
+        .decode_images(MediaMode::Paths)
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    let prepared = model.prepare(request, &images, max_tokens)?;
+    for sequence in &prepared.sequences {
+        let (id, ids) = (&sequence.id, &sequence.ids);
         let question = prepared
             .questions
             .get(id)
@@ -143,7 +162,7 @@ fn dump_prompts(
         let user =
             crate::decision::format::user_prompt(&request.state, question, &model.config.codes)
                 .map_err(|message| anyhow::anyhow!("{message}"))?;
-        let prompt = crate::decision::format::chatml(&user);
+        let prompt = crate::decision::format::chatml_images(&user, prepared.images.len());
         let path = dir.join(format!("{case}__{id}.prompt.txt"));
         std::fs::write(&path, &prompt).with_context(|| format!("write {}", path.display()))?;
         println!("wrote {} ({} tokens)", path.display(), ids.len());

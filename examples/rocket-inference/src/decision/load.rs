@@ -9,8 +9,9 @@ use burn::tensor::{DType, TensorData};
 use tokenizers::Tokenizer;
 
 use super::config::{self, DecisionConfig};
+use super::format;
 use super::model::DecisionModel;
-use super::vision::TensorSource;
+use super::vision::{TensorSource, load_tower};
 use crate::qwen35_intent::loader::{IntentLoadOptions, load_intent_model};
 use crate::qwen35_intent::model::IntentModel;
 use crate::util::checkpoint::{self, AnyCheckpoint, Checkpoint};
@@ -45,7 +46,9 @@ impl TensorSource for AnyCheckpoint {
 /// `opts` carries the placement (`npu`/`text`/`keep_cpu_weights`/`embed_f16`);
 /// the prefix, the label and the rotary-table cap are set here, the full-attention
 /// layers are switched to the checkpoint's bidirectional mode, and the placement
-/// invariants are applied exactly as the intent server applies them.
+/// invariants are applied exactly as the intent server applies them. An
+/// image-capable package (`config.json` `vision_config`) also loads its
+/// `visual.*` vision tower.
 pub fn load_decision_model(
     model_dir: &Path,
     device: &Device,
@@ -53,6 +56,7 @@ pub fn load_decision_model(
     max_tokens: usize,
 ) -> Result<DecisionModel> {
     let config = DecisionConfig::load(model_dir)?;
+    let config_json = read_config_json(model_dir)?;
     let mut ckpt = checkpoint::open_in_dir(model_dir)
         .with_context(|| format!("open the checkpoint in {}", model_dir.display()))?;
     if ckpt.format() == "gguf" {
@@ -66,6 +70,7 @@ pub fn load_decision_model(
     // it from the tokenizer before spending time on the weights.
     let tokenizer: Tokenizer = ckpt.tokenizer()?;
     check_codes(&tokenizer, &config)?;
+    let (image_token_id, video_token_id) = check_media_tokens(&tokenizer, &config_json)?;
     let opts = IntentLoadOptions {
         prefix: DECISION_PREFIX,
         label: "decision",
@@ -79,12 +84,76 @@ pub fn load_decision_model(
     apply_placement(&mut backbone, &opts);
     let hidden = backbone.cfg.hidden_size;
     let readout = config::load_readout(model_dir, hidden, device)?;
+    // `vision_config` makes the package image-capable (`visual.*` beside the
+    // backbone); a text-only package has no tower and refuses images.
+    let vision = if config_json.get("vision_config").is_some() {
+        Some(
+            load_tower(&mut ckpt, &config_json, device)
+                .context("load the vision tower of the d3 checkpoint")?,
+        )
+    } else {
+        None
+    };
     Ok(DecisionModel {
         backbone,
         readout,
         config,
         tokenizer,
+        vision,
+        image_token_id,
+        video_token_id,
     })
+}
+
+/// `<dir>/config.json` as a value (the checkpoint's own config, beside
+/// `decision_config.json`).
+fn read_config_json(model_dir: &Path) -> Result<serde_json::Value> {
+    let path = model_dir.join("config.json");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// `config.json` `image_token_id`/`video_token_id`, checked against the
+/// tokenizer's `<|image_pad|>`/`<|video_pad|>` tokens: the prompt expansion counts
+/// those ids, so a mismatch would splice the wrong rows.
+fn check_media_tokens(tokenizer: &Tokenizer, config: &serde_json::Value) -> Result<(u32, u32)> {
+    let id = |name: &str| -> Option<u32> {
+        config
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as u32)
+    };
+    let image_token_id = id("image_token_id").ok_or_else(|| {
+        anyhow::anyhow!(
+            "config.json declares no image_token_id; the d3 image path needs the \
+             checkpoint's own <|image_pad|> id"
+        )
+    })?;
+    let video_token_id = id("video_token_id").unwrap_or(u32::MAX);
+    if tokenizer.token_to_id("<|vision_start|>").is_none() {
+        bail!("the tokenizer has no <|vision_start|> token; this is not a d3 image checkpoint");
+    }
+    for (name, token, expected) in [
+        ("image", format::IMAGE_TOKEN, Some(image_token_id)),
+        (
+            "video",
+            format::VIDEO_TOKEN,
+            (video_token_id != u32::MAX).then_some(video_token_id),
+        ),
+    ] {
+        let Some(expected) = expected else {
+            continue;
+        };
+        let found = tokenizer.token_to_id(token);
+        if found != Some(expected) {
+            bail!(
+                "the tokenizer maps '{token}' to {found:?}, but config.json declares \
+                 {name}_token_id {expected}"
+            );
+        }
+    }
+    Ok((image_token_id, video_token_id))
 }
 
 /// The placement invariants `load_for_serving` applies for the intent family: a

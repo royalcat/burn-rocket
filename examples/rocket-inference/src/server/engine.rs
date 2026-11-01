@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use axum::http::StatusCode;
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
@@ -11,7 +12,7 @@ use tokenizers::Tokenizer;
 pub use crate::family::Family;
 
 use crate::decision::model::DecisionModel;
-use crate::decision::request::DecisionRequest;
+use crate::decision::request::{DecisionRequest, MediaMode};
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
 use crate::gemma::gemma4::loader::load_towers;
@@ -732,10 +733,29 @@ impl IntentEngine {
 
 impl DecisionEngine {
     fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionReply, ApiError> {
+        // The server's media contract is the reference `d3_server.py` one: data
+        // URLs only, never local paths or remote URLs. A media problem is the
+        // reference's 422 `{"detail": "<reason>"}`; nothing runs. Videos are
+        // phase 3 (`Request::from_value` already refuses them).
+        if !req.videos.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "videos are not supported yet",
+            ));
+        }
+        let images = req
+            .decode_images(MediaMode::DataUrls)
+            .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
+        if !images.is_empty() && !self.model.has_vision() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                crate::decision::model::NO_VISION_TOWER,
+            ));
+        }
         let prepared = self
             .model
-            .prepare(&req, self.max_tokens)
-            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+            .prepare(&req, &images, self.max_tokens)
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
         let invalid = prepared.invalid_questions();
         if !invalid.is_empty() {
             return Ok(DecisionReply::Refused(invalid));

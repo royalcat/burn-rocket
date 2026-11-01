@@ -13,14 +13,18 @@
 //! [`config`]. `tools/decision.md` and `tools/decision_parity.py` are the
 //! reference and the parity gate.
 //!
-//! Images (Phase 2a): [`vision`] holds the Qwen3.5 vision tower and the Qwen2-VL
-//! image processor. It is not wired into the text path yet — the multimodal RoPE,
-//! the placeholder splice and the request's `images` field are Phase 2b.
+//! Images: [`vision`] holds the Qwen3.5 vision tower and the Qwen2-VL image
+//! processor, [`mrope`] the multimodal rotary positions of an image prompt, and
+//! [`model`] splices the tower's features into the text token rows. The
+//! transport decides how an `images` entry is read ([`MediaMode`]): the CLI takes
+//! local paths (parity fixtures), the server takes `data:image/...;base64` URLs
+//! only, like the checkpoint's `d3_server.py`.
 
 pub mod config;
 pub mod format;
 pub mod load;
 pub mod model;
+pub mod mrope;
 pub mod request;
 pub mod vision;
 

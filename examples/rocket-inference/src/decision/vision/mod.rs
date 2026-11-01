@@ -1,12 +1,13 @@
 //! The d3 image path's vision half: the Qwen3.5 vision tower and the Qwen2-VL
-//! image preprocessing that feeds it (Phase 2a).
+//! image preprocessing that feeds it.
 //!
 //! The tower turns one image into `[tokens, out_hidden]` merged tokens, i.e. the
 //! features the text backbone sees in place of each `<|image_pad|>`; [`processor`]
 //! produces the `[patches, 1536]` pixel matrix and the `[1, H/16, W/16]` grid from
-//! a file. Nothing here touches the prompt: the multimodal RoPE positions, the
-//! placeholder splice and the request's `images` field are Phase 2b, so
-//! `system_one`/`decide`/`/v1/systemone` stay text-only for now.
+//! decoded RGB pixels. [`crate::decision::model`] splices those features into the
+//! prompt and [`crate::decision::mrope`] supplies the multimodal rotary positions;
+//! [`crate::decision::request::MediaMode`] decides how an `images` entry is read
+//! (local path in the CLI, data URL on the server).
 //!
 //! Split:
 //!
@@ -17,8 +18,12 @@
 //! | [`model`] | the tower forward (position table, axial RoPE, attention, merger) |
 //! | [`load`] | the `visual.*` tensor reader (`TensorSource`) |
 
-#![allow(dead_code, unused_imports)] // Phase 2b wires the tower into the image request;
-// until then the main binary only re-exports it and `decision_vision_probe` is the one consumer.
+// This module is shared with the standalone probe `src/bin/decision_vision_probe.rs`
+// (included by path), which consumes the whole surface — `prepare_image`,
+// `smart_resize`, `patches`, `source`/`resized` and the load helpers. The app
+// reaches most of it by full path, so the unused-item lints would fire here for
+// things the probe (and the parity tooling) actually use.
+#![allow(dead_code, unused_imports)]
 
 pub mod config;
 pub mod load;

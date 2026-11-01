@@ -6,8 +6,12 @@
 //! - the body must be a JSON object carrying only `state`, `questions`, `images`,
 //!   `videos` and `model`; anything else is `422 {"detail": "<reason>"}`;
 //! - `questions` must be a nonempty object of nonempty ids (422 otherwise);
-//! - `images`/`videos` are phase 2: a non-empty list is 422 (data URLs only when
-//!   the vision tower lands);
+//! - `images` is a list of `data:image/{png,jpeg,webp};base64,...` URLs shared by
+//!   every question (`d3_runtime.MAX_IMAGE_BYTES` 8,000,000 decoded bytes,
+//!   `MAX_IMAGE_SOURCE_PIXELS` 16,000,000 pixels, PNG/JPEG/WebP); a local path, a
+//!   remote URL, another subtype or an undecodable payload is a 422 whose detail
+//!   is the decoder's message (`images[i]: ...`). `videos` is phase 3: a
+//!   non-empty list is a 422;
 //! - a question that fails validation refuses the whole request (422
 //!   `{"detail": {"invalid_questions": {qid: message}}}`) and nothing runs;
 //! - a question over the prompt cap is **not** a refusal: it keeps its
@@ -104,11 +108,15 @@ mod tests {
 
     #[test]
     fn a_message_error_is_a_422_detail_string() {
-        let error = DecisionError::unprocessable("images/videos are not supported yet");
+        let error = DecisionError::unprocessable(
+            "images[0]: strict mode: images must be given as a data: URL string, not a file \
+             path, web address or PIL image",
+        );
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             error.body(),
-            serde_json::json!({"detail": "images/videos are not supported yet"})
+            serde_json::json!({"detail": "images[0]: strict mode: images must be given as a \
+                data: URL string, not a file path, web address or PIL image"})
         );
     }
 

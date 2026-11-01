@@ -141,6 +141,90 @@ impl PartialRope {
     }
 }
 
+/// Explicit rotary tables for one request: `cos`/`sin` of shape `[seq, rotary]`.
+///
+/// The d3 image prompt needs positions that are not a plain `0..seq` ramp (the
+/// multimodal RoPE mixes a temporal/height/width index per token), so the caller
+/// builds the tables for the whole prompt and hands them to the forward instead
+/// of the [`PartialRope`] cache. `rotary` is the model's partial-rotation width
+/// (`head_dim * partial_rotary_factor`, 64 for d3): the table covers the first
+/// `rotary` dims of the head and the tail passes through untouched, exactly like
+/// the reference's `apply_rotary_pos_emb` with a partial cos/sin.
+#[derive(Debug)]
+pub struct RopeTables {
+    cos: Tensor<2>,
+    sin: Tensor<2>,
+}
+
+impl RopeTables {
+    /// Wrap a `cos`/`sin` pair of the same `[seq, rotary]` shape (f32).
+    pub fn new(cos: Tensor<2>, sin: Tensor<2>) -> Self {
+        assert_eq!(
+            cos.dims(),
+            sin.dims(),
+            "the rope cos/sin tables must share one shape"
+        );
+        let [seq, rotary] = cos.dims();
+        assert!(
+            seq > 0 && rotary > 0 && rotary.is_multiple_of(2),
+            "bad rope table shape {seq}x{rotary}"
+        );
+        Self { cos, sin }
+    }
+
+    /// Table rows (prompt length it was built for).
+    pub fn len(&self) -> usize {
+        self.cos.dims()[0]
+    }
+
+    /// Rotated head dims (`head_dim * partial_rotary_factor`).
+    pub fn rotary(&self) -> usize {
+        self.cos.dims()[1]
+    }
+
+    /// Whether the table covers no tokens (an empty prompt can never be run).
+    #[allow(dead_code)] // the `len`/`is_empty` pair clippy wants; nothing builds an empty table
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `x * cos + rotate_half(x) * sin` over the first `rotary` dims of a
+    /// `[batch, seq, heads, head_dim]` tensor; the rest of the head passes
+    /// through.
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        let [_, s, _, d] = x.dims();
+        let rotary = self.rotary();
+        assert_eq!(
+            s,
+            self.len(),
+            "the rope table has {} rows for {s} tokens",
+            self.len()
+        );
+        assert!(
+            rotary <= d,
+            "the rope table covers {rotary} of {d} head dims"
+        );
+        if rotary == d {
+            return self.rotate(x);
+        }
+        let head = self.rotate(x.clone().slice(s![.., .., .., 0..rotary]));
+        let tail = x.slice(s![.., .., .., rotary..d]);
+        Tensor::cat(vec![head, tail], 3)
+    }
+
+    /// The rotation on a tensor whose last dim is exactly `rotary`.
+    fn rotate(&self, x: Tensor<4>) -> Tensor<4> {
+        let [_, s, _, rotary] = x.dims();
+        let half = rotary / 2;
+        let cos = self.cos.clone().reshape([1, s, 1, rotary]).cast(x.dtype());
+        let sin = self.sin.clone().reshape([1, s, 1, rotary]).cast(x.dtype());
+        let x1 = x.clone().slice(s![.., .., .., 0..half]);
+        let x2 = x.clone().slice(s![.., .., .., half..rotary]);
+        let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
+        x * cos + rotated * sin
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Caches
 // ---------------------------------------------------------------------------
@@ -668,6 +752,7 @@ impl GatedAttention {
         cache: &mut IntentCache,
         idx: usize,
         rope: &PartialRope,
+        tables: Option<&RopeTables>,
         start: usize,
         npu: bool,
         causal_full: bool,
@@ -715,8 +800,12 @@ impl GatedAttention {
 
         let q = zc_norm4(q, &self.q_norm_w, self.eps);
         let k = zc_norm4(k, &self.k_norm_w, self.eps);
-        let q = rope.apply(q, start);
-        let k = rope.apply(k, start);
+        // An explicit per-request table replaces the position ramp; every other
+        // caller passes `None` and keeps the shared cache (bit-identical).
+        let (q, k) = match tables {
+            Some(tables) => (tables.apply(q), tables.apply(k)),
+            None => (rope.apply(q, start), rope.apply(k, start)),
+        };
 
         // Append to the KV cache ([b, kv, S, d] layout).
         let k = k.swap_dims(1, 2);
@@ -840,6 +929,7 @@ impl Layer {
         cache: &mut IntentCache,
         idx: usize,
         rope: &PartialRope,
+        tables: Option<&RopeTables>,
         start: usize,
         chunk: usize,
         npu: bool,
@@ -849,7 +939,7 @@ impl Layer {
         let h = zc_norm3(x, &self.input_norm_w, self.eps);
         let h = match &self.mixer {
             Mixer::Linear(dn) => dn.forward(h, cache, idx, chunk, npu),
-            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, start, npu, causal_full),
+            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, tables, start, npu, causal_full),
         } + residual;
 
         let residual = h.clone();
@@ -956,7 +1046,20 @@ impl IntentModel {
     /// at the last position `[1, hidden]`. Multi-token input is only allowed for a
     /// fresh cache (prefill).
     pub fn forward_last_normed(&mut self, ids: &[u32]) -> Tensor<2> {
-        let s = ids.len();
+        let embeds = self.embed_ids(ids);
+        self.forward_last_normed_embeds(embeds, None)
+    }
+
+    /// The same forward from caller-supplied embeddings `[1, seq, hidden]`
+    /// (a d3 image prompt splices the vision features into the text rows) with an
+    /// optional explicit RoPE table; `None` uses the shared position ramp exactly
+    /// like [`IntentModel::forward_last_normed`].
+    pub fn forward_last_normed_embeds(
+        &mut self,
+        embeds: Tensor<3>,
+        tables: Option<&RopeTables>,
+    ) -> Tensor<2> {
+        let s = embeds.dims()[1];
         assert!(
             self.cache.len == 0 || s == 1,
             "only single-token steps are supported after a prefill (cache len {})",
@@ -967,7 +1070,7 @@ impl IntentModel {
         let eps = self.cfg.rms_norm_eps;
         let npu = self.npu_only || self.npu_decode || s > 1;
         let causal_full = self.full_attn_causal;
-        let mut h = self.embed_ids(ids);
+        let mut h = embeds;
         let IntentModel {
             layers,
             cache,
@@ -975,7 +1078,7 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, start, chunk, npu, causal_full);
+            h = layer.forward(h, cache, i, rope, tables, start, chunk, npu, causal_full);
         }
         let h = zc_norm3(h, &self.norm_w, eps);
         self.cache.len += s;
@@ -1014,7 +1117,7 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, 0, chunk, npu, causal_full);
+            h = layer.forward(h, cache, i, rope, None, 0, chunk, npu, causal_full);
             out.push(h.clone());
         }
         out

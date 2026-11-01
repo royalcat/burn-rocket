@@ -199,15 +199,17 @@ usage: rocket-inference decide --model-dir <dir> (--requests <file> | --request 
 
 Valid for decision models (vllm-sr d3, `d3-code-readout-v1`: a Qwen3.5 text
 backbone plus a 255-code readout head). One noncausal forward per question; the
-answer is a probability for every option. This phase serves the text path only:
-images/videos are refused. The checkpoint must be a local safetensors package
+answer is a probability for every option. Text and image requests are served
+(`images` entries are local paths here; the HTTP server takes data URLs only);
+videos are refused. The checkpoint must be a local safetensors package
 (`--model-dir`); `-hf` (a GGUF Hub repo) is not accepted.
 
 input:
   --requests <path>            a JSON array of cases
-                               [{\"name\", \"state\", \"questions\"}, ...]
+                               [{\"name\", \"state\", \"questions\", \"images\"}, ...]
   --request <json>             one case as a JSON object
-  --max-state-tokens <n>       per-question prompt cap (default 8192)
+  --max-state-tokens <n>       per-question prompt cap (default 32768; an image
+                               spends one token per merged image token)
 
 output:
   --out <path>                 write the JSON result (default: stdout)

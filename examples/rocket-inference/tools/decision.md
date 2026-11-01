@@ -79,11 +79,11 @@ bare response. The parity script reads the answers either from that official sha
 Implementation: `examples/rocket-inference/src/decision/` (the `d3_format.py` contract, the
 readout head, the prompt/answer path) on the intent family's Qwen3.5 backbone
 (`src/qwen35_intent/`), with `IntentModel::full_attn_causal = false` for the checkpoint's
-`noncausal_full_attention` mode. The text path is complete; the vision tower and the
-image processor landed in phase 2a (`src/decision/vision/`, gated by
-`decision_vision_probe` + `tools/vision_parity.py` below), but the multimodal RoPE
-splice and the request's `images` field are phase 2b, so requests still refuse images
-with a 400.
+`noncausal_full_attention` mode. Text and image requests are complete: the vision tower
+and the image processor live in `src/decision/vision/` (phase 2a, gated by
+`decision_vision_probe` + `tools/vision_parity.py`), and phase 2b added the placeholder
+splice, the multimodal RoPE (`src/decision/mrope.rs`) and the request's `images` field.
+Videos are phase 3.
 
 ```sh
 /tmp/opencode/d3/venv/bin/python tools/decision_parity.py \
@@ -116,9 +116,13 @@ prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` proc
   `model`; anything else (or a non-object, or a body that is not JSON) is
   `422 {"detail": "<reason>"}`;
 - `questions` must be a nonempty object of nonempty ids (422 string otherwise);
-- `images`/`videos` are phase 2: a non-empty list is `422 {"detail": "images/videos are
-  not supported yet"}`, a non-list is `422` naming the field (data URLs only, never local
-  paths or URLs);
+- `images` is a list of `data:image/{png,jpeg,jpg,webp};base64,...` URLs shared by every
+  question: the reference's strict loader (decoded bytes <= 8,000,000, source pixels
+  <= 16,000,000, PNG/JPEG/WebP, a payload that decodes). A non-list is `422` naming the
+  field; a local path, a remote URL, another subtype or a broken payload is a `422` whose
+  detail is the loader's message, `images[i]: <reason>` (**never** a local path or a
+  remote fetch — the server does not read files for a client);
+- `videos` is phase 3: a non-empty list is `422 {"detail": "videos are not supported yet"}`;
 - a question that fails validation refuses the whole request with
   `422 {"detail": {"invalid_questions": {qid: "<message>"}}}` and **nothing runs**;
 - a question over the prompt cap is *not* a refusal: it keeps its `max_length_exceeded`
@@ -127,6 +131,14 @@ prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` proc
 `/v1/models` advertises the `decisions` capability; `/health` and `/v1/models` never touch
 the model. The served name comes from `MODEL_MANIFEST.json` `model_name` unless
 `--model-name` overrides it.
+
+The per-question prompt cap defaults to **32768** tokens for this family
+(`decide --max-state-tokens`, `serve --max-tokens`): the shipped checkpoints declare
+`max_length: null` (the model's own 262144), an image spends one token per merged image
+token (868 for a receipt page), and the RoPE table the cap sizes is only ~16 MiB. It stays
+a flag: a memory-tight deployment passes 8192. The reference
+server's `/health`/`/v1/models` still report its own `max_input_tokens` (null), which the
+Rust server does not model; the cap it enforces is the flag.
 
 ### Deferred
 
@@ -243,5 +255,54 @@ reports a clean error instead of aborting the process.  Eight-bit and 8-bit-JPEG
 are unchanged (`to_rgb8` and mozjpeg as before).
 
 Text behaviour is unchanged: the phase-1 parity still reports 67/67 top-1 and max
-|Δp| 2.36e-06 over the 47 text cases, and `system_one`/`decide`/`/v1/systemone` still
-refuse images (the multimodal RoPE splice and the request field are phase 2b).
+|Δp| 2.36e-06 over the 47 text cases after phase 2b (the text path passes `None` for the
+multimodal rope tables and keeps the shared position ramp).
+
+## Images end to end (phase 2b)
+
+Every question of an image request renders `chatml_images(user, n_images)`: one
+`<|vision_start|><|image_pad|><|vision_end|>` group per image immediately after
+`<|im_start|>user\n`, then the normal `State:` body (byte-exact against the reference
+dump's `expanded_text`). The prompt is tokenized with `add_special_tokens=false`; each
+`<|image_pad|>` id is then expanded to its image's merged token count
+(`H_patches * W_patches / merge^2`), `mm_token_type_ids` marks those rows `1`, and
+`usage.input_tokens` counts the expanded ids.
+
+The forward embeds the expanded ids, replaces each image's expanded rows with the tower's
+`[tokens, out_hidden]` features, and rotates the full-attention layers with the multimodal
+positions (`src/decision/mrope.rs`, a port of `get_rope_index` +
+`recomposition_frequencies`): text runs advance `current_pos` on all three rows, an image
+`[1, H, W]` contributes `T = current_pos`, `H = current_pos + 0..H/merge` row-major,
+`W = current_pos + 0..W/merge`, then `current_pos += max(H, W) / merge`. The d3
+`mrope_section = [11, 11, 10]` puts the height row on the frequency indices
+`1, 4, .. 31` and the width row on `2, 5, .. 29`; `cos`/`sin` are `cat([freqs, freqs])`,
+64 wide, and rotate the first 64 of the 256 head dims. A text-only request never builds a
+table (it takes the unchanged `forward_last_normed` path).
+
+```sh
+# one case per process, like the text gate; run from examples/rocket-inference so the
+# fixtures' relative `data/cat.jpeg` resolves
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures_images.json \
+    --ref /tmp/opencode/d3/ref_images_lite_f32.json \
+    --out /tmp/opencode/d3/parity_images.json
+```
+
+Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01): **8/8 questions top-1 (100%)**,
+max |dp| **7.70e-06** (`image-receipt-total/total`; noul 2.26e-07), 121 s as 7 processes;
+the expanded token counts are exact on every case (1029 / 1657 / 740 / 1706 / 2550 / 982 /
+1029 + 987 = 10,680 planned tokens, the reference's own total). One process for all seven
+cases: 109 s. The noul case (`image-receipt-with-text`) lands at 0.820605 vs the
+reference's 0.820605.
+
+The tower matches the vision dump through the same code the app runs: phase 2a's
+`decision_vision_probe` + `tools/vision_parity.py` gate (8/8 pixel `max|Δ|` 0, pooled
+cosine >= 0.999999999) is unchanged, because phase 2b only feeds its `pooled.f32` into the
+prompt.
+
+Server smoke (d3-lite, port 8399, `serve --model-dir ...`): a `data:image/jpeg;base64,...`
+cat request answers `cat` at 0.996876 in 11 s (`questions=1 tokens=740` in the request
+log line); a local path, a remote URL, `data:image/gif`, invalid base64 and a bad subtype
+are each a `422 {"detail": "images[0]: <reason>"}`; an unknown question type stays
+`422 {"detail": {"invalid_questions": ...}}`; a text-only request is unchanged.
