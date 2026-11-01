@@ -410,18 +410,31 @@ pub fn chunk_gated_delta_rule(
     let beta_u = beta.clone().unsqueeze_dim::<5>(4); // [., c, 1]
     let v_beta = v * beta_u.clone();
     let k_beta = k.clone() * beta_u;
+    drop(beta);
 
     let cum = g.cumsum(3); // [b,h,nc,c]
-    let up = cum.clone().unsqueeze_dim::<5>(4);
-    let lo = cum.clone().unsqueeze_dim::<5>(3);
-    let upper = Tensor::<2, Bool>::tril_mask([c, c], 0, device)
-        .reshape([1, 1, 1, c, c])
-        .expand([b, h, nc, c, c]);
-    let pair = (up - lo).mask_fill(upper, f32::NEG_INFINITY).exp(); // [b,h,nc,c,c]
 
-    let kt = k.clone().swap_dims(3, 4); // [b,h,nc,dk,c]
-    let ut = k_beta.clone().matmul(kt.clone()) * pair.clone();
-    let intra = q.clone().matmul(kt) * pair;
+    // The chunk-local matrices below are the prefill's working set: each is
+    // `[b, h, nc, c, .]`, i.e. 34-69 MiB per layer at 8k, so every one of them
+    // is released at its last use instead of at the end of the function (Burn
+    // frees a tensor when its last handle drops). `pair`/`kt` only feed `ut` and
+    // `intra` and die with this block; `ut` is consumed by the substitution and
+    // `inv` by `new_values`/`k_cumdecay`. What must stay alive across the chunk
+    // loop is exactly `intra`, `new_values`, `k_cumdecay`, `q_scaled`,
+    // `key_scaled` and `chunk_decay`.
+    let (ut, intra) = {
+        let up = cum.clone().unsqueeze_dim::<5>(4);
+        let lo = cum.clone().unsqueeze_dim::<5>(3);
+        let upper = Tensor::<2, Bool>::tril_mask([c, c], 0, device)
+            .reshape([1, 1, 1, c, c])
+            .expand([b, h, nc, c, c]);
+        let pair = (up - lo).mask_fill(upper, f32::NEG_INFINITY).exp(); // [b,h,nc,c,c]
+        let kt = k.clone().swap_dims(3, 4); // [b,h,nc,dk,c]
+        let ut = k_beta.clone().matmul(kt.clone()) * pair.clone();
+        let intra = q.clone().matmul(kt) * pair;
+        (ut, intra)
+    };
+    // `k_beta`/`decayed_k_beta` feed only `ut` and `k_cumdecay`.
     let decayed_k_beta = k_beta * cum.clone().exp().unsqueeze_dim::<5>(4);
 
     // Forward substitution for (I + L)^-1, the reference's export path: with
@@ -602,7 +615,11 @@ impl DeltaNet {
             let last = padded.clone().slice(s![.., .., s..s + k - 1]);
             (padded, last)
         };
-        cache.conv[idx] = Some(new_state);
+        // Burn's `slice` is a *view*: storing it as-is would keep the whole
+        // `[b, conv_dim, s + k - 1]` padding buffer alive for the rest of the
+        // request (0.19 GiB per linear layer at 8k, 18 of them). The state is
+        // only `k-1` tokens wide (75 KiB for d3-lite), so materialize it.
+        cache.conv[idx] = Some(Tensor::from_data(new_state.into_data(), &device));
 
         let mut out = Tensor::<3>::zeros([b, c, s], (&device, DType::F32));
         for j in 0..k {
@@ -756,6 +773,7 @@ impl GatedAttention {
         start: usize,
         npu: bool,
         causal_full: bool,
+        keep_kv: bool,
     ) -> Tensor<3> {
         let [b, s, _] = x.dims();
         let (nh, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
@@ -817,7 +835,14 @@ impl GatedAttention {
             ),
             None => (k, v),
         };
-        cache.kv[idx] = Some((k_all.clone(), v_all.clone()));
+        // A decoder keeps the prompt's K/V for its single-token steps; a
+        // one-prefill model (the d3 decision family) never does, and the store
+        // would retain `layers x 2 x kv_heads x head_dim x 4 B` per token
+        // (24.5 KiB/token for d3-lite) with no reader. The prefill's attention
+        // reads `k_all`/`v_all` below either way.
+        if keep_kv {
+            cache.kv[idx] = Some((k_all.clone(), v_all.clone()));
+        }
 
         let o = if s > 1 {
             // Prefill: backend fused attention (GQA native). Causal for generation,
@@ -934,12 +959,23 @@ impl Layer {
         chunk: usize,
         npu: bool,
         causal_full: bool,
+        keep_kv: bool,
     ) -> Tensor<3> {
         let residual = x.clone();
         let h = zc_norm3(x, &self.input_norm_w, self.eps);
         let h = match &self.mixer {
             Mixer::Linear(dn) => dn.forward(h, cache, idx, chunk, npu),
-            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, tables, start, npu, causal_full),
+            Mixer::Full(fa) => fa.forward(
+                h,
+                cache,
+                idx,
+                rope,
+                tables,
+                start,
+                npu,
+                causal_full,
+                keep_kv,
+            ),
         } + residual;
 
         let residual = h.clone();
@@ -1097,6 +1133,15 @@ pub struct IntentModel {
     /// bidirectional (`noncausal_full_attention`, the d3 decision prompt). The
     /// Gated DeltaNet layers are always causal.
     pub full_attn_causal: bool,
+    /// Whether the full-attention layers store the prompt's K/V after a prefill.
+    ///
+    /// A decoder needs it for its single-token steps; the d3 decision family
+    /// runs exactly one prefill per question and never reads it again, and the
+    /// store pins `n_full_layers * 2 * kv_heads * head_dim * 4 B` per prompt
+    /// token (24.5 KiB/token for d3-lite: ~190 MiB at 8k, ~800 MiB at the 32k
+    /// cap). The decision loader turns it off ([`IntentModel::keep_kv`] stays
+    /// `true` everywhere else).
+    pub keep_kv: bool,
     pub stage: StageStats,
 }
 
@@ -1147,6 +1192,7 @@ impl IntentModel {
             npu_decode: false,
             npu_only: false,
             full_attn_causal: true,
+            keep_kv: true,
             stage: StageStats::default(),
         }
     }
@@ -1181,6 +1227,14 @@ impl IntentModel {
             "only single-token steps are supported after a prefill (cache len {})",
             self.cache.len
         );
+        let keep_kv = self.keep_kv;
+        // Without the K/V store a later step would attend to its own token only,
+        // so this model is a one-prefill model: refuse to reuse its cache.
+        debug_assert!(
+            keep_kv || self.cache.len == 0,
+            "a model with keep_kv = false can only run a fresh prefill (cache len {})",
+            self.cache.len
+        );
         let start = self.cache.len;
         let chunk = self.chunk;
         let eps = self.cfg.rms_norm_eps;
@@ -1194,7 +1248,18 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, tables, start, chunk, npu, causal_full);
+            h = layer.forward(
+                h,
+                cache,
+                i,
+                rope,
+                tables,
+                start,
+                chunk,
+                npu,
+                causal_full,
+                keep_kv,
+            );
         }
         let h = zc_norm3(h, &self.norm_w, eps);
         self.cache.len += s;
@@ -1230,6 +1295,7 @@ impl IntentModel {
         let chunk = self.chunk;
         let npu = self.npu_only || self.npu_decode || ids.len() > 1;
         let causal_full = self.full_attn_causal;
+        let keep_kv = self.keep_kv;
         let mut h = self.embed_ids(ids);
         let mut out = vec![h.clone()];
         let IntentModel {
@@ -1239,7 +1305,7 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, None, 0, chunk, npu, causal_full);
+            h = layer.forward(h, cache, i, rope, None, 0, chunk, npu, causal_full, keep_kv);
             out.push(h.clone());
         }
         out
@@ -1500,6 +1566,61 @@ mod tests {
 
     fn rows(tensor: Tensor<2>) -> Vec<f32> {
         tensor.to_data().try_to_vec().unwrap()
+    }
+
+    #[test]
+    fn keep_kv_off_skips_the_prefill_kv_store() {
+        // The d3 decision family runs one prefill per question and never decodes:
+        // storing the prompt's K/V there would pin 24.5 KiB/token for nothing.
+        // The store is never read by the prefill itself, so turning it off must
+        // not change the last hidden state.
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut keeping = filled_model(&cfg, &device);
+        assert!(
+            keeping.keep_kv,
+            "the default keeps the cache (intent/decode)"
+        );
+        let kept = rows(keeping.forward_last_normed(&ids));
+        let stored = keeping.cache.kv.iter().filter(|k| k.is_some()).count();
+        assert!(stored > 0, "a keeping model stores the full layers' K/V");
+        assert_eq!(keeping.cache.len, ids.len());
+
+        let mut skipping = filled_model(&cfg, &device);
+        skipping.keep_kv = false;
+        let skipped = rows(skipping.forward_last_normed(&ids));
+        assert_eq!(kept, skipped, "the prefill never reads the KV store");
+        assert!(skipping.cache.kv.iter().all(Option::is_none));
+        assert_eq!(skipping.cache.len, ids.len());
+    }
+
+    #[test]
+    fn a_decode_step_reuses_the_prefill_conv_history() {
+        // The conv history is an owned `[1, conv_dim, k-1]` copy of the last
+        // convolution inputs (storing the `slice` would pin the whole padded
+        // prefill buffer). A single-token step prepends it, so the shapes and
+        // the forward have to line up across the two paths.
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let mut model = filled_model(&cfg, &device);
+        let ids = [1u32, 4, 7, 9, 3];
+        let prefill = rows(model.forward_last_normed(&ids));
+        let linear = model
+            .layers
+            .iter()
+            .position(|layer| matches!(layer.mixer, Mixer::Linear(_)))
+            .expect("tiny_cfg has a delta-rule layer");
+        let state = model.cache.conv[linear].as_ref().expect("conv history");
+        assert_eq!(
+            state.dims(),
+            [1, cfg.conv_dim(), cfg.linear_conv_kernel_dim - 1]
+        );
+
+        let step = rows(model.forward_last_normed(&[7u32]));
+        assert!(step.iter().all(|v| v.is_finite()));
+        assert_eq!(model.cache.len, ids.len() + 1);
+        assert_ne!(prefill, step, "the decode step must see the whole prompt");
     }
 
     #[test]

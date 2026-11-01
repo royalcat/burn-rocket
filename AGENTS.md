@@ -1550,6 +1550,35 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   it restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
   (nano) resident, for deployments that need the probabilities themselves to
   match the f32 reference.
+- **Prefill memory round** (phase M4): a d3 request is one prefill per question and
+  never decodes, so two prompt-proportional retentions were removed, both exact
+  (byte-identical JSON at 2.1k and 7,893 tokens). (1) **`cache.conv` kept a view**:
+  `DeltaNet::conv` stored a `slice` of the left-padded conv input as the conv
+  history, and a Burn `slice` is a *view* (`burn-flex`'s `slice` shares the parent
+  `Arc<Bytes>`), so each of the 18 linear layers pinned its whole
+  `[1, conv_dim, s + k - 1]` f32 buffer — 0.19 GiB per layer, **3.5 GiB at 8k**,
+  0.93 GiB at 2.1k — for the rest of the request. The state is now materialized
+  (`Tensor::from_data(new_state.into_data(), &device)`, 75 KiB per layer); the
+  same pattern is worth checking anywhere a cache stores a `slice` of a big
+  tensor. (2) **KV skip**: `IntentModel.keep_kv` (default `true`, threaded to
+  `GatedAttention::forward` as a `Layer::forward` arg) lets the decision loader
+  turn off the prefill KV store — 24.5 KiB/token for d3-lite (6 full layers ×
+  (k,v) × 2 kv heads × 256 × 4 B), 194 MiB at 8k and ~800 MiB at the 32k cap —
+  with a `debug_assert` in `forward_last_normed_embeds` that a non-keeping model
+  only ever runs a fresh prefill. `new_stub` and the intent/decode paths keep
+  `true`, so the intent family is unchanged. (3) `chunk_gated_delta_rule`'s
+  chunk-local matrices (`pair`/`ut`/`inv`/`kt`, `k_beta`/`decayed_k_beta`/
+  `v_beta`) now die with explicit scopes; they were already move-consumed, so this
+  is hygiene, and the function's own peak (the five `[b,h,nc,c,·]` tensors,
+  ~310 MiB at 8k) is left as is — **chunk blocking was not needed**: it would not
+  have touched the conv-view term. Dev host, text-only `--defer-towers`, peak
+  `RssAnon` (resident 2,222 MiB both arms): 2.1k tokens 3,380 -> **2,477** MiB
+  (transient 1,158 -> 255), 7,893 tokens 6,385 -> **3,048** MiB (transient
+  4,163 -> 826), end-of-run anon 5,952 -> **2,312** MiB; wall 37.14 -> 37.03 s and
+  44.98 -> 44.10 s. The prefill creep is not the allocator (it survives
+  `malloc_trim` per layer and a fixed `MALLOC_MMAP_THRESHOLD_`) and does not
+  accumulate across prefills, which is why the two-prefill test is the right
+  plateau check.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel

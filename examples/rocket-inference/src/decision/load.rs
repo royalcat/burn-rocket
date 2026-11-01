@@ -97,6 +97,10 @@ pub fn load_decision_model(
     // `attention_mode: noncausal_full_attention`: the full-attention layers read
     // the whole prompt; the Gated DeltaNet layers keep their causal scan.
     backbone.full_attn_causal = false;
+    // A d3 request is one prefill per question and never decodes, so the prompt's
+    // K/V must not be retained (24.5 KiB per token for d3-lite, ~800 MiB at the
+    // 32k prompt cap); `cache.reset()` runs before every question anyway.
+    backbone.keep_kv = false;
     apply_placement(&mut backbone, &opts);
     let hidden = backbone.cfg.hidden_size;
     let readout = config::load_readout(model_dir, hidden, device)?;

@@ -71,6 +71,35 @@ deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, which it passes. Use
 restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
 (nano).
 
+### Prefill memory
+
+A request is one prefill per question and no decode, so nothing prompt-sized is
+retained between questions. Two retentions used to make a long prompt expensive
+and are gone (exact: the `decide` JSON is byte-identical before/after at 2.1k and
+7,893 tokens):
+
+- **Conv history**: `DeltaNet::conv` stored a Burn `slice` of the left-padded
+  conv input, and a `slice` is a *view* of the parent buffer — every one of the
+  18 linear layers pinned its `[1, 6144, s + 3]` f32 block (0.19 GiB per layer,
+  3.5 GiB at 8k). The state is a 75 KiB copy now.
+- **KV store**: the full-attention layers used to keep the prompt's K/V for a
+  decode step that never comes (24.5 KiB/token: 194 MiB at 8k, ~800 MiB at the
+  32k cap). `IntentModel.keep_kv = false` in the decision loader skips it.
+
+Dev host (`d3-lite`, text-only `--defer-towers`, resident 2,222 MiB, `RssAnon`
+sampled at 20 ms):
+
+| prompt tokens | peak anon before | peak anon after | transient after | wall |
+|---|---|---|---|---|
+| 2,102 × 3 questions (6,307) | 3,380 MiB | **2,477 MiB** | 255 MiB | 37.0 s |
+| 7,893 | 6,385 MiB | **3,048 MiB** | 826 MiB | 44.1 s |
+
+The remaining transient is the delta-rule chunk working set plus the per-layer
+MLP/attention activations, so a long prompt now fits a board that could not host
+the old 8k peak. Blocking the chunk dimension was not needed (it does not touch
+the conv term) and is not implemented.
+
+
 ## Serve
 
 ```sh
