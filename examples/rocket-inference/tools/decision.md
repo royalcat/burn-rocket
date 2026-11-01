@@ -232,8 +232,15 @@ near-white), while 16-bit colour and Pillow's 16-bit gray+alpha keep the **high 
 (`v >> 8`, alpha dropped) — and a CMYK/YCCK Adobe JPEG no longer aborts the process:
 libjpeg cannot convert it and mozjpeg raises that as a `resume_unwind`, so the loader
 refuses it up front and falls back to the `image` crate (1 LSB from PIL, pooled cosine
-0.99992 on a 640x480 CMYK photo).  Eight-bit and 8-bit-JPEG decodes are unchanged
-(`to_rgb8` and mozjpeg as before).
+0.99992 on a 640x480 CMYK photo).  A CMYK case therefore cannot pass the probe's 1e-6
+pixel gate: one source LSB becomes up to two LSB after the antialiased resize (measured
+pixel `max|Δ|` 1.569e-2 at pooled cosine 0.999976862 for the review's CMYK case, and
+7.8e-3 / 0.99992 for a 640x480 photo), so judge a CMYK fixture by the pooled cosine and
+the RGB-domain decode, not by the pixel gate.  The same containment covers a malformed
+JPEG header (an unsupported SOF precision, a bogus segment length): libjpeg fires
+`error_exit` inside `jpeg_read_header`, which is now inside the guard, so the loader
+reports a clean error instead of aborting the process.  Eight-bit and 8-bit-JPEG decodes
+are unchanged (`to_rgb8` and mozjpeg as before).
 
 Text behaviour is unchanged: the phase-1 parity still reports 67/67 top-1 and max
 |Δp| 2.36e-06 over the 47 text cases, and `system_one`/`decide`/`/v1/systemone` still

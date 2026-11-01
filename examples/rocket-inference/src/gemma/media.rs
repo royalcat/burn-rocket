@@ -332,11 +332,30 @@ fn pil_rgb8(img: &DynamicImage) -> RgbImage {
 
 /// JPEG decode via mozjpeg (libjpeg-turbo), PIL-compatible.
 ///
-/// libjpeg has no CMYK/YCCK -> RGB conversion, so an Adobe CMYK JPEG makes its
-/// `error_exit` fire; mozjpeg turns that into a `resume_unwind` (a process abort
-/// for a plain call).  Such files are refused up front and any other libjpeg
-/// abort is contained here, so [`load_image`] can fall back to the `image` crate.
+/// libjpeg reports a fatal problem by calling `error_exit`, which mozjpeg turns
+/// into a `resume_unwind` (an abort for an unguarded call) — and that fires from
+/// `jpeg_read_header` too, i.e. inside [`mozjpeg::Decompress::new_path`] on a
+/// malformed header (unsupported precision, a bogus segment length, ...).  The
+/// whole decode, header included, therefore runs inside `catch_unwind`; a CMYK
+/// or YCCK source is refused before decompression starts (libjpeg has no
+/// CMYK -> RGB conversion), and [`load_image`] falls back to the `image` crate.
 fn load_jpeg(path: &Path) -> Result<RgbImage> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_jpeg(path))) {
+        Ok(result) => result,
+        // libjpeg's `unwind_error_exit` resumes with a `String` — the formatted
+        // error message — and deliberately skips the panic hook.  A `String`
+        // payload is therefore libjpeg's own fatal; any other payload is a real
+        // panic (an `expect` in mozjpeg, our own code) and is re-raised so it
+        // still reaches the caller's panic policy.
+        Err(payload) => match payload.downcast::<String>() {
+            Ok(message) => bail!("libjpeg aborted the decode: {message}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// Open, vet and decode one JPEG.  Every libjpeg fatal in here is a panic.
+fn decode_jpeg(path: &Path) -> Result<RgbImage> {
     let decompress = mozjpeg::Decompress::new_path(path)
         .with_context(|| format!("open jpeg {}", path.display()))?;
     let space = decompress.color_space();
@@ -346,15 +365,7 @@ fn load_jpeg(path: &Path) -> Result<RgbImage> {
     ) {
         bail!("the JPEG stores CMYK/YCCK (libjpeg cannot convert it to RGB)");
     }
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_rgb(decompress))) {
-        Ok(result) => result,
-        // `unwind_error_exit` resumes with libjpeg's message string; anything
-        // else is a genuine panic and is left to the caller's panic policy.
-        Err(payload) => match payload.downcast::<String>() {
-            Ok(message) => bail!("libjpeg aborted the decode: {message}"),
-            Err(payload) => std::panic::resume_unwind(payload),
-        },
-    }
+    decode_rgb(decompress)
 }
 
 fn decode_rgb<R: std::io::Read>(decompress: mozjpeg::Decompress<R>) -> Result<RgbImage> {
@@ -943,5 +954,96 @@ mod tests {
             worst <= 2,
             "CMYK fallback differs from PIL by up to {worst} LSB"
         );
+    }
+
+    /// The marker offsets (the `0xFF` of each segment) of a JPEG, in file order.
+    fn jpeg_markers(data: &[u8]) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        let mut i = 2; // past SOI
+        while i + 4 <= data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = data[i + 1];
+            offsets.push(i);
+            if marker == 0xD9 {
+                break;
+            }
+            if marker == 0xD8 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let length = usize::from(data[i + 2]) << 8 | usize::from(data[i + 3]);
+            if length < 2 {
+                break;
+            }
+            i += 2 + length;
+        }
+        offsets
+    }
+
+    /// A malformed JPEG must never abort the process.
+    ///
+    /// `jpeg_read_header` — called inside `Decompress::new_path`, before any pixel
+    /// is read — fires libjpeg's `error_exit` for an unsupported SOF precision or a
+    /// bogus segment length, and mozjpeg raises that as a resumed unwind (a silent
+    /// exit 101 before the guard covered the header).  Both cases must come back as
+    /// a contained error, and `load_image` must either fall back to a decoded image
+    /// or report a clean error.
+    #[test]
+    fn a_malformed_jpeg_header_does_not_abort() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let source = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
+        let markers = jpeg_markers(&source);
+        let sof = markers
+            .iter()
+            .copied()
+            .find(|&i| {
+                matches!(
+                    source[i + 1],
+                    0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB
+                )
+            })
+            .expect("cat.jpeg has an SOF segment");
+        assert_eq!(source[sof + 4], 8, "cat.jpeg is an 8-bit JPEG");
+        let app0 = markers
+            .iter()
+            .copied()
+            .find(|&i| source[i + 1] == 0xE0)
+            .expect("cat.jpeg has an APP0 segment");
+
+        let mut sof12 = source.clone();
+        sof12[sof + 4] = 12;
+        let mut long_app0 = source.clone();
+        long_app0[app0 + 2..app0 + 4].copy_from_slice(&[0xFF, 0xFF]);
+
+        for (label, bytes) in [("SOF-precision-12", sof12), ("APP0-length-ffff", long_app0)] {
+            let path = std::env::temp_dir().join(format!(
+                "rocket-malformed-{}-{label}.jpg",
+                std::process::id()
+            ));
+            std::fs::write(&path, &bytes).expect("write the malformed jpeg");
+            // libjpeg's fatal is contained by the guard in `load_jpeg` and named ...
+            let err = load_jpeg(&path).expect_err("libjpeg refuses this header");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("libjpeg aborted the decode"),
+                "{label}: {message}"
+            );
+            // ... and the loader survives: a fallback decode or a clean error.
+            match load_image(&path) {
+                Ok(image) => assert_eq!(
+                    (image.width(), image.height()),
+                    (960, 686),
+                    "{label}: the fallback decoded a different size"
+                ),
+                Err(err) => assert!(
+                    format!("{err:#}").contains("decode image"),
+                    "{label}: {err:#}"
+                ),
+            }
+            std::fs::remove_file(&path).ok();
+        }
     }
 }

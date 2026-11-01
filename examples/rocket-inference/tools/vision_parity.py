@@ -19,8 +19,8 @@ the tanh approximation, which Phase 2a's review caught) moves the cosine to
 0.99999996 at 1.3e-3 ``max|Δ|``; the fixed tower scores 1 - 4e-10 with a
 2.4e-5 to 1.7e-4 relative ``max|Δ|``.  That residual is the attention kernel, not
 this implementation: swapping torch's own SDPA backend moves the reference pooled
-output by 4.4e-5 to 1.9e-4 absolute, so ``--pooled-max-abs`` is an advisory
-opt-in (a useful band is 2e-3), not the gate.
+output by 4.4e-5 to 1.9e-4 absolute, so ``--pooled-max-abs`` is an opt-in gate
+(a useful band is 2e-3) rather than the default.
 
 Usage:
     vision_parity.py --ref DIR --probe DIR [--stem NAME] [--json OUT]
@@ -173,7 +173,7 @@ def main(argv=None) -> int:
         "--pooled-max-abs",
         type=float,
         default=None,
-        help="also require max|Δpooled| <= this (advisory: the residual is the "
+        help="opt-in gate: also require max|Δpooled| <= this (the residual is the "
         "attention kernel, up to ~9e-4 absolute)",
     )
     args = p.parse_args(argv)

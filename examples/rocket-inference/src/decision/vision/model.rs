@@ -744,11 +744,16 @@ mod tests {
             .unwrap();
         assert_eq!(out.len(), cfg.out_hidden_size);
 
-        // gelu(2) exact = 2 * Phi(2) = 2 * 0.9772498680518208.
-        let erf_gelu = 2.0 * 0.977_249_868_f32;
-        // The tanh approximation, as the blocks compute it.
-        let sqrt_2_over_pi = 0.797_884_56_f32;
-        let tanh_gelu = 0.5 * x * (1.0 + (sqrt_2_over_pi * (x + 0.044715 * x * x * x)).tanh());
+        // gelu(2) exact = 2 * Phi(2), and the tanh approximation as the blocks
+        // compute it.  Both constants are f64 and narrowed once (an f32 literal
+        // cannot hold these digits).
+        const PHI_2: f64 = 0.977_249_868_051_820_8;
+        const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
+        let x64 = x as f64;
+        let erf_gelu = (2.0 * PHI_2) as f32;
+        let tanh_gelu =
+            (0.5 * x64 * (1.0 + (SQRT_2_OVER_PI * (x64 + 0.044715 * x64 * x64 * x64)).tanh()))
+                as f32;
 
         let expected = merged as f32 * erf_gelu;
         let approximate = merged as f32 * tanh_gelu;

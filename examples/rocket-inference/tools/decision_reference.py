@@ -50,8 +50,10 @@ hidden is the runtime's own encoder output, recorded by wrapping it; the logits 
 ``hidden.float() @ readout.T`` exactly as the runtime computes them (``--check-dump``
 re-runs the runtime's ``logits`` for the first dumped question and asserts equality).
 
-``--dump-vision DIR`` writes the image-path tensors of every question of an image
-case: the processor's ``pixel_values`` (``.pixel_values.npy``), ``image_grid_thw``
+``--dump-vision DIR`` (which requires ``--batch-size 1``; a larger batch repeats a
+case's images once per question, so the dumped tensors are batch-sized) writes the
+image-path tensors of every question of an image case: the processor's
+``pixel_values`` (``.pixel_values.npy``), ``image_grid_thw``
 (``.image_grid_thw.npy``), the expanded prompt (``.expanded_text.txt``), the
 processor's ``input_ids``/``mm_token_type_ids``/``attention_mask`` rows
 (``.input_ids.npy``, ``.mm_token_type_ids.npy``, ``.attention_mask.npy``), the
