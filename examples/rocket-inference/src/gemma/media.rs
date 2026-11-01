@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use image::RgbImage;
+use image::{DynamicImage, RgbImage};
 use reqwest::header::CONTENT_TYPE;
 
 use crate::server::telemetry;
@@ -246,7 +246,12 @@ pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Resul
 ///
 /// JPEGs go through mozjpeg (libjpeg-turbo), matching PIL's decoder; the Rust
 /// `image` crate's zune-jpeg decoder differs by up to ±4 LSB, which is the only
-/// remaining gap versus the HF reference on JPEG inputs.
+/// remaining gap versus the HF reference on JPEG inputs.  A JPEG libjpeg cannot
+/// handle (a CMYK/YCCK Adobe file, or one whose decode aborts) falls back to the
+/// `image` crate instead of aborting the process.
+///
+/// 16-bit PNGs get PIL's own conversion rules rather than `to_rgb8`'s rounding,
+/// because the checkpoints' processors see PIL pixels (see [`pil_rgb8`]).
 #[telemetry::instrument(name = "image.decode", skip_all)]
 pub fn load_image(path: &Path) -> Result<RgbImage> {
     let is_jpeg = path
@@ -265,21 +270,98 @@ pub fn load_image(path: &Path) -> Result<RgbImage> {
         }
     }
     let img = image::open(path).with_context(|| format!("decode image {}", path.display()))?;
-    Ok(img.to_rgb8())
+    Ok(pil_rgb8(&img))
+}
+
+/// The RGB8 pixels of a decoded image with PIL's `convert("RGB")` semantics.
+///
+/// 8-bit, palette and float images go through `to_rgb8` (which already matches
+/// PIL: luma is replicated, alpha dropped).  16-bit PNGs need Pillow's rules
+/// instead, because `to_rgb8` scales them (`(v + 128) / 257`) while PIL does not:
+///
+/// * a 16-bit **grayscale** PNG opens as `I;16` and `convert("RGB")` **clips each
+///   sample to `[0, 255]`** (so a 16-bit image reads as near-white);
+/// * a 16-bit **colour** PNG (RGB or RGBA) opens as `RGB`/`RGBA` and keeps the
+///   **high byte** (`v >> 8`), alpha dropped by the conversion;
+/// * a 16-bit **gray+alpha** PNG is opened by Pillow as `RGBA`, i.e. the same
+///   high-byte rule (`v >> 8`) replicated to RGB.
+///
+/// These are byte-exact against `PIL.Image.convert("RGB")` (see the unit tests).
+fn pil_rgb8(img: &DynamicImage) -> RgbImage {
+    fn from_rgb(mut pixels: impl Iterator<Item = [u8; 3]>, (w, h): (u32, u32)) -> RgbImage {
+        let mut out = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        for pixel in &mut pixels {
+            out.extend_from_slice(&pixel);
+        }
+        RgbImage::from_raw(w, h, out).expect("pil_rgb8: buffer sized from the image")
+    }
+    match img {
+        DynamicImage::ImageLuma16(luma) => {
+            let (w, h) = luma.dimensions();
+            let pixels = luma.pixels().map(|p| {
+                let v = p.0[0].min(255) as u8;
+                [v, v, v]
+            });
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageLumaA16(luma) => {
+            let (w, h) = luma.dimensions();
+            let pixels = luma.pixels().map(|p| {
+                let v = (p.0[0] >> 8) as u8;
+                [v, v, v]
+            });
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageRgb16(rgb) => {
+            let (w, h) = rgb.dimensions();
+            let pixels = rgb
+                .pixels()
+                .map(|p| [p.0[0] >> 8, p.0[1] >> 8, p.0[2] >> 8].map(|v| v as u8));
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageRgba16(rgba) => {
+            let (w, h) = rgba.dimensions();
+            let pixels = rgba
+                .pixels()
+                .map(|p| [p.0[0] >> 8, p.0[1] >> 8, p.0[2] >> 8].map(|v| v as u8));
+            from_rgb(pixels, (w, h))
+        }
+        other => other.to_rgb8(),
+    }
 }
 
 /// JPEG decode via mozjpeg (libjpeg-turbo), PIL-compatible.
+///
+/// libjpeg has no CMYK/YCCK -> RGB conversion, so an Adobe CMYK JPEG makes its
+/// `error_exit` fire; mozjpeg turns that into a `resume_unwind` (a process abort
+/// for a plain call).  Such files are refused up front and any other libjpeg
+/// abort is contained here, so [`load_image`] can fall back to the `image` crate.
 fn load_jpeg(path: &Path) -> Result<RgbImage> {
     let decompress = mozjpeg::Decompress::new_path(path)
         .with_context(|| format!("open jpeg {}", path.display()))?;
-    let mut image = decompress
-        .rgb()
-        .with_context(|| format!("decode jpeg {}", path.display()))?;
+    let space = decompress.color_space();
+    if matches!(
+        space,
+        mozjpeg::ColorSpace::JCS_CMYK | mozjpeg::ColorSpace::JCS_YCCK
+    ) {
+        bail!("the JPEG stores CMYK/YCCK (libjpeg cannot convert it to RGB)");
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_rgb(decompress))) {
+        Ok(result) => result,
+        // `unwind_error_exit` resumes with libjpeg's message string; anything
+        // else is a genuine panic and is left to the caller's panic policy.
+        Err(payload) => match payload.downcast::<String>() {
+            Ok(message) => bail!("libjpeg aborted the decode: {message}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+fn decode_rgb<R: std::io::Read>(decompress: mozjpeg::Decompress<R>) -> Result<RgbImage> {
+    let mut image = decompress.rgb().context("convert the jpeg to RGB")?;
     let width = image.width() as u32;
     let height = image.height() as u32;
-    let pixels: Vec<u8> = image
-        .read_scanlines()
-        .with_context(|| format!("read jpeg scanlines {}", path.display()))?;
+    let pixels: Vec<u8> = image.read_scanlines().context("read jpeg scanlines")?;
     let buf = RgbImage::from_raw(width, height, pixels)
         .context("jpeg scanline buffer has an unexpected size")?;
     Ok(buf)
@@ -752,5 +834,114 @@ mod tests {
         assert!((parse_rate("30000/1001").unwrap() - 29.970_029_970_03).abs() < 1e-9);
         assert!(parse_rate("0/0").is_err());
         assert!(parse_rate("25").is_err());
+    }
+
+    /// PIL's `convert("RGB")` rules for 16-bit PNGs, with the exact samples the
+    /// review probe used (`0, 255, 256, 1000, 65535`).
+    ///
+    /// The expectations are `PIL.Image.convert("RGB")` output, measured on
+    /// Pillow 11: a 16-bit grayscale (`I;16`) is **clipped** to `[0, 255]`, while
+    /// 16-bit colour keeps the **high byte** and Pillow's 16-bit gray+alpha is
+    /// opened as RGBA and follows the high-byte rule too (alpha dropped).
+    #[test]
+    fn sixteen_bit_pngs_follow_pils_convert_rules() {
+        use image::{ImageBuffer, Luma, LumaA, Rgb, Rgba};
+        // `Gray16Image`/`GrayAlpha16Image` are crate-private in `image`, so name
+        // the buffers by their pixel types.
+        type Luma16 = ImageBuffer<Luma<u16>, Vec<u16>>;
+        type LumaA16 = ImageBuffer<LumaA<u16>, Vec<u16>>;
+        type Rgb16 = ImageBuffer<Rgb<u16>, Vec<u16>>;
+        type Rgba16 = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+        let luma: Luma16 =
+            Luma16::from_raw(3, 2, vec![0, 255, 256, 1000, 32768, 65535]).expect("luma buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageLuma16(luma));
+        assert_eq!(
+            rgb.as_raw(),
+            &[
+                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+            ],
+            "a 16-bit gray sample is clipped, not scaled"
+        );
+
+        let rgb16: Rgb16 = Rgb16::from_raw(
+            2,
+            2,
+            vec![
+                0, 255, 256, // -> (0, 0, 1)
+                1000, 65535, 32768, // -> (3, 255, 128)
+                257, 512, 1023, // -> (1, 2, 3)
+                65535, 256, 0, // -> (255, 1, 0)
+            ],
+        )
+        .expect("rgb16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageRgb16(rgb16));
+        assert_eq!(rgb.as_raw(), &[0, 0, 1, 3, 255, 128, 1, 2, 3, 255, 1, 0]);
+
+        let rgba16: Rgba16 =
+            Rgba16::from_raw(2, 1, vec![0, 255, 256, 7, 1000, 65535, 32768, 65535])
+                .expect("rgba16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageRgba16(rgba16));
+        assert_eq!(rgb.as_raw(), &[0, 0, 1, 3, 255, 128], "alpha is dropped");
+
+        let la16: LumaA16 = LumaA16::from_raw(2, 1, vec![0, 7, 1000, 65535]).expect("la16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageLumaA16(la16));
+        assert_eq!(
+            rgb.as_raw(),
+            &[0, 0, 0, 3, 3, 3],
+            "Pillow opens LA16 as RGBA"
+        );
+    }
+
+    /// 8-bit images keep the `to_rgb8` mapping (luma replicated, alpha dropped),
+    /// which is PIL's: the EmbeddingGemma tower's pixels must not move.
+    #[test]
+    fn eight_bit_images_keep_the_to_rgb8_mapping() {
+        use image::{GrayAlphaImage, GrayImage, RgbaImage};
+
+        let luma: GrayImage = GrayImage::from_raw(2, 1, vec![0, 200]).unwrap();
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageLuma8(luma)).as_raw(),
+            &[0, 0, 0, 200, 200, 200]
+        );
+
+        let la: GrayAlphaImage = GrayAlphaImage::from_raw(2, 1, vec![7, 0, 9, 255]).unwrap();
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageLumaA8(la)).as_raw(),
+            &[7, 7, 7, 9, 9, 9]
+        );
+
+        let rgba: RgbaImage = RgbaImage::from_raw(1, 1, vec![10, 20, 30, 40]).expect("rgba buffer");
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageRgba8(rgba)).as_raw(),
+            &[10, 20, 30]
+        );
+
+        let rgb = RgbImage::from_raw(1, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(pil_rgb8(&DynamicImage::ImageRgb8(rgb)).as_raw(), &[1, 2, 3]);
+    }
+
+    /// A CMYK (Adobe) JPEG must not abort the process: libjpeg has no CMYK to RGB
+    /// conversion and mozjpeg raises it as a `resume_unwind`, so the loader has to
+    /// fall back to the `image` crate.  `data/cmyk-test-rgb.raw` is PIL's
+    /// `convert("RGB")` of `data/cmyk-test.jpg`; zune-jpeg agrees within one LSB.
+    #[test]
+    fn a_cmyk_jpeg_decodes_without_aborting() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let expected = std::fs::read(dir.join("cmyk-test-rgb.raw")).expect("cmyk-test-rgb.raw");
+        let image = load_image(&dir.join("cmyk-test.jpg")).expect("a CMYK JPEG decodes");
+        assert_eq!((image.width(), image.height()), (32, 24));
+        let ours = image.as_raw();
+        assert_eq!(ours.len(), expected.len());
+        let worst = ours
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst <= 2,
+            "CMYK fallback differs from PIL by up to {worst} LSB"
+        );
     }
 }

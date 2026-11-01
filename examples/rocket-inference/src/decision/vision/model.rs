@@ -23,13 +23,19 @@
 //! * merger: LayerNorm(hidden) per patch, `[patches/4, 4*hidden]` reshape in
 //!   block order, `fc1 (4h->4h) -> gelu -> fc2 (4h->out_hidden)`.
 //!
+//! The two GELUs differ and both are load-bearing: the blocks use the
+//! checkpoint's `hidden_act` (`gelu_pytorch_tanh`, the tanh approximation), while
+//! `Qwen3_5VisionPatchMerger` hard-codes `nn.GELU()` — the exact **erf** form.
+//! The two differ by up to 4.7e-4 per element (4.7e-4 at `|x| ~ 2.7`), which is
+//! enough to move the pooled output by 1.3e-3 and the cosine off 1.
+//!
 //! Every norm is `nn.LayerNorm(..., eps=1e-6)` (see [`LAYER_NORM_EPS`]). The
 //! tower runs in f32: a d3 checkpoint stores bf16 weights, and Phase 2a's gate is
 //! an f32 reference.
 
 use anyhow::{Result, bail};
 use burn::prelude::*;
-use burn::tensor::activation::gelu_approximate;
+use burn::tensor::activation::{gelu, gelu_approximate};
 use burn::tensor::module::attention;
 use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Int, TensorData, s};
@@ -434,12 +440,17 @@ impl VisionTower {
             x = x + linear(h, &block.fc2_w, &block.fc2_b);
         }
 
-        // Merger: LayerNorm per patch, merge-block reshape, fc1, gelu, fc2.
+        // Merger: LayerNorm per patch, merge-block reshape, fc1, exact GELU, fc2.
+        //
+        // The reference merger is `nn.GELU()` (the **erf** form), unlike the
+        // blocks' `gelu_pytorch_tanh` (`config.hidden_act`): the two differ by up
+        // to 4.7e-4 per element (9.8e-5 at x = 2), which was the whole pooled
+        // residual of the first cut.
         let h = layer_norm(x, &self.merger.norm_w, &self.merger.norm_b);
         let tokens = config.merged_tokens(grid_h, grid_w);
         let h = h.reshape([tokens, config.merge_unit() * hidden]);
         let h = linear(h, &self.merger.fc1_w, &self.merger.fc1_b);
-        let h = gelu_approximate(h);
+        let h = gelu(h);
         Ok(linear(h, &self.merger.fc2_w, &self.merger.fc2_b))
     }
 
@@ -696,6 +707,61 @@ mod tests {
         assert_eq!(tower.merger.fc1_w.dims(), [32, 32]);
         assert_eq!(tower.merger.fc2_w.dims(), [32, 4]);
         assert_eq!(tower.blocks[0].qkv_w.dims(), [8, 24]);
+    }
+
+    /// The merger's activation is `nn.GELU()` (exact erf), not the blocks'
+    /// `gelu_pytorch_tanh`.  With the merger's `fc1` biased to a fixed input and
+    /// `fc2` summing, the whole tower output is `merge_unit * hidden * gelu(2)`;
+    /// the two forms differ by 9.8e-5 per element (3.2e-3 here), which is the
+    /// size of the pooled residual Phase 2a's review measured.
+    #[test]
+    fn the_merger_uses_the_exact_erf_gelu() {
+        let cfg = config();
+        let device = Device::default();
+        let mut tower = VisionTower::new_stub(cfg.clone(), &device);
+        let merged = cfg.merge_unit() * cfg.hidden_size; // 32 values per token
+        let x = 2.0f32;
+        // `fc1` ignores its input and emits a constant 2.0; `fc2` sums it.
+        tower.merger.norm_w = Tensor::<1>::ones([cfg.hidden_size], &device);
+        tower.merger.norm_b = Tensor::<1>::zeros([cfg.hidden_size], &device);
+        tower.merger.fc1_w = Tensor::<2>::zeros([merged, merged], &device);
+        tower.merger.fc1_b = Tensor::<1>::full([merged], x, &device);
+        tower.merger.fc2_w = Tensor::<2>::ones([merged, cfg.out_hidden_size], &device);
+        tower.merger.fc2_b = Tensor::<1>::zeros([cfg.out_hidden_size], &device);
+
+        let image = PreparedImage {
+            pixel_values: Tensor::<2>::zeros([cfg.merge_unit(), cfg.patch_dim()], &device),
+            grid: [1, 2, 2],
+            tokens: 1,
+            source: (4, 4),
+            resized: (4, 4),
+        };
+        let out: Vec<f32> = tower
+            .encode(&image)
+            .unwrap()
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(out.len(), cfg.out_hidden_size);
+
+        // gelu(2) exact = 2 * Phi(2) = 2 * 0.9772498680518208.
+        let erf_gelu = 2.0 * 0.977_249_868_f32;
+        // The tanh approximation, as the blocks compute it.
+        let sqrt_2_over_pi = 0.797_884_56_f32;
+        let tanh_gelu = 0.5 * x * (1.0 + (sqrt_2_over_pi * (x + 0.044715 * x * x * x)).tanh());
+
+        let expected = merged as f32 * erf_gelu;
+        let approximate = merged as f32 * tanh_gelu;
+        assert!(
+            (out[0] - expected).abs() < 1e-3,
+            "merger output {} should be the erf gelu ({expected})",
+            out[0]
+        );
+        assert!(
+            (out[0] - approximate).abs() > 1e-3,
+            "merger output {} must not be the tanh gelu ({approximate})",
+            out[0]
+        );
     }
 
     #[test]

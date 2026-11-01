@@ -160,6 +160,12 @@ and one image with two questions.  Rendered prompts put every image (as
 `<|vision_start|><|image_pad|><|vision_end|>`) immediately after `<|im_start|>user\n`
 with no separator, then the `State:` block.
 
+The vision dump needs `--batch-size 1` (the default), and the script refuses
+`--dump-vision` with anything else: the image path feeds the processor one batch per
+question chunk with the case's images **repeated once per question**, so a dump taken with
+`N > 1` records a batch-sized `pixel_values`/`grid`/`pooled` that no single-image probe
+run can be compared against.
+
 ```sh
 /tmp/opencode/d3/venv/bin/python tools/decision_reference.py \
     --model /tmp/opencode/d3/models/d3-lite \
@@ -196,16 +202,38 @@ decision_vision_probe --model-dir /tmp/opencode/d3/models/d3-lite \
 The probe loads only `config.json` and the `visual.*` tensors (no text backbone), writes
 `pixel_values.f32` (`[patches, 1536]`), `pooled.f32` (`[tokens, out_hidden]`) and a
 `meta.json` (per image source/resized size, grid, patches, tokens, row offsets), and the
-parity script gates pixel `max|Δ| <= 1e-6`, pooled cosine `>= 0.9999` and an exact
+parity script gates pixel `max|Δ| <= 1e-6`, pooled cosine `>= 0.999999` and an exact
 grid/token match.
 
-Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01, 8 dumped entries): pixel
-`max|Δ|` **0** on every image (the resize/normalize/patchify are bit-identical to
-torchvision's processor), pooled cosine **0.999999961-0.999999973** (max |Δ| 1.29e-3 to
-1.48e-3 at a pooled peak of 3.7-5.5), grid/token exact; tower wall 3.4-13.1 s per probe
-run (2520-9744 patches, load 0.2 s; d3-nano 8.2-21.4 s).  d3-nano (depth 24, hidden
-1024, out 2048) gives the same 0 pixel delta and cosine 0.999999970-0.999999985 on
-receipt/pareto/cat, which is what pins the dimension-generic loader.
+Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01, 8 dumped entries, after the review
+fixes): pixel `max|Δ|` **0** on every image (the resize/normalize/patchify are
+bit-identical to torchvision's processor), pooled cosine **0.999999999-1.000000000**,
+`max|Δ|` 9.1e-5 to 9.0e-4 at a pooled peak of 3.7-5.5 (2.4e-5 to 1.7e-4 relative),
+grid/token exact; tower wall 3.4-13.1 s per probe run (2520-9744 patches, load 0.2 s;
+d3-nano 8.2-21.4 s).  The residual is the attention kernel, not the tower: swapping
+torch's own SDPA backend moves the reference pooled output by 4.4e-5 to 1.9e-4 absolute,
+which is why `vision_parity.py --pooled-max-abs` is an advisory opt-in rather than the
+gate.  d3-nano (depth 24, hidden 1024, out 2048) gives the same 0 pixel delta and cosine
+0.999999999-1.000000000 on receipt/pareto/cat, which is what pins the dimension-generic
+loader.
+
+**Review fix (phase 2a control): the merger's GELU.** `Qwen3_5VisionPatchMerger` builds
+`nn.GELU()` — the **exact erf** form — while the blocks use the checkpoint's
+`hidden_act` (`gelu_pytorch_tanh`).  The first cut used the tanh form in both places; with
+`pixel` still bit-exact it produced pooled cosine 0.999999961 at `max|Δ|` 1.34e-3 (the
+whole residual), against 5.95e-05 for a torch reference with the erf merger.  The merger
+now calls `burn::tensor::activation::gelu` and a unit test pins both activations
+(`the_merger_uses_the_exact_erf_gelu`).
+
+**Review fix: image decoding.** `gemma::media::load_image` (shared with EmbeddingGemma)
+now converts 16-bit PNGs with PIL's own rules instead of `to_rgb8`'s rounding — a 16-bit
+gray PNG (`I;16`) is **clipped to [0, 255]** by `convert("RGB")` (so it reads as
+near-white), while 16-bit colour and Pillow's 16-bit gray+alpha keep the **high byte**
+(`v >> 8`, alpha dropped) — and a CMYK/YCCK Adobe JPEG no longer aborts the process:
+libjpeg cannot convert it and mozjpeg raises that as a `resume_unwind`, so the loader
+refuses it up front and falls back to the `image` crate (1 LSB from PIL, pooled cosine
+0.99992 on a 640x480 CMYK photo).  Eight-bit and 8-bit-JPEG decodes are unchanged
+(`to_rgb8` and mozjpeg as before).
 
 Text behaviour is unchanged: the phase-1 parity still reports 67/67 top-1 and max
 |Δp| 2.36e-06 over the 47 text cases, and `system_one`/`decide`/`/v1/systemone` still

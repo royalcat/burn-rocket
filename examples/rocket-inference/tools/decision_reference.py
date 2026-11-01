@@ -365,6 +365,12 @@ def main(argv=None) -> int:
     import torch
     from transformers import AutoModel
 
+    if args.dump_vision and args.batch_size != 1:
+        raise SystemExit(
+            "--dump-vision needs --batch-size 1: a larger batch repeats a case's images "
+            "once per question, so the dumped pixel_values/grid/pooled are batch-sized"
+        )
+
     if args.threads:
         torch.set_num_threads(args.threads)
 

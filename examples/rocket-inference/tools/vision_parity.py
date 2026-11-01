@@ -10,18 +10,29 @@ script loads both and reports, per image:
 * ``max|Δpixel|`` over the processor's ``pixel_values`` (gate ``<= 1e-6``; 0 is
   what a faithful processor gives, since both sides compute
   ``(u8 - 127.5) / 127.5``);
-* the pooled cosine and ``max|Δ|`` (gate: cosine ``>= 0.9999``);
+* the pooled cosine and ``max|Δ|`` (gate: cosine ``>= 0.999999``, and
+  ``--pooled-max-abs`` when given);
 * the patch grid and token count (must be exact).
+
+The pooled gate is tight because a wrong activation in the merger (exact erf vs
+the tanh approximation, which Phase 2a's review caught) moves the cosine to
+0.99999996 at 1.3e-3 ``max|Δ|``; the fixed tower scores 1 - 4e-10 with a
+2.4e-5 to 1.7e-4 relative ``max|Δ|``.  That residual is the attention kernel, not
+this implementation: swapping torch's own SDPA backend moves the reference pooled
+output by 4.4e-5 to 1.9e-4 absolute, so ``--pooled-max-abs`` is an advisory
+opt-in (a useful band is 2e-3), not the gate.
 
 Usage:
     vision_parity.py --ref DIR --probe DIR [--stem NAME] [--json OUT]
-                     [--pixel-tol 1e-6] [--pooled-cosine 0.9999]
+                     [--pixel-tol 1e-6] [--pooled-cosine 0.999999]
+                     [--pooled-max-abs X]
 
 ``--ref`` is the reference dump directory and ``--probe`` the probe's output
 directory.  Without ``--stem`` every entry of the dump's ``index.json`` is
-scored, each against its own probe run: pass ``--probe-out`` once per entry if
-the probes live in separate directories, otherwise the probe must have been
-produced for the same single case (its ``meta.json`` records one image set).
+scored, each against its own probe run: pass ``--probe`` once per entry (in
+index order) if the probes live in separate directories, otherwise the probe
+must have been produced for exactly one case (its ``meta.json`` records one
+image set).
 
 Exit code 0 when every checked case passes, 1 otherwise.
 """
@@ -66,6 +77,7 @@ def score_case(
     probe_dir: Path,
     pixel_tol: float,
     pooled_min_cosine: float,
+    pooled_max_abs: float | None = None,
 ) -> tuple[bool, dict]:
     files = entry["files"]
     reference = np.load(ref_dir / files["pixel_values"]).astype(np.float64)
@@ -134,6 +146,10 @@ def score_case(
             report["problems"].append(
                 f"pooled cosine {report['pooled_cosine']:.8f} < {pooled_min_cosine}"
             )
+        if pooled_max_abs is not None and not (report["pooled_max_abs"] <= pooled_max_abs):
+            report["problems"].append(
+                f"pooled max|d| {report['pooled_max_abs']:.3e} > {pooled_max_abs:.1e}"
+            )
 
     return (not report["problems"]), report
 
@@ -152,7 +168,14 @@ def main(argv=None) -> int:
     p.add_argument("--stem", help="only the entry whose case/question stem matches this")
     p.add_argument("--json", help="write the report as JSON here")
     p.add_argument("--pixel-tol", type=float, default=1e-6)
-    p.add_argument("--pooled-cosine", type=float, default=0.9999)
+    p.add_argument("--pooled-cosine", type=float, default=0.999999)
+    p.add_argument(
+        "--pooled-max-abs",
+        type=float,
+        default=None,
+        help="also require max|Δpooled| <= this (advisory: the residual is the "
+        "attention kernel, up to ~9e-4 absolute)",
+    )
     args = p.parse_args(argv)
 
     ref_dir = Path(args.ref).expanduser()
@@ -188,7 +211,12 @@ def main(argv=None) -> int:
     for i, entry in enumerate(entries):
         probe_dir = probes[0] if len(probes) == 1 else probes[i]
         ok, report = score_case(
-            ref_dir, entry, probe_dir, args.pixel_tol, args.pooled_cosine
+            ref_dir,
+            entry,
+            probe_dir,
+            args.pixel_tol,
+            args.pooled_cosine,
+            args.pooled_max_abs,
         )
         failures += 0 if ok else 1
         reports.append(report)
@@ -216,6 +244,7 @@ def main(argv=None) -> int:
         "reference": str(ref_dir),
         "pixel_tol": args.pixel_tol,
         "pooled_min_cosine": args.pooled_cosine,
+        "pooled_max_abs": args.pooled_max_abs,
         "entries": len(entries),
         "failures": failures,
         "reports": reports,
