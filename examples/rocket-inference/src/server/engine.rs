@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 
 pub use crate::family::Family;
 
-use crate::decision::model::DecisionModel;
+use crate::decision::model::{DecisionModel, PrepareError};
 use crate::decision::request::{DecisionRequest, MediaMode};
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
@@ -752,10 +752,17 @@ impl DecisionEngine {
                 crate::decision::model::NO_VISION_TOWER,
             ));
         }
+        // A rejected image is the client's fault and keeps the reference's 422
+        // detail string; everything else (tokenizer, tower, device) is a 500.
         let prepared = self
             .model
             .prepare(&req, &images, self.max_tokens)
-            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+            .map_err(|error| match error {
+                PrepareError::InvalidImage(message) => {
+                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+                }
+                PrepareError::Internal(error) => ApiError::internal(format!("{error:#}")),
+            })?;
         let invalid = prepared.invalid_questions();
         if !invalid.is_empty() {
             return Ok(DecisionReply::Refused(invalid));

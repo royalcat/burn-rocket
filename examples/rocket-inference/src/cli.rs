@@ -568,8 +568,12 @@ impl LoadArgs {
             bail!("--quant does not apply to the {} model", family.name());
         }
         if self.defer_towers.is_some() && !family.supports_defer_towers() {
+            // A decision checkpoint *has* a vision tower, it just loads it with the
+            // backbone instead of on first use, so name the deferred halves rather
+            // than claiming there are no towers.
             bail!(
-                "--defer-towers does not apply to the {} model (no multimodal towers)",
+                "--defer-towers does not apply to the {} model (it has no tower halves to \
+                 load on first use)",
                 family.name()
             );
         }

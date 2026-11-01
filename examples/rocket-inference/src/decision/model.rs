@@ -37,6 +37,42 @@ use crate::qwen35_intent::model::IntentModel;
 pub const NO_VISION_TOWER: &str =
     "image inputs are not available: this checkpoint has no vision tower";
 
+/// Why [`DecisionModel::prepare`] failed, split by what the client can do about
+/// it: a rejected image is the reference's `422 {"detail": ...}` string, anything
+/// else is a server fault.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// The request's media cannot be used: an image the processor refuses (its
+    /// aspect ratio, its size), a checkpoint with no vision tower, or an image
+    /// that produced no tokens. The message is the reference's.
+    InvalidImage(String),
+    /// Tokenizer, tower or device failures: `500`.
+    Internal(anyhow::Error),
+}
+
+impl PrepareError {
+    fn image(message: impl Into<String>) -> Self {
+        Self::InvalidImage(message.into())
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidImage(message) => f.write_str(message),
+            Self::Internal(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareError {}
+
+impl From<anyhow::Error> for PrepareError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
 /// A loaded decision checkpoint, ready to answer System One requests.
 #[derive(Debug)]
 pub struct DecisionModel {
@@ -134,20 +170,25 @@ impl DecisionModel {
     /// `images` are already decoded (see [`DecisionRequest::decode_images`]);
     /// this runs the Qwen2-VL processor and the vision tower. Returns the images
     /// with their merged features, in list order.
-    pub fn prepare_images(&self, images: &[RgbImage]) -> Result<Vec<PreparedVision>> {
+    pub fn prepare_images(&self, images: &[RgbImage]) -> Result<Vec<PreparedVision>, PrepareError> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
         let Some(vision) = self.vision.as_ref() else {
-            bail!("{NO_VISION_TOWER}");
+            return Err(PrepareError::image(NO_VISION_TOWER));
         };
         let device = &self.backbone.device;
         let mut prepared = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
-            let image = prepare_from_rgb(image, &vision.config, device)
-                .map_err(|e| anyhow!("image rejected by the processor: {e:#}"))?;
+            // The processor's own refusals (aspect ratio, budgets) are the
+            // client's problem; they carry the reference's text.
+            let image = prepare_from_rgb(image, &vision.config, device).map_err(|e| {
+                PrepareError::image(format!("image rejected by the processor: {e:#}"))
+            })?;
             if image.tokens == 0 {
-                bail!("images[{index}]: the processor produced no image tokens");
+                return Err(PrepareError::image(format!(
+                    "images[{index}]: the processor produced no image tokens"
+                )));
             }
             prepared.push(image);
         }
@@ -156,7 +197,9 @@ impl DecisionModel {
         let [rows, _] = features.dims();
         let total: usize = prepared.iter().map(|image| image.tokens).sum();
         if rows != total {
-            bail!("the vision tower produced {rows} rows for {total} image tokens");
+            return Err(PrepareError::Internal(anyhow!(
+                "the vision tower produced {rows} rows for {total} image tokens"
+            )));
         }
         let mut offset = 0usize;
         let mut out = Vec::with_capacity(prepared.len());
@@ -183,7 +226,7 @@ impl DecisionModel {
         req: &DecisionRequest,
         images: &[RgbImage],
         max_tokens: usize,
-    ) -> Result<Prepared> {
+    ) -> Result<Prepared, PrepareError> {
         let cap = self.prompt_cap(max_tokens);
         let media = self.prepare_images(images)?;
         let n_images = media.len();
@@ -213,7 +256,7 @@ impl DecisionModel {
                 Err(message) => {
                     prepared.errors.insert(
                         id.clone(),
-                        error_answer(kind.clone(), "invalid_question", message),
+                        error_answer(kind.clone(), "invalid_question", message.to_string()),
                     );
                     prepared.questions.insert(id.clone(), question);
                     continue;
@@ -225,19 +268,15 @@ impl DecisionModel {
             } else {
                 format::chatml_images(&user, n_images)
             };
-            // A literal placeholder in the state or an option would make the plan
-            // ambiguous; the reference refuses that question.
-            if prompt.matches(format::IMAGE_TOKEN).count() != n_images
-                || prompt.contains(format::VIDEO_TOKEN)
-            {
+            // An image prompt's placeholder count must match the request, or a
+            // state/option carrying a literal placeholder would splice or drop
+            // rows; the reference refuses that question. A **text** prompt has no
+            // such check (`d3_runtime._prepare_text`), so a literal token there is
+            // just a token the model reads — as it was before images landed.
+            if let Some(message) = placeholder_problem(&prompt, n_images) {
                 prepared.errors.insert(
                     id.clone(),
-                    error_answer(
-                        kind.clone(),
-                        "invalid_question",
-                        "the state or question contains a literal image or video placeholder token"
-                            .to_string(),
-                    ),
+                    error_answer(kind.clone(), "invalid_question", message.to_string()),
                 );
                 prepared.questions.insert(id.clone(), question);
                 continue;
@@ -252,7 +291,7 @@ impl DecisionModel {
                 Err(message) => {
                     prepared.errors.insert(
                         id.clone(),
-                        error_answer(kind.clone(), "invalid_question", message),
+                        error_answer(kind.clone(), "invalid_question", message.to_string()),
                     );
                     prepared.questions.insert(id.clone(), question);
                     continue;
@@ -295,43 +334,8 @@ impl DecisionModel {
         raw: &[u32],
         images: &[PreparedVision],
     ) -> Result<PreparedSequence, String> {
-        let mut ids: Vec<u32> = Vec::with_capacity(raw.len());
-        let mut mm_types: Vec<u8> = Vec::with_capacity(raw.len());
-        let mut image_spans = Vec::with_capacity(images.len());
-        let mut next = 0usize;
-        for &token in raw {
-            if token == self.image_token_id {
-                let Some(image) = images.get(next) else {
-                    return Err(format!(
-                        "the '{id}' prompt has more image placeholders than the {} image(s) of \
-                         the request",
-                        images.len()
-                    ));
-                };
-                let start = ids.len();
-                ids.extend(std::iter::repeat_n(token, image.image.tokens));
-                mm_types.extend(std::iter::repeat_n(mrope::TYPE_IMAGE, image.image.tokens));
-                image_spans.push((start, ids.len()));
-                next += 1;
-            } else if token == self.video_token_id {
-                return Err("video placeholders are not supported yet".to_string());
-            } else {
-                ids.push(token);
-                mm_types.push(mrope::TYPE_TEXT);
-            }
-        }
-        if next != images.len() {
-            return Err(format!(
-                "the '{id}' prompt uses {next} of the {} image(s) of the request",
-                images.len()
-            ));
-        }
-        Ok(PreparedSequence {
-            id: id.to_string(),
-            ids,
-            mm_types,
-            image_spans,
-        })
+        let tokens: Vec<usize> = images.iter().map(|image| image.image.tokens).collect();
+        expand_placeholders(id, raw, self.image_token_id, self.video_token_id, &tokens)
     }
 
     /// Forward every runnable question (request order) and return its option
@@ -467,6 +471,81 @@ impl DecisionModel {
             self.config.temperature,
         ))
     }
+}
+
+/// Expand the placeholders of one tokenized prompt: each `<|image_pad|>` becomes
+/// `tokens[i]` copies of itself (the i-th image's merged token count) and the
+/// copies are marked as image rows; every other token stays text.
+///
+/// `tokens` empty is the **text** path: a literal `<|image_pad|>`/`<|video_pad|>`
+/// in the state is then just a token the model reads (the reference's text path
+/// expands nothing either), so nothing is refused.
+pub(crate) fn expand_placeholders(
+    id: &str,
+    raw: &[u32],
+    image_token_id: u32,
+    video_token_id: u32,
+    tokens: &[usize],
+) -> Result<PreparedSequence, String> {
+    let mut ids: Vec<u32> = Vec::with_capacity(raw.len());
+    let mut mm_types: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut image_spans = Vec::with_capacity(tokens.len());
+    let mut next = 0usize;
+    for &token in raw {
+        if token == image_token_id && !tokens.is_empty() {
+            let Some(count) = tokens.get(next) else {
+                return Err(format!(
+                    "the '{id}' prompt has more image placeholders than the {} image(s) of \
+                     the request",
+                    tokens.len()
+                ));
+            };
+            let start = ids.len();
+            ids.extend(std::iter::repeat_n(token, *count));
+            mm_types.extend(std::iter::repeat_n(mrope::TYPE_IMAGE, *count));
+            image_spans.push((start, ids.len()));
+            next += 1;
+        } else if token == video_token_id && !tokens.is_empty() {
+            // A literal video placeholder in an *image* prompt is the
+            // reference's invalid_question; in a text prompt it is a plain token
+            // (phase 3 adds the real video path).
+            return Err("video placeholders are not supported yet".to_string());
+        } else {
+            ids.push(token);
+            mm_types.push(mrope::TYPE_TEXT);
+        }
+    }
+    if next != tokens.len() {
+        return Err(format!(
+            "the '{id}' prompt uses {next} of the {} image(s) of the request",
+            tokens.len()
+        ));
+    }
+    Ok(PreparedSequence {
+        id: id.to_string(),
+        ids,
+        mm_types,
+        image_spans,
+    })
+}
+
+/// Why an image prompt is unusable, or `None` when it is fine.
+///
+/// The reference (`d3_runtime.PreparedText._prepare_images`) refuses a question
+/// whose rendered text carries a different number of `<|image_pad|>` placeholders
+/// than the request has images, or any `<|video_pad|>`, because the expansion
+/// would then disagree with the images. Its **text** path has no such check, so a
+/// text-only request is never refused for a literal placeholder token.
+pub(crate) fn placeholder_problem(prompt: &str, n_images: usize) -> Option<&'static str> {
+    if n_images == 0 {
+        return None;
+    }
+    if prompt.matches(format::IMAGE_TOKEN).count() != n_images
+        || prompt.contains(format::VIDEO_TOKEN)
+    {
+        return Some("the state or question contains a literal image or video placeholder token");
+    }
+    None
 }
 
 /// Write each image's features into its expanded rows of `[1, seq, hidden]`.
@@ -643,6 +722,77 @@ mod tests {
                 0.0, 1.0, 2.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 9.0, 10.0, 11.0
             ]
         );
+    }
+
+    /// The expansion: text prompts keep every token (even a literal placeholder),
+    /// image prompts turn each placeholder into its image's rows.
+    #[test]
+    fn placeholders_expand_only_for_image_prompts() {
+        let (image, video) = (7u32, 8u32);
+        let raw = [1, image, 2, video, 3];
+        // No images: the literal tokens are text and nothing is expanded.
+        let text = expand_placeholders("q", &raw, image, video, &[]).unwrap();
+        assert_eq!(text.ids, raw);
+        assert_eq!(text.mm_types, vec![mrope::TYPE_TEXT; raw.len()]);
+        assert!(text.image_spans.is_empty());
+
+        // One image of two merged tokens.
+        let one = expand_placeholders("q", &[1, image, 2], image, video, &[2]).unwrap();
+        assert_eq!(one.ids, [1, image, image, 2]);
+        assert_eq!(
+            one.mm_types,
+            [
+                mrope::TYPE_TEXT,
+                mrope::TYPE_IMAGE,
+                mrope::TYPE_IMAGE,
+                mrope::TYPE_TEXT
+            ]
+        );
+        assert_eq!(one.image_spans, [(1, 3)]);
+
+        // Two images: each placeholder takes its own image's count.
+        let two = expand_placeholders("q", &[image, image], image, video, &[1, 3]).unwrap();
+        assert_eq!(two.ids.len(), 4);
+        assert_eq!(two.image_spans, [(0, 1), (1, 4)]);
+
+        // An image prompt with a literal video token is refused, and so is a
+        // placeholder count that disagrees with the images.
+        assert!(
+            expand_placeholders("q", &[image, video], image, video, &[1]).is_err(),
+            "a video placeholder in an image prompt"
+        );
+        assert!(expand_placeholders("q", &[image, image], image, video, &[1]).is_err());
+        assert!(expand_placeholders("q", &[image], image, video, &[1, 1]).is_err());
+    }
+
+    /// A text prompt is never refused for a literal placeholder token: the
+    /// reference's `_prepare_text` has no count check, so a state that quotes
+    /// `<|image_pad|>` is answered like any other text (the token is just a token).
+    /// An image prompt does need the count to match the request.
+    #[test]
+    fn only_image_prompts_check_their_placeholder_count() {
+        let literal = format!("State:\nplease echo {} here\n", format::IMAGE_TOKEN);
+        assert_eq!(placeholder_problem(&literal, 0), None);
+        // Two literal image tokens and no images: still a text prompt.
+        let two = format!("{}{}", literal, format::IMAGE_TOKEN);
+        assert_eq!(placeholder_problem(&two, 0), None);
+        // A literal video token in a text prompt is plain text too.
+        assert_eq!(placeholder_problem(format::VIDEO_TOKEN, 0), None);
+
+        // With images, an extra literal token breaks the count.
+        let prompt = format::chatml_images("State:\necho {} here", 1);
+        assert_eq!(placeholder_problem(&prompt, 1), None);
+        assert!(
+            placeholder_problem(&prompt, 2).is_some(),
+            "fewer placeholders than images"
+        );
+        let with_literal = format!("{}{}", prompt, format::IMAGE_TOKEN);
+        assert!(
+            placeholder_problem(&with_literal, 1).is_some(),
+            "a literal token in the state would add a placeholder"
+        );
+        // A video placeholder in an image prompt is refused by the reference.
+        assert!(placeholder_problem(&format!("{prompt}{}", format::VIDEO_TOKEN), 1).is_some());
     }
 
     /// A span that does not match its features is a hard error, not a silent

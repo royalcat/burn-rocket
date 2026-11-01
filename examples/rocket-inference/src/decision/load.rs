@@ -117,6 +117,11 @@ fn read_config_json(model_dir: &Path) -> Result<serde_json::Value> {
 /// `config.json` `image_token_id`/`video_token_id`, checked against the
 /// tokenizer's `<|image_pad|>`/`<|video_pad|>` tokens: the prompt expansion counts
 /// those ids, so a mismatch would splice the wrong rows.
+///
+/// Only an **image-capable** package (`vision_config`) has to declare them: a
+/// text-only d3 package (no tower, no placeholders) loads without them and refuses
+/// an image request with [`crate::decision::model::NO_VISION_TOWER`] instead. Both ids come back as
+/// `u32::MAX` (never a real token id) when the package has no vision.
 fn check_media_tokens(tokenizer: &Tokenizer, config: &serde_json::Value) -> Result<(u32, u32)> {
     let id = |name: &str| -> Option<u32> {
         config
@@ -124,10 +129,14 @@ fn check_media_tokens(tokenizer: &Tokenizer, config: &serde_json::Value) -> Resu
             .and_then(serde_json::Value::as_u64)
             .map(|v| v as u32)
     };
+    if config.get("vision_config").is_none() {
+        // Text-only: nothing to expand, nothing to check.
+        return Ok((u32::MAX, u32::MAX));
+    }
     let image_token_id = id("image_token_id").ok_or_else(|| {
         anyhow::anyhow!(
-            "config.json declares no image_token_id; the d3 image path needs the \
-             checkpoint's own <|image_pad|> id"
+            "config.json declares a vision_config but no image_token_id; the d3 image \
+             path needs the checkpoint's own <|image_pad|> id"
         )
     })?;
     let video_token_id = id("video_token_id").unwrap_or(u32::MAX);
@@ -286,6 +295,49 @@ mod tests {
         std::fs::write(dir.join("MODEL_MANIFEST.json"), "{not json").unwrap();
         assert_eq!(manifest_model_name(&dir), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The load-time media-token checks only apply to an image-capable package: a
+    /// text-only d3 package (no `vision_config`) has no placeholders to expand and
+    /// must still load, while one that *does* declare a tower must name both ids
+    /// and keep them consistent with the tokenizer.
+    #[test]
+    fn media_tokens_are_required_only_for_an_image_capable_package() {
+        let source = Path::new("/tmp/opencode/d3/models/d3-lite/tokenizer.json");
+        let Ok(tokenizer) = Tokenizer::from_file(source) else {
+            eprintln!("skipping: {} is not available", source.display());
+            return;
+        };
+        let text_only = serde_json::json!({"text_config": {"model_type": "qwen3_5_text"}});
+        assert_eq!(
+            check_media_tokens(&tokenizer, &text_only).unwrap(),
+            (u32::MAX, u32::MAX)
+        );
+
+        // An image package must declare the image id ...
+        let no_id = serde_json::json!({"vision_config": {"depth": 12}});
+        let message = format!("{:#}", check_media_tokens(&tokenizer, &no_id).unwrap_err());
+        assert!(message.contains("no image_token_id"), "{message}");
+
+        // ... and it must match the tokenizer's own <|image_pad|>.
+        let real = crate::decision::format::IMAGE_TOKEN;
+        let actual = tokenizer.token_to_id(real).expect("<|image_pad|>");
+        let good = serde_json::json!({
+            "vision_config": {"depth": 12},
+            "image_token_id": actual,
+            "video_token_id": actual + 1,
+        });
+        assert_eq!(
+            check_media_tokens(&tokenizer, &good).unwrap(),
+            (actual, actual + 1)
+        );
+
+        let wrong = serde_json::json!({
+            "vision_config": {"depth": 12},
+            "image_token_id": actual + 3,
+        });
+        let message = format!("{:#}", check_media_tokens(&tokenizer, &wrong).unwrap_err());
+        assert!(message.contains("image_token_id"), "{message}");
     }
 
     /// A d3 checkpoint whose `decision_config.json` lists the codes in another

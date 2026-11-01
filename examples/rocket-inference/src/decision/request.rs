@@ -12,18 +12,20 @@
 //! question that cannot be answered is reported inside the response's `answers`
 //! (see [`crate::decision::model`]); only envelope problems fail the request.
 //!
-//! Media: `images` is a list of strings shared by every question of the request.
-//! How those strings are read depends on the transport ([`MediaMode`]): the
-//! server takes `data:image/{png,jpeg,webp};base64,...` URLs only (the reference
-//! `d3_server.py` contract, see [`decode_data_url`]), the CLI takes local paths so
-//! the parity fixtures can point at the checkpoint's own assets. `videos` is
-//! phase 3: a non-empty list is refused up front.
+//! Media: `images` is a list shared by every question of the request. How those
+//! entries are read depends on the transport ([`MediaMode`]): the server takes
+//! `data:image/{png,jpeg,webp};base64,...` URLs only (the reference `d3_server.py`
+//! contract, see [`decode_data_url`]), the CLI takes local paths so the parity
+//! fixtures can point at the checkpoint's own assets. Both decode the *bytes* by
+//! content (magic number), like `PIL.Image.open`, so a JPEG declared as
+//! `image/png` decodes as a JPEG. `videos` is phase 3: a non-empty list is
+//! refused up front.
 
 use anyhow::Result;
 use image::RgbImage;
 use serde_json::{Map, Value};
 
-use crate::gemma::media::load_image;
+use crate::gemma::media::{decode_image, load_image};
 
 /// The fields a request may carry (the reference's `ACCEPTED_FIELDS`).
 pub const ACCEPTED_FIELDS: [&str; 5] = ["state", "questions", "images", "videos", "model"];
@@ -36,6 +38,12 @@ pub const MAX_IMAGE_SOURCE_PIXELS: u64 = 16_000_000;
 pub const IMAGE_FORMATS: [&str; 3] = ["PNG", "JPEG", "WEBP"];
 /// `d3_runtime.DATA_URL_IMAGE_TYPES`: the data-URL subtypes the server accepts.
 pub const DATA_URL_IMAGE_TYPES: [&str; 4] = ["png", "jpeg", "jpg", "webp"];
+/// `d3_runtime.load_image(..., strict=True)`'s refusal of anything that is not a
+/// `data:` URL string (the server never reads files or fetches URLs for a client).
+pub const STRICT_IMAGE_MESSAGE: &str = "strict mode: images must be given as a data: URL string, not a file path, web address or PIL image";
+/// The in-process loader's list of accepted shapes (a non-string or empty entry).
+pub const IMAGE_SHAPES_MESSAGE: &str =
+    "an image is a PIL image, a local path, an http(s) URL or a data:image/...;base64 URL";
 
 /// How a request's `images` entries are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +56,22 @@ pub enum MediaMode {
 
 impl MediaMode {
     /// Decode one `images` entry to RGB8, or the message a client gets.
-    pub fn decode(self, value: &str, index: usize) -> Result<RgbImage, String> {
-        let decoded = match self {
-            Self::Paths => load_image(std::path::Path::new(value))
-                .map_err(|e| format!("cannot read the image {value} ({e:#})")),
-            Self::DataUrls => decode_data_url(value),
+    ///
+    /// An entry that is not a nonempty string gets the mode's own wording, which
+    /// is the reference's: the strict server loader refuses anything that is not
+    /// a `data:` URL string, the in-process path loader names the four accepted
+    /// shapes.
+    pub fn decode(self, value: &Value, index: usize) -> Result<RgbImage, String> {
+        let decoded = match value.as_str().filter(|text| !text.is_empty()) {
+            None => Err(match self {
+                Self::DataUrls => STRICT_IMAGE_MESSAGE.to_string(),
+                Self::Paths => IMAGE_SHAPES_MESSAGE.to_string(),
+            }),
+            Some(text) => match self {
+                Self::Paths => load_image(std::path::Path::new(text))
+                    .map_err(|e| format!("cannot read the image {text} ({e:#})")),
+                Self::DataUrls => decode_data_url(text),
+            },
         };
         decoded.map_err(|message| format!("images[{index}]: {message}"))
     }
@@ -66,10 +85,11 @@ pub struct DecisionRequest {
     /// Question id -> question object, request order.
     pub questions: Map<String, Value>,
     /// Image inputs shared by every question, as given (paths or data URLs,
-    /// depending on the transport).
-    pub images: Vec<String>,
-    /// Video inputs: stored for phase 3, refused by [`DecisionRequest::parse`].
-    pub videos: Vec<String>,
+    /// depending on the transport; kept as JSON so a non-string entry gets the
+    /// loader's own message rather than an envelope error).
+    pub images: Vec<Value>,
+    /// Video inputs: kept for phase 3, refused by [`DecisionRequest::parse`].
+    pub videos: Vec<Value>,
 }
 
 /// One case of a `--requests` array: a request plus the name reported back.
@@ -161,19 +181,13 @@ impl DecisionRequest {
     }
 }
 
-/// `images`/`videos` must be absent, `null` or a list of nonempty strings.
-fn media_list(name: &str, value: &Value) -> Result<Vec<String>, String> {
+/// `images`/`videos` must be absent, `null` or a list; the entries themselves are
+/// checked by the loader, which knows the transport
+/// (`d3_server.py` checks the list shape here and the items in `load_images`).
+fn media_list(name: &str, value: &Value) -> Result<Vec<Value>, String> {
     match value {
         Value::Null => Ok(Vec::new()),
-        Value::Array(items) => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| match item {
-                Value::String(text) if !text.is_empty() => Ok(text.clone()),
-                Value::String(_) => Err(format!("{name}[{index}] must be a nonempty string")),
-                _ => Err(format!("{name} takes a list of base64 data URLs")),
-            })
-            .collect(),
+        Value::Array(items) => Ok(items.clone()),
         _ => Err(format!("{name} takes a list of base64 data URLs")),
     }
 }
@@ -204,20 +218,19 @@ fn split_data_url<'a>(value: &'a str, media: &str) -> Result<(String, &'a str), 
 /// pixels, and a payload that decodes.
 ///
 /// The pixels come from the same decoder the file path uses
-/// ([`crate::gemma::media::load_image`]: mozjpeg/libjpeg-turbo for JPEGs, PIL's
-/// 16-bit PNG rules), through a temporary file named after the data URL's subtype.
+/// ([`crate::gemma::media::decode_image`]: mozjpeg/libjpeg-turbo for JPEGs, PIL's
+/// 16-bit PNG rules), which picks the decoder by the payload's magic number — the
+/// declared subtype is only a whitelist, exactly like the reference, so a JPEG
+/// declared `image/png` still decodes.
 pub fn decode_data_url(value: &str) -> Result<RgbImage, String> {
     if !value.starts_with("data:") {
-        return Err(
-            "strict mode: images must be given as a data: URL string, not a file path, \
-             web address or PIL image"
-                .to_string(),
-        );
+        return Err(STRICT_IMAGE_MESSAGE.to_string());
     }
     let (subtype, text) = split_data_url(value, "image")?;
     if !DATA_URL_IMAGE_TYPES.contains(&subtype.as_str()) {
+        // `{subtype!r}` in the reference, i.e. a Python repr with single quotes.
         return Err(format!(
-            "image data URLs take the types {}, got {subtype:?}",
+            "image data URLs take the types {}, got '{subtype}'",
             DATA_URL_IMAGE_TYPES.join(", ")
         ));
     }
@@ -234,13 +247,7 @@ pub fn decode_data_url(value: &str) -> Result<RgbImage, String> {
             thousands(MAX_IMAGE_SOURCE_PIXELS)
         ));
     }
-    // The decoders pick their backend by extension, so the temp file carries the
-    // data URL's own subtype (`jpg` normalizes to the same JPEG path).
-    let path =
-        write_temp(&bytes, &subtype).map_err(|e| format!("the image could not be read ({e})"))?;
-    let image = load_image(&path).map_err(|e| format!("the image could not be decoded ({e:#})"));
-    let _ = std::fs::remove_file(&path);
-    image
+    decode_image(&bytes).map_err(|e| format!("the image could not be decoded ({e:#})"))
 }
 
 /// `d3_runtime._decode_base64`: validated base64 with the reference's limits.
@@ -301,19 +308,6 @@ fn probe_image(bytes: &[u8]) -> Result<(String, u32, u32), String> {
         .into_dimensions()
         .map_err(|e| format!("the image could not be identified ({e})"))?;
     Ok((name, width, height))
-}
-
-/// Write upload bytes to the app's temp directory (the decoder reads a path).
-fn write_temp(bytes: &[u8], ext: &str) -> Result<std::path::PathBuf, String> {
-    let dir = std::env::temp_dir().join("rocket-inference");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = dir.join(format!("decision-{}-{nanos}.{ext}", std::process::id()));
-    std::fs::write(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
 }
 
 impl CaseInput {
@@ -378,7 +372,11 @@ mod tests {
             "images": ["a.png", "data:image/png;base64,AA=="],
         }))
         .unwrap();
-        assert_eq!(req.images, ["a.png", "data:image/png;base64,AA=="]);
+        assert_eq!(
+            req.images,
+            [json!("a.png"), json!("data:image/png;base64,AA==")],
+            "entries are kept as given; the transport decodes them"
+        );
         assert!(req.videos.is_empty());
 
         let err = parse(json!({
@@ -388,15 +386,13 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "videos are not supported yet");
 
-        // A media list of the wrong shape or with a non-string entry.
+        // Only the list shape is checked here; the entries are the loader's job
+        // (so the message can name the transport's accepted shapes).
         let err = parse(json!({"questions": {"q": {"type": "noul"}}, "images": 5})).unwrap_err();
         assert_eq!(err, "images takes a list of base64 data URLs");
         let err = parse(json!({"questions": {"q": {"type": "noul"}}, "videos": {}})).unwrap_err();
         assert_eq!(err, "videos takes a list of base64 data URLs");
-        let err = parse(json!({"questions": {"q": {"type": "noul"}}, "images": [7]})).unwrap_err();
-        assert_eq!(err, "images takes a list of base64 data URLs");
-        let err = parse(json!({"questions": {"q": {"type": "noul"}}, "images": [""]})).unwrap_err();
-        assert_eq!(err, "images[0] must be a nonempty string");
+        assert!(parse(json!({"questions": {"q": {"type": "noul"}}, "images": [7]})).is_ok());
         // An empty media list is the same as none.
         let req = parse(json!({"questions": {"q": {"type": "noul"}}, "images": [], "videos": []}))
             .unwrap();
@@ -421,7 +417,7 @@ mod tests {
         let err = decode_data_url("data:image/gif;base64,QUJD").unwrap_err();
         assert_eq!(
             err,
-            "image data URLs take the types png, jpeg, jpg, webp, got \"gif\""
+            "image data URLs take the types png, jpeg, jpg, webp, got 'gif'"
         );
         // Not a base64 data URL at all.
         assert_eq!(
@@ -462,13 +458,116 @@ mod tests {
         assert_eq!(decoded.dimensions(), expected.dimensions());
         assert_eq!(decoded.as_raw(), expected.as_raw(), "same RGB8 pixels");
         // ... and the same image through the path mode.
-        let via_path = MediaMode::Paths.decode(path.to_str().unwrap(), 0).unwrap();
+        let via_path = MediaMode::Paths
+            .decode(&json!(path.to_str().unwrap()), 0)
+            .unwrap();
         assert_eq!(via_path.as_raw(), expected.as_raw());
         // The error carries the reference's `images[i]: ` prefix.
         let err = MediaMode::Paths
-            .decode("/nonexistent/none.png", 2)
+            .decode(&json!("/nonexistent/none.png"), 2)
             .unwrap_err();
         assert!(err.starts_with("images[2]: "), "{err}");
+    }
+
+    /// The reference's per-entry messages: the strict server loader for anything
+    /// that is not a nonempty `data:` URL string, the in-process loader's shape
+    /// list otherwise.
+    #[test]
+    fn an_unusable_entry_gets_the_transports_wording() {
+        let empty = json!("");
+        assert_eq!(
+            MediaMode::DataUrls.decode(&empty, 0).unwrap_err(),
+            "images[0]: strict mode: images must be given as a data: URL string, not a file \
+             path, web address or PIL image"
+        );
+        assert_eq!(
+            MediaMode::Paths.decode(&empty, 0).unwrap_err(),
+            "images[0]: an image is a PIL image, a local path, an http(s) URL or a \
+             data:image/...;base64 URL"
+        );
+        // A non-string entry takes the same wording as an empty one.
+        let number = json!(7);
+        assert!(
+            MediaMode::DataUrls
+                .decode(&number, 2)
+                .unwrap_err()
+                .starts_with("images[2]: strict mode:")
+        );
+        assert!(
+            MediaMode::Paths
+                .decode(&number, 2)
+                .unwrap_err()
+                .starts_with("images[2]: an image is a PIL image")
+        );
+    }
+
+    /// The decoder is chosen by the payload, not by the declared subtype: the
+    /// reference's strict loader only *whitelists* the subtype, PIL then sniffs
+    /// the content. A JPEG sent as `image/png` (and a PNG sent as `image/jpeg`)
+    /// decodes to the same pixels as the file.
+    #[test]
+    fn the_declared_subtype_does_not_select_the_decoder() {
+        use base64::Engine;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let Ok(jpeg) = std::fs::read(dir.join("cat.jpeg")) else {
+            eprintln!("skipping: cat.jpeg is not available");
+            return;
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+        let expected = crate::gemma::media::load_image(&dir.join("cat.jpeg")).unwrap();
+        for subtype in ["png", "webp", "jpeg"] {
+            let url = format!("data:image/{subtype};base64,{encoded}");
+            let decoded = decode_data_url(&url).unwrap_or_else(|e| panic!("{subtype}: {e}"));
+            assert_eq!(
+                decoded.as_raw(),
+                expected.as_raw(),
+                "a JPEG declared {subtype} must decode as a JPEG"
+            );
+        }
+        // A real PNG declared as a JPEG decodes too.
+        let png = {
+            let img = image::RgbImage::from_raw(2, 1, vec![9, 8, 7, 6, 5, 4]).unwrap();
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
+            cursor.into_inner()
+        };
+        let url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        let decoded = decode_data_url(&url).unwrap();
+        assert_eq!(decoded.dimensions(), (2, 1));
+        assert_eq!(decoded.as_raw(), &[9, 8, 7, 6, 5, 4]);
+    }
+
+    /// A truncated JPEG is refused by the data-URL path as well: the structural
+    /// check runs before any decoder (the reference's PIL raises
+    /// `image file is truncated`), and no temporary path leaks into the message.
+    #[test]
+    fn a_truncated_jpeg_data_url_is_refused() {
+        use base64::Engine;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/cat.jpeg");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: {} is not available", path.display());
+            return;
+        };
+        let cut = &bytes[..bytes.len() - 36];
+        let url = format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(cut)
+        );
+        let message = decode_data_url(&url).unwrap_err();
+        assert!(
+            message.starts_with("the image could not be decoded ("),
+            "{message}"
+        );
+        assert!(message.contains("truncated JPEG"), "{message}");
+        assert!(
+            !message.contains("rocket-inference"),
+            "no temp path in the message: {message}"
+        );
     }
 
     #[test]

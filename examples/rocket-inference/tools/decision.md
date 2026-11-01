@@ -145,8 +145,25 @@ Rust server does not model; the cap it enforces is the flag.
 Left for phase 5 (documented here so the gap is explicit): **D8** (stricter
 `decision_config.json` cross-checks such as `codes`/`token_ids` against
 `MODEL_MANIFEST.json` and the manifest hash verification the reference optionally does)
-and **D11** (README/recipes/docstring polish for the new family). The text path is
-otherwise complete; images/videos are phase 2.
+and **D11** (README/recipes/docstring polish for the new family). Text and image
+requests are complete; **videos** are phase 3 (a non-empty `videos` list is a 422 and a
+`<|video_pad|>` inside an image prompt is an `invalid_question`).
+
+Known differences from the reference, both harmless but named:
+
+- **Media work runs inside the model lock.** The reference decodes the request's images
+  before taking its lock (`Decider.arguments` -> `load_images`, then `prepare`/`run` under
+  the lock); this server decodes, preprocesses and tower-encodes inside the single
+  compute closure, i.e. one image request blocks the next request's decode as well. Two
+  concurrent image requests are therefore serialized end to end rather than at decode
+  only. Deferred: decoding is ~10-50 ms against seconds of forward, so the lock is not
+  what bounds throughput today; it would matter if a large upload arrived while another
+  request was waiting.
+- **`images` entries are validated in two steps.** The list shape is the envelope's
+  (`images takes a list of base64 data URLs`), the entries are the loader's
+  (`images[i]: <reason>`), exactly like `d3_server.py`; the difference is only that a
+  non-string or empty entry cannot be checked before the transport is known, so its
+  message is the loader's rather than the envelope's (same 422).
 
 The checkpoint must be a local safetensors package: `decide` rejects `-hf` (a GGUF Hub
 repo cannot carry `readout.safetensors`), and a directory with several sharded
@@ -159,6 +176,11 @@ repo cannot carry `readout.safetensors`), and a directory with several sharded
 domains: support-ticket routing, receipt totals, sentiment, policy compliance,
 scheduling, structured account state, intent, language and audit findings.  Every
 string is newline-free; receipt totals are computed from their line items.
+
+`decision_fixtures_placeholders.json`: the two text cases whose state quotes a literal
+`<|image_pad|>` / `<|video_pad|>` token (the reference's text path has no placeholder
+check, so both must answer; see the phase-2b review-fixes section).  Reference:
+`decision_reference.py --backbone-dtype f32` on the same file.
 
 ## Images (phase 2a)
 
@@ -303,6 +325,60 @@ prompt.
 
 Server smoke (d3-lite, port 8399, `serve --model-dir ...`): a `data:image/jpeg;base64,...`
 cat request answers `cat` at 0.996876 in 11 s (`questions=1 tokens=740` in the request
-log line); a local path, a remote URL, `data:image/gif`, invalid base64 and a bad subtype
-are each a `422 {"detail": "images[0]: <reason>"}`; an unknown question type stays
-`422 {"detail": {"invalid_questions": ...}}`; a text-only request is unchanged.
+log line); a local path, a remote URL, `data:image/gif`, invalid base64, an empty entry
+and a non-string entry are each a `422 {"detail": "images[0]: <reason>"}`; an unknown
+question type stays `422 {"detail": {"invalid_questions": ...}}`; a text-only request is
+unchanged.
+
+### Review fixes (phase 2b control)
+
+**Rejected images are 422, not 500.** `decision::model::PrepareError` splits
+`InvalidImage(String)` (the Qwen2-VL processor's own refusals — aspect ratio, budgets, an
+image that produced no merged tokens, a checkpoint without a tower) from `Internal(anyhow::Error)`
+(tokenizer/tower/device). The server maps the first to the reference's
+`422 {"detail": "<message>"}` and the second to 500. A 4000x10 PNG (aspect 400) now
+answers `image rejected by the processor: absolute aspect ratio must be smaller than 200,
+got 400.0` (Python's float repr, so the `.0` stays), where it used to be a 500.
+
+**JPEG integrity before any decoder.** `gemma::media::check_jpeg` walks the container: an
+SOI, marker segments with in-range lengths, an 8-bit SOF and an EOI after the first scan
+(stuffed `FF 00` and `FF D0-D7` restart markers are skipped). `load_image` (paths) and
+`decode_data_url` (uploads) both run it on JPEG bytes, so a cut-off upload is
+`the image could not be decoded (truncated JPEG (the scan has no EOI marker))` instead of
+being accepted by the `image` crate, and a 12-bit frame or a nonsense segment length is a
+clean error instead of libjpeg's `error_exit` (the phase-2a containment tests now pin the
+structural message). libjpeg's CMYK/YCCK fallback to the `image` crate stays, because
+that one is a decoder limitation, not a broken file.
+
+**The declared subtype does not select the decoder.** `decode_image` sniffs the payload
+(`FF D8 FF` JPEG, the PNG signature, `RIFF....WEBP`) and dispatches, like
+`PIL.Image.open`: a valid JPEG sent as `data:image/png` decodes as a JPEG (200, same
+pixels), a PNG sent as `data:image/jpeg` likewise. The subtype is only the reference's
+whitelist. Nothing is written to disk any more (the old temp file made the payload's name
+decide the decoder and could leak its path into the message).
+
+**A literal placeholder is only refused in image prompts.** The reference's
+`_prepare_text` has no placeholder check, so a text state quoting `<|image_pad|>` or
+`<|video_pad|>` is answered like any other text (`tools/decision_fixtures_placeholders.json`
+is the gate: `text-literal-image-token` 109 tokens, noul 0.9643; `text-literal-video-token`
+117 tokens, `marker` at 0.9946; both exact to <=1.2e-07 against
+`ref_placeholders_lite_f32.json`). `placeholder_problem(prompt, n_images)` and
+`expand_placeholders` gate the count and video checks on `n_images > 0`.
+
+**A text-only package loads.** `config.json` `image_token_id`/`video_token_id` and the
+tokenizer's `<|vision_start|>` are required only when the package declares a
+`vision_config`; without one the ids are `u32::MAX`, the tower is absent and an image
+request is `422 {"detail": "image inputs are not available: this checkpoint has no vision
+tower"}` (verified with d3-lite's `config.json` minus `vision_config`/`image_token_id`:
+text answers unchanged at 107 tokens, 0.9293 for the routing case).
+
+The tower is 100.5M f32 parameters (~0.40 GB for d3-lite) and loads eagerly with the
+backbone: a d3-lite process is 2926 MiB anon with it, the same package without the tower
+2488 MiB.
+
+Re-verified after the fixes (dev host, f32 d3-lite): image parity **8/8**, max |dp|
+**7.70e-06**; text parity **67/67**, max |dp| **2.36e-06**, one-process batch **76,829
+tokens**; the literal-placeholder pair **2/2**, max |dp| 1.16e-07
+(`ref_placeholders_lite_f32.json`); a 2-image x 2-question case (`which` choice +
+one noul, ref `ref_2x2_lite_f32.json`) **5086/5086 tokens**, both answers, max |dp|
+7.23e-08.

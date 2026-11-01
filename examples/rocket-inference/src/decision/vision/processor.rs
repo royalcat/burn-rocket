@@ -70,6 +70,17 @@ impl PreparedImage {
     }
 }
 
+/// A float as Python's `repr` prints it: the shortest round-trip form, with a
+/// `.0` on an integral value (`400`, never `400.0`-less).
+fn python_float(value: f64) -> String {
+    let text = format!("{value}");
+    if text.contains(['.', 'e', 'E']) || !value.is_finite() {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
 /// Python's `round(x)` for `x >= 0`: ties go to the **even** integer.
 ///
 /// `smart_resize` uses Python's `round`, which is half-to-even; Rust's
@@ -102,9 +113,11 @@ pub fn smart_resize(
     let (h, w) = (height as f64, width as f64);
     let aspect = h.max(w) / h.min(w);
     if aspect > MAX_ASPECT_RATIO {
+        // The reference's message, verbatim (`Qwen2VLImageProcessor.smart_resize`):
+        // a Python float repr of the ratio, so an integral one keeps its `.0`.
         bail!(
-            "absolute aspect ratio must be smaller than {MAX_ASPECT_RATIO}, got {aspect} \
-             ({width}x{height})"
+            "absolute aspect ratio must be smaller than {MAX_ASPECT_RATIO}, got {}",
+            python_float(aspect)
         );
     }
     let factor_f = factor as f64;
@@ -320,10 +333,34 @@ mod tests {
 
     #[test]
     fn smart_resize_refuses_extreme_aspect_and_empty_images() {
-        assert!(smart_resize(1, 300, 32, MIN_PIXELS, MAX_PIXELS).is_err());
+        let err = smart_resize(1, 300, 32, MIN_PIXELS, MAX_PIXELS).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "absolute aspect ratio must be smaller than 200, got 300.0"
+        );
+        // The control's 4000x10 case: Python's repr keeps the `.0`.
+        let err = smart_resize(10, 4000, 32, MIN_PIXELS, MAX_PIXELS).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "absolute aspect ratio must be smaller than 200, got 400.0"
+        );
+        // A fractional ratio prints like Python too (no trailing zero padding).
+        let err = smart_resize(10, 2010, 32, MIN_PIXELS, MAX_PIXELS).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "absolute aspect ratio must be smaller than 200, got 201.0"
+        );
         assert!(smart_resize(0, 64, 32, MIN_PIXELS, MAX_PIXELS).is_err());
         // 200:1 is allowed (the check is `> 200`).
         assert!(smart_resize(1, 200, 32, MIN_PIXELS, MAX_PIXELS).is_ok());
+    }
+
+    #[test]
+    fn a_python_float_keeps_its_decimal_point() {
+        assert_eq!(python_float(400.0), "400.0");
+        assert_eq!(python_float(200.5), "200.5");
+        assert_eq!(python_float(201.0), "201.0");
+        assert_eq!(python_float(1.0 / 3.0), "0.3333333333333333");
     }
 
     #[test]

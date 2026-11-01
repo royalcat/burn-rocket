@@ -1,0 +1,27 @@
+[
+  {
+    "name": "text-literal-image-token",
+    "state": "The template log says the field <|image_pad|> was expanded twice: <|image_pad|><|image_pad|>.",
+    "questions": {
+      "expanded": {
+        "type": "noul",
+        "instructions": "Does the log say the placeholder was expanded?"
+      }
+    }
+  },
+  {
+    "name": "text-literal-video-token",
+    "state": "A renderer printed the raw marker <|video_pad|> instead of a clip.",
+    "questions": {
+      "cause": {
+        "type": "choice",
+        "instructions": "What did the renderer print?",
+        "criteria": {
+          "marker": "A raw video placeholder marker",
+          "clip": "A decoded video",
+          "nothing": "Nothing at all"
+        }
+      }
+    }
+  }
+]
