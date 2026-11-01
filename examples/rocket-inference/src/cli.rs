@@ -229,7 +229,8 @@ output:
 
 placement / model:
   --device / --text-device auto|cpu|npu
-  --model-dir / --family / --cpu-backend / --npu-threads / --embed-f16
+  --model-dir / --family / --cpu-backend / --npu-threads / --embed-f16 /
+  --defer-towers (load the vision tower on the first media request)
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";

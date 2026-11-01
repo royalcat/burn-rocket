@@ -194,11 +194,18 @@ fn linear(x: Tensor<2>, weight: &Tensor<2>, bias: &Tensor<1>) -> Tensor<2> {
 ///
 /// An f32 weight is used as it is (a swapped view of the checkpoint's `[out, in]`
 /// buffer). A 16-bit weight — the dtype a d3 checkpoint actually stores — is
-/// widened per call, which is exact; the two swaps matter: widening the `[in, out]`
-/// view would materialize a row-major f32 tensor, and flex's gemm reorders the K
-/// accumulation against the f32 path's transposed view (1 ULP measured), so the
-/// product is widened in its stored `[out, in]` orientation and swapped afterwards.
-/// That reproduces the f32 operand bit for bit, at half the resident bytes.
+/// widened per call, which is exact.
+///
+/// The widening goes through the stored `[out, in]` orientation and swaps
+/// afterwards. flex's cast makes its input contiguous first, so widening the
+/// `[in, out]` view directly would hand the matmul a row-major f32 tensor, while
+/// this path hands it exactly the operand buffer the f32 load produced (a
+/// transposed view over the same bytes). On this flex build the gemm reads the
+/// two layouts identically (0 differing bits at the tower's shapes:
+/// `[2304,768]`, `[3072,3072]` and the merger's wide tiles), so the swap is a
+/// guarantee rather than a measured fix: it pins the operand layout the f32 path
+/// produces regardless of a backend's cast or gemm behaviour (the CubeCL `cpu`
+/// backend is not exercised here).
 fn weight_f32(weight: &Tensor<2>) -> Tensor<2> {
     match weight.dtype() {
         DType::F32 => weight.clone(),
@@ -835,8 +842,9 @@ mod tests {
 
     /// A 16-bit weight must multiply exactly like the f32 checkpoint's: the
     /// tower stores it as a swapped view of the checkpoint's `[out, in]` buffer,
-    /// and widening `[out, in]` and swapping afterwards reproduces the f32
-    /// operand's layout (and therefore its accumulation order).
+    /// and `weight_f32` widens that buffer and swaps afterwards, so both arms
+    /// hand the gemm the same f32 bytes (this test is what proves the layout
+    /// choice is free on flex; a layout-sensitive backend would need it).
     #[test]
     fn a_16_bit_weight_multiplies_like_an_f32_one() {
         let device = Device::default();

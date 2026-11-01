@@ -243,10 +243,10 @@ attention kernels used when that attention stage is not offloaded),
 width, default 1024), `--dtype`, `--quant none|q8` (Q8-resident CPU weights;
 `--quant q8` does not touch NPU-packed weights) and `--defer-towers`.
 
-`--defer-towers` applies to `embeddinggemma` and `gemma4`, whose vision/audio
-tower halves are deferred. A `decision` checkpoint does have a vision tower but
-no tower *halves* to load on first use: its tower loads eagerly with the
-backbone, so the flag is rejected (the error says so).
+`--defer-towers` applies to `embeddinggemma` and `gemma4` (their vision/audio
+tower halves) and to `decision`, whose CPU vision tower otherwise loads with the
+backbone: the flag leaves it to the first media request, so a text-only d3
+service never allocates it.
 
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final
@@ -858,8 +858,10 @@ reference's `detail` string. `--max-tokens` is the same per-question cap as
 `--max-state-tokens` (default 32768); the body limit is 96 MiB. Placement:
 `--device npu` packs the text projections as resident fp16 (96 weights, ~1.0 GiB
 of BO); the tower, the backbone attention and the readout stay on the CPU in
-both configurations. `--defer-towers` is rejected (nothing to defer), and so are
-the attention/vision/decode stage flags.
+both configurations. `--defer-towers` leaves the tower to the first media
+request (a package that declares `vision_config` but lacks `visual.*` therefore
+starts healthy and fails each media request with a 500 instead of failing at
+startup); the attention/vision/decode stage flags are rejected.
 
 Board (d3-lite, cores 4-7, 600 MHz NPU module, embedding service stopped): text
 5 questions / 6,546 tokens 197 s (CPU f32) -> **113 s** (NPU fp16, 1.7x, ~3x

@@ -1453,7 +1453,7 @@ redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
 
 ### Tests
 
-`cargo test -p rocket-inference --no-default-features` = **162** tests. The CLI
+`cargo test -p rocket-inference --no-default-features` = **167** tests. The CLI
 refactor's 53 cover flag parsing, the auto/CPU/NPU stage resolution including
 the NPU-build case, family-scoped flag rejection, int8 dependencies and
 `--keep-cpu-weights` rules; the decision family adds its contract, readout,
@@ -1496,6 +1496,33 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   attention stage); `RssAnon` 943.6 -> 1,034.3 MiB, the BOs not being charged to
   the process. The three deployment profiles collapse to `--device npu` vs
   `--device cpu`.
+- **Deferred tower + bf16 tower storage** (phase M1): the `visual.*` matmul
+  weights are read in the checkpoint's own dtype (bf16 for every shipped package)
+  and widened per linear — exact, and the widening goes through the stored
+  `[out, in]` order so the f32 matmul receives the same operand buffer the f32
+  load produced (flex reads both layouts identically; the swap is backend
+  insurance, not a measured fix). Norms, biases and the position table stay f32.
+  `DecisionModel` keeps `model_dir`/`defer_towers`/`vision_declared`;
+  `has_vision()` reports the **declaration** (so a deferred package keeps
+  accepting media), `towers_pending()` is the deferred state, and
+  `ensure_vision()` loads the tower on the first media `prepare` (`prepare` and
+  `prepare_media` are `&mut self`); a text request never builds it. Both
+  tower-load sites `trim_heap()` (without it the load's freed pages hide the
+  smaller tower). Load lines: `decision: vision tower 12 blocks (bf16 weights)` /
+  `decision: vision tower deferred to the first media request` /
+  `decision: text-only package, no vision tower`, then `decision: loaded vision
+  tower in 0.2s (12 blocks, bf16 weights)` on the first media request;
+  `Family::Decision` accepts `--defer-towers` and `DECIDE_USAGE` lists it.
+  `RssAnon` after load, text-only one-case CLI run: d3-lite 2926 -> 2652 MiB
+  eager / **2456** deferred, d3-nano 7721 -> 6918 / 6321 (image case: 2917 ->
+  2652 eager, 2456 before the first media request, tower +172). Byte-identity
+  gate (HEAD binary vs new): all three d3 fixture sets `cmp`-identical, wall
+  within ±1 %; the vision probe's pooled and pixel dumps are byte-identical
+  between the f32 and bf16 loads (tower-only peak 554 -> 397 MiB).
+  **Failure timing caveat**: the deferred load is retried on every media
+  request, so a package that declares `vision_config` but lacks the `visual.*`
+  tensors starts healthy and returns 500 per media request, where an eager load
+  fails at startup.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel

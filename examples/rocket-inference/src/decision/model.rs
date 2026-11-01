@@ -33,14 +33,14 @@ use tokenizers::Tokenizer;
 
 use super::config::{DecisionConfig, MAX_OPTIONS};
 use super::format::{self, Question};
-use super::load::read_config_json;
+use super::load::{read_config_json, storage_dtype};
 use super::mrope;
 use super::request::{DecisionRequest, MediaMode};
 use super::vision::processor::{VIDEO_MAX_TOKENS, planned_video_tokens, prepare_video};
 use super::vision::video::{DecodedVideo, thousands, video_replacement};
 use super::vision::{PreparedImage, VisionTower, load_tower, prepare_from_rgb};
 use crate::qwen35_intent::model::IntentModel;
-use crate::util::checkpoint;
+use crate::util::checkpoint::{self, Checkpoint};
 
 /// Why a text-only d3 package refuses images: the reference's own
 /// `image_unavailable` text, verbatim.
@@ -269,10 +269,11 @@ impl DecisionModel {
         }
     }
 
-    /// Whether the checkpoint carries a vision tower (a media request needs one).
+    /// Whether the package **declares** a vision tower (a media request needs
+    /// one).
     ///
-    /// The **declaration**, not the load: a `--defer-towers` package answers
-    /// `true` before its tower exists, so the server does not refuse its media.
+    /// The declaration, not the load: a `--defer-towers` package answers `true`
+    /// before its tower exists, so the server does not refuse its media.
     pub fn has_vision(&self) -> bool {
         self.vision_declared
     }
@@ -287,8 +288,10 @@ impl DecisionModel {
     ///
     /// Idempotent, and a no-op for a text-only package (its media are refused by
     /// the caller, [`DecisionModel::prepare_media`]) and for the eager load.
-    /// Re-opens the checkpoint exactly like [`crate::decision::load_decision_model`]
-    /// does and prints one line with the wall time and the block count.
+    /// Re-opens the checkpoint and reads only its `visual.*` tensors — the
+    /// backbone, the readout, the tokenizer and `load_decision_model`'s
+    /// GGUF/code checks do not run again — then prints one line with the wall
+    /// time, the block count and the weight dtype.
     pub fn ensure_vision(&mut self) -> Result<()> {
         if !self.towers_pending() {
             return Ok(());
@@ -297,15 +300,17 @@ impl DecisionModel {
         let config_json = read_config_json(&self.model_dir)?;
         let mut ckpt = checkpoint::open_in_dir(&self.model_dir)
             .with_context(|| format!("re-open the checkpoint in {}", self.model_dir.display()))?;
+        let weight_dtype = storage_dtype(ckpt.native_dtype());
         let tower = load_tower(&mut ckpt, &config_json, &self.backbone.device)
             .context("load the vision tower of the d3 checkpoint")?;
         // Same as the eager load: release the load's freed pages before the
         // request's forward allocates its scratch.
         crate::util::trim_heap();
         println!(
-            "decision: loaded vision tower in {:.1}s ({} blocks)",
+            "decision: loaded vision tower in {:.1}s ({} blocks, {} weights)",
             started.elapsed().as_secs_f64(),
-            tower.config.depth
+            tower.config.depth,
+            weight_dtype
         );
         self.vision = Some(tower);
         Ok(())
@@ -1473,5 +1478,65 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PrepareError::InvalidMedia(ref m) if m == NO_VISION_TOWER));
         assert!(model.vision.is_none());
+    }
+
+    /// The **wiring** a text-only `ensure_vision` test cannot see: a media
+    /// `prepare` on a deferred model loads the tower itself (no explicit call) and
+    /// returns a sequence whose image placeholders were expanded from the tower's
+    /// merged tokens.
+    ///
+    /// The image is a 16x16 synthetic one: the processor upscales it to its
+    /// 65,536-pixel floor (256 patches), which keeps a debug-build tower pass
+    /// short; the real fixture image is 2,520 patches (the release path the gates
+    /// exercise).
+    #[test]
+    fn a_deferred_media_prepare_loads_the_tower_itself() {
+        let dir = std::path::Path::new("/tmp/opencode/d3/models/d3-lite");
+        let Some(mut model) = deferred_model(dir, true) else {
+            return;
+        };
+        let image = RgbImage::from_fn(16, 16, |x, y| {
+            image::Rgb([(x * 16) as u8, (y * 16) as u8, ((x + y) * 8) as u8])
+        });
+        assert!(model.vision.is_none());
+        assert!(model.towers_pending(), "the tower must still be deferred");
+
+        let request = DecisionRequest::from_value(serde_json::json!({
+            "state": "Which team should handle this receipt?",
+            "questions": {"route": {"type": "noul"}},
+        }))
+        .unwrap();
+        let prepared = model.prepare(&request, &[image], &[], 4096).unwrap();
+        assert!(
+            model.vision.is_some(),
+            "a media prepare must load the deferred tower"
+        );
+        assert!(!model.towers_pending());
+        assert_eq!(prepared.images.len(), 1);
+        assert_eq!(
+            prepared.images[0].image.tokens,
+            prepared.images[0].features.dims()[0]
+        );
+        assert_eq!(prepared.sequences.len(), 1);
+        let sequence = &prepared.sequences[0];
+        assert!(
+            sequence
+                .spans
+                .iter()
+                .any(|span| span.kind == MediaKind::Image && !span.is_empty()),
+            "the image placeholders must expand into a span: {:?}",
+            sequence.spans
+        );
+        // One `<|image_pad|>` per merged token, spliced from the tower's rows.
+        let image_tokens = prepared.images[0].image.tokens;
+        assert_eq!(sequence.spans[0].len(), image_tokens);
+        assert_eq!(
+            sequence
+                .ids
+                .iter()
+                .filter(|id| **id == model.image_token_id)
+                .count(),
+            image_tokens
+        );
     }
 }

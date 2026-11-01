@@ -2,7 +2,6 @@
 //! intent family), the 255-code readout head and the tokenizer.
 
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
@@ -70,7 +69,6 @@ pub fn load_decision_model(
     max_tokens: usize,
     defer_towers: bool,
 ) -> Result<DecisionModel> {
-    let started = Instant::now();
     let config = DecisionConfig::load(model_dir)?;
     let config_json = read_config_json(model_dir)?;
     let mut ckpt = checkpoint::open_in_dir(model_dir)
@@ -104,25 +102,29 @@ pub fn load_decision_model(
     // backbone); a text-only package has no tower and refuses images.
     let vision_declared = config_json.get("vision_config").is_some();
     let vision = if vision_declared && !defer_towers {
-        let tower = load_tower(&mut ckpt, &config_json, device)
-            .context("load the vision tower of the d3 checkpoint")?;
-        // The tower's tensors are widened per linear, so the load leaves the
-        // checkpoint's 16-bit bytes and the per-tensor copies in glibc's arenas:
-        // return them, or the smaller resident tower is hidden behind them.
-        crate::util::trim_heap();
-        Some(tower)
+        Some(
+            load_tower(&mut ckpt, &config_json, device)
+                .context("load the vision tower of the d3 checkpoint")?,
+        )
     } else {
         None
     };
-    println!(
-        "decision model ready in {:.1}s ({})",
-        started.elapsed().as_secs_f64(),
-        match (&vision, vision_declared) {
-            (Some(tower), _) => format!("vision tower: {} blocks", tower.config.depth),
-            (None, true) => "vision tower deferred to the first media request".to_string(),
-            (None, false) => "text-only, no vision tower".to_string(),
-        }
-    );
+    // Both branches (and a text-only package) leave the checkpoint's per-tensor
+    // copies and freed pages in glibc's arenas: return them, or the tower's
+    // 16-bit storage — and, without a tower, the body load's own churn — stays
+    // resident behind the freed pages.
+    crate::util::trim_heap();
+    // The intent loader above already printed `<label> model ready in ...`; this
+    // line only reports what the vision tower did.
+    match (&vision, vision_declared) {
+        (Some(tower), _) => println!(
+            "decision: vision tower {} blocks ({} weights)",
+            tower.config.depth,
+            storage_dtype(ckpt.native_dtype())
+        ),
+        (None, true) => println!("decision: vision tower deferred to the first media request"),
+        (None, false) => println!("decision: text-only package, no vision tower"),
+    }
     Ok(DecisionModel {
         backbone,
         readout,
@@ -144,6 +146,17 @@ pub(crate) fn read_config_json(model_dir: &Path) -> Result<serde_json::Value> {
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// A checkpoint's float dtype as the load-report label (`bf16`/`f16`/`f32`).
+///
+/// The vision tower keeps its matmul weights in this dtype when it is 16-bit.
+pub(crate) fn storage_dtype(dtype: DType) -> &'static str {
+    match dtype {
+        DType::BF16 => "bf16",
+        DType::F16 => "f16",
+        _ => "f32",
+    }
 }
 
 /// `config.json` `image_token_id`/`video_token_id`, checked against the

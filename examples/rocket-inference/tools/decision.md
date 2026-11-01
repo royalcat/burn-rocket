@@ -392,6 +392,13 @@ The tower is 100.5M f32 parameters (~0.40 GB for d3-lite) and loads eagerly with
 backbone: a d3-lite process is 2926 MiB anon with it, the same package without the tower
 2488 MiB.
 
+`--defer-towers` is accepted for the decision family: the tower stays out of the process
+until the first media request (`decision: vision tower deferred to the first media
+request`, then one `decision: loaded vision tower ...` line), and a text-only service
+never allocates it. The deferred load is retried on every media request, so a package
+that declares `vision_config` but lacks the `visual.*` tensors starts healthy and fails
+each media request with a 500, where an eager load fails at startup.
+
 Re-verified after the fixes (dev host, f32 d3-lite): image parity **8/8**, max |dp|
 **7.70e-06**; text parity **67/67**, max |dp| **2.36e-06**, one-process batch **76,829
 tokens**; the literal-placeholder pair **2/2**, max |dp| 1.16e-07
