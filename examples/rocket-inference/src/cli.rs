@@ -200,7 +200,8 @@ usage: rocket-inference decide --model-dir <dir> (--requests <file> | --request 
 Valid for decision models (vllm-sr d3, `d3-code-readout-v1`: a Qwen3.5 text
 backbone plus a 255-code readout head). One noncausal forward per question; the
 answer is a probability for every option. This phase serves the text path only:
-images/videos are refused.
+images/videos are refused. The checkpoint must be a local safetensors package
+(`--model-dir`); `-hf` (a GGUF Hub repo) is not accepted.
 
 input:
   --requests <path>            a JSON array of cases
@@ -210,15 +211,19 @@ input:
 
 output:
   --out <path>                 write the JSON result (default: stdout)
-  --model-name <name>          reported model name (default: the model dir name)
+  --model-name <name>          reported model name (default: MODEL_MANIFEST.json
+                               `model_name`, else the model dir name)
+  --dump-prompts <dir>         write each rendered prompt as <case>__<qid>.prompt.txt
 
   --requests writes {\"schema\": \"d3-decision-v1\", \"model\", \"cases\":
   [{\"name\", \"response\"}]}; --request writes the bare response
-  {\"model\", \"answers\", \"usage\"}.
+  {\"model\", \"answers\", \"usage\"}. A question that cannot be answered keeps its
+  error record in `answers` (the `/v1/systemone` server refuses an invalid
+  question with a 422 instead).
 
 placement / model:
   --device / --text-device auto|cpu|npu
-  --model-dir / -hf / --family / --cpu-backend / --npu-threads / --embed-f16
+  --model-dir / --family / --cpu-backend / --npu-threads / --embed-f16
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -715,7 +720,9 @@ impl LoadArgs {
             key_block: self.key_block.unwrap_or(256),
             vision_attn_kernel,
             attn_chunk: self.attn_chunk.unwrap_or(1024),
-            embed_f16: self.embed_f16.unwrap_or(false),
+            // The intent family keeps an f32 table unless asked; a d3 checkpoint
+            // always wants the f16 copy of its tied table (saves ~0.5 GB).
+            embed_f16: self.embed_f16.unwrap_or(family == Family::Decision),
         })
     }
 }

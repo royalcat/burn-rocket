@@ -906,3 +906,32 @@ fn config_from_gguf(c: &GgufCheckpoint) -> Result<serde_json::Value> {
     });
     Ok(cfg)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example parses JSON with `serde_json`'s `arbitrary_precision` (a d3
+    /// state must keep big integers and Python-exact float text). Numbers that
+    /// other families read back with `as_u64`/`as_f64` must keep converting.
+    #[test]
+    fn parsed_json_numbers_still_convert() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"eos": 248044, "eos_list": [1, 2], "eps": 1e-06, "big": 123456789012345678901234567890}"#,
+        )
+        .unwrap();
+        assert_eq!(eos_from_value(json.get("eos")), vec![248044]);
+        assert_eq!(eos_from_value(json.get("eos_list")), vec![1, 2]);
+        assert_eq!(json["eps"].as_f64(), Some(1e-06));
+        assert_eq!(json["big"].as_u64(), None, "past u64::MAX");
+        assert!(
+            json["big"]
+                .to_string()
+                .contains("123456789012345678901234567890")
+        );
+        // Values the code builds itself (GGUF metadata, synthesized configs).
+        let built = serde_json::json!({"n": 7u64, "x": 1.5});
+        assert_eq!(built["n"].as_u64(), Some(7));
+        assert_eq!(built["x"].as_f64(), Some(1.5));
+    }
+}

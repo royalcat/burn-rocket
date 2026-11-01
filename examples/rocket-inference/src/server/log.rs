@@ -130,11 +130,12 @@ fn as_i64(value: usize) -> i64 {
 /// questions that were answered (a per-question error still counts as a 200 but
 /// not as a prompt); `tokens` is `usage.input_tokens`, matching the same set.
 pub(crate) fn decision(state: &AppState, questions: usize, tokens: usize, timing: &RequestTiming) {
+    const ENDPOINT: &str = "/v1/systemone";
     let tok_s = round(tokens as f64 / timing.compute_s.max(1e-9), 10.0);
     let rss = rss_mib();
 
     let span = tracing::Span::current();
-    span.set_attribute("rocket.endpoint", "/v1/systemone");
+    span.set_attribute("rocket.endpoint", ENDPOINT);
     span.set_attribute("questions", as_i64(questions));
     span.set_attribute("tokens", as_i64(tokens));
     span.set_attribute("queue_s", timing.queue_s);
@@ -143,7 +144,7 @@ pub(crate) fn decision(state: &AppState, questions: usize, tokens: usize, timing
     span.set_attribute("rss_mib", rss);
 
     info!(
-        endpoint = "/v1/systemone",
+        endpoint = %ENDPOINT,
         model = %state.settings.model_name,
         questions,
         tokens,

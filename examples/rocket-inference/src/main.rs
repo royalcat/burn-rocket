@@ -70,6 +70,16 @@ fn main() -> Result<()> {
         );
         return Ok(());
     }
+    // A d3 package is a local safetensors directory (backbone + readout head);
+    // `-hf` resolves GGUF repos, which the decision loader does not accept.
+    if cmd == "decide" && rest.iter().any(|a| a == "-hf" || a == "--hf") {
+        bail!(
+            "`decide` reads a local d3 package: pass --model-dir <dir> \
+             (a directory with config.json, decision_config.json, readout.safetensors \
+             and the backbone weights); `-hf` pulls a GGUF repo, which cannot carry \
+             the readout head"
+        );
+    }
     let rest = util::hub::resolve_args(rest.into_iter())?;
     let it = rest.into_iter();
     match cmd.as_str() {

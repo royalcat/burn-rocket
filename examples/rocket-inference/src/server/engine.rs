@@ -237,6 +237,14 @@ pub struct DecisionOutcome {
     pub tokens: usize,
 }
 
+/// The answer to one `/v1/systemone` request.
+pub enum DecisionReply {
+    /// Questions that failed validation: the reference server refuses the whole
+    /// request (422 `{"detail": {"invalid_questions": ...}}`) and runs nothing.
+    Refused(serde_json::Map<String, serde_json::Value>),
+    Answered(DecisionOutcome),
+}
+
 /// A multimodal block after resolution: text with one placeholder per media
 /// input, the local media paths, and the guards that keep downloaded/uploaded
 /// files alive until the forward has read them.
@@ -372,7 +380,7 @@ impl Engine {
         &mut self,
         model: &str,
         req: DecisionRequest,
-    ) -> Result<DecisionOutcome, ApiError> {
+    ) -> Result<DecisionReply, ApiError> {
         match self {
             Self::Decision(engine) => engine.decide(model, req),
             _ => Err(ApiError::bad_request(
@@ -723,16 +731,26 @@ impl IntentEngine {
 }
 
 impl DecisionEngine {
-    fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionOutcome, ApiError> {
-        let (response, tokens, questions) = self
+    fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionReply, ApiError> {
+        let prepared = self
             .model
-            .system_one(model, req, self.max_tokens)
+            .prepare(&req, self.max_tokens)
             .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-        Ok(DecisionOutcome {
+        let invalid = prepared.invalid_questions();
+        if !invalid.is_empty() {
+            return Ok(DecisionReply::Refused(invalid));
+        }
+        let (probabilities, tokens) = self
+            .model
+            .run(&prepared)
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+        let questions = prepared.sequences.len();
+        let response = self.model.respond(model, &prepared, &probabilities, tokens);
+        Ok(DecisionReply::Answered(DecisionOutcome {
             response,
             questions,
             tokens,
-        })
+        }))
     }
 }
 

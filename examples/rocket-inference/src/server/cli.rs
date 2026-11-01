@@ -221,6 +221,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 // A d3 prompt is always a prefill: no decode stage needs CPU copies.
                 keep_cpu_weights: false,
                 npu_threads: load.npu_threads,
+                embed_f16: load.embed_f16,
                 ..IntentLoadOptions::default()
             };
             let model = load_decision_model(&model_dir, &device, &opts, max_tokens)?;
@@ -234,7 +235,15 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
     };
 
-    let model_name = model_name.unwrap_or_else(|| dir_name(&model_dir));
+    let model_name = match model_name {
+        Some(name) => name,
+        // A d3 package declares its served name in MODEL_MANIFEST.json.
+        None if family == Family::Decision => {
+            crate::decision::load::manifest_model_name(&model_dir)
+                .unwrap_or_else(|| dir_name(&model_dir))
+        }
+        None => dir_name(&model_dir),
+    };
     let settings = Settings {
         model_name,
         family,

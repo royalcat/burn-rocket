@@ -1,10 +1,15 @@
 //! The loaded d3 model: one noncausal backbone pass per question, then the
 //! 255-code readout.
 //!
-//! `system_one` reproduces `d3_runtime.D3.system_one` for the text path: the
-//! questions run in request order, each in its own forward pass, and a question
-//! that cannot be answered (invalid shape, over the length cap) is reported in
-//! `answers` while the rest of the request still runs.
+//! The flow mirrors `d3_runtime.D3`: [`DecisionModel::prepare`] validates and
+//! tokenizes every question (`invalid_question` / `max_length_exceeded` land in
+//! the per-question errors, nothing runs yet), [`DecisionModel::run`] forwards
+//! the runnable ones and [`DecisionModel::respond`] builds the official answer
+//! object. The HTTP handler refuses a request whose `prepare` reported an
+//! `invalid_question` (422, nothing runs); the CLI keeps the runtime's per-question
+//! errors in a 200-shaped answer.
+
+use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use burn::prelude::*;
@@ -26,6 +31,39 @@ pub struct DecisionModel {
     pub tokenizer: Tokenizer,
 }
 
+/// One validated request: the questions that will run and the errors of those
+/// that will not (`d3_runtime.Prepared`).
+#[derive(Debug)]
+pub struct Prepared {
+    /// Question ids in request order.
+    pub keys: Vec<String>,
+    /// The validated question of every entry that got past normalization.
+    pub questions: HashMap<String, Question>,
+    /// Question id -> its answer error record (`invalid_question` or
+    /// `max_length_exceeded`).
+    pub errors: Map<String, Value>,
+    /// `(question id, prompt token ids)` of the runnable questions, request order.
+    pub sequences: Vec<(String, Vec<u32>)>,
+}
+
+impl Prepared {
+    /// Question id -> message of every question that failed to normalize, in
+    /// request order. The HTTP server refuses the request (422) when this is not
+    /// empty; `max_length_exceeded` is not part of it (that stays a 200 answer).
+    pub fn invalid_questions(&self) -> Map<String, Value> {
+        let mut invalid = Map::new();
+        for key in &self.keys {
+            if let Some(error) = self.errors.get(key)
+                && error.get("error").and_then(Value::as_str) == Some("invalid_question")
+                && let Some(message) = error.get("message")
+            {
+                invalid.insert(key.clone(), message.clone());
+            }
+        }
+        invalid
+    }
+}
+
 impl DecisionModel {
     /// The per-question prompt-token cap for a request (`--max-state-tokens` /
     /// the server's `--max-tokens`), narrowed by the checkpoint's own
@@ -37,25 +75,25 @@ impl DecisionModel {
         }
     }
 
-    /// Answer one request. Returns `(response, input_tokens, answered_questions)`;
-    /// only envelope problems (empty/malformed `questions`, media) are errors.
-    pub fn system_one(
-        &mut self,
-        model: &str,
-        req: DecisionRequest,
-        max_tokens: usize,
-    ) -> Result<(Value, usize, usize)> {
-        let questions = req.questions()?;
+    /// Validate, render and tokenize every question of one request.
+    ///
+    /// Envelope problems are already refused by [`DecisionRequest::from_value`];
+    /// a question that cannot be answered ends up in [`Prepared::errors`] and the
+    /// rest still runs.
+    pub fn prepare(&self, req: &DecisionRequest, max_tokens: usize) -> Result<Prepared> {
         let cap = self.prompt_cap(max_tokens);
-        let mut answers = Map::new();
-        let mut tokens = 0usize;
-        let mut answered = 0usize;
-        for (id, value) in questions {
+        let mut prepared = Prepared {
+            keys: req.questions.keys().cloned().collect(),
+            questions: HashMap::new(),
+            errors: Map::new(),
+            sequences: Vec::new(),
+        };
+        for (id, value) in &req.questions {
             let raw_kind = value.get("type").cloned().unwrap_or(Value::Null);
             let question = match format::normalize_question(value) {
                 Ok(question) => question,
                 Err(message) => {
-                    answers.insert(
+                    prepared.errors.insert(
                         id.clone(),
                         error_answer(raw_kind, "invalid_question", message),
                     );
@@ -65,7 +103,7 @@ impl DecisionModel {
             let user = match format::user_prompt(&req.state, &question, &self.config.codes) {
                 Ok(user) => user,
                 Err(message) => {
-                    answers.insert(
+                    prepared.errors.insert(
                         id.clone(),
                         error_answer(
                             Value::String(question.kind.as_str().to_string()),
@@ -73,6 +111,7 @@ impl DecisionModel {
                             message,
                         ),
                     );
+                    prepared.questions.insert(id.clone(), question);
                     continue;
                 }
             };
@@ -82,11 +121,20 @@ impl DecisionModel {
                 .encode(prompt.as_str(), false)
                 .map_err(|e| anyhow!("tokenize the '{id}' prompt: {e}"))?;
             let ids = encoding.get_ids();
+            prepared.questions.insert(id.clone(), question);
             if ids.len() > cap {
-                answers.insert(
+                prepared.errors.insert(
                     id.clone(),
                     error_answer(
-                        Value::String(question.kind.as_str().to_string()),
+                        Value::String(
+                            prepared
+                                .questions
+                                .get(id)
+                                .expect("just inserted")
+                                .kind
+                                .as_str()
+                                .to_string(),
+                        ),
                         "max_length_exceeded",
                         format!(
                             "the question prompt has {} tokens, over the maximum context length \
@@ -97,31 +145,83 @@ impl DecisionModel {
                 );
                 continue;
             }
-            let probabilities = self.probabilities(&question, ids)?;
-            let answer = match format::product_answer(&question, &probabilities) {
+            prepared.sequences.push((id.clone(), ids.to_vec()));
+        }
+        Ok(prepared)
+    }
+
+    /// Forward every runnable question (request order) and return its option
+    /// probabilities plus the answered questions' prompt-token sum.
+    pub fn run(&mut self, prepared: &Prepared) -> Result<(HashMap<String, Vec<f64>>, usize)> {
+        let mut probabilities = HashMap::with_capacity(prepared.sequences.len());
+        let mut tokens = 0usize;
+        for (id, ids) in &prepared.sequences {
+            let question = prepared
+                .questions
+                .get(id)
+                .ok_or_else(|| anyhow!("internal error: '{id}' has no validated question"))?;
+            probabilities.insert(id.clone(), self.probabilities(question, ids)?);
+            tokens += ids.len();
+        }
+        Ok((probabilities, tokens))
+    }
+
+    /// The official System One response for one prepared request
+    /// (`d3_runtime.D3.respond`): every question id in request order, either its
+    /// answer or its error record.
+    pub fn respond(
+        &self,
+        model: &str,
+        prepared: &Prepared,
+        probabilities: &HashMap<String, Vec<f64>>,
+        tokens: usize,
+    ) -> Value {
+        let mut answers = Map::new();
+        for id in &prepared.keys {
+            if let Some(error) = prepared.errors.get(id) {
+                answers.insert(id.clone(), error.clone());
+                continue;
+            }
+            let Some(question) = prepared.questions.get(id) else {
+                continue;
+            };
+            let Some(values) = probabilities.get(id) else {
+                continue;
+            };
+            let answer = match format::product_answer(question, values) {
                 Ok(answer) => answer,
-                Err(message) => {
-                    answers.insert(
-                        id.clone(),
-                        error_answer(
-                            Value::String(question.kind.as_str().to_string()),
-                            "invalid_model_output",
-                            message,
-                        ),
-                    );
-                    continue;
-                }
+                Err(message) => error_answer(
+                    Value::String(question.kind.as_str().to_string()),
+                    "invalid_model_output",
+                    message,
+                ),
             };
             answers.insert(id.clone(), answer);
-            tokens += ids.len();
-            answered += 1;
         }
-        let response = serde_json::json!({
+        serde_json::json!({
             "model": model,
             "answers": Value::Object(answers),
             "usage": {"input_tokens": tokens, "output_tokens": 0},
-        });
-        Ok((response, tokens, answered))
+        })
+    }
+
+    /// Answer one request with the runtime's own semantics (per-question errors
+    /// stay in the answer). Returns `(response, input_tokens, answered_questions)`;
+    /// only envelope problems are errors.
+    pub fn system_one(
+        &mut self,
+        model: &str,
+        req: DecisionRequest,
+        max_tokens: usize,
+    ) -> Result<(Value, usize, usize)> {
+        let prepared = self.prepare(&req, max_tokens)?;
+        let (probabilities, tokens) = self.run(&prepared)?;
+        let answered = prepared.sequences.len();
+        Ok((
+            self.respond(model, &prepared, &probabilities, tokens),
+            tokens,
+            answered,
+        ))
     }
 
     /// One forward pass: the final-normed last hidden through the readout, the
@@ -214,5 +314,41 @@ mod tests {
         assert!(warm[0] < hot[0], "{hot:?} vs {warm:?}");
         assert!(warm[1] > hot[1]);
         assert!((warm.iter().sum::<f64>() - 1.0).abs() < 1e-6);
+    }
+
+    fn prepared_with(errors: Vec<(&str, &'static str)>) -> Prepared {
+        let mut prepared = Prepared {
+            keys: errors.iter().map(|(id, _)| id.to_string()).collect(),
+            questions: HashMap::new(),
+            errors: Map::new(),
+            sequences: Vec::new(),
+        };
+        for (id, error) in errors {
+            prepared.errors.insert(
+                id.to_string(),
+                error_answer(
+                    Value::String("choice".to_string()),
+                    error,
+                    format!("{error} for {id}"),
+                ),
+            );
+        }
+        prepared
+    }
+
+    #[test]
+    fn only_invalid_questions_refuse_a_request() {
+        let prepared = prepared_with(vec![
+            ("a", "invalid_question"),
+            ("b", "max_length_exceeded"),
+        ]);
+        let invalid = prepared.invalid_questions();
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid["a"], "invalid_question for a");
+        assert!(
+            prepared.sequences.is_empty(),
+            "nothing runs for a refused question"
+        );
+        assert!(prepared_with(vec![]).invalid_questions().is_empty());
     }
 }

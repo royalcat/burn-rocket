@@ -98,6 +98,42 @@ Measured (dev host, 32 cores, f32, 2026-11-01): d3-lite **67/67 top-1**, max |dp
 prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` process take
 428 s (model load included).
 
+### CLI and server error semantics
+
+`decide` is the runtime's own path: a question that cannot be answered keeps its
+`{"type", "error", "message"}` record in `answers` and the other questions still run
+(`invalid_question`, `max_length_exceeded`).
+
+`POST /v1/systemone` is the reference server's contract (`d3_server.py`):
+
+- the body must be a JSON object carrying only `state`, `questions`, `images`, `videos`,
+  `model`; anything else (or a non-object, or a body that is not JSON) is
+  `422 {"detail": "<reason>"}`;
+- `questions` must be a nonempty object of nonempty ids (422 string otherwise);
+- `images`/`videos` are phase 2: a non-empty list is `422 {"detail": "images/videos are
+  not supported yet"}`, a non-list is `422` naming the field (data URLs only, never local
+  paths or URLs);
+- a question that fails validation refuses the whole request with
+  `422 {"detail": {"invalid_questions": {qid: "<message>"}}}` and **nothing runs**;
+- a question over the prompt cap is *not* a refusal: it keeps its `max_length_exceeded`
+  record in a `200` answer, and `usage.input_tokens` sums the answered questions only.
+
+`/v1/models` advertises the `decisions` capability; `/health` and `/v1/models` never touch
+the model. The served name comes from `MODEL_MANIFEST.json` `model_name` unless
+`--model-name` overrides it.
+
+### Deferred
+
+Left for phase 5 (documented here so the gap is explicit): **D8** (stricter
+`decision_config.json` cross-checks such as `codes`/`token_ids` against
+`MODEL_MANIFEST.json` and the manifest hash verification the reference optionally does)
+and **D11** (README/recipes/docstring polish for the new family). The text path is
+otherwise complete; images/videos are phase 2.
+
+The checkpoint must be a local safetensors package: `decide` rejects `-hf` (a GGUF Hub
+repo cannot carry `readout.safetensors`), and a directory with several sharded
+`model-*.safetensors` files is refused (merge them into `model.safetensors` first).
+
 ## Fixtures
 
 `decision_fixtures.json`: 47 text-only cases / 67 questions (25 choice-led, 10 noul,

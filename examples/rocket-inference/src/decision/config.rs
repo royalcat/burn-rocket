@@ -10,6 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
 use burn::tensor::{DType, Tensor};
+use tokenizers::Tokenizer;
 
 use crate::util::checkpoint::SafetensorsCheckpoint;
 
@@ -19,6 +20,8 @@ pub const FORMAT_ID: &str = "d3-code-readout-v1";
 pub const MAX_OPTIONS: usize = 255;
 /// `d3_runtime.FORMAT_VERSION`.
 pub const FORMAT_VERSION: u64 = 1;
+/// `d3_format._CODE_PROBE`: the user message the answer-code prefix is built from.
+pub const CODE_PROBE: &str = "Choose an option.";
 
 /// The validated parts of `decision_config.json`.
 #[derive(Debug, Clone)]
@@ -74,10 +77,12 @@ impl DecisionConfig {
 
 impl RawConfig {
     fn validate(self) -> Result<DecisionConfig> {
-        if let Some(version) = self.format_version
-            && version != FORMAT_VERSION
-        {
-            bail!("format_version is {version}; this build reads version {FORMAT_VERSION}");
+        match self.format_version {
+            Some(FORMAT_VERSION) => {}
+            Some(version) => {
+                bail!("format_version is {version}; this build reads version {FORMAT_VERSION}")
+            }
+            None => bail!("format_version is missing; this build reads version {FORMAT_VERSION}"),
         }
         match self.format_id.as_deref() {
             Some(FORMAT_ID) => {}
@@ -148,6 +153,13 @@ pub fn load_readout(dir: &Path, hidden: usize, device: &Device) -> Result<Tensor
     let mut store = SafetensorsCheckpoint::open(&path)?;
     let data = crate::util::checkpoint::Checkpoint::get(&mut store, "weight", DType::F32)?
         .ok_or_else(|| anyhow::anyhow!("{} has no `weight` tensor", path.display()))?;
+    let rank = data.shape().num_dims();
+    if rank != 2 {
+        bail!(
+            "{} weight has {rank} dimensions, expected 2 ([{MAX_OPTIONS}, {hidden}])",
+            path.display()
+        );
+    }
     let shape = data.shape().dims::<2>();
     if shape != [MAX_OPTIONS, hidden] {
         bail!(
@@ -156,6 +168,73 @@ pub fn load_readout(dir: &Path, hidden: usize, device: &Device) -> Result<Tensor
         );
     }
     Ok(Tensor::<2>::from_data(data, device))
+}
+
+/// Every code the model may use, in preference order (`d3_format.candidate_codes`):
+/// the single letters `A`..`Z`, then the two-letter codes `AA`..`ZZ`.
+pub fn candidate_codes() -> Vec<String> {
+    let letters: Vec<char> = ('A'..='Z').collect();
+    let mut codes: Vec<String> = letters.iter().map(|c| c.to_string()).collect();
+    for first in &letters {
+        for second in &letters {
+            codes.push(format!("{first}{second}"));
+        }
+    }
+    codes
+}
+
+/// The assistant-turn prefix `d3_format.answer_codes` probes with: the chat
+/// template of one user turn (`enable_thinking=False`), up to where the answer
+/// code is read.
+pub fn code_probe_prefix() -> String {
+    format!(
+        "<|im_start|>user\n{CODE_PROBE}<|im_end|>\n\
+         <|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+}
+
+fn encode(tokenizer: &Tokenizer, text: &str) -> Result<Vec<u32>> {
+    tokenizer
+        .encode(text, false)
+        .map(|encoding| encoding.get_ids().to_vec())
+        .map_err(|e| anyhow::anyhow!("tokenize the answer-code probe: {e}"))
+}
+
+/// `d3_format.answer_codes`: the canonical 255 answer codes and their token ids.
+///
+/// A code qualifies when it is a single token of its own, that token is not
+/// already taken by an earlier code, and it stays that single token right after
+/// the assistant turn opens.
+pub fn answer_codes(tokenizer: &Tokenizer) -> Result<(Vec<String>, Vec<u32>)> {
+    let prefix = code_probe_prefix();
+    let prefix_ids = encode(tokenizer, &prefix)?;
+    let mut chosen: Vec<String> = Vec::with_capacity(MAX_OPTIONS);
+    let mut chosen_ids: Vec<u32> = Vec::with_capacity(MAX_OPTIONS);
+    let mut taken = std::collections::HashSet::new();
+    for code in candidate_codes() {
+        let alone = encode(tokenizer, &code)?;
+        let [id] = alone.as_slice() else {
+            continue;
+        };
+        if taken.contains(id) {
+            continue;
+        }
+        let mut after_prefix = prefix_ids.clone();
+        after_prefix.push(*id);
+        if encode(tokenizer, &format!("{prefix}{code}"))? != after_prefix {
+            continue;
+        }
+        chosen.push(code);
+        chosen_ids.push(*id);
+        taken.insert(*id);
+        if chosen.len() == MAX_OPTIONS {
+            return Ok((chosen, chosen_ids));
+        }
+    }
+    bail!(
+        "the tokenizer yields only {} usable answer codes; the model needs {MAX_OPTIONS}",
+        chosen.len()
+    )
 }
 
 #[cfg(test)]
@@ -215,8 +294,41 @@ mod tests {
             let err = format!("{}", raw(json).validate().unwrap_err());
             assert!(err.contains(needle), "{key}: {err}");
         }
-        let mut json = good();
-        json["format_version"] = serde_json::json!(2);
-        assert!(format!("{}", raw(json).validate().unwrap_err()).contains("format_version"));
+        // The reference refuses another version and a missing one.
+        for version in [serde_json::json!(2), serde_json::Value::Null] {
+            let mut json = good();
+            json["format_version"] = version.clone();
+            if version.is_null() {
+                json.as_object_mut().unwrap().remove("format_version");
+            }
+            let err = format!("{}", raw(json).validate().unwrap_err());
+            assert!(err.contains("format_version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_candidate_codes_are_the_reference_sequence() {
+        let codes = candidate_codes();
+        assert_eq!(codes.len(), 26 + 26 * 26);
+        assert_eq!(&codes[..3], ["A", "B", "C"]);
+        assert_eq!(codes[25], "Z");
+        assert_eq!(codes[26], "AA");
+        assert_eq!(codes[27], "AB");
+        assert_eq!(codes[26 + 25], "AZ");
+        assert_eq!(codes[26 + 26], "BA");
+        assert_eq!(codes.last().unwrap(), "ZZ");
+        let mut unique = codes.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "the sequence must be unique");
+    }
+
+    #[test]
+    fn the_code_probe_prefix_is_the_chat_template_opening() {
+        assert_eq!(
+            code_probe_prefix(),
+            "<|im_start|>user\nChoose an option.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 }
