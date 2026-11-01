@@ -50,6 +50,27 @@ The output is the official shape
 `{"model", "answers", "usage"}`; `--requests` wraps the cases as
 `{"schema": "d3-decision-v1", "model", "cases": [{"name", "response"}]}`.
 
+### Token table
+
+The tied token table (vocab 248,320 × hidden) is CPU resident in both
+configurations. `decide` and `serve` store it as **per-row symmetric int8** by
+default (`--embed-int8`): it halves the table (d3-lite 2,462 -> 2,222 MiB
+resident, d3-nano 6,287 -> 5,804; peak anon 2,583 -> 2,397 and 6,457 -> 5,969 on
+a text-only `--defer-towers` run) and only the current prompt's rows are
+dequantized per forward. `--embed-f16` keeps the previous table — bit-exact for
+these bf16 checkpoints — and the two flags are mutually exclusive.
+
+int8 costs probability, not answers: over the full fixture sets
+(`tools/decision_fixtures*.json`, f16 vs int8, 32k cap) top-1 is unchanged
+(text 67/67, images 8/8, videos 9/9) while the largest option probability moves
+by **6.96e-3** (text), **8.36e-3** (image) and **3.81e-3** (video), median
+1.4e-4-8.6e-4. Per-row int8's error is `max|row|/254` — 0.86 % of the row RMS at
+this table — so it cannot meet the phase's 2e-3 **probe** gate; the approved
+deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, which it passes. Use
+`--embed-f16` where the probabilities themselves must match the f32 reference: it
+restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
+(nano).
+
 ## Serve
 
 ```sh

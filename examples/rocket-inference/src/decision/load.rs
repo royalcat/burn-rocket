@@ -55,7 +55,8 @@ impl TensorSource for AnyCheckpoint {
 
 /// Load a d3 checkpoint directory.
 ///
-/// `opts` carries the placement (`npu`/`text`/`keep_cpu_weights`/`embed_f16`);
+/// `opts` carries the placement (`npu`/`text`/`keep_cpu_weights`) and the token
+/// table's storage (`embed_f16`/`embed_int8`);
 /// the prefix, the label and the rotary-table cap are set here, the full-attention
 /// layers are switched to the checkpoint's bidirectional mode, and the placement
 /// invariants are applied exactly as the intent server applies them. An

@@ -949,13 +949,140 @@ impl Layer {
 }
 
 // ---------------------------------------------------------------------------
+// Token table
+// ---------------------------------------------------------------------------
+
+/// The tied token-embedding table (`[vocab, hidden]`, also the LM head).
+///
+/// It is CPU resident in every deployment (the NPU never holds it), and a forward
+/// only reads the rows of the current prompt, so the decision family stores it as
+/// per-row symmetric int8: half of f16, and one rayon dequant pass per prompt.
+// The dense tensor is larger than the two int8 vectors; boxing it would only add
+// indirection to the row gather for the dense path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Embed {
+    /// f32 or f16 `[vocab, hidden]` (the intent family's path).
+    Dense(Tensor<2>),
+    /// Per-row symmetric int8: `codes[row * hidden + i] = round(v / scale[row])`
+    /// clamped to `[-127, 127]`, `scales[row] = max|row| / 127`. A value is at
+    /// most half a step (`max|row| / 254`) off; an all-zero row has scale 0.
+    Int8 { codes: Vec<i8>, scales: Vec<f32> },
+}
+
+impl Embed {
+    /// The ready line's label: `F32`, `F16` or `I8`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Embed::Dense(t) if t.dtype() == DType::F16 => "F16",
+            Embed::Dense(_) => "F32",
+            Embed::Int8 { .. } => "I8",
+        }
+    }
+
+    /// The table as a dense tensor: a clone for [`Embed::Dense`], the dequantized
+    /// whole table for [`Embed::Int8`]. Only the tied LM head needs it (the
+    /// intent/gemma generation paths, which never enable int8); the forwards use
+    /// [`Embed::rows`].
+    pub fn dense(&self, device: &Device) -> Tensor<2> {
+        match self {
+            Embed::Dense(t) => t.clone(),
+            Embed::Int8 { codes, scales } => {
+                let rows = scales.len();
+                let cols = codes.len().checked_div(rows).unwrap_or(0);
+                let ids: Vec<u32> = (0..rows as u32).collect();
+                let data = dequant_rows(codes, scales, &ids, cols);
+                Tensor::<2>::from_data(TensorData::new(data, [rows, cols]), device)
+            }
+        }
+    }
+
+    /// The `[1, s, hidden]` f32 rows of `ids`, in the given order. A dense f16
+    /// table yields f16 rows, cast back because the body is f32.
+    pub fn rows(&self, ids: &[u32], hidden: usize, device: &Device) -> Tensor<3> {
+        let s = ids.len();
+        match self {
+            Embed::Dense(t) => {
+                let idx: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
+                let idx = Tensor::<1, Int>::from_data(TensorData::new(idx, [s]), device);
+                let rows = t.clone().select(0, idx).reshape([1, s, hidden]);
+                if t.dtype() == DType::F16 {
+                    rows.cast(DType::F32)
+                } else {
+                    rows
+                }
+            }
+            Embed::Int8 { codes, scales } => {
+                let data = dequant_rows(codes, scales, ids, hidden);
+                Tensor::<3>::from_data(TensorData::new(data, [1, s, hidden]), device)
+            }
+        }
+    }
+
+    /// Quantize a `[rows, cols]` f32 table row-wise. Values are rounded half away
+    /// from zero (`f32::round`), then clamped to `[-127, 127]` (a no-op by
+    /// construction: `|v| <= max|row| = 127 * scale`).
+    pub fn quantize(table: &[f32], rows: usize, cols: usize) -> Self {
+        assert_eq!(table.len(), rows * cols, "table shape mismatch");
+        let (codes, scales) = quantize_rows(table, rows, cols);
+        Embed::Int8 { codes, scales }
+    }
+}
+
+/// Per-row symmetric int8 quantization of a `[rows, cols]` f32 table (rayon over
+/// the rows): `scales[row] = max|row| / 127`, `codes = round(v / scale)`.
+pub fn quantize_rows(table: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
+    let mut scales = vec![0f32; rows];
+    scales.par_iter_mut().enumerate().for_each(|(r, scale)| {
+        let row = &table[r * cols..(r + 1) * cols];
+        let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+        // An all-zero row keeps scale 0 and quantizes to all zeros.
+        *scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+    });
+    let mut codes = vec![0i8; rows * cols];
+    codes.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
+        let scale = scales[r];
+        if scale == 0.0 {
+            return;
+        }
+        let inv = 1.0 / scale;
+        let row = &table[r * cols..(r + 1) * cols];
+        for (o, &v) in out.iter_mut().zip(row) {
+            *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    });
+    (codes, scales)
+}
+
+/// Dequantize the rows `ids` of a per-row int8 table into `ids.len() * cols` f32
+/// values, in `ids` order (rayon over the rows).
+pub fn dequant_rows(codes: &[i8], scales: &[f32], ids: &[u32], cols: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    let rows = scales.len();
+    let mut out = vec![0f32; ids.len() * cols];
+    out.par_chunks_mut(cols)
+        .zip(ids.par_iter())
+        .for_each(|(dst, &id)| {
+            let row = id as usize;
+            assert!(row < rows, "token id {id} is outside the {rows}-row table");
+            let scale = scales[row];
+            let src = &codes[row * cols..(row + 1) * cols];
+            for (d, &c) in dst.iter_mut().zip(src) {
+                *d = c as f32 * scale;
+            }
+        });
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct IntentModel {
     pub cfg: IntentTextConfig,
-    pub embed: Tensor<2>, // [vocab, hidden]
+    pub embed: Embed,
     pub layers: Vec<Layer>,
     pub norm_w: Tensor<1>,
     pub rope: PartialRope,
@@ -1004,7 +1131,7 @@ impl IntentModel {
             .collect();
         Self {
             cfg: cfg.clone(),
-            embed: Tensor::zeros([cfg.vocab_size, cfg.hidden_size], device),
+            embed: Embed::Dense(Tensor::zeros([cfg.vocab_size, cfg.hidden_size], device)),
             layers,
             norm_w: Tensor::zeros([cfg.hidden_size], device),
             rope: PartialRope::new(
@@ -1024,22 +1151,11 @@ impl IntentModel {
         }
     }
 
-    /// Gather `[1, s, hidden]` embeddings for `ids` (no EOS/BOS handling). An f16
-    /// table yields f16 rows; the model body is f32, so cast them back.
+    /// Gather `[1, s, hidden]` embeddings for `ids` (no EOS/BOS handling) as f32,
+    /// in the given order. A dense f16 table yields f16 rows; the model body is
+    /// f32, so they are cast back. An int8 table dequantizes only these rows.
     pub fn embed_ids(&self, ids: &[u32]) -> Tensor<3> {
-        let s = ids.len();
-        let ids_i64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
-        let idx = Tensor::<1, Int>::from_data(TensorData::new(ids_i64, [s]), &self.device);
-        let rows = self
-            .embed
-            .clone()
-            .select(0, idx)
-            .reshape([1, s, self.cfg.hidden_size]);
-        if self.embed.dtype() == DType::F16 {
-            rows.cast(DType::F32)
-        } else {
-            rows
-        }
+        self.embed.rows(ids, self.cfg.hidden_size, &self.device)
     }
 
     /// Forward `ids`; appends to the cache. Returns the final-normed hidden state
@@ -1090,7 +1206,7 @@ impl IntentModel {
     /// `[1, vocab]`. Multi-token input is only allowed for a fresh cache (prefill).
     pub fn forward_logits(&mut self, ids: &[u32]) -> Tensor<2> {
         let last = self.forward_last_normed(ids);
-        let table = self.embed.clone();
+        let table = self.dense_embed();
         if table.dtype() == DType::F16 {
             last.cast(DType::F16)
                 .matmul(table.transpose())
@@ -1098,6 +1214,12 @@ impl IntentModel {
         } else {
             last.matmul(table.transpose())
         }
+    }
+
+    /// The tied table as a dense tensor (the LM head). Generation only: a d3
+    /// decision prompt never reads the head, so it never pays the dequantization.
+    fn dense_embed(&self) -> Tensor<2> {
+        self.embed.dense(&self.device)
     }
 
     /// Debug helper: run a fresh forward and return the hidden state after the
@@ -1306,7 +1428,7 @@ mod tests {
 
     fn filled_model(cfg: &IntentTextConfig, device: &Device) -> IntentModel {
         let mut model = IntentModel::new_stub(cfg, 64, device);
-        model.embed = tensor2(cfg.vocab_size, cfg.hidden_size, 1, device);
+        model.embed = Embed::Dense(tensor2(cfg.vocab_size, cfg.hidden_size, 1, device));
         model.norm_w = tensor1(cfg.hidden_size, 2, device);
         for (i, layer) in model.layers.iter_mut().enumerate() {
             let seed = 10 + i as u64 * 10;
@@ -1389,12 +1511,191 @@ mod tests {
         let logits = rows(logits_model.forward_logits(&ids));
         let mut hidden_model = filled_model(&cfg, &device);
         let hidden = hidden_model.forward_last_normed(&ids);
-        let expected = rows(hidden.matmul(hidden_model.embed.clone().transpose()));
+        let expected = rows(hidden.matmul(hidden_model.dense_embed().transpose()));
         assert_eq!(logits.len(), cfg.vocab_size);
         assert_eq!(
             logits, expected,
             "forward_logits must be the readout of the hidden"
         );
+    }
+
+    // ---- int8 token table ----
+
+    /// A `[rows, cols]` table whose rows differ in magnitude (row 0 is all zeros,
+    /// the last row is the widest) so the per-row scales are all different.
+    fn table_with_row_scales(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+        let mut out = values(rows * cols, seed);
+        for (r, row) in out.chunks_mut(cols).enumerate() {
+            let gain = if r == 0 { 0.0 } else { r as f32 * 0.5 };
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = *v * gain
+                    + if i % 3 == 0 {
+                        gain * 0.001
+                    } else {
+                        -gain * 0.002
+                    };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_int8_table_is_within_half_a_step_of_every_row() {
+        let (rows, cols) = (24usize, 17);
+        let table = table_with_row_scales(rows, cols, 7);
+        let (codes, scales) = quantize_rows(&table, rows, cols);
+        for r in 0..rows {
+            let row = &table[r * cols..(r + 1) * cols];
+            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            if r == 0 {
+                assert_eq!(scales[r], 0.0, "an all-zero row keeps scale 0");
+                assert!(
+                    codes[r * cols..(r + 1) * cols].iter().all(|&c| c == 0),
+                    "an all-zero row quantizes to zeros"
+                );
+                continue;
+            }
+            assert!(scales[r] > 0.0);
+            let step = max / 127.0;
+            assert!((scales[r] - step).abs() <= step * 1e-5, "scale = max/127");
+            for (i, &v) in row.iter().enumerate() {
+                let q = codes[r * cols + i] as f32 * scales[r];
+                assert!(
+                    (q - v).abs() <= step / 2.0 * 1.0001,
+                    "row {r} col {i}: {v} quantized to {q}, step {step}"
+                );
+                assert!(
+                    (-127..=127).contains(&(codes[r * cols + i] as i16)),
+                    "codes stay in the symmetric range"
+                );
+            }
+        }
+        // The dequantized gather reproduces the rows in id order.
+        let ids = [23u32, 0, 5];
+        let gathered = dequant_rows(&codes, &scales, &ids, cols);
+        assert_eq!(gathered.len(), ids.len() * cols);
+        for (k, &id) in ids.iter().enumerate() {
+            let r = id as usize;
+            for i in 0..cols {
+                let want = table[r * cols + i];
+                let got = gathered[k * cols + i];
+                assert!(
+                    (got - want).abs() <= scales[r] / 2.0 * 1.0001,
+                    "gather order: id {id} slot {k} col {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_int8_table_gathers_the_prompt_rows_in_id_order() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
+        let table = table_with_row_scales(vocab, hidden, 11);
+        let quantized = Embed::quantize(&table, vocab, hidden);
+        let mut dense = filled_model(&cfg, &device);
+        dense.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(table.clone(), [vocab, hidden]),
+            &device,
+        ));
+        let mut int8 = filled_model(&cfg, &device);
+        int8.embed = quantized;
+
+        // Out of order and repeated: the rows must follow `ids` exactly.
+        let ids = [7u32, 2, 5, 2];
+        let want = rows2(dense.embed_ids(&ids));
+        let got = rows2(int8.embed_ids(&ids));
+        assert_eq!(got.len(), ids.len() * hidden);
+        let mut max_abs = 0f32;
+        for (k, &id) in ids.iter().enumerate() {
+            let row = &table[id as usize * hidden..(id as usize + 1) * hidden];
+            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for i in 0..hidden {
+                let d = (got[k * hidden + i] - want[k * hidden + i]).abs();
+                max_abs = max_abs.max(d);
+                assert!(
+                    d <= max / 254.0 * 1.0001,
+                    "id {id} slot {k} col {i}: dense {} vs int8 {}",
+                    want[k * hidden + i],
+                    got[k * hidden + i]
+                );
+            }
+        }
+        // Relative to the row's own magnitude the error is tiny (<= half a step).
+        assert!(max_abs > 0.0, "the fixture must exercise the quantizer");
+        println!("int8 table vs dense rows: max |delta| {max_abs:.3e}");
+
+        // The whole model still runs from the int8 table, to the same tolerance.
+        let h_dense = rows2_row(dense.forward_last_normed(&ids));
+        let h_int8 = rows2_row(int8.forward_last_normed(&ids));
+        let scale = h_dense.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = h_dense
+            .iter()
+            .zip(&h_int8)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst <= scale * 2e-2,
+            "hidden state moved by {worst} (magnitude {scale})"
+        );
+    }
+
+    #[test]
+    fn the_tied_head_dequantizes_an_int8_table() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
+        let table = table_with_row_scales(vocab, hidden, 13);
+        let (codes, scales) = quantize_rows(&table, vocab, hidden);
+        let ids = [1u32, 4, 7];
+        let mut int8 = filled_model(&cfg, &device);
+        int8.embed = Embed::Int8 {
+            codes: codes.clone(),
+            scales: scales.clone(),
+        };
+        // The dense table the int8 one stands for.
+        let dequant: Vec<f32> = dequant_rows(
+            &codes,
+            &scales,
+            &(0..vocab as u32).collect::<Vec<_>>(),
+            hidden,
+        );
+        let mut dense = filled_model(&cfg, &device);
+        dense.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(dequant, [vocab, hidden]),
+            &device,
+        ));
+        assert_eq!(
+            rows2_row(int8.forward_logits(&ids)),
+            rows2_row(dense.forward_logits(&ids)),
+            "forward_logits over an int8 table is the readout of its dequantized form"
+        );
+        // And it still tracks the unquantized table closely (`forward_logits`
+        // appends to the cache, so reset before the second prefill).
+        int8.cache.reset();
+        let mut original = filled_model(&cfg, &device);
+        original.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(table, [vocab, hidden]),
+            &device,
+        ));
+        let a = rows2_row(original.forward_logits(&ids));
+        let b = rows2_row(int8.forward_logits(&ids));
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(worst <= scale * 2e-2, "logits moved by {worst} of {scale}");
+    }
+
+    /// `[1, s, hidden]` -> a flat vector.
+    fn rows2(tensor: Tensor<3>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
+    }
+
+    /// A `[1, hidden]` tensor -> a flat vector.
+    fn rows2_row(tensor: Tensor<2>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
     }
 
     #[test]

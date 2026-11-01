@@ -1523,6 +1523,33 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   request, so a package that declares `vision_config` but lacks the `visual.*`
   tensors starts healthy and returns 500 per media request, where an eager load
   fails at startup.
+- **Int8 token table** (phase M2): the tied table is CPU resident in **every**
+  deployment (the NPU never holds it) and a prompt only reads its own rows, so the
+  decision family stores it as **per-row symmetric int8** — `scale = max|row|/127`,
+  round half away from zero, codes clamped to ±127 — behind
+  `Embed::Int8 { codes, scales }` (`qwen35_intent/model.rs`); `quantize_rows` and
+  `dequant_rows` are rayon passes, `embed_ids` dequantizes just the prompt's rows
+  (a bandwidth-trivial pass: 8k × 1024 elements in a few ms) and only the
+  generation paths' `dense_embed` read the whole
+  table (decision never does). The loader consumes the f32 checkpoint table **in
+  place** (`TensorData::try_into_vec`, no tensor copy), so the load transient also
+  drops. `--embed-int8` is the decision **default**, `--embed-f16` keeps the exact
+  table, both is an error, `Family::supports_embed_int8` is Decision-only, and the
+  ready line prints `embed I8`/`F16`/`F32`. Dev host, text-only `--defer-towers`,
+  resident / peak anon: d3-lite 2462 / 2583 -> **2222 / 2397** MiB, d3-nano
+  6287 / 6457 -> **5804 / 5969** (the expected -242 / -485 resident). Numerics on
+  the full fixture sets against the f16 table — which is **bit-exact** for these
+  bf16 checkpoints (f16 has more mantissa, and the values fit its range), so the
+  whole delta is int8: top-1 is unchanged (67/67, 8/8, 9/9) and max |Δp| is
+  **6.96e-3** text / **8.36e-3** image / **3.81e-3** video (median 1.4e-4-8.6e-4).
+  That exceeds the phase's 2e-3 **probe** gate, which is expected — per-row int8's
+  error is `max|row|/254` (1.46e-4 at the table's median row max 0.0747, 0.86 % of
+  the row RMS) and block-32 scales would only buy 1.56x — so the **approved
+  deployment bar is max |Δp| ≤ 1e-2 with 100 % top-1**, which this passes with no
+  answer changed on the 84 fixture questions. `--embed-f16` is the escape hatch:
+  it restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
+  (nano) resident, for deployments that need the probabilities themselves to
+  match the f32 reference.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel

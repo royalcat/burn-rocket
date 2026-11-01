@@ -149,6 +149,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 keep_cpu_weights: load.keep_cpu_weights,
                 npu_threads: load.npu_threads,
                 embed_f16: load.embed_f16,
+                embed_int8: load.embed_int8,
                 ..IntentLoadOptions::default()
             };
             let loaded = intent_loader::load_for_serving(
@@ -224,6 +225,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 keep_cpu_weights: false,
                 npu_threads: load.npu_threads,
                 embed_f16: load.embed_f16,
+                embed_int8: load.embed_int8,
                 ..IntentLoadOptions::default()
             };
             let model =

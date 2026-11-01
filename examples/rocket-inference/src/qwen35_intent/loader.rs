@@ -15,7 +15,9 @@ use burn::module::Param;
 use burn::prelude::*;
 use burn::tensor::{DType, TensorData};
 
-use crate::qwen35_intent::model::{DeltaNet, GatedAttention, IntentModel, IntentTextConfig, Mixer};
+use crate::qwen35_intent::model::{
+    DeltaNet, Embed, GatedAttention, IntentModel, IntentTextConfig, Mixer,
+};
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::proj::Proj;
 use tokenizers::Tokenizer;
@@ -37,6 +39,9 @@ pub struct IntentLoadOptions {
     pub npu_threads: usize,
     /// Keep only an f16 copy of the tied embedding/LM-head table (saves ~0.5 GB).
     pub embed_f16: bool,
+    /// Store the tied table as per-row symmetric int8 (halves f16 again; the
+    /// decision family's default). Mutually exclusive with [`Self::embed_f16`].
+    pub embed_int8: bool,
     /// Checkpoint key prefix of the text backbone (`model.language_model.` for the
     /// intent SFT, `language_model.` for a d3 decision checkpoint).
     pub prefix: &'static str,
@@ -55,6 +60,7 @@ impl Default for IntentLoadOptions {
             keep_cpu_weights: true,
             npu_threads: 5,
             embed_f16: false,
+            embed_int8: false,
             prefix: "model.language_model.",
             label: "intent",
             rope_max_seq: None,
@@ -174,11 +180,30 @@ pub fn load_intent_model(
     let prefix = opts.prefix;
 
     // Global tensors.
-    let embed = read2(ckpt, &format!("{prefix}embed_tokens.weight"), device)?;
-    model.embed = if opts.embed_f16 {
-        embed.cast(DType::F16)
+    if opts.embed_f16 && opts.embed_int8 {
+        bail!("the token table cannot be both f16 and int8 (pick one)");
+    }
+    let embed_key = format!("{prefix}embed_tokens.weight");
+    model.embed = if opts.embed_int8 {
+        // Per-row symmetric int8. The f32 table is consumed in place (no tensor
+        // copy), so the load transient is the table plus the codes — less than
+        // the f16 cast's — and only the codes stay resident.
+        let data = read_tensor(ckpt, &embed_key)?;
+        if data.shape().num_dims() != 2 {
+            bail!("{embed_key}: expected a 2-D tensor, got {:?}", data.shape());
+        }
+        let [rows, cols] = data.shape().dims::<2>();
+        let table: Vec<f32> = data
+            .try_into_vec()
+            .map_err(|e| anyhow::anyhow!("read {embed_key} as f32: {e}"))?;
+        Embed::quantize(&table, rows, cols)
     } else {
-        embed
+        let embed = read2(ckpt, &embed_key, device)?;
+        if opts.embed_f16 {
+            Embed::Dense(embed.cast(DType::F16))
+        } else {
+            Embed::Dense(embed)
+        }
     };
     model.norm_w = read_norm1(ckpt, &format!("{prefix}norm.weight"), device)?;
 
@@ -220,11 +245,11 @@ pub fn load_intent_model(
     }
 
     println!(
-        "{} model ready in {:.2}s ({} layers, embed {:?}{})",
+        "{} model ready in {:.2}s ({} layers, embed {}{})",
         opts.label,
         t0.elapsed().as_secs_f64(),
         cfg.num_hidden_layers,
-        model.embed.dtype(),
+        model.embed.mode(),
         if opts.npu {
             format!(", {packed} resident NPU weights")
         } else {
@@ -395,4 +420,58 @@ pub fn load_for_serving(
         tokenizer,
         stop_ids,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen35_intent::model::Embed;
+
+    /// The int8 branch on the real d3-lite table: the codes and scales are a
+    /// finite table of the checkpoint's shape, and every sampled row dequantizes
+    /// to finite f32. Skips when the checkpoint is not on this host.
+    #[test]
+    fn the_int8_table_loads_from_a_real_checkpoint() {
+        let dir = Path::new("/tmp/opencode/d3/models/d3-lite");
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: {} is not on this host", dir.display());
+            return;
+        }
+        let device = Device::default();
+        let mut ckpt = crate::util::checkpoint::open_in_dir(dir).unwrap();
+        let cfg = IntentTextConfig::from_value(ckpt.config_json().unwrap()).unwrap();
+        let opts = IntentLoadOptions {
+            // The d3 package's backbone (`language_model.*`).
+            prefix: "language_model.",
+            label: "decision-test",
+            embed_int8: true,
+            ..IntentLoadOptions::default()
+        };
+        let model = load_intent_model(&mut ckpt, &device, &opts).unwrap();
+        assert_eq!(model.embed.mode(), "I8", "the ready line reports the mode");
+        match &model.embed {
+            Embed::Int8 { codes, scales } => {
+                assert_eq!(scales.len(), cfg.vocab_size, "one scale per row");
+                assert_eq!(codes.len(), cfg.vocab_size * cfg.hidden_size);
+                assert!(
+                    scales.iter().all(|s| s.is_finite() && *s >= 0.0),
+                    "scales are finite and non-negative"
+                );
+                assert!(
+                    scales.iter().filter(|s| **s > 0.0).count() > cfg.vocab_size / 2,
+                    "nearly every row is non-zero"
+                );
+            }
+            Embed::Dense(_) => panic!("expected an int8 table"),
+        }
+        let ids = [0u32, 1, 2, 100, (cfg.vocab_size - 1) as u32];
+        let rows: Vec<f32> = model
+            .embed_ids(&ids)
+            .into_data()
+            .try_to_vec()
+            .expect("f32 rows");
+        assert_eq!(rows.len(), ids.len() * cfg.hidden_size);
+        assert!(rows.iter().all(|v| v.is_finite()), "rows are finite");
+        assert!(rows.iter().any(|v| *v != 0.0), "rows are not all zero");
+    }
 }

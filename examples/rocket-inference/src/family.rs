@@ -137,6 +137,12 @@ impl Family {
     pub fn supports_embed_f16(self) -> bool {
         matches!(self, Self::Intent | Self::Decision)
     }
+
+    /// The per-row int8 table: a d3 decision checkpoint's tied table is CPU
+    /// resident in every deployment, so its default is int8.
+    pub fn supports_embed_int8(self) -> bool {
+        matches!(self, Self::Decision)
+    }
 }
 
 /// Detect the model family from a checkpoint's `config.json` (`model_type`), or
@@ -225,6 +231,9 @@ mod tests {
         assert!(!d.is_embedding());
         assert!(!d.is_chat());
         assert!(d.supports_embed_f16());
+        assert!(d.supports_embed_int8());
+        assert!(!Family::Intent.supports_embed_int8());
+        assert!(!Family::Emb2.supports_embed_f16());
         assert!(!d.supports_text_attn());
         assert!(!d.supports_vision());
         assert!(!d.supports_decode());

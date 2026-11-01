@@ -91,8 +91,8 @@ placement:
 
 model and memory:
   --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision /
-  --cpu-backend / --dtype / --quant / --defer-towers / --embed-f16 /
-  --attn-chunk / --chunk / --key-block
+  --cpu-backend / --dtype / --quant / --defer-towers /
+  --embed-f16 / --embed-int8 / --attn-chunk / --chunk / --key-block
 
 See `rocket-inference help` for the shared placement flags and README.md for
 the endpoints.";
@@ -229,8 +229,11 @@ output:
 
 placement / model:
   --device / --text-device auto|cpu|npu
-  --model-dir / --family / --cpu-backend / --npu-threads / --embed-f16 /
-  --defer-towers (load the vision tower on the first media request)
+  --model-dir / --family / --cpu-backend / --npu-threads /
+  --embed-int8 (default) / --embed-f16 / --defer-towers
+    --embed-int8 keeps the tied token table as per-row int8 (the default);
+    --embed-f16 keeps the exact table; --defer-towers loads the vision tower
+    on the first media request.
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -429,6 +432,7 @@ pub struct LoadArgs {
     pub vision_attn_kernel: Option<AttnKernel>,
     pub attn_chunk: Option<usize>,
     pub embed_f16: Option<bool>,
+    pub embed_int8: Option<bool>,
 }
 
 impl LoadArgs {
@@ -515,6 +519,7 @@ impl LoadArgs {
             a.attn_chunk = Some(v);
         }
         a.embed_f16 = f.take_flag("--embed-f16");
+        a.embed_int8 = f.take_flag("--embed-int8");
         Ok(a)
     }
 
@@ -614,6 +619,16 @@ impl LoadArgs {
         if self.embed_f16.is_some() && !family.supports_embed_f16() {
             bail!("--embed-f16 does not apply to the {} model", family.name());
         }
+        if self.embed_int8.is_some() && !family.supports_embed_int8() {
+            bail!(
+                "--embed-int8 does not apply to the {} model (it has no per-row int8 \
+                 token table; only the decision family does)",
+                family.name()
+            );
+        }
+        if self.embed_f16 == Some(true) && self.embed_int8 == Some(true) {
+            bail!("--embed-f16 and --embed-int8 select different token tables; pick one");
+        }
         if self.npu_dtype.is_some() && !family.supports_int8() {
             bail!(
                 "--npu-dtype only applies to the embeddinggemma text backbone, \
@@ -712,6 +727,7 @@ impl LoadArgs {
         let cpu_backend = self.cpu_backend.clone().unwrap_or_else(default_backend);
         let attn_kernel = self.attn_kernel.unwrap_or(AttnKernel::Fused);
         let vision_attn_kernel = self.vision_attn_kernel.unwrap_or(AttnKernel::Fused);
+        let (embed_f16, embed_int8) = resolve_embed_table(family, self.embed_f16, self.embed_int8)?;
 
         Ok(ResolvedLoad {
             model_dir,
@@ -731,10 +747,32 @@ impl LoadArgs {
             key_block: self.key_block.unwrap_or(256),
             vision_attn_kernel,
             attn_chunk: self.attn_chunk.unwrap_or(1024),
-            // The intent family keeps an f32 table unless asked; a d3 checkpoint
-            // always wants the f16 copy of its tied table (saves ~0.5 GB).
-            embed_f16: self.embed_f16.unwrap_or(family == Family::Decision),
+            embed_f16,
+            embed_int8,
         })
+    }
+}
+
+/// Resolve the token-table flags into `(f16, int8)`.
+///
+/// One choice per run, so no pair is ambiguous: an explicit `--embed-int8` wins,
+/// then an explicit `--embed-f16`; `--embed-int8 false` on the decision family
+/// keeps its historical f16 table, and with neither flag the decision family
+/// defaults to int8 while every other family stays f32. The caller has already
+/// rejected `--embed-f16`/`--embed-int8` on a family without them.
+fn resolve_embed_table(
+    family: Family,
+    embed_f16: Option<bool>,
+    embed_int8: Option<bool>,
+) -> Result<(bool, bool)> {
+    match (embed_int8, embed_f16) {
+        (Some(true), Some(true)) => {
+            bail!("--embed-f16 and --embed-int8 select different token tables; pick one")
+        }
+        (Some(true), _) => Ok((false, true)),
+        (_, Some(true)) => Ok((true, false)),
+        (Some(false), _) => Ok((family == Family::Decision, false)),
+        (None, _) => Ok((false, family == Family::Decision)),
     }
 }
 
@@ -826,6 +864,8 @@ pub struct ResolvedLoad {
     pub vision_attn_kernel: AttnKernel,
     pub attn_chunk: usize,
     pub embed_f16: bool,
+    /// Store the tied table as per-row int8 (`--embed-int8`, the decision default).
+    pub embed_int8: bool,
 }
 
 impl ResolvedLoad {
@@ -1055,5 +1095,41 @@ mod tests {
         assert!(r.keep_cpu_weights);
         let err = resolve(&["--keep-cpu-weights", "no"], Family::Intent).unwrap_err();
         assert!(format!("{err:#}").contains("decode stage runs on the CPU"));
+    }
+
+    // ---- token table ----
+
+    #[test]
+    fn the_token_table_flags_resolve_to_one_choice() {
+        // A decision checkpoint defaults to the per-row int8 table (half of f16,
+        // and the table is CPU resident in every deployment).
+        let r = resolve(&[], Family::Decision).unwrap();
+        assert!(r.embed_int8 && !r.embed_f16);
+        // Every other family keeps its f32 table unless asked.
+        let r = resolve(&[], Family::Intent).unwrap();
+        assert!(!r.embed_f16 && !r.embed_int8);
+        // Explicit flags win.
+        let r = resolve(&["--embed-f16"], Family::Decision).unwrap();
+        assert!(r.embed_f16 && !r.embed_int8);
+        let r = resolve(&["--embed-int8"], Family::Decision).unwrap();
+        assert!(r.embed_int8 && !r.embed_f16);
+        // `--embed-int8 false` (the model-level `Some(false)`, not a CLI form)
+        // keeps the decision family's historical f16 table and leaves the other
+        // families at f32.
+        assert_eq!(
+            resolve_embed_table(Family::Decision, None, Some(false)).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_embed_table(Family::Intent, None, Some(false)).unwrap(),
+            (false, false)
+        );
+        // Ambiguous and unsupported combinations are rejected.
+        let err = resolve(&["--embed-f16", "--embed-int8"], Family::Decision).unwrap_err();
+        assert!(format!("{err:#}").contains("pick one"));
+        let err = resolve(&["--embed-int8"], Family::Intent).unwrap_err();
+        assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
+        let err = resolve(&["--embed-int8"], Family::Gemma4).unwrap_err();
+        assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
     }
 }

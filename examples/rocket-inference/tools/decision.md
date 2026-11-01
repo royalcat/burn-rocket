@@ -808,3 +808,66 @@ future re-run: `image-two-images` names the *d3-lite* `serving-throughput.png` (
 fixtures' absolute asset paths), and d3-nano ships a **different** file under that name
 (`4603c2c3…` vs `c6536167…`); both sides consumed the same file here, so the parity
 holds, but a run that mixed the packages' assets would not be comparable.
+
+## Token table (phase M2)
+
+The tied token table (248,320 × hidden) is CPU resident in every deployment, and a
+prompt only reads its own rows, so the decision family stores it as per-row symmetric
+int8 by default (`--embed-int8`; `--embed-f16` keeps the dense table, and the two flags
+are mutually exclusive). What that costs is measured on the full fixture sets against
+the f16 arm (dev host, f32 body, 32k cap; the f16 table is bit-exact for these bf16
+checkpoints, so the whole delta is int8):
+
+| set | questions | top-1 | max \|Δp\| | median \|Δp\| |
+|---|---|---|---|
+| text | 67 | 67/67 | 6.96e-3 | 7.3e-4 |
+| images | 8 | 8/8 | 8.36e-3 | 1.4e-4 |
+| videos | 9 | 9/9 | 3.81e-3 | 8.6e-4 |
+
+For the halved table: resident anon d3-lite 2,462 → **2,222** MiB and d3-nano
+6,287 → **5,804** MiB (peak 2,583 → 2,397 and 6,457 → 5,969).
+
+The phase's 2e-3 **probe** gate is exceeded by design: per-row symmetric int8 carries an
+inherent `max|row|/254` error (1.46e-4 per element at this table's median row max
+0.0747, 0.86 % of the row RMS), and even block-32 scales would only buy 1.56x. The
+approved deployment bar is instead **max |Δp| ≤ 1e-2 with 100 % top-1**, which this
+passes: no answer changes on the 84 fixture questions and the largest probability move
+is 8.36e-3. `--embed-f16` restores the exact table (f16-vs-f32 max |Δp| 2.4e-6) for
++242 MiB on d3-lite or +485 MiB on d3-nano — use it where the probabilities themselves
+have to match the f32 reference.
+
+Reproduce (from `examples/rocket-inference`; `--embed-f16` is the baseline arm):
+
+```sh
+B=$CARGO_TARGET_DIR/release/rocket-inference
+M=/tmp/opencode/d3/models/d3-lite
+for set in decision_fixtures decision_fixtures_images decision_fixtures_videos; do
+  for arm in f16 i8; do
+    flag=""; [ $arm = f16 ] && flag=--embed-f16
+    $B decide --model-dir $M --requests tools/$set.json --max-state-tokens 32768 \
+        $flag --out /tmp/$set-$arm.json
+  done
+done
+# top-1 and the largest per-option probability move, both arms
+python3 - <<'PY'
+import json
+for s in ("decision_fixtures", "decision_fixtures_images", "decision_fixtures_videos"):
+    a = {c["name"]: c for c in json.load(open(f"/tmp/{s}-f16.json"))["cases"]}
+    b = {c["name"]: c for c in json.load(open(f"/tmp/{s}-i8.json"))["cases"]}
+    worst = 0.0; bad = 0; n = 0
+    for name, case in a.items():
+        for qid, va in case["response"]["answers"].items():
+            vb = b[name]["response"]["answers"][qid]; n += 1
+            pa = va.get("probabilities") or {"_": va["noul"]}
+            pb = vb.get("probabilities") or {"_": vb["noul"]}
+            worst = max(worst, max(abs(pa[k] - pb[k]) for k in pa))
+            if va.get("choice") != vb.get("choice"):
+                bad += 1
+    print(f"{s}: {n} questions, top-1 mismatches {bad}, max |dp| {worst:.3e}")
+PY
+```
+
+Memory, text-only `--defer-towers`, one 128-token case (`RssAnon` sampled every 50 ms;
+`--embed-f16` in parentheses): d3-lite resident **2,222** (2,462) MiB, peak **2,397**
+(2,583); d3-nano resident **5,804** (6,287), peak **5,969** (6,457). The loader consumes
+the checkpoint's f32 table in place, so the int8 load also peaks lower than the f16 cast.

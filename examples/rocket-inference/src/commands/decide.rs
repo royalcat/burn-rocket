@@ -128,6 +128,7 @@ fn load_model(load: &ResolvedLoad, args: &Args) -> Result<DecisionModel> {
         keep_cpu_weights: false,
         npu_threads: load.npu_threads,
         embed_f16: load.embed_f16,
+        embed_int8: load.embed_int8,
         ..IntentLoadOptions::default()
     };
     let model = load_decision_model(

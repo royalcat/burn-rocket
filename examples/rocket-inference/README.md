@@ -858,7 +858,11 @@ reference's `detail` string. `--max-tokens` is the same per-question cap as
 `--max-state-tokens` (default 32768); the body limit is 96 MiB. Placement:
 `--device npu` packs the text projections as resident fp16 (96 weights, ~1.0 GiB
 of BO); the tower, the backbone attention and the readout stay on the CPU in
-both configurations. `--defer-towers` leaves the tower to the first media
+both configurations. The tied token table is **per-row int8** by default
+(`--embed-int8`; `--embed-f16` keeps the exact table): 2,462 -> 2,222 MiB
+resident on d3-lite and 6,287 -> 5,804 on d3-nano, with top-1 unchanged and the
+largest option probability moving by up to 8.4e-3 over the fixture sets.
+`--defer-towers` leaves the tower to the first media
 request (a package that declares `vision_config` but lacks `visual.*` therefore
 starts healthy and fails each media request with a 500 instead of failing at
 startup); the attention/vision/decode stage flags are rejected.

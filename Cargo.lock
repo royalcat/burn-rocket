@@ -6483,6 +6483,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rayon",
  "reqwest",
  "rustfft",
  "serde",
