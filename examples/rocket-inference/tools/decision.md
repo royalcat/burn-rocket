@@ -666,3 +666,138 @@ image **8/8**, max |Δp| **7.69724e-06**; the literal-placeholder pair **2/2**, 
 **1.15617e-07**; `cargo test -p rocket-inference --no-default-features` **162 passed**;
 `cargo fmt --all -- --check`, clippy (cpu and aarch64 `--features npu`) and the aarch64
 npu check clean.
+
+## d3-nano dev-host (phase 4)
+
+`vllm-sr/d3-nano` is the family's second geometry. `config.json` differs from d3-lite in
+every text dimension (`text_config` hidden **2048** vs 1024, intermediate **6144** vs
+3584, same 24 layers / 8 heads / head_dim 256 / `mrope_section` `[11, 11, 10]`) and in
+the tower (`vision_config` depth **24** vs 12, hidden **1024** vs 768, `num_heads` 16 vs
+12, intermediate 4096 vs 3072, `out_hidden_size` **2048** vs 1024). The family code is
+dimension-generic, so the round's question is only whether the loader, the readout, the
+multimodal RoPE and the tower follow those fields end to end. Nothing had to change.
+
+Subset: 7 of the shipped cases / 10 questions (choice, noul, score, one long state, a
+single image, two images, one clip), run as **one** `--requests` file — 12,155 prompt
+tokens (the file is a plain filter of the three fixture arrays by name, so nothing new is
+committed as a fixture):
+
+| cases | questions | tokens | covers |
+|---|---|---|---|
+| choice-routing-short, noul-refund-window, score-urgency-billing | 3 | 549 | the three answer types at short state |
+| choice-policy-long | 3 | 6,307 | a 9,047-character state (3 questions, 2,100-2,107 tokens each) |
+| image-receipt-total, image-two-images | 2 | 3,579 | one and two `<\|image_pad\|>` spans |
+| video-example | 2 | 1,720 | a 4-pair clip (868 + 852) |
+
+The reference is **f32**, not the official bf16 (the f32 body is what the Rust side
+runs); `--dump-vision` is batch-size 1 and writes the nano pooled tensors (`[tokens,
+2048]`) for a later probe:
+
+```sh
+python3 tools/decision_reference.py --model /tmp/opencode/d3/models/d3-nano \
+    --backbone-dtype f32 --requests subset.json --out ref_nano_f32.json \
+    --batch-size 1 --dump-vision dump-nano-f32
+# 7 cases / 10 questions / 12,155 tokens, 83.7 s of forwards (88.9 s process),
+# 13,286 MiB peak RSS / 9,767 MiB peak anon
+
+$CARGO_TARGET_DIR/release/rocket-inference decide \
+    --model-dir /tmp/opencode/d3/models/d3-nano --requests subset.json \
+    --out our_nano_f32.json --max-state-tokens 32768
+# model ready in 3.00 s (24 layers), resident 7,716 MiB anon;
+# 10 questions / 12,155 tokens, 152.2 s of forwards (156.4 s process)
+```
+
+`tools/decision_parity.py --model-dir /tmp/opencode/d3/models/d3-nano` on that pair:
+**10/10 top-1 (100 %)**, max |Δp| **1.741e-06** (`score-urgency-billing/score`; choice
+6.86e-07, noul 1.72e-06, score 1.74e-06), **token counts exact on all 7 cases**
+(128 / 140 / 281 / 2,107 + 2,100 + 2,100 / 1,029 / 2,550 / 868 + 852 = 12,155),
+`RESULT: PASS`. The two-image case answers `first` at 0.99779206 vs the reference's
+0.99779201, i.e. the multi-span splice and the 2048-wide tower features are right.
+
+| case | question | type | tokens | top | p | max abs Δp |
+|---|---|---|---|---|---|---|
+| choice-routing-short | route | choice | 128 | billing | 0.925584971 | 6.71e-08 |
+| noul-refund-window | in_window | noul | 140 | true | 0.732728004 | 7.75e-07 |
+| score-urgency-billing | score | score | 281 | level 1 | 0.417736483 | 1.74e-06 |
+| choice-policy-long | verdict | choice | 2,107 | violation | 0.939493302 | 1.46e-07 |
+| choice-policy-long | approval | noul | 2,100 | true | 0.998911441 | 6.06e-08 |
+| choice-policy-long | risk | score | 2,100 | level 0 | 0.653321626 | 9.70e-08 |
+| image-receipt-total | total | choice | 1,029 | over_150 | 0.896590022 | 5.33e-07 |
+| image-two-images | which | choice | 2,550 | first | 0.997792122 | 1.17e-07 |
+| video-example | direction | choice | 868 | right | 0.986120553 | 6.86e-07 |
+| video-example | color_change | noul | 852 | true | 0.972875702 | 1.72e-06 |
+
+The two checkpoints disagree on 4 of these 10 answers (nano says `billing`,
+`violation`, risk level 0 and `over_150`; lite says `returns`, `needs review`, risk level
+1 and `100_to_150`), which is why the gate is per-checkpoint: parity is against each
+model's own reference, and lite answers the same subset exactly as its own references
+do (`ref_text_lite_f32.json`, `ref_images_lite_f32.json`, `ref_videos_lite_f32.json`
+— 10/10).
+
+Wall and memory, d3-nano against d3-lite on the same 12,155-token subset (dev host, 32
+cores, f32, 2026-11-01). The per-case columns are one process per case, so they include
+the model load (3.0 s nano, 1.25 s lite); the totals row is the single `--requests`
+process, whose "compute" is the CLI's own number (load excluded):
+
+| case | tokens | nano wall | nano anon | lite wall | lite anon |
+|---|---|---|---|---|---|
+| choice-routing-short | 128 | 6.9 s | 7,774 MiB | 3.3 s | 2,978 MiB |
+| noul-refund-window | 140 | 7.1 s | 7,844 MiB | 3.5 s | 2,983 MiB |
+| score-urgency-billing | 281 | 8.2 s | 7,864 MiB | 4.0 s | 3,054 MiB |
+| choice-policy-long | 6,307 | 51.2 s | 8,856 MiB | 37.3 s | 4,025 MiB |
+| image-receipt-total | 1,029 | 25.3 s | 8,339 MiB | 12.0 s | 3,484 MiB |
+| image-two-images | 2,550 | 56.0 s | 9,222 MiB | 28.6 s | 4,373 MiB |
+| video-example | 1,720 | 28.2 s | 8,200 MiB | 14.1 s | 3,363 MiB |
+
+| model | questions | load | compute | wall | peak RSS | peak anon | user CPU |
+|---|---|---|---|---|---|---|---|
+| d3-nano f32 (Rust) | 10 | 3.00 s | 152.2 s | 156.4 s | 12,061 MiB | 9,220 MiB | 1,722 s |
+| d3-lite f32 (Rust) | 10 | 1.25 s | 89.4 s | 91.3 s | 4,631 MiB | 4,391 MiB | 788 s |
+| d3-nano f32 (torch reference) | 10 | — | 83.7 s | 88.9 s | 13,286 MiB | 9,767 MiB | 1,181 s |
+
+So nano costs **1.71x** the wall and **2.10x** the anon (2.60x the RSS, which also holds
+the checkpoint's file-backed pages) for the same answers; the resident f32 body alone is
+7,716 MiB anon against lite's 2,926 MiB. Two things to read out of the per-case column:
+a short prompt is *weight-bandwidth*-bound, not attention-bound (a 128-token forward
+streams the whole resident body — ~7.7 GiB anon on nano, ~2.9 GiB on lite — in ~3.9 s
+against ~2.1 s), so the flat ~7 s for the three short cases is the load plus one
+streaming pass; and a media request scales with **patches**, not with the text length
+(the receipt is 3,472 patches for its 1,029 tokens, the two-image request 9,744 for
+2,550, and the tower dominates that wall: 25.3 s vs 6.9 s for the short text case on
+nano, 12.0 s vs 3.3 s on lite).
+
+What the run pins, field by field (all read from the checkpoint, no constants):
+
+- **text**: `IntentTextConfig` is `serde`-deserialized from `config.json` `text_config`;
+  the loader checks `layer_types.len() == num_hidden_layers`, loads `0..num_hidden_layers`
+  keys and prints the config's own count (`decision model ready in 3.00s (24 layers,
+  embed F16)`). hidden 2048 / intermediate 6144 / 24 layers come from the file.
+- **readout**: `load_readout(dir, backbone.cfg.hidden_size)` refuses any weight whose
+  shape is not exactly `[255, hidden]`; nano's `readout.safetensors` is `[255, 2048]`,
+  lite's `[255, 1024]`, and both load.
+- **tower**: `VisionConfig::from_value` reads the `vision_config` object (depth 24,
+  hidden 1024, `num_heads` 16 → head_dim 64, `out_hidden_size` 2048), the loader loops
+  `0..depth` and bails unless the applied count equals `3 + 12 * depth + 6` = **297**
+  tensors for nano (153 for lite). The checkpoint holds exactly 297 `visual.*` tensors
+  over 24 blocks, so a wrong depth would be a load error, not a silent partial tower.
+- **splice**: the tower's merged rows are `out_hidden_size` wide and the prompt write
+  errors unless they match the text embedding width (`the vision features are {width}
+  wide, the text embeddings {hidden}`) — 2048 here, 1024 for lite.
+- **mrope**: the tables are built per prompt from the text config
+  (`mrope::rope_tables(..., &self.backbone.cfg, merge, ...)`), so the rotary width is
+  `head_dim * partial_rotary_factor` (64, the same in both checkpoints) and the section
+  split is `rope_parameters.mrope_section`.
+
+One measurement note: the reference must be f32 here too. nano bf16 (the existing
+`ref_nano_4cases.json`) and this f32 reference agree on all six text answers but differ
+by up to **6.6e-3** in probability (`noul-refund-window`, 3.1e-3 at
+`choice-policy-long/risk`), i.e. above the 2e-3 gate — the same body-dtype rule the
+phase-1 text section gives for lite.
+
+Not measured here: **the board NPU run is still pending**. This round is the dev host
+only (f32 CPU body, no device); the NPU offload needs the aarch64 build plus the
+RK3588's 600 MHz module, and the numbers above say nothing about it. Also noted for a
+future re-run: `image-two-images` names the *d3-lite* `serving-throughput.png` (the
+fixtures' absolute asset paths), and d3-nano ships a **different** file under that name
+(`4603c2c3…` vs `c6536167…`); both sides consumed the same file here, so the parity
+holds, but a run that mixed the packages' assets would not be comparable.
