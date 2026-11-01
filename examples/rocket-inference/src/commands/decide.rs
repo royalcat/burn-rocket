@@ -10,10 +10,11 @@
 //! answer (a `--requests` batch reports every question); the HTTP server refuses
 //! a request that carries an `invalid_question` with a 422.
 //!
-//! `images` entries are local paths here (the parity fixtures point at the
-//! checkpoint's own assets): the HTTP server takes data URLs only, like the
+//! `images`/`videos` entries are local paths here (the parity fixtures point at
+//! the checkpoint's own assets): the HTTP server takes data URLs only, like the
 //! reference `d3_server.py`, so the fixture files could not be sent over the wire
-//! unchanged.
+//! unchanged. A video is decoded by `ffmpeg` at 2 frames per second (4-32 frames,
+//! temporal pairs), the same sampling the server applies to an upload.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -152,7 +153,10 @@ fn dump_prompts(
     let images = request
         .decode_images(MediaMode::Paths)
         .map_err(|message| anyhow::anyhow!("{message}"))?;
-    let prepared = model.prepare(request, &images, max_tokens)?;
+    let videos = request
+        .decode_videos(MediaMode::Paths)
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    let prepared = model.prepare(request, &images, &videos, max_tokens)?;
     for sequence in &prepared.sequences {
         let (id, ids) = (&sequence.id, &sequence.ids);
         let question = prepared
@@ -162,7 +166,13 @@ fn dump_prompts(
         let user =
             crate::decision::format::user_prompt(&request.state, question, &model.config.codes)
                 .map_err(|message| anyhow::anyhow!("{message}"))?;
-        let prompt = crate::decision::format::chatml_images(&user, prepared.images.len());
+        // The expanded prompt, i.e. the reference dump's `expanded_text`: the
+        // image groups plus each video's timestamped groups.
+        let prompt = crate::decision::model::dump_prompt(
+            &user,
+            &prepared.image_token_counts(),
+            &prepared.videos,
+        );
         let path = dir.join(format!("{case}__{id}.prompt.txt"));
         std::fs::write(&path, &prompt).with_context(|| format!("write {}", path.display()))?;
         println!("wrote {} ({} tokens)", path.display(), ids.len());

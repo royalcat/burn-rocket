@@ -41,13 +41,17 @@ use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Int, TensorData, s};
 
 use super::config::{LAYER_NORM_EPS, VisionConfig};
-use super::processor::PreparedImage;
+use super::processor::{PreparedImage, PreparedVideo};
 
-/// One image's axial RoPE tables: `(cos, sin)` of shape `[patches, head_dim/2]`.
+/// One image's (or one video's, per frame) axial RoPE tables: `(cos, sin)` of
+/// shape `[patches, head_dim/2]`.
 ///
 /// The reference builds `[cos(h*f) | cos(w*f)]` and doubles it over the head, so
 /// the first half of the head sees the h angles and the second half the w angles
-/// with the same values — one `head_dim/2` table per patch is all of it.
+/// with the same values — one `head_dim/2` table per patch is all of it. A video
+/// has no temporal axis in the tower: `get_vision_position_ids` repeats each
+/// frame's `(h, w)` indices `t` times, so its table is the single-frame table
+/// repeated once per sampled frame.
 pub fn axial_rope_tables(
     grid: [usize; 3],
     config: &VisionConfig,
@@ -63,20 +67,24 @@ pub fn axial_rope_tables(
     let inv_freq: Vec<f32> = (0..n_freq)
         .map(|i| 1.0 / theta.powf((2 * i) as f32 / spatial as f32))
         .collect();
-    let (grid_h, grid_w) = (grid[1], grid[2]);
-    let patches = grid_h * grid_w;
+    let (frames, grid_h, grid_w) = (grid[0], grid[1], grid[2]);
+    let frame_patches = grid_h * grid_w;
+    let patches = frames * frame_patches;
+    let positions = patch_positions(grid_h, grid_w, merge);
     let mut cos = Vec::with_capacity(patches * spatial);
     let mut sin = Vec::with_capacity(patches * spatial);
-    for (row, col) in patch_positions(grid_h, grid_w, merge) {
-        for &freq in &inv_freq {
-            let angle = row as f32 * freq;
-            cos.push(angle.cos());
-            sin.push(angle.sin());
-        }
-        for &freq in &inv_freq {
-            let angle = col as f32 * freq;
-            cos.push(angle.cos());
-            sin.push(angle.sin());
+    for _ in 0..frames {
+        for (row, col) in &positions {
+            for &freq in &inv_freq {
+                let angle = *row as f32 * freq;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
+            for &freq in &inv_freq {
+                let angle = *col as f32 * freq;
+                cos.push(angle.cos());
+                sin.push(angle.sin());
+            }
         }
     }
     let cos = Tensor::<2>::from_data(TensorData::new(cos, [patches, spatial]), device);
@@ -350,38 +358,96 @@ impl VisionTower {
 
     /// Encode one preprocessed image into `[tokens, out_hidden]` merged tokens.
     pub fn encode(&self, image: &PreparedImage) -> Result<Tensor<2>> {
-        let config = &self.config;
-        let [patches, dim] = image.pixel_values.dims();
         let (grid_h, grid_w) = image.patch_grid();
+        self.check_grid(
+            image.pixel_values.clone(),
+            [1, grid_h, grid_w],
+            grid_h * grid_w,
+            "image",
+        )?;
+        self.encode_grid(image.pixel_values.clone(), image.grid)
+    }
+
+    /// Encode one preprocessed video into `[tokens, out_hidden]` merged tokens.
+    ///
+    /// A video is a multi-frame grid `[T, H, W]`: the position table resamples each
+    /// frame's `H x W` patches (`within % (H*W)`), the axial rope is the single
+    /// frame's table repeated `T` times (there is no temporal axis), and every
+    /// frame is its **own attention sequence** over `H*W` patches — the
+    /// reference's `get_vision_cu_seqlens(grid_thw, merge_temporal=False)` makes
+    /// `T` segments of `H*W` per video (measured: the whole-clip variant moves the
+    /// pooled output to cosine 0.68 against the reference dump, the per-frame one
+    /// reproduces it bit for bit). The merger then groups 2x2 patches within each
+    /// frame, giving `T * H * W / merge^2` tokens.
+    pub fn encode_video(&self, video: &PreparedVideo) -> Result<Tensor<2>> {
+        let [frames, grid_h, grid_w] = video.grid;
+        self.check_grid(
+            video.pixel_values.clone(),
+            video.grid,
+            frames * grid_h * grid_w,
+            "video",
+        )?;
+        self.encode_grid(video.pixel_values.clone(), video.grid)
+    }
+
+    /// Shape checks of one `[T, H, W]` patch grid.
+    fn check_grid(
+        &self,
+        pixel_values: Tensor<2>,
+        grid: [usize; 3],
+        expected: usize,
+        what: &str,
+    ) -> Result<()> {
+        let config = &self.config;
+        let [patches, dim] = pixel_values.dims();
+        let (frames, grid_h, grid_w) = (grid[0], grid[1], grid[2]);
         if dim != config.patch_dim() {
             bail!(
-                "the image has {dim} values per patch, the tower takes {}",
+                "the {what} has {dim} values per patch, the tower takes {}",
                 config.patch_dim()
             );
         }
-        if patches != grid_h * grid_w {
-            bail!("{patches} patch rows do not match the {grid_h}x{grid_w} grid");
+        if frames == 0 || grid_h == 0 || grid_w == 0 {
+            bail!("the {what} has an empty {grid:?} patch grid");
+        }
+        if patches != expected {
+            bail!("{patches} patch rows do not match the {grid:?} grid");
         }
         let merge = config.spatial_merge_size;
         if !grid_h.is_multiple_of(merge) || !grid_w.is_multiple_of(merge) {
             bail!("the {grid_h}x{grid_w} patch grid is not divisible by the merge size {merge}");
         }
+        Ok(())
+    }
+
+    /// The patch-embedding + position-table + blocks + merger forward over a
+    /// `[T, H, W]` patch grid.
+    fn encode_grid(&self, pixel_values: Tensor<2>, grid: [usize; 3]) -> Result<Tensor<2>> {
+        let config = &self.config;
+        let (frames, grid_h, grid_w) = (grid[0], grid[1], grid[2]);
+        let frame_patches = grid_h * grid_w;
+        let patches = frames * frame_patches;
+        let merge = config.spatial_merge_size;
         let hidden = config.hidden_size;
         let heads = config.num_heads;
         let head_dim = config.head_dim();
 
-        // Patch embedding + bilinear position table.
-        let mut x = linear(image.pixel_values.clone(), &self.patch_w, &self.patch_b);
+        // Patch embedding + bilinear position table. A video resamples each frame's
+        // grid, i.e. the single-frame taps repeat once per frame.
+        let mut x = linear(pixel_values, &self.patch_w, &self.patch_b);
         let device = x.device();
         let (indices, weights) = position_taps(grid_h, grid_w, config.position_grid_side(), merge);
         let mut position: Option<Tensor<2>> = None;
         for tap in 0..4 {
-            let index = Tensor::<1, Int>::from_data(
-                TensorData::new(indices[tap].clone(), [patches]),
-                &device,
-            );
-            let weight =
-                Tensor::<1>::from_data(TensorData::new(weights[tap].clone(), [patches]), &device);
+            let mut index = indices[tap].clone();
+            let mut weight = weights[tap].clone();
+            for _ in 1..frames {
+                index.extend_from_slice(&indices[tap]);
+                weight.extend_from_slice(&weights[tap]);
+            }
+            debug_assert_eq!(index.len(), patches);
+            let index = Tensor::<1, Int>::from_data(TensorData::new(index, [patches]), &device);
+            let weight = Tensor::<1>::from_data(TensorData::new(weight, [patches]), &device);
             let row = self.position_table.clone().select(0, index) * weight.reshape([patches, 1]);
             position = Some(match position {
                 Some(sum) => sum + row,
@@ -392,12 +458,12 @@ impl VisionTower {
             x = x + position;
         }
 
-        // Axial RoPE tables for this image.
-        let (cos, sin) = axial_rope_tables(image.grid, config, &x.device());
+        // Axial RoPE tables for this grid (repeated per frame for a video).
+        let (cos, sin) = axial_rope_tables(grid, config, &x.device());
         let scale = (head_dim as f64).powf(-0.5);
 
         for block in &self.blocks {
-            // Attention: pre-LN, q|k|v, rope, per-image full attention, proj.
+            // Attention: pre-LN, q|k|v, rope, per-frame full attention, proj.
             let h = layer_norm(x.clone(), &block.norm1_w, &block.norm1_b);
             let qkv = linear(h, &block.qkv_w, &block.qkv_b).reshape([patches, 3, heads, head_dim]);
             let q = qkv
@@ -413,24 +479,48 @@ impl VisionTower {
                 .reshape([patches, heads, head_dim]);
             let q = apply_axial_rope(q, &cos, &sin);
             let k = apply_axial_rope(k, &cos, &sin);
-            let q = q.swap_dims(0, 1).unsqueeze_dim::<4>(0);
-            let k = k.swap_dims(0, 1).unsqueeze_dim::<4>(0);
-            let v = v.swap_dims(0, 1).unsqueeze_dim::<4>(0);
-            let attn = attention(
-                q,
-                k,
-                v,
-                None,
-                None,
-                AttentionModuleOptions {
-                    scale: Some(scale),
-                    softcap: None,
-                    is_causal: false,
-                },
-            )
-            .reshape([heads, patches, head_dim])
-            .swap_dims(0, 1)
-            .reshape([patches, hidden]);
+            let mut frames_out = Vec::with_capacity(frames);
+            for frame in 0..frames {
+                let start = frame * frame_patches;
+                let end = start + frame_patches;
+                let qf = q
+                    .clone()
+                    .slice(s![start..end, .., ..])
+                    .swap_dims(0, 1)
+                    .unsqueeze_dim::<4>(0);
+                let kf = k
+                    .clone()
+                    .slice(s![start..end, .., ..])
+                    .swap_dims(0, 1)
+                    .unsqueeze_dim::<4>(0);
+                let vf = v
+                    .clone()
+                    .slice(s![start..end, .., ..])
+                    .swap_dims(0, 1)
+                    .unsqueeze_dim::<4>(0);
+                frames_out.push(
+                    attention(
+                        qf,
+                        kf,
+                        vf,
+                        None,
+                        None,
+                        AttentionModuleOptions {
+                            scale: Some(scale),
+                            softcap: None,
+                            is_causal: false,
+                        },
+                    )
+                    .reshape([heads, frame_patches, head_dim])
+                    .swap_dims(0, 1)
+                    .reshape([frame_patches, hidden]),
+                );
+            }
+            let attn = if frames_out.len() == 1 {
+                frames_out.remove(0)
+            } else {
+                Tensor::cat(frames_out, 0)
+            };
             x = x + linear(attn, &block.proj_w, &block.proj_b);
 
             // MLP: pre-LN, fc1, gelu_pytorch_tanh, fc2.
@@ -447,7 +537,7 @@ impl VisionTower {
         // to 4.7e-4 per element (9.8e-5 at x = 2), which was the whole pooled
         // residual of the first cut.
         let h = layer_norm(x, &self.merger.norm_w, &self.merger.norm_b);
-        let tokens = config.merged_tokens(grid_h, grid_w);
+        let tokens = config.merged_tokens(grid_h, grid_w) * frames;
         let h = h.reshape([tokens, config.merge_unit() * hidden]);
         let h = linear(h, &self.merger.fc1_w, &self.merger.fc1_b);
         let h = gelu(h);

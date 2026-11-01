@@ -18,10 +18,11 @@ order, which is what a parity run compares.
 
 Request file: a JSON array of ``{"name": str, "state": <string or JSON value>,
 "questions": {qid: {"type": "choice"|"noul"|"score", "instructions": str,
-"criteria": ...}}, "images": [path, ...]}`` -- exactly the arguments of one
-``system_one`` call; ``images`` is optional (absent = the text path) and lists local
-paths the request shares across all of its questions.  Videos are not part of the
-request objects.
+"criteria": ...}}, "images": [path, ...], "videos": [path, ...]}`` -- exactly the
+arguments of one ``system_one`` call; ``images`` and ``videos`` are optional (absent =
+the text path) and list local paths the request shares across all of its questions.
+A case with ``videos`` takes the runtime's video path (which also processes its
+``images``); video frames are decoded by OpenCV, exactly as the runtime does.
 
 Usage:
     decision_reference.py --model /path/to/d3-lite --requests fixtures.json \
@@ -62,6 +63,17 @@ vision tower's pooled output (``.pooled.npy``: the concatenation of
 multimodal RoPE positions (``.mrope.npy``, ``[3, 1, L]`` int64), the final-normed
 hidden (``.hidden.npy``), the raw code logits (``.logits.npy``) and a
 ``DIR/index.json``.
+
+A **video** case dumps the same set from its video path: the processor's
+``pixel_values_videos`` (``.pixel_values_videos.npy``, ``[T*H*W, 1536]``),
+``video_grid_thw`` (``.video_grid_thw.npy``, ``[n, 3]``), the request's images
+(``.pixel_values.npy``/``.image_grid_thw.npy`` when it has any), the expanded prompt
+(the runtime's own ``replace_image_token``/``replace_video_token`` text, including the
+per-frame timestamps), the tokenized rows, the tower's pooled output
+(``backbone.get_video_features(...).pooler_output``, concatenated over videos), the
+positions and the rest, plus every sampled source frame as decoded RGB
+(``.frames.{i}.npy``, uint8 ``[frames, height, width, 3]``) and the sampling metadata
+(``.video_metadata.json``: per video ``fps``/``total_frames``/``frames_indices``).
 
 dtype: the official runtime fixes BF16 for the backbone (its ``D3Model`` refuses a
 ``dtype`` argument).  ``--backbone-dtype f32`` keeps the official runtime and casts the
@@ -124,21 +136,23 @@ def load_requests(path: Path) -> list[dict]:
     names = set()
     for i, case in enumerate(cases):
         required = {"name", "state", "questions"}
-        optional = {"images"}
+        optional = {"images", "videos"}
         if (
             not isinstance(case, dict)
             or not required <= set(case)
             or set(case) - required - optional
         ):
             raise SystemExit(
-                f"{path}: case {i} must hold exactly name, state, questions and optionally images"
+                f"{path}: case {i} must hold exactly name, state, questions and optionally "
+                "images and videos"
             )
-        images = case.get("images")
-        if images is not None:
-            if not isinstance(images, list) or not images:
-                raise SystemExit(f"{path}: case {i} images must be a nonempty list of paths")
-            if not all(isinstance(p, str) and p for p in images):
-                raise SystemExit(f"{path}: case {i} image paths must be nonempty strings")
+        for field in ("images", "videos"):
+            media = case.get(field)
+            if media is not None:
+                if not isinstance(media, list) or not media:
+                    raise SystemExit(f"{path}: case {i} {field} must be a nonempty list of paths")
+                if not all(isinstance(p, str) and p for p in media):
+                    raise SystemExit(f"{path}: case {i} {field} paths must be nonempty strings")
         name = case["name"]
         if not isinstance(name, str) or not name:
             raise SystemExit(f"{path}: case {i} has no name")
@@ -197,12 +211,15 @@ class Recorder:
         self.original_encoder = runtime.encoder
         self.original_logits = runtime.logits
         self.original_image_logits = getattr(runtime, "image_logits", None)
+        self.original_video_logits = getattr(runtime, "video_logits", None)
         self.original_processor = getattr(runtime, "processor", None)
         self.proxy: ProcessorProxy | None = None
         self.pending = None
         self.pending_texts: list[str] | None = None
+        self.pending_video_texts: list[str] | None = None
         self.frames: list[tuple[list[list[int]], "object"]] = []
         self.image_frames: list[tuple[list[str], "object"]] = []
+        self.video_frames: list[tuple[list[str], "object"]] = []
 
     def __enter__(self):
         runtime, recorder = self.runtime, self
@@ -214,6 +231,10 @@ class Recorder:
         def image_logits(texts, images, counts, width):
             recorder.pending_texts = list(texts)
             return recorder.original_image_logits(texts, images, counts, width)
+
+        def video_logits(texts, prepared, features, counts, width):
+            recorder.pending_video_texts = list(texts)
+            return recorder.original_video_logits(texts, prepared, features, counts, width)
 
         def encoder(embeds, present, mrope=None):
             out = (
@@ -232,11 +253,18 @@ class Recorder:
                     raise RuntimeError("encoder rows do not match the image batch")
                 recorder.image_frames.append((recorder.pending_texts, rows))
                 recorder.pending_texts = None
+            if recorder.pending_video_texts is not None:
+                if rows.shape[0] != len(recorder.pending_video_texts):
+                    raise RuntimeError("encoder rows do not match the video batch")
+                recorder.video_frames.append((recorder.pending_video_texts, rows))
+                recorder.pending_video_texts = None
             return out
 
         runtime.logits = logits
         if self.original_image_logits is not None:
             runtime.image_logits = image_logits
+        if self.original_video_logits is not None:
+            runtime.video_logits = video_logits
         if self.original_processor is not None:
             self.proxy = ProcessorProxy(self.original_processor)
             runtime.processor = self.proxy
@@ -247,6 +275,8 @@ class Recorder:
         self.runtime.logits = self.original_logits
         if self.original_image_logits is not None:
             self.runtime.image_logits = self.original_image_logits
+        if self.original_video_logits is not None:
+            self.runtime.video_logits = self.original_video_logits
         if self.original_processor is not None:
             self.runtime.processor = self.original_processor
         self.runtime.encoder = self.original_encoder
@@ -262,6 +292,9 @@ class Recorder:
     def hidden_by_text(self) -> dict[str, "object"]:
         table = {}
         for texts, rows in self.image_frames:
+            for text, row in zip(texts, rows):
+                table[text] = row
+        for texts, rows in self.video_frames:
             for text, row in zip(texts, rows):
                 table[text] = row
         return table
@@ -361,6 +394,157 @@ def dump_image_question(
     }
 
 
+def video_expanded_text(runtime, prepared, text: str) -> str:
+    """The prompt ``D3.video_logits`` feeds the tokenizer for one question.
+
+    Same two calls the runtime makes: ``replace_image_token`` for every image, then
+    ``get_text_with_replacements`` with the request's per-video replacement strings
+    (which already carry the timestamps and the per-group vision markers).
+    """
+    processor = runtime.processor
+    media = prepared.media
+    image_texts = [
+        processor.replace_image_token(media, image_idx=i)
+        for i in range(len(prepared.images))
+    ]
+    return processor.get_text_with_replacements([text], image_texts, prepared.video_texts)[0][0]
+
+
+def dump_video_question(
+    torch,
+    runtime,
+    recorder: "Recorder",
+    prepared,
+    qid: str,
+    stem: str,
+    out_dir: Path,
+    row,
+    options: int,
+) -> dict:
+    """Write the video-path tensors the runtime reads for one question.
+
+    ``pixel_values_videos``/``video_grid_thw``/``pixel_values``/``image_grid_thw`` are
+    the processor's own outputs (``D3._prepare_videos`` keeps them in
+    ``prepared.media``); the expanded prompt, ids and type ids are the exact
+    ``video_logits`` steps; ``pooled``/``mrope`` are the backbone's
+    ``get_video_features`` and ``compute_3d_position_ids`` on those tensors.
+    """
+    import json as _json
+
+    text = prepared.texts[qid]
+    if recorder.proxy is None:
+        raise RuntimeError("the runtime has no processor; cannot dump video tensors")
+    media = prepared.media
+    expanded = video_expanded_text(runtime, prepared, text)
+    tokenizer = runtime.processor.tokenizer
+    encoded = tokenizer(
+        expanded, padding=False, return_token_type_ids=False, return_tensors="pt"
+    )
+    ids = encoded["input_ids"].to(torch.int64)
+    mask = encoded["attention_mask"].to(torch.int64)
+    mm = torch.as_tensor(
+        runtime.processor.create_mm_token_type_ids(encoded["input_ids"]),
+        dtype=torch.int64,
+    )
+    video_grid = media["video_grid_thw"].to(torch.int64)
+    pixel_values_videos = media["pixel_values_videos"].to(torch.float32)
+    image_grid = media.get("image_grid_thw")
+    pixel_values = media.get("pixel_values")
+    device = runtime.device
+    backbone = runtime.backbone
+    with torch.inference_mode():
+        pooler = backbone.get_video_features(
+            pixel_values_videos.to(device), video_grid.to(device), return_dict=True
+        ).pooler_output
+        pooled = torch.cat(list(pooler), dim=0).float().cpu()
+        embeds = backbone.get_input_embeddings()(ids.to(device))
+        mrope = backbone.compute_3d_position_ids(
+            input_ids=ids.to(device),
+            image_grid_thw=(
+                image_grid.to(torch.int64).to(device) if image_grid is not None else None
+            ),
+            video_grid_thw=video_grid.to(device),
+            inputs_embeds=embeds,
+            attention_mask=mask.to(device),
+            past_key_values=None,
+            mm_token_type_ids=mm.to(device),
+        )
+    if mrope is None:
+        raise RuntimeError(f"{stem}: the backbone returned no multimodal positions")
+    logits = (row.float() @ runtime.readout.T.cpu()).numpy().astype(np.float32)
+
+    files = {
+        "pixel_values_videos": f"{stem}.pixel_values_videos.npy",
+        "video_grid_thw": f"{stem}.video_grid_thw.npy",
+        "input_ids": f"{stem}.input_ids.npy",
+        "mm_token_type_ids": f"{stem}.mm_token_type_ids.npy",
+        "attention_mask": f"{stem}.attention_mask.npy",
+        "expanded_text": f"{stem}.expanded_text.txt",
+        "pooled": f"{stem}.pooled.npy",
+        "mrope": f"{stem}.mrope.npy",
+        "hidden": f"{stem}.hidden.npy",
+        "logits": f"{stem}.logits.npy",
+    }
+    np.save(out_dir / files["pixel_values_videos"], pixel_values_videos.numpy().astype(np.float32))
+    np.save(out_dir / files["video_grid_thw"], video_grid.numpy().astype(np.int64))
+    np.save(out_dir / files["input_ids"], ids.numpy().astype(np.int64))
+    np.save(out_dir / files["mm_token_type_ids"], mm.numpy().astype(np.int64))
+    np.save(out_dir / files["attention_mask"], mask.numpy().astype(np.int64))
+    (out_dir / files["expanded_text"]).write_text(expanded, encoding="utf-8")
+    np.save(out_dir / files["pooled"], pooled.numpy().astype(np.float32))
+    np.save(out_dir / files["mrope"], mrope.cpu().numpy().astype(np.int64))
+    np.save(out_dir / files["hidden"], row.numpy().astype(np.float32))
+    np.save(out_dir / files["logits"], logits)
+    if pixel_values is not None and image_grid is not None:
+        files["pixel_values"] = f"{stem}.pixel_values.npy"
+        files["image_grid_thw"] = f"{stem}.image_grid_thw.npy"
+        np.save(out_dir / files["pixel_values"], pixel_values.float().numpy().astype(np.float32))
+        np.save(
+            out_dir / files["image_grid_thw"],
+            image_grid.to(torch.int64).numpy().astype(np.int64),
+        )
+
+    # The sampled source frames as decoded (OpenCV BGR -> RGB) and where they come
+    # from; the Rust probe compares both against its ffmpeg decode.
+    videos = []
+    for index, video in enumerate(prepared.videos):
+        frames = np.ascontiguousarray(video.frames)
+        if frames.dtype != np.uint8 or frames.ndim != 4 or frames.shape[-1] != 3:
+            raise RuntimeError(f"{stem}: unexpected frame array {frames.shape} {frames.dtype}")
+        name = f"{stem}.frames.{index}.npy"
+        np.save(out_dir / name, frames)
+        videos.append(
+            {
+                "frames_file": name,
+                "fps": float(video.fps),
+                "total_frames": int(video.total_frames),
+                "frames_indices": [int(i) for i in video.indices],
+                "source": [int(frames.shape[2]), int(frames.shape[1])],
+                "frame_count": int(frames.shape[0]),
+            }
+        )
+    metadata_name = f"{stem}.video_metadata.json"
+    (out_dir / metadata_name).write_text(
+        _json.dumps({"videos": videos}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    files["video_metadata"] = metadata_name
+
+    merge = int(runtime.processor.video_processor.merge_size) ** 2
+    frame_rows = [int(g[0] * g[1] * g[2]) // merge for g in video_grid.tolist()]
+    return {
+        "case": stem.split("__")[0],
+        "question": qid,
+        "images": len(prepared.images),
+        "videos": len(prepared.videos),
+        "files": files,
+        "tokens": prepared.lengths[qid],
+        "sequence_tokens": int(ids.shape[1]),
+        "grid": video_grid.tolist(),
+        "video_tokens": frame_rows,
+        "options": options,
+    }
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
 
@@ -430,9 +614,14 @@ def main(argv=None) -> int:
     for index, case in enumerate(cases, 1):
         name = case["name"]
         images = case.get("images")
+        videos = case.get("videos")
         case_started = time.perf_counter()
         try:
-            if images:
+            if videos:
+                prepared = runtime.prepare(
+                    case["state"], case["questions"], images=images or [], videos=videos
+                )
+            elif images:
                 prepared = runtime.prepare(case["state"], case["questions"], images=images)
             else:
                 prepared = runtime.prepare(case["state"], case["questions"])
@@ -483,6 +672,8 @@ def main(argv=None) -> int:
             }
             if expanded is not None:
                 record["images"] = len(prepared.images)
+                if prepared.videos:
+                    record["videos"] = len(prepared.videos)
             questions[qid] = record
             total_questions += 1
             if dump_dir is not None and expanded is None:
@@ -514,9 +705,10 @@ def main(argv=None) -> int:
                 })
             if dump_vision_dir is not None and expanded is not None:
                 if row is None:
-                    raise RuntimeError(f"{name}/{qid}: no recorded final hidden for its image forward")
+                    raise RuntimeError(f"{name}/{qid}: no recorded final hidden for its media forward")
                 stem = f"{sanitize(name)}__{sanitize(qid)}"
-                entry = dump_image_question(
+                dump = dump_video_question if prepared.videos else dump_image_question
+                entry = dump(
                     torch, runtime, recorder, prepared, qid, stem, dump_vision_dir,
                     row, len(labels),
                 )
@@ -531,6 +723,8 @@ def main(argv=None) -> int:
         request = {"state": case["state"], "questions": case["questions"]}
         if images:
             request["images"] = list(images)
+        if videos:
+            request["videos"] = list(videos)
         out_cases.append({
             "name": name,
             "elapsed_s": round(elapsed, 3),

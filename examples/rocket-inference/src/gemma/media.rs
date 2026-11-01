@@ -896,6 +896,16 @@ fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Write `bytes` to a temporary file with this extension and return it as a
+/// [`ResolvedMedia`], so the file is removed when the guard drops.
+///
+/// The decoders (ffmpeg, hound) pick their backend by file extension, so a caller
+/// that only has encoded bytes needs a named file on disk; the d3 video path uses
+/// this for `data:video/...` uploads and removes the file after decoding.
+pub(crate) fn temporary_file(bytes: &[u8], ext: &str) -> Result<ResolvedMedia, String> {
+    Ok(ResolvedMedia::temp(write_temp(bytes, ext)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

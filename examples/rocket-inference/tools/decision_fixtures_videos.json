@@ -1,0 +1,104 @@
+[
+  {
+    "name": "video-example",
+    "videos": ["/tmp/opencode/d3/models/d3-lite/assets/example-video.mp4"],
+    "state": "A short clip from a test camera.",
+    "questions": {
+      "direction": {
+        "type": "choice",
+        "instructions": "Which way does the square move?",
+        "criteria": {
+          "right": "From left to right",
+          "left": "From right to left",
+          "still": "It does not move"
+        }
+      },
+      "color_change": {
+        "type": "noul",
+        "instructions": "Does the square change color?"
+      }
+    }
+  },
+  {
+    "name": "video-testcard",
+    "videos": ["data/test.mp4"],
+    "state": "A screen recording attached to a playback report.",
+    "questions": {
+      "content": {
+        "type": "choice",
+        "instructions": "What does the recording show?",
+        "criteria": {
+          "test_card": "Colour bars with a counter",
+          "person": "A person talking to the camera",
+          "street": "A street with passing traffic"
+        }
+      },
+      "counter": {
+        "type": "noul",
+        "instructions": "Does a number in the picture change during the clip?"
+      }
+    }
+  },
+  {
+    "name": "video-longer",
+    "videos": ["/tmp/opencode/d3/models/d3-lite/assets/example-video.mp4"],
+    "state": "Camera footage from the QA bench.",
+    "questions": {
+      "rate": {
+        "type": "score",
+        "instructions": "How steady is the recording?",
+        "criteria": ["Shaky", "Slightly shaky", "Steady", "Rock steady"]
+      }
+    }
+  },
+  {
+    "name": "video-with-image",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/example-receipt.png"],
+    "videos": ["/tmp/opencode/d3/models/d3-lite/assets/example-video.mp4"],
+    "state": "A receipt and a camera clip from the same support ticket.",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "Which range holds the receipt total?",
+        "criteria": {
+          "under_100": "The total is under 100.00",
+          "100_to_150": "The total is between 100.00 and 150.00",
+          "over_150": "The total is over 150.00"
+        }
+      },
+      "direction": {
+        "type": "choice",
+        "instructions": "Which way does the square in the clip move?",
+        "criteria": {
+          "right": "From left to right",
+          "left": "From right to left",
+          "still": "It does not move"
+        }
+      }
+    }
+  },
+  {
+    "name": "video-two-clips",
+    "videos": [
+      "/tmp/opencode/d3/models/d3-lite/assets/example-video.mp4",
+      "data/test.mp4"
+    ],
+    "state": "Two short clips captured by the same test rig.",
+    "questions": {
+      "which": {
+        "type": "choice",
+        "instructions": "Which clip shows something moving across the frame?",
+        "criteria": {
+          "first": "The first clip",
+          "second": "The second clip",
+          "both": "Both clips",
+          "neither": "Neither clip"
+        }
+      },
+      "both_tests": {
+        "type": "noul",
+        "instructions": "Do both clips look like synthetic test footage?"
+      }
+    }
+  }
+]

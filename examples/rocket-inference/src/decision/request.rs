@@ -12,19 +12,22 @@
 //! question that cannot be answered is reported inside the response's `answers`
 //! (see [`crate::decision::model`]); only envelope problems fail the request.
 //!
-//! Media: `images` is a list shared by every question of the request. How those
-//! entries are read depends on the transport ([`MediaMode`]): the server takes
-//! `data:image/{png,jpeg,webp};base64,...` URLs only (the reference `d3_server.py`
-//! contract, see [`decode_data_url`]), the CLI takes local paths so the parity
-//! fixtures can point at the checkpoint's own assets. Both decode the *bytes* by
-//! content (magic number), like `PIL.Image.open`, so a JPEG declared as
-//! `image/png` decodes as a JPEG. `videos` is phase 3: a non-empty list is
-//! refused up front.
+//! Media: `images` and `videos` are lists shared by every question of the
+//! request. How those entries are read depends on the transport ([`MediaMode`]):
+//! the server takes `data:image/{png,jpeg,webp};base64,...` and
+//! `data:video/{mp4,webm,quicktime,x-matroska};base64,...` URLs only (the
+//! reference `d3_server.py` contract, see [`decode_data_url`] and
+//! [`decode_video_data_url`]), the CLI takes local paths so the parity fixtures
+//! can point at the checkpoint's own assets. Image bytes decode by content (magic
+//! number), like `PIL.Image.open`, so a JPEG declared as `image/png` decodes as a
+//! JPEG; a video is written to a temporary file and decoded by `ffmpeg`, exactly
+//! like the same clip given by path.
 
 use anyhow::Result;
 use image::RgbImage;
 use serde_json::{Map, Value};
 
+use crate::decision::vision::video::{self, DecodedVideo};
 use crate::gemma::media::{decode_image, load_image};
 
 /// The fields a request may carry (the reference's `ACCEPTED_FIELDS`).
@@ -44,6 +47,14 @@ pub const STRICT_IMAGE_MESSAGE: &str = "strict mode: images must be given as a d
 /// The in-process loader's list of accepted shapes (a non-string or empty entry).
 pub const IMAGE_SHAPES_MESSAGE: &str =
     "an image is a PIL image, a local path, an http(s) URL or a data:image/...;base64 URL";
+/// `d3_runtime.load_video`'s list of accepted shapes (a non-string or empty
+/// entry).
+pub const VIDEO_SHAPES_MESSAGE: &str =
+    "a video is a path, an http(s) URL, a data:video/...;base64 URL or a frame array";
+/// `d3_runtime.load_video(..., strict=True)`'s refusal of anything that is not a
+/// `data:` URL string: the server never reads files or fetches URLs for a client.
+pub const STRICT_VIDEO_MESSAGE: &str =
+    "cannot load this video with strict=True; pass the clip inline as a data:video/... URL";
 
 /// How a request's `images` entries are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +86,35 @@ impl MediaMode {
         };
         decoded.map_err(|message| format!("images[{index}]: {message}"))
     }
+
+    /// Decode one `videos` entry, or the message a client gets
+    /// (`d3_runtime.load_video`, prefixed `videos[i]: `).
+    ///
+    /// `Paths` reads a local file (`no video file at <path>` when it is absent);
+    /// `DataUrls` takes the reference's strict contract (data URLs of MP4, WebM,
+    /// QuickTime or Matroska at most 32,000,000 decoded bytes, 8,294,400 pixels per
+    /// frame and 300 seconds) and never touches the filesystem beyond a temporary
+    /// file the decoder reads and removes.
+    pub fn decode_video(self, value: &Value, index: usize) -> Result<DecodedVideo, String> {
+        let decoded = match value.as_str().filter(|text| !text.is_empty()) {
+            None => Err(match self {
+                Self::DataUrls => STRICT_VIDEO_MESSAGE.to_string(),
+                Self::Paths => VIDEO_SHAPES_MESSAGE.to_string(),
+            }),
+            Some(text) => match self {
+                Self::Paths => {
+                    let path = std::path::Path::new(text);
+                    if !path.is_file() {
+                        Err(format!("no video file at {text}"))
+                    } else {
+                        video::decode(path, false)
+                    }
+                }
+                Self::DataUrls => decode_video_data_url(text),
+            },
+        };
+        decoded.map_err(|message| format!("videos[{index}]: {message}"))
+    }
 }
 
 /// One System One request.
@@ -88,7 +128,8 @@ pub struct DecisionRequest {
     /// depending on the transport; kept as JSON so a non-string entry gets the
     /// loader's own message rather than an envelope error).
     pub images: Vec<Value>,
-    /// Video inputs: kept for phase 3, refused by [`DecisionRequest::parse`].
+    /// Video inputs shared by every question, as given (paths or data URLs, like
+    /// [`DecisionRequest::images`]).
     pub videos: Vec<Value>,
 }
 
@@ -157,9 +198,6 @@ impl DecisionRequest {
         }
         let images = media_list("images", &images)?;
         let videos = media_list("videos", &videos)?;
-        if !videos.is_empty() {
-            return Err("videos are not supported yet".to_string());
-        }
         Ok(Self {
             state,
             questions,
@@ -177,6 +215,18 @@ impl DecisionRequest {
             .iter()
             .enumerate()
             .map(|(index, value)| mode.decode(value, index))
+            .collect()
+    }
+
+    /// Decode this request's `videos` for the transport in `mode`, in list order.
+    ///
+    /// The message is the reference's (`videos[0]: <reason>`), which the server
+    /// returns as a 422 `detail` string.
+    pub fn decode_videos(&self, mode: MediaMode) -> Result<Vec<DecodedVideo>, String> {
+        self.videos
+            .iter()
+            .enumerate()
+            .map(|(index, value)| mode.decode_video(value, index))
             .collect()
     }
 }
@@ -248,6 +298,32 @@ pub fn decode_data_url(value: &str) -> Result<RgbImage, String> {
         ));
     }
     decode_image(&bytes).map_err(|e| format!("the image could not be decoded ({e:#})"))
+}
+
+/// One served video: the strict, server-side reading of a `videos` entry
+/// (`d3_runtime.load_video(..., strict=True)`), i.e. a `data:video/<type>;base64,`
+/// URL of MP4, WebM, QuickTime or Matroska, at most
+/// [`video::MAX_BYTES`](crate::decision::vision::video::MAX_BYTES) decoded bytes,
+/// whose frames are at most 8,294,400 pixels and whose clip is at most 300
+/// seconds.
+///
+/// The reference decodes encoded bytes from a temporary file so they decode
+/// exactly like the same clip given by path; this writes one too and removes it
+/// after the frames are read.
+pub fn decode_video_data_url(value: &str) -> Result<DecodedVideo, String> {
+    if !value.starts_with("data:") {
+        return Err(STRICT_VIDEO_MESSAGE.to_string());
+    }
+    let (rest, text) = split_data_url(value, "video")?;
+    let subtype = rest.split(';').next().unwrap_or("");
+    if !video::FORMATS.contains(&subtype) {
+        return Err(format!(
+            "video data URLs take the types {}, got '{subtype}'",
+            video::FORMATS.join(", ")
+        ));
+    }
+    let bytes = decode_base64(text, video::MAX_BYTES)?;
+    video::decode_bytes(&bytes, video::extension_for(subtype), true)
 }
 
 /// `d3_runtime._decode_base64`: validated base64 with the reference's limits.
@@ -366,10 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn media_is_parsed_and_videos_are_refused() {
+    fn media_is_parsed_for_both_fields() {
         let req = parse(json!({
             "questions": {"q": {"type": "noul"}},
             "images": ["a.png", "data:image/png;base64,AA=="],
+            "videos": ["clip.mp4", "data:video/mp4;base64,AA=="],
         }))
         .unwrap();
         assert_eq!(
@@ -377,14 +454,10 @@ mod tests {
             [json!("a.png"), json!("data:image/png;base64,AA==")],
             "entries are kept as given; the transport decodes them"
         );
-        assert!(req.videos.is_empty());
-
-        let err = parse(json!({
-            "questions": {"q": {"type": "noul"}},
-            "videos": ["data:video/mp4;base64,AA=="],
-        }))
-        .unwrap_err();
-        assert_eq!(err, "videos are not supported yet");
+        assert_eq!(
+            req.videos,
+            [json!("clip.mp4"), json!("data:video/mp4;base64,AA==")]
+        );
 
         // Only the list shape is checked here; the entries are the loader's job
         // (so the message can name the transport's accepted shapes).
@@ -397,6 +470,86 @@ mod tests {
         let req = parse(json!({"questions": {"q": {"type": "noul"}}, "images": [], "videos": []}))
             .unwrap();
         assert!(req.images.is_empty() && req.videos.is_empty());
+    }
+
+    /// The strict server reading of a `videos` entry: data URLs of the four
+    /// whitelisted types with the reference's messages.
+    #[test]
+    fn video_data_urls_are_checked_like_the_reference_server() {
+        assert_eq!(
+            decode_video_data_url("clip.mp4").unwrap_err(),
+            "cannot load this video with strict=True; pass the clip inline as a \
+             data:video/... URL"
+        );
+        let err = decode_video_data_url("data:video/gif;base64,QUJD").unwrap_err();
+        assert_eq!(
+            err,
+            "video data URLs take the types mp4, webm, quicktime, x-matroska, got 'gif'"
+        );
+        assert_eq!(
+            decode_video_data_url("data:video/mp4,QUJD").unwrap_err(),
+            "expected a base64 data URL: data:video/<type>;base64,<data>"
+        );
+        assert_eq!(
+            decode_video_data_url("data:video/mp4;base64,!!").unwrap_err(),
+            "the data URL does not hold valid base64"
+        );
+        // The encoded-text guard comes before any decode.
+        let huge = "A".repeat(4 * video::MAX_BYTES.div_ceil(3) + 4);
+        let err = decode_video_data_url(&format!("data:video/mp4;base64,{huge}")).unwrap_err();
+        assert_eq!(err, "the encoded data exceeds the 32,000,000 byte limit");
+        // Valid base64 that is not a video.
+        let err = decode_video_data_url("data:video/mp4;base64,QUJD").unwrap_err();
+        assert!(err.contains("the video could not be opened"), "{err}");
+
+        // A non-string or empty entry takes the transport's wording.
+        let req = parse(json!({"questions": {"q": {"type": "noul"}}, "videos": [""]})).unwrap();
+        assert_eq!(
+            req.decode_videos(MediaMode::DataUrls).unwrap_err(),
+            format!("videos[0]: {STRICT_VIDEO_MESSAGE}")
+        );
+        assert_eq!(
+            req.decode_videos(MediaMode::Paths).unwrap_err(),
+            format!("videos[0]: {VIDEO_SHAPES_MESSAGE}")
+        );
+    }
+
+    /// A real data URL round trip through ffmpeg: the repo's test clip encodes to
+    /// the same sampled frames as the file. The temporary file the decoder writes
+    /// is gone afterwards.
+    #[test]
+    fn a_video_data_url_decodes_to_the_same_frames_as_the_path() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test.mp4");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("skipping: {} is not available", path.display());
+            return;
+        };
+        use base64::Engine;
+        let url = format!(
+            "data:video/mp4;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        let decoded = decode_video_data_url(&url).unwrap();
+        let expected = video::decode(&path, true).unwrap();
+        assert_eq!(decoded.indices, expected.indices);
+        assert_eq!(decoded.fps, expected.fps);
+        assert_eq!(decoded.total, expected.total);
+        assert_eq!(decoded.frame_count(), expected.frame_count());
+        for (a, b) in decoded.frames.iter().zip(&expected.frames) {
+            assert_eq!(a.as_raw(), b.as_raw(), "same RGB8 frames");
+        }
+        // The path mode agrees too.
+        let via_path = MediaMode::Paths
+            .decode_video(&json!(path.to_str().unwrap()), 0)
+            .unwrap();
+        assert_eq!(via_path.frames.len(), expected.frames.len());
+        // A missing file names itself.
+        assert_eq!(
+            MediaMode::Paths
+                .decode_video(&json!("/nonexistent/clip.mp4"), 2)
+                .unwrap_err(),
+            "videos[2]: no video file at /nonexistent/clip.mp4"
+        );
     }
 
     /// The strict server reading of an `images` entry: data URLs only, with the

@@ -42,6 +42,17 @@ pub const MAX_PIXELS: usize = 1_638_400;
 /// `smart_resize`'s aspect-ratio ceiling.
 pub const MAX_ASPECT_RATIO: f64 = 200.0;
 
+/// `d3_runtime.VIDEO_MIN_PIXELS` (the video processor's `shortest_edge`).
+pub const VIDEO_MIN_PIXELS: usize = 4_096;
+/// `d3_runtime.VIDEO_MAX_PIXELS`: the per-frame pixel ceiling the processor's
+/// `cap_pixels_per_frame` enforces (0.2 MP, 200,704 = 196 * 32^2).
+pub const VIDEO_MAX_PIXELS: usize = 200_704;
+/// `d3_runtime.VIDEO_MAX_FRAMES`: the `longest_edge` the runtime configures is
+/// this many frames' worth of pixels.
+pub const VIDEO_MAX_FRAMES: usize = 32;
+/// `d3_runtime.VIDEO_MAX_TOKENS`: all videos of one request together.
+pub const VIDEO_MAX_TOKENS: usize = 16_384;
+
 /// One preprocessed image, ready for the vision tower.
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
@@ -67,6 +78,45 @@ impl PreparedImage {
     /// The patch grid as `(rows, cols)`.
     pub fn patch_grid(&self) -> (usize, usize) {
         (self.grid[1], self.grid[2])
+    }
+}
+
+/// One preprocessed video, ready for the vision tower.
+///
+/// A video's temporal pairs are packed into patches exactly like an image, with
+/// one extra axis: the sample's `frames / temporal_patch_size` pairs come first,
+/// then the merge block, the in-block patch and the `[channel, temporal,
+/// patch_row, patch_col]` values of the pair (`Qwen3VLVideoProcessor.patchify`).
+#[derive(Debug, Clone)]
+pub struct PreparedVideo {
+    /// `[T * grid_h * grid_w, in_channels * temporal_patch_size * patch^2]` f32
+    /// pixel values in `[-1, 1]`, pairs in merge-block order.
+    pub pixel_values: Tensor<2>,
+    /// `[T = frames / 2, grid_h, grid_w]` patch grid.
+    pub grid: [usize; 3],
+    /// Merged tokens the whole video contributes to the prompt
+    /// (`T * grid_h * grid_w / merge^2`).
+    pub tokens: usize,
+    /// Merged tokens one temporal pair contributes (`grid_h * grid_w / merge^2`),
+    /// the number of `<|video_pad|>` tokens inside one prompt group.
+    pub frame_tokens: usize,
+    /// Frames the video was sampled at (even: one per temporal pair).
+    pub frames: usize,
+    /// `(height, width)`, in pixels, of the sampled frames (all the same size).
+    pub source: (usize, usize),
+    /// `(height, width)` after `smart_resize`.
+    pub resized: (usize, usize),
+}
+
+impl PreparedVideo {
+    /// Patch rows packed (`frames * grid_h * grid_w`).
+    pub fn patches(&self) -> usize {
+        self.grid[0] * self.grid[1] * self.grid[2]
+    }
+
+    /// The patch grid as `(frames, rows, cols)`.
+    pub fn patch_grid(&self) -> (usize, usize, usize) {
+        (self.grid[0], self.grid[1], self.grid[2])
     }
 }
 
@@ -250,6 +300,238 @@ pub fn prepare_image(
 ) -> Result<PreparedImage> {
     let img = load_image(path).with_context(|| format!("load the d3 image {}", path.display()))?;
     prepare_from_rgb(&img, config, device)
+}
+
+/// `Qwen3VLVideoProcessor`'s per-frame pixel budget for `frames` sampled frames.
+///
+/// The processor `resize` builds `max_pixels` exactly like this when
+/// `cap_pixels_per_frame` is on (the runtime turns it on): the per-frame cap is
+/// `max_video_tokens * factor^2`, the budget's even share is
+/// `longest_edge // frames`, and a frame never drops below `int(shortest_edge *
+/// 1.05)` pixels. `get_num_of_video_patches` uses the same arithmetic, so the
+/// planned token count and the resize agree.
+pub fn video_max_pixels(frames: usize, config: &VisionConfig) -> usize {
+    let factor = config.pixel_factor();
+    let max_video_tokens = VIDEO_MAX_PIXELS / (factor * factor);
+    let frame_cap = max_video_tokens * factor * factor;
+    let share = (VIDEO_MAX_PIXELS * VIDEO_MAX_FRAMES) / frames.max(1);
+    let floor = (VIDEO_MIN_PIXELS as f64 * 1.05) as usize;
+    frame_cap.min(share).max(floor) * frames.max(1)
+}
+
+/// `Qwen3VLVideoProcessor.smart_resize`: the image version with the temporal axis
+/// in the budget, its own grow-tiny-frames step and no `min_pixels` floor after
+/// the shrink.
+pub fn video_smart_resize(
+    frames: usize,
+    height: usize,
+    width: usize,
+    factor: usize,
+    temporal: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize)> {
+    if frames == 0 || height == 0 || width == 0 {
+        bail!("the video has no pixels ({width}x{height}, {frames} frames)");
+    }
+    if temporal == 0 || factor == 0 {
+        bail!("invalid video processor budget (factor {factor}, temporal {temporal})");
+    }
+    if frames < temporal {
+        bail!("t:{frames} must be larger than temporal_factor:{temporal}");
+    }
+    let (mut height, mut width) = (height as f64, width as f64);
+    if height < factor as f64 || width < factor as f64 {
+        let scale = (factor as f64 / height).max(factor as f64 / width);
+        // Python's `int()` truncates.
+        height = (height * scale).trunc();
+        width = (width * scale).trunc();
+    }
+    let aspect = height.max(width) / height.min(width);
+    if aspect > MAX_ASPECT_RATIO {
+        bail!(
+            "absolute aspect ratio must be smaller than {MAX_ASPECT_RATIO}, got {}",
+            python_float(aspect)
+        );
+    }
+    let factor_f = factor as f64;
+    let mut h_bar = round_half_even(height / factor_f) * factor_f;
+    let mut w_bar = round_half_even(width / factor_f) * factor_f;
+    let t_bar = round_half_even(frames as f64 / temporal as f64) * temporal as f64;
+    let budget = t_bar * h_bar * w_bar;
+    if budget > max_pixels as f64 {
+        let beta = ((frames as f64 * height * width) / max_pixels as f64).sqrt();
+        h_bar = ((height / beta / factor_f).floor() * factor_f).max(factor_f);
+        w_bar = ((width / beta / factor_f).floor() * factor_f).max(factor_f);
+    } else if budget < min_pixels as f64 {
+        let beta = (min_pixels as f64 / (frames as f64 * height * width)).sqrt();
+        h_bar = (height * beta / factor_f).ceil() * factor_f;
+        w_bar = (width * beta / factor_f).ceil() * factor_f;
+    }
+    Ok((h_bar as usize, w_bar as usize))
+}
+
+/// Patchify the resized frames of one video into the processor's flat layout.
+///
+/// Rows are `(temporal pair, merge block row, merge block col, in-block row,
+/// in-block col)`; each patch's values are `[channel, temporal, patch_row,
+/// patch_col]` with the pair's two frames in the temporal slots
+/// (`Qwen3VLVideoProcessor.patchify`'s permute).
+pub fn patchify_video(
+    frames: &[RgbImage],
+    config: &VisionConfig,
+) -> Result<(Vec<f32>, [usize; 3])> {
+    let p = config.patch_size;
+    let m = config.spatial_merge_size;
+    let t = config.temporal_patch_size;
+    let channels = config.in_channels;
+    let factor = p * m;
+    if frames.is_empty() {
+        bail!("the video has no frames");
+    }
+    let (w, h) = (frames[0].width() as usize, frames[0].height() as usize);
+    if frames
+        .iter()
+        .any(|frame| (frame.width() as usize, frame.height() as usize) != (w, h))
+    {
+        bail!("all frames of a video must have the same size");
+    }
+    if !h.is_multiple_of(factor) || !w.is_multiple_of(factor) {
+        bail!(
+            "video frames {w}x{h} are not divisible by the patch factor {factor} \
+             (patch {p} * merge {m})"
+        );
+    }
+    if !frames.len().is_multiple_of(t) {
+        bail!(
+            "the video has {} frames, not a multiple of the temporal patch size {t}",
+            frames.len()
+        );
+    }
+    let (grid_t, grid_h, grid_w) = (frames.len() / t, h / p, w / p);
+    let patch_dim = config.patch_dim();
+    let patches = grid_t * grid_h * grid_w;
+    let stride = w * channels;
+    let mut values = Vec::with_capacity(patches * patch_dim);
+    for pair in 0..grid_t {
+        let raw: Vec<&[u8]> = frames[pair * t..(pair + 1) * t]
+            .iter()
+            .map(|frame| frame.as_raw().as_slice())
+            .collect();
+        for block_row in 0..grid_h / m {
+            for block_col in 0..grid_w / m {
+                for in_row in 0..m {
+                    for in_col in 0..m {
+                        let row = block_row * m + in_row;
+                        let col = block_col * m + in_col;
+                        for c in 0..channels {
+                            for frame in &raw {
+                                for i in 0..p {
+                                    let y = row * p + i;
+                                    for j in 0..p {
+                                        let x = col * p + j;
+                                        values.push(normalize_channel(
+                                            frame[y * stride + x * channels + c],
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if values.len() != patches * patch_dim {
+        bail!(
+            "patchify produced {} values, expected {} ({patches} patches of {patch_dim})",
+            values.len(),
+            patches * patch_dim
+        );
+    }
+    Ok((values, [grid_t, grid_h, grid_w]))
+}
+
+/// Merged tokens of a video with `frames` samples whose frames are `height`x
+/// `width`: `get_num_of_video_patches(...) // merge^2`, the runtime's planned
+/// count before any frame is processed.
+pub fn planned_video_tokens(
+    frames: usize,
+    height: usize,
+    width: usize,
+    config: &VisionConfig,
+) -> Result<usize> {
+    let (resized_h, resized_w) = video_smart_resize(
+        frames,
+        height,
+        width,
+        config.pixel_factor(),
+        config.temporal_patch_size,
+        VIDEO_MIN_PIXELS,
+        video_max_pixels(frames, config),
+    )?;
+    let pairs = frames / config.temporal_patch_size;
+    let tokens = pairs * (resized_h / config.patch_size) * (resized_w / config.patch_size);
+    Ok(tokens / config.merge_unit())
+}
+
+/// Preprocess one video's sampled RGB8 frames: `smart_resize`, resize, normalize,
+/// patchify in temporal pairs.
+///
+/// `frames` must be even (the decoder duplicates the last sample when its count is
+/// odd), so every frame belongs to a temporal pair.
+pub fn prepare_video(
+    frames: &[RgbImage],
+    config: &VisionConfig,
+    device: &Device,
+) -> Result<PreparedVideo> {
+    if frames.is_empty() {
+        bail!("the video has no frames");
+    }
+    if !frames.len().is_multiple_of(config.temporal_patch_size) {
+        bail!(
+            "the video has {} sampled frames, not a multiple of the temporal patch size {}",
+            frames.len(),
+            config.temporal_patch_size
+        );
+    }
+    let (source_h, source_w) = (frames[0].height() as usize, frames[0].width() as usize);
+    let (resized_h, resized_w) = video_smart_resize(
+        frames.len(),
+        source_h,
+        source_w,
+        config.pixel_factor(),
+        config.temporal_patch_size,
+        VIDEO_MIN_PIXELS,
+        video_max_pixels(frames.len(), config),
+    )?;
+    let resized: Vec<RgbImage> = frames
+        .iter()
+        .map(|frame| {
+            if (frame.height() as usize, frame.width() as usize) == (resized_h, resized_w) {
+                frame.clone()
+            } else {
+                resize_bicubic_aa(frame, resized_w, resized_h)
+            }
+        })
+        .collect();
+    let (values, grid) = patchify_video(&resized, config)?;
+    let patches = grid[0] * grid[1] * grid[2];
+    let tokens = config.merged_tokens(grid[1], grid[2]) * grid[0];
+    let frame_tokens = config.merged_tokens(grid[1], grid[2]);
+    let pixel_values = Tensor::<2>::from_data(
+        TensorData::new(values, [patches, config.patch_dim()]),
+        device,
+    );
+    Ok(PreparedVideo {
+        pixel_values,
+        grid,
+        tokens,
+        frame_tokens,
+        frames: frames.len(),
+        source: (source_h, source_w),
+        resized: (resized_h, resized_w),
+    })
 }
 
 #[cfg(test)]

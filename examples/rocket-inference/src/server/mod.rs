@@ -158,8 +158,11 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
         app = app.route("/v1/systemone", post(systemone::systemone));
     }
     // Base64 images (data URIs) and multi-image batches exceed axum's 2 MiB
-    // default JSON body limit.
-    let app = app.layer(DefaultBodyLimit::max(32 * 1024 * 1024));
+    // default JSON body limit, and a `/v1/systemone` video is a data URL of at most
+    // 32,000,000 decoded bytes — ~42.7 MB of base64 inside the body, which the
+    // handler's own media checks then reject or accept. This only bounds the
+    // transport; every route keeps its own payload limits.
+    let app = app.layer(DefaultBodyLimit::max(48 * 1024 * 1024));
     // Outermost layer (added last), so every route and fallback is covered.
     let app = if telemetry::enabled() {
         app.layer(middleware::from_fn_with_state(

@@ -14,6 +14,13 @@ script loads both and reports, per image:
   ``--pooled-max-abs`` when given);
 * the patch grid and token count (must be exact).
 
+A **video** dump (``decision_reference.py --dump-vision`` of a case with
+``videos``) is scored the same way from the probe's ``decision_video_probe``
+output: every sampled source frame must decode **byte for byte** (``ffmpeg`` vs
+the reference's OpenCV), ``pixel_values_videos`` and ``pooled_videos`` are the
+same two gates as an image, and the ``[T, H, W]`` grid, the frames-per-video and
+the token counts must be exact.
+
 The pooled gate is tight because a wrong activation in the merger (exact erf vs
 the tanh approximation, which Phase 2a's review caught) moves the cosine to
 0.99999996 at 1.3e-3 ``max|Δ|``; the fixed tower scores 1 - 4e-10 with a
@@ -72,6 +79,168 @@ def cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def score_case(
+    ref_dir: Path,
+    entry: dict,
+    probe_dir: Path,
+    pixel_tol: float,
+    pooled_min_cosine: float,
+    pooled_max_abs: float | None = None,
+) -> tuple[bool, dict]:
+    if "pixel_values_videos" in entry["files"]:
+        return score_video_case(
+            ref_dir, entry, probe_dir, pixel_tol, pooled_min_cosine, pooled_max_abs
+        )
+    return score_image_case(
+        ref_dir, entry, probe_dir, pixel_tol, pooled_min_cosine, pooled_max_abs
+    )
+
+
+def score_video_case(
+    ref_dir: Path,
+    entry: dict,
+    probe_dir: Path,
+    pixel_tol: float,
+    pooled_min_cosine: float,
+    pooled_max_abs: float | None = None,
+) -> tuple[bool, dict]:
+    files = entry["files"]
+    reference = np.load(ref_dir / files["pixel_values_videos"]).astype(np.float64)
+    pooled_ref = np.load(ref_dir / files["pooled"]).astype(np.float64)
+    grid_ref = np.load(ref_dir / files["video_grid_thw"]).astype(np.int64)
+    metadata = json.loads((ref_dir / files["video_metadata"]).read_text(encoding="utf-8"))
+    meta = json.loads((probe_dir / "meta.json").read_text(encoding="utf-8"))
+    p_rows, p_dim = (int(v) for v in meta["pixel_shape"])
+    t_rows, t_dim = (int(v) for v in meta["pooled_shape"])
+    pixels = read_f32(probe_dir / "pixel_values_videos.f32").reshape(p_rows, p_dim)
+    pooled = read_f32(probe_dir / "pooled_videos.f32").reshape(t_rows, t_dim)
+
+    report: dict = {
+        "case": entry["case"],
+        "question": entry["question"],
+        "probe": str(probe_dir),
+        "kind": "video",
+        "reference_pixels": list(reference.shape),
+        "probe_pixels": [p_rows, p_dim],
+        "reference_pooled": list(pooled_ref.shape),
+        "probe_pooled": [t_rows, t_dim],
+        "grids_match": True,
+        "tokens_match": True,
+        "frames": [],
+        "problems": [],
+    }
+
+    probe_grids = [list(map(int, video["grid"])) for video in meta["videos"]]
+    reference_grids = [[int(v) for v in row] for row in grid_ref.tolist()]
+    report["reference_grid"] = reference_grids
+    report["probe_grid"] = probe_grids
+    if reference_grids != probe_grids:
+        report["grids_match"] = False
+        report["problems"].append(f"grid {probe_grids} != reference {reference_grids}")
+    probe_tokens = sum(int(video["tokens"]) for video in meta["videos"])
+    reference_tokens = int(sum(int(g) for g in entry["video_tokens"]))
+    report["tokens"] = {"reference": reference_tokens, "probe": probe_tokens}
+    if reference_tokens != probe_tokens:
+        report["tokens_match"] = False
+        report["problems"].append(
+            f"tokens {probe_tokens} != reference {reference_tokens}"
+        )
+
+    # The decoder: every sampled frame, byte for byte, plus its source index, the
+    # source fps and the frame count the sampling ran over.
+    if len(metadata["videos"]) != len(meta["videos"]):
+        report["problems"].append(
+            f"{len(meta['videos'])} probe videos != {len(metadata['videos'])} reference videos"
+        )
+    for index, (reference_video, probe_video) in enumerate(
+        zip(metadata["videos"], meta["videos"])
+    ):
+        frame_report = {
+            "index": index,
+            "fps": {"reference": reference_video["fps"], "probe": probe_video["fps"]},
+            "total_frames": {
+                "reference": reference_video["total_frames"],
+                "probe": probe_video["total_frames"],
+            },
+            "indices_match": list(reference_video["frames_indices"])
+            == list(probe_video["indices"]),
+            "timestamps": probe_video["timestamps"],
+        }
+        frames = np.load(ref_dir / reference_video["frames_file"])
+        raw = (probe_dir / f"frames.{index}.raw").read_bytes()
+        count = int.from_bytes(raw[0:4], "little")
+        height = int.from_bytes(raw[4:8], "little")
+        width = int.from_bytes(raw[8:12], "little")
+        ours = np.frombuffer(raw[12:], dtype=np.uint8).reshape(count, height, width, 3)
+        frame_report["shape"] = {
+            "reference": list(frames.shape),
+            "probe": list(ours.shape),
+        }
+        if frames.shape == ours.shape:
+            delta = np.abs(frames.astype(np.int16) - ours.astype(np.int16))
+            frame_report["max_abs"] = int(delta.max()) if delta.size else 0
+            frame_report["differing"] = int(np.count_nonzero(delta))
+            if frame_report["max_abs"] != 0:
+                report["problems"].append(
+                    f"video {index}: frames differ from the reference by "
+                    f"{frame_report['max_abs']} LSB on {frame_report['differing']} values"
+                )
+        else:
+            report["problems"].append(
+                f"video {index}: frames {ours.shape} != reference {frames.shape}"
+            )
+        if not frame_report["indices_match"]:
+            report["problems"].append(
+                f"video {index}: indices {probe_video['indices']} != "
+                f"{reference_video['frames_indices']}"
+            )
+        if frame_report["fps"]["reference"] != frame_report["fps"]["probe"]:
+            report["problems"].append(
+                f"video {index}: fps {frame_report['fps']['probe']} != "
+                f"{frame_report['fps']['reference']}"
+            )
+        if frame_report["total_frames"]["reference"] != frame_report["total_frames"]["probe"]:
+            report["problems"].append(
+                f"video {index}: total frames {frame_report['total_frames']['probe']} != "
+                f"{frame_report['total_frames']['reference']}"
+            )
+        report["frames"].append(frame_report)
+
+    if reference.shape != pixels.shape:
+        report["problems"].append(
+            f"pixel_values_videos shape {pixels.shape} != reference {reference.shape}"
+        )
+        report["pixel_max_abs"] = None
+    else:
+        delta = np.abs(pixels - reference)
+        report["pixel_max_abs"] = float(delta.max()) if delta.size else 0.0
+        report["pixel_nonzero"] = int(np.count_nonzero(delta))
+        if report["pixel_max_abs"] > pixel_tol:
+            report["problems"].append(
+                f"pixel max|d| {report['pixel_max_abs']:.3e} > {pixel_tol:.1e}"
+            )
+
+    if pooled_ref.shape != pooled.shape:
+        report["problems"].append(
+            f"pooled shape {pooled.shape} != reference {pooled_ref.shape}"
+        )
+        report["pooled_cosine"] = None
+    else:
+        report["pooled_cosine"] = cosine(pooled.ravel(), pooled_ref.ravel())
+        report["pooled_max_abs"] = float(np.abs(pooled - pooled_ref).max())
+        report["pooled_scale"] = float(np.abs(pooled_ref).max())
+        if not (report["pooled_cosine"] >= pooled_min_cosine):
+            report["problems"].append(
+                f"pooled cosine {report['pooled_cosine']:.8f} < {pooled_min_cosine}"
+            )
+        if pooled_max_abs is not None and not (report["pooled_max_abs"] <= pooled_max_abs):
+            report["problems"].append(
+                f"pooled max|d| {report['pooled_max_abs']:.3e} > {pooled_max_abs:.1e}"
+            )
+
+    return (not report["problems"]), report
+
+
+def score_image_case(
     ref_dir: Path,
     entry: dict,
     probe_dir: Path,
@@ -231,10 +400,14 @@ def main(argv=None) -> int:
         max_abs = (
             "n/a" if "pooled_max_abs" not in report else f"{report['pooled_max_abs']:.3e}"
         )
+        frames = ""
+        if report.get("frames"):
+            worst = max((f.get("max_abs", 0) for f in report["frames"]), default=0)
+            frames = f", frames max|d| {worst}"
         print(
             f"  {'PASS' if ok else 'FAIL'} {report['case']}/{report['question']}: "
             f"pixel max|d| {pixel}, pooled cos {pooled} (max|d| {max_abs}), "
-            f"grid {report['probe_grid']}, tokens {report['tokens']['probe']}"
+            f"grid {report['probe_grid']}, tokens {report['tokens']['probe']}{frames}"
         )
         for problem in report["problems"]:
             print(f"        ! {problem}")

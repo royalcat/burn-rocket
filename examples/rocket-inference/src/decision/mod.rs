@@ -13,12 +13,14 @@
 //! [`config`]. `tools/decision.md` and `tools/decision_parity.py` are the
 //! reference and the parity gate.
 //!
-//! Images: [`vision`] holds the Qwen3.5 vision tower and the Qwen2-VL image
-//! processor, [`mrope`] the multimodal rotary positions of an image prompt, and
-//! [`model`] splices the tower's features into the text token rows. The
-//! transport decides how an `images` entry is read ([`MediaMode`]): the CLI takes
-//! local paths (parity fixtures), the server takes `data:image/...;base64` URLs
-//! only, like the checkpoint's `d3_server.py`.
+//! Media: [`vision`] holds the Qwen3.5 vision tower, the Qwen2-VL image processor
+//! and the d3 video sampling/processor (2 frames per second, 4-32 frames, temporal
+//! pairs), [`mrope`] the multimodal rotary positions of an image or video prompt,
+//! and [`model`] splices the tower's features into the text token rows (a video in
+//! one run per temporal pair, with the timestamps between the runs). The transport
+//! decides how an `images`/`videos` entry is read ([`MediaMode`]): the CLI takes
+//! local paths (parity fixtures), the server takes `data:image/...;base64` and
+//! `data:video/...;base64` URLs only, like the checkpoint's `d3_server.py`.
 
 pub mod config;
 pub mod format;

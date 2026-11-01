@@ -445,14 +445,44 @@ pub fn user_prompt(state: &Value, question: &Question, codes: &[String]) -> Resu
 /// The full prompt text: the system turn, the user turn and the empty thinking
 /// block the assistant answer starts in.
 pub fn chatml(user_prompt: &str) -> String {
-    chatml_images(user_prompt, 0)
+    chatml_media(user_prompt, "", "")
 }
 
 /// The marker the processor expands into one token per vision feature.
 pub const IMAGE_TOKEN: &str = "<|image_pad|>";
 
-/// The marker of a video placeholder (phase 3; refused while tokenizing).
+/// The marker of a video placeholder: one token per merged vision feature of one
+/// temporal pair (see [`crate::decision::vision::video_replacement`]).
 pub const VIDEO_TOKEN: &str = "<|video_pad|>";
+
+/// The `n_images` image placeholder groups the chat template renders before the
+/// user text: one `<|vision_start|><|image_pad|><|vision_end|>` each.
+pub fn image_groups(n_images: usize) -> String {
+    let mut media = String::new();
+    for _ in 0..n_images {
+        media.push_str("<|vision_start|>");
+        media.push_str(IMAGE_TOKEN);
+        media.push_str("<|vision_end|>");
+    }
+    media
+}
+
+/// The chat template's media part **before** the placeholder replacement: one
+/// image group per image, then one
+/// `<|vision_start|><|video_pad|><|vision_end|>` group per video.
+///
+/// `placeholder_problem` counts the markers in this rendering, exactly like the
+/// reference does on its rendered prompt, so a state or question that quotes a
+/// literal placeholder is refused.
+pub fn chatml_template(user_prompt: &str, n_images: usize, n_videos: usize) -> String {
+    let mut media = image_groups(n_images);
+    for _ in 0..n_videos {
+        media.push_str("<|vision_start|>");
+        media.push_str(VIDEO_TOKEN);
+        media.push_str("<|vision_end|>");
+    }
+    chatml_media(user_prompt, &media, "")
+}
 
 /// The full prompt of an image request: one
 /// `<|vision_start|><|image_pad|><|vision_end|>` group per image, immediately
@@ -463,15 +493,24 @@ pub const VIDEO_TOKEN: &str = "<|video_pad|>";
 /// Each `<|image_pad|>` placeholder is expanded to its image's merged token count
 /// when the prompt is tokenized (see `DecisionModel::prepare`).
 pub fn chatml_images(user_prompt: &str, n_images: usize) -> String {
-    let mut media = String::new();
-    for _ in 0..n_images {
-        media.push_str("<|vision_start|>");
-        media.push_str(IMAGE_TOKEN);
-        media.push_str("<|vision_end|>");
-    }
+    chatml_media(user_prompt, &image_groups(n_images), "")
+}
+
+/// The full prompt of a video request: the request's image groups, then the
+/// per-video replacement strings, then the user turn — both before the `State:`
+/// body (`video_messages` renders `[image ...] + [video ...] + text`).
+///
+/// `videos` is the reference's `Qwen3VLProcessor.replace_video_token` output: one
+/// `<t seconds><|vision_start|><|video_pad|>*frame_seqlen<|vision_end|>` group per
+/// temporal pair, concatenated with no separator. The chat template's own
+/// `<|vision_start|>`/`<|vision_end|>` stay around the **whole** replacement (the
+/// processor replaces only the single `<|video_pad|>` placeholder that the
+/// template emitted), which is what the reference's expanded prompt looks like
+/// token for token.
+pub fn chatml_media(user_prompt: &str, images: &str, videos: &str) -> String {
     format!(
         "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n\
-         <|im_start|>user\n{media}{user_prompt}<|im_end|>\n\
+         <|im_start|>user\n{images}{videos}{user_prompt}<|im_end|>\n\
          <|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 }

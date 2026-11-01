@@ -1,13 +1,13 @@
-//! Multimodal RoPE positions (mrope) for d3 image prompts.
+//! Multimodal RoPE positions (mrope) for d3 prompts with images and videos.
 //!
-//! A text prompt rotates token `i` by `i * inv_freq`; an image prompt needs three
-//! positions per token — temporal, height and width — because the image tokens
-//! form a 2-D grid. The reference (`get_rope_index` +
+//! A text prompt rotates token `i` by `i * inv_freq`; an image or video prompt
+//! needs three positions per token — temporal, height and width — because the
+//! vision tokens form a 2-D grid per frame. The reference (`get_rope_index` +
 //! `Qwen3_5TextRotaryEmbedding.recomposition_frequencies`, see
 //! `transformers/models/qwen3_5/modeling_qwen3_5.py`) builds them like this:
 //!
-//! 1. Walk `mm_token_type_ids` in runs (`0` text, `1` image), keeping a running
-//!    `current_pos`:
+//! 1. Walk `mm_token_type_ids` in runs (`0` text, `1` image, `2` video), keeping a
+//!    running `current_pos`:
 //!    - a text run of `len` tokens takes `current_pos .. current_pos + len` on
 //!      **all three** rows; `current_pos += len`.
 //!    - an image with `grid_thw = [1, H_patches, W_patches]` becomes
@@ -15,6 +15,14 @@
 //!      row-major order (`h` outer, `w` inner): `T = 0`, `H = 0..llm_h`,
 //!      `W = 0..llm_w`, each **plus `current_pos`**;
 //!      `current_pos += max(H_patches, W_patches) / merge`.
+//!    - a video run is one **temporal pair**: the reference repeats every
+//!      `video_grid_thw` row by its `T` and sets the temporal extent to 1
+//!      (`repeat_interleave(video_grid_thw, video_grid_thw[:, 0])`), so a video of
+//!      `T` pairs is `T` runs of `H_patches * W_patches / merge^2` tokens, each
+//!      positioned as a `[1, H, W]` grid at the current position, and every run
+//!      advances `current_pos` by `max(H, W) / merge` — the timestamp and
+//!      `<|vision_start|>`/`<|vision_end|>` text between two runs consumes
+//!      positions like any other text.
 //! 2. Per axis, `freqs[axis] = pos[axis] * inv_freq` (`[S, rotary/2]`, f32).
 //! 3. Recompose: start from the temporal row and overwrite the height indices
 //!    `(1..3*section[1]).step_by(3)` with the height row and the width indices
@@ -36,9 +44,10 @@ use crate::qwen35_intent::model::{IntentTextConfig, RopeTables};
 /// `mrope_section` of the d3 text config (`rope_parameters.mrope_section`).
 pub const DEFAULT_SECTIONS: [usize; 3] = [11, 11, 10];
 
-/// Text (`0`) and image (`1`) run markers of `mm_token_type_ids`.
+/// Text (`0`), image (`1`) and video (`2`) run markers of `mm_token_type_ids`.
 pub const TYPE_TEXT: u8 = 0;
 pub const TYPE_IMAGE: u8 = 1;
+pub const TYPE_VIDEO: u8 = 2;
 
 /// `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`:
 /// `1 / theta ** (arange(0, rotary, 2) / rotary)`, computed in **f32** like the
@@ -57,16 +66,27 @@ pub type Positions = Vec<[u32; 3]>;
 
 /// `get_rope_index` for one sequence.
 ///
-/// `mm_types` is `[S]` of [`TYPE_TEXT`]/[`TYPE_IMAGE`]; `grids[i]` is the
-/// `[1, H_patches, W_patches]` grid of the i-th image run, in run order (the
-/// reference's `image_grid_thw` rows). Every image run must have a grid and every
-/// grid must be consumed.
-pub fn positions(mm_types: &[u8], grids: &[[usize; 3]], merge: usize) -> Result<Positions> {
+/// `mm_types` is `[S]` of [`TYPE_TEXT`]/[`TYPE_IMAGE`]/[`TYPE_VIDEO`]; `images[i]`
+/// is the `[1, H_patches, W_patches]` grid of the i-th image run and `videos[j]`
+/// the `[T, H_patches, W_patches]` grid of the j-th video, both in run order (the
+/// reference's `image_grid_thw`/`video_grid_thw` rows). A video contributes one
+/// run per temporal pair, so `videos[j].0` must equal the number of type-2 runs
+/// that video owns. Every run must have a grid and every grid must be consumed.
+pub fn positions_media(
+    mm_types: &[u8],
+    images: &[[usize; 3]],
+    videos: &[[usize; 3]],
+    merge: usize,
+) -> Result<Positions> {
     if merge == 0 {
         bail!("the vision merge size must be positive");
     }
     let mut out: Positions = Vec::with_capacity(mm_types.len());
-    let mut next_grid = 0usize;
+    let mut next_image = 0usize;
+    let mut next_video = 0usize;
+    // The temporal-pair index of the video whose runs are being consumed, and how
+    // many of its runs have been seen.
+    let mut video_run = 0usize;
     let mut current = 0u32;
     let mut index = 0usize;
     while index < mm_types.len() {
@@ -85,46 +105,88 @@ pub fn positions(mm_types: &[u8], grids: &[[usize; 3]], merge: usize) -> Result<
                 current += len as u32;
             }
             TYPE_IMAGE => {
-                let grid = grids.get(next_grid).ok_or_else(|| {
+                let grid = images.get(next_image).ok_or_else(|| {
                     anyhow::anyhow!(
                         "the prompt has more image runs than the {} image grid(s) of the request",
-                        grids.len()
+                        images.len()
                     )
                 })?;
-                next_grid += 1;
+                next_image += 1;
                 let [temporal, height, width] = *grid;
                 if temporal != 1 {
                     bail!("an image grid must have one frame, got {temporal}");
                 }
-                if !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
-                    bail!(
-                        "the {height}x{width} patch grid is not divisible by the merge size {merge}"
-                    );
-                }
-                let llm_h = height / merge;
-                let llm_w = width / merge;
-                if llm_h * llm_w != len {
-                    bail!(
-                        "an image run of {len} tokens does not match its {llm_h}x{llm_w} merged grid"
-                    );
-                }
-                for h in 0..llm_h {
-                    for w in 0..llm_w {
-                        out.push([current, current + h as u32, current + w as u32]);
-                    }
-                }
-                current += (height.max(width) / merge) as u32;
+                push_grid(&mut out, &mut current, height, width, len, merge)?;
             }
-            other => bail!("unknown multimodal token type {other} (text is 0, image is 1)"),
+            TYPE_VIDEO => {
+                // Each run is one temporal pair of the current video; the video ends
+                // when its `T` runs have been consumed.
+                let grid = *videos.get(next_video).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the prompt has more video runs than the {} video(s) of the request",
+                        videos.len()
+                    )
+                })?;
+                let [pairs, height, width] = grid;
+                push_grid(&mut out, &mut current, height, width, len, merge)?;
+                video_run += 1;
+                if video_run == pairs {
+                    next_video += 1;
+                    video_run = 0;
+                }
+            }
+            other => {
+                bail!("unknown multimodal token type {other} (text is 0, image is 1, video is 2)")
+            }
         }
     }
-    if next_grid != grids.len() {
+    if next_image != images.len() {
         bail!(
-            "the prompt uses {next_grid} of the {} image grid(s) of the request",
-            grids.len()
+            "the prompt uses {next_image} of the {} image grid(s) of the request",
+            images.len()
+        );
+    }
+    if next_video != videos.len() {
+        bail!(
+            "the prompt uses {next_video} of the {} video(s) of the request",
+            videos.len()
         );
     }
     Ok(out)
+}
+
+/// Push one `[1, height, width]` frame grid's merged positions and advance
+/// `current` by `max(height, width) / merge`.
+fn push_grid(
+    out: &mut Positions,
+    current: &mut u32,
+    height: usize,
+    width: usize,
+    len: usize,
+    merge: usize,
+) -> Result<()> {
+    if !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
+        bail!("the {height}x{width} patch grid is not divisible by the merge size {merge}");
+    }
+    let llm_h = height / merge;
+    let llm_w = width / merge;
+    if llm_h * llm_w != len {
+        bail!("a media run of {len} tokens does not match its {llm_h}x{llm_w} merged grid");
+    }
+    for h in 0..llm_h {
+        for w in 0..llm_w {
+            out.push([*current, *current + h as u32, *current + w as u32]);
+        }
+    }
+    *current += (height.max(width) / merge) as u32;
+    Ok(())
+}
+
+/// [`positions_media`] for an image-only prompt (no video grids): the image
+/// tests and any image-only caller.
+#[allow(dead_code)]
+pub fn positions(mm_types: &[u8], grids: &[[usize; 3]], merge: usize) -> Result<Positions> {
+    positions_media(mm_types, grids, &[], merge)
 }
 
 /// The recomposed `rotary`-wide frequency row of one token: the temporal row with
@@ -199,12 +261,13 @@ pub fn sections(config: &IntentTextConfig) -> Result<[usize; 3]> {
 /// The per-prompt tables of the checkpoint's text config.
 pub fn rope_tables(
     mm_types: &[u8],
-    grids: &[[usize; 3]],
+    images: &[[usize; 3]],
+    videos: &[[usize; 3]],
     config: &IntentTextConfig,
     merge: usize,
     device: &Device,
 ) -> Result<RopeTables> {
-    let positions = positions(mm_types, grids, merge)?;
+    let positions = positions_media(mm_types, images, videos, merge)?;
     tables(
         &positions,
         config.rotary_dim(),
@@ -349,6 +412,79 @@ mod tests {
         assert_eq!(positions[981], [144, 144, 144]);
     }
 
+    /// The video case from the reference dump (`dump-videos-lite-f32`,
+    /// `video-example__direction`): 50 text tokens (system turn, `<|vision_start|>`
+    /// and the first timestamp), then four temporal pairs of a 20x36 grid (180
+    /// merged tokens each) separated by 8 text tokens, then 74 text tokens. Each
+    /// pair is a `[1, 20, 36]` grid at the current position and advances it by
+    /// `max(20, 36) / 2 = 18`, so the T row of the last token is 219 while the
+    /// sequence is 868 long.
+    #[test]
+    fn the_video_positions_match_the_reference_dump() {
+        let mut types = vec![TYPE_TEXT; 50];
+        for pair in 0..4 {
+            if pair > 0 {
+                types.extend(std::iter::repeat_n(TYPE_TEXT, 8));
+            }
+            types.extend(std::iter::repeat_n(TYPE_VIDEO, 180));
+        }
+        types.extend(std::iter::repeat_n(TYPE_TEXT, 74));
+        assert_eq!(types.len(), 868);
+        let positions = positions_media(&types, &[], &[[4, 20, 36]], 2).unwrap();
+        assert_eq!(positions.len(), 868);
+        // Text before the first pair.
+        assert_eq!(positions[49], [49, 49, 49]);
+        // Inside the first pair: T fixed, H row-major over 10, W over 18.
+        assert_eq!(positions[50], [50, 50, 50]);
+        assert_eq!(positions[51], [50, 50, 51]);
+        assert_eq!(positions[50 + 17], [50, 50, 67]);
+        assert_eq!(positions[50 + 18], [50, 51, 50]);
+        assert_eq!(positions[50 + 179], [50, 59, 67]);
+        // The 8 text tokens after it continue at 50 + 18 = 68.
+        assert_eq!(positions[230], [68, 68, 68]);
+        assert_eq!(positions[237], [75, 75, 75]);
+        // The next pair starts after those 8 tokens.
+        assert_eq!(positions[238], [76, 76, 76]);
+        // The last pair (formula: 50 + 3 * 188).
+        assert_eq!(positions[614], [128, 128, 128]);
+        assert_eq!(positions[614 + 179], [128, 137, 145]);
+        // The closing text run of 74 tokens ends at 128 + 18 + 74 - 1.
+        assert_eq!(positions[867], [219, 219, 219]);
+    }
+
+    /// Two videos: every temporal pair is its own run (a separator between them),
+    /// and each pair advances `current_pos` by `max(H, W) / merge` of its grid.
+    #[test]
+    fn a_second_video_continues_after_the_first() {
+        let mut types = vec![TYPE_TEXT; 2];
+        types.extend(std::iter::repeat_n(TYPE_VIDEO, 4)); // 4x4 grid, pair 1
+        types.push(TYPE_TEXT);
+        types.extend(std::iter::repeat_n(TYPE_VIDEO, 4)); // pair 2
+        types.push(TYPE_TEXT);
+        types.extend(std::iter::repeat_n(TYPE_VIDEO, 6)); // 4x6 grid, pair 1
+        types.push(TYPE_TEXT);
+        types.extend(std::iter::repeat_n(TYPE_VIDEO, 6)); // pair 2
+        types.push(TYPE_TEXT);
+        assert_eq!(types.len(), 26);
+        let positions = positions_media(&types, &[], &[[2, 4, 4], [2, 4, 6]], 2).unwrap();
+        assert_eq!(positions[0], [0, 0, 0]);
+        assert_eq!(positions[2], [2, 2, 2]);
+        assert_eq!(positions[3], [2, 2, 3]);
+        // Pair 1 advanced by max(4, 4)/2 = 2: the separator sits at 4.
+        assert_eq!(positions[6], [4, 4, 4]);
+        assert_eq!(positions[7], [5, 5, 5]);
+        assert_eq!(positions[10], [5, 6, 6]);
+        // 5 + 2 = 7: the separator, then the second video at 8.
+        assert_eq!(positions[11], [7, 7, 7]);
+        assert_eq!(positions[12], [8, 8, 8]);
+        assert_eq!(positions[17], [8, 9, 10]);
+        // 8 + max(4, 6)/2 = 11, then the separator at 12.
+        assert_eq!(positions[18], [11, 11, 11]);
+        assert_eq!(positions[19], [12, 12, 12]);
+        assert_eq!(positions[24], [12, 13, 14]);
+        assert_eq!(positions[25], [15, 15, 15]);
+    }
+
     #[test]
     fn mismatched_grids_are_refused() {
         // An image run without a grid.
@@ -357,12 +493,19 @@ mod tests {
         assert!(positions(&[TYPE_TEXT; 2], &[[1, 4, 4]], 2).is_err());
         // A run that does not match the merged grid.
         assert!(positions(&[TYPE_IMAGE; 5], &[[1, 4, 4]], 2).is_err());
-        // Video grids are phase 3.
+        // An image grid with more than one frame.
         assert!(positions(&[TYPE_IMAGE; 4], &[[2, 4, 4]], 2).is_err());
         // A grid not divisible by the merge size.
         assert!(positions(&[TYPE_IMAGE; 4], &[[1, 3, 4]], 2).is_err());
         // An unknown token type.
         assert!(positions(&[7; 4], &[], 2).is_err());
+        // A video run without a video grid, and a video grid nobody consumed.
+        assert!(positions_media(&[TYPE_VIDEO; 4], &[], &[], 2).is_err());
+        assert!(positions_media(&[TYPE_TEXT; 2], &[], &[[1, 4, 4]], 2).is_err());
+        // More runs than the video's temporal pairs.
+        assert!(positions_media(&[TYPE_VIDEO; 8], &[], &[[1, 4, 4]], 2).is_err());
+        // Fewer runs than its pairs.
+        assert!(positions_media(&[TYPE_VIDEO; 4], &[], &[[2, 4, 4]], 2).is_err());
     }
 
     #[test]

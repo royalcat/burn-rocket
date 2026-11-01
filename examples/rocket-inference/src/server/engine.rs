@@ -735,16 +735,18 @@ impl DecisionEngine {
     fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionReply, ApiError> {
         // The server's media contract is the reference `d3_server.py` one: data
         // URLs only, never local paths or remote URLs. A media problem is the
-        // reference's 422 `{"detail": "<reason>"}`; nothing runs. Videos are
-        // phase 3 (`Request::from_value` already refuses them).
-        if !req.videos.is_empty() {
+        // reference's 422 `{"detail": "<reason>"}`; nothing runs.
+        if !req.videos.is_empty() && !self.model.has_vision() {
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "videos are not supported yet",
+                crate::decision::model::NO_VIDEO_TOWER,
             ));
         }
         let images = req
             .decode_images(MediaMode::DataUrls)
+            .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
+        let videos = req
+            .decode_videos(MediaMode::DataUrls)
             .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
         if !images.is_empty() && !self.model.has_vision() {
             return Err(ApiError::new(
@@ -752,13 +754,14 @@ impl DecisionEngine {
                 crate::decision::model::NO_VISION_TOWER,
             ));
         }
-        // A rejected image is the client's fault and keeps the reference's 422
-        // detail string; everything else (tokenizer, tower, device) is a 500.
+        // A refused image or video is the client's fault and keeps the
+        // reference's 422 detail string; everything else (tokenizer, tower,
+        // device) is a 500.
         let prepared = self
             .model
-            .prepare(&req, &images, self.max_tokens)
+            .prepare(&req, &images, &videos, self.max_tokens)
             .map_err(|error| match error {
-                PrepareError::InvalidImage(message) => {
+                PrepareError::InvalidMedia(message) => {
                     ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
                 }
                 PrepareError::Internal(error) => ApiError::internal(format!("{error:#}")),

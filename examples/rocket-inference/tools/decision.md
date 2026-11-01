@@ -79,11 +79,13 @@ bare response. The parity script reads the answers either from that official sha
 Implementation: `examples/rocket-inference/src/decision/` (the `d3_format.py` contract, the
 readout head, the prompt/answer path) on the intent family's Qwen3.5 backbone
 (`src/qwen35_intent/`), with `IntentModel::full_attn_causal = false` for the checkpoint's
-`noncausal_full_attention` mode. Text and image requests are complete: the vision tower
-and the image processor live in `src/decision/vision/` (phase 2a, gated by
-`decision_vision_probe` + `tools/vision_parity.py`), and phase 2b added the placeholder
-splice, the multimodal RoPE (`src/decision/mrope.rs`) and the request's `images` field.
-Videos are phase 3.
+`noncausal_full_attention` mode. Text, image and video requests are complete: the vision
+tower, the image processor and the video processor/decoder live in
+`src/decision/vision/` (phase 2a, gated by `decision_vision_probe` +
+`tools/vision_parity.py`; phase 3 added `video.rs` and `decision_video_probe`), phase 2b
+added the placeholder splice, the multimodal RoPE (`src/decision/mrope.rs`) and the
+request's `images` field, and phase 3 added the `videos` field (per-pair prompt groups,
+per-frame tower attention, the video sampling and the transport limits).
 
 ```sh
 /tmp/opencode/d3/venv/bin/python tools/decision_parity.py \
@@ -122,7 +124,15 @@ prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` proc
   field; a local path, a remote URL, another subtype or a broken payload is a `422` whose
   detail is the loader's message, `images[i]: <reason>` (**never** a local path or a
   remote fetch — the server does not read files for a client);
-- `videos` is phase 3: a non-empty list is `422 {"detail": "videos are not supported yet"}`;
+- `videos` is a list of `data:video/{mp4,webm,quicktime,x-matroska};base64,...` URLs shared
+  by every question (a non-list is `422` naming the field, as for `images`): the
+  reference's strict loader (decoded bytes <= 32,000,000, source frames <= 8,294,400
+  pixels, a clip <= 300 seconds, a payload `ffmpeg` opens, 2 sampled frames per second
+  with 4-32 frames), and every refusal is `videos[i]: <reason>`. All videos of one
+  request together may not exceed 16,384 input tokens, else
+  `422 {"detail": "the videos take N input tokens, over the 16,384 tokens a request may
+  spend on videos; send fewer or shorter videos"}`. The server's transport body limit is
+  48 MiB (a 32 MB video is ~42.7 MB of base64);
 - a question that fails validation refuses the whole request with
   `422 {"detail": {"invalid_questions": {qid: "<message>"}}}` and **nothing runs**;
 - a question over the prompt cap is *not* a refusal: it keeps its `max_length_exceeded`
@@ -145,9 +155,8 @@ Rust server does not model; the cap it enforces is the flag.
 Left for phase 5 (documented here so the gap is explicit): **D8** (stricter
 `decision_config.json` cross-checks such as `codes`/`token_ids` against
 `MODEL_MANIFEST.json` and the manifest hash verification the reference optionally does)
-and **D11** (README/recipes/docstring polish for the new family). Text and image
-requests are complete; **videos** are phase 3 (a non-empty `videos` list is a 422 and a
-`<|video_pad|>` inside an image prompt is an `invalid_question`).
+and **D11** (README/recipes/docstring polish for the new family). Text, image and video
+requests are complete.
 
 Known differences from the reference, both harmless but named:
 
@@ -176,6 +185,10 @@ repo cannot carry `readout.safetensors`), and a directory with several sharded
 domains: support-ticket routing, receipt totals, sentiment, policy compliance,
 scheduling, structured account state, intent, language and audit findings.  Every
 string is newline-free; receipt totals are computed from their line items.
+
+`decision_fixtures_videos.json`: 5 video cases / 9 questions (see "Videos" below);
+`data/test.mp4` (4 s, 8 fps, 32 frames, a colour-bar test card with a counter) and the
+checkpoint's own `assets/example-video.mp4` (4 s, 8 fps, a square crossing the frame).
 
 `decision_fixtures_placeholders.json`: the two text cases whose state quotes a literal
 `<|image_pad|>` / `<|video_pad|>` token (the reference's text path has no placeholder
@@ -382,3 +395,187 @@ tokens**; the literal-placeholder pair **2/2**, max |dp| 1.16e-07
 (`ref_placeholders_lite_f32.json`); a 2-image x 2-question case (`which` choice +
 one noul, ref `ref_2x2_lite_f32.json`) **5086/5086 tokens**, both answers, max |dp|
 7.23e-08.
+
+## Videos (phase 3)
+
+A video request reads every clip at **2 frames per second**, at least 4 and at most 32
+frames spread evenly over the whole clip, groups the frames in **temporal pairs**
+(`temporal_patch_size = 2`) and gives every pair its own prompt group with a timestamp.
+
+### Sampling, decoding and the prompt
+
+`src/decision/vision/video.rs` is the sampling half, a port of
+`d3_runtime.video_sample_indices` / `_decode_video` / `_video`:
+
+- `count = int(total / fps * 2)`, clamped to `[4, 32]` and `<= total`, then
+  `np.linspace(0, total - 1, count).round()` — **half to even** on an exact `.5`
+  (Python's `round`, not Rust's half-away-from-zero) with numpy's endpoint correction.
+  An **odd** count duplicates the last frame *and its source index*, so every frame is
+  part of a temporal pair.
+- The source rate is the container's `r_frame_rate`; an unknown or implausible one
+  (`< 0.1`, `> 1000`, not finite) is **24**. The total is the container's `nb_frames`;
+  a container that does not say has its frames counted (`ffprobe -count_frames`).
+- Frames come from `ffmpeg` (`select` on the sampled indices, `rawvideo`/`rgb24`) through
+  `gemma::media::extract_frames`. **Measured: `ffmpeg`'s RGB is bit-identical to
+  OpenCV's `BGR -> RGB`** on both fixtures (8 frames each, `max|d| 0`), so the decoder
+  is not a parity variable; the probe's frame gate is exact.
+- The prompt group of one pair is `<{t:.1} seconds><|vision_start|><|video_pad|>*
+  frame_seqlen<|vision_end|>` with `t = (idx[2k] + idx[2k+1]) / 2 / fps` and
+  `frame_seqlen = H_patches * W_patches / merge^2`; the groups are concatenated with no
+  separator. The chat template's own `<|vision_start|>`/`<|vision_end|>` stay **around
+  the whole replacement** (the processor replaces only the single `<|video_pad|>` the
+  template emitted), so the expanded prompt starts with a `vision_start` and ends with a
+  `vision_end` around the groups — the reference's `expanded_text`, token for token.
+
+The processor (`processor::prepare_video`) is `Qwen3VLVideoProcessor` with
+`cap_pixels_per_frame=True`, `do_sample_frames=False` and the runtime's budget
+(`shortest_edge` 4,096, `longest_edge` 200,704 x 32): the per-frame ceiling is
+`max_video_tokens * 32^2 = 200,704` pixels, the budget's even share is
+`longest_edge // frames`, a frame never drops below `int(4096 * 1.05) = 4300` pixels, and
+`smart_resize` then uses `t_bar * h_bar * w_bar` against `pixels_per_frame * frames`.
+Patches are packed `(pair, merge block, in-block, channel, temporal patch, patch row,
+patch col)` and the grid is `[T = frames / 2, H/16, W/16]`.
+
+### The tower on a multi-frame grid
+
+`VisionTower::encode_video` runs the same forward as an image on the `[T, H, W]` grid: the
+learned position table resamples each frame's `H x W` patches (`within % (H*W)`), the
+axial rope is the single frame's table repeated `T` times (the tower has no temporal rope),
+and the merger groups 2x2 patches **within a frame**, giving `T * H * W / 4` tokens.
+
+**Attention is per frame.** The phase-3 brief said one sequence per video; the reference
+(`get_vision_attention_seqlens` -> `get_vision_cu_seqlens(merge_temporal=False)` in
+transformers 5.17) makes **`T` segments of `H*W`** per video, and the measurement is
+unambiguous on the dumped `video-example__direction` clip: the per-frame arm reproduces
+the reference pooled output **bit for bit** (`max|d| 0`) while the whole-clip arm lands at
+cosine **0.680** (`max|d| 2.89`). So `encode_video` loops the frames, one attention call
+each — which is also what keeps the image path (T = 1) bit-identical.
+
+`mrope` gained `TYPE_VIDEO = 2`: each type-2 run is one temporal pair, positioned as a
+`[1, H, W]` grid (`T = current_pos`, `H/W` row-major, then `current_pos += max(H, W) /
+merge`), so the timestamps and vision markers between two pairs consume positions like any
+other text. The prompt assembly (`model::prepare`) records a video's feature rows as **one
+run per pair** (`MediaSpan { kind: Video, runs: [(start, end), ...] }`) and splices them in
+order, leaving the timestamps between them untouched.
+
+### Transport and limits
+
+The CLI takes local paths (`videos: ["clip.mp4"]`), the server data URLs only, like
+`d3_server.py`: `data:video/{mp4,webm,quicktime,x-matroska};base64,...` at most
+**32,000,000** decoded bytes (the encoded text is length-checked before decoding), frames
+of at most **8,294,400** pixels and a clip of at most **300** seconds. Uploads are written
+to a temporary file (removed when the decoder returns) so they decode exactly like the same
+clip by path. All videos of one request together may not exceed **16,384** input tokens
+(`sum(T*H*W/4)`), else the request is refused before anything runs. The per-question cap
+message carries both media counts:
+`({visual} for {n} image(s) and {m} video(s))` where `visual` is the image tokens plus the
+video prompt groups' token counts (the reference's `sum(visual) + expanded`).
+
+### Reference, probe and gate
+
+```sh
+# reference answers + the video dumps (pixel_values_videos, video_grid_thw, the expanded
+# prompt, ids/types/mask, pooled, mrope, hidden, logits, every sampled frame, metadata)
+/tmp/opencode/d3/venv/bin/python tools/decision_reference.py \
+    --model /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures_videos.json \
+    --out /tmp/opencode/d3/ref_videos_lite_f32.json \
+    --dump-vision /tmp/opencode/d3/dump-videos-lite-f32 --backbone-dtype f32
+
+# the Rust processor + tower for the same clips
+cargo build --release -p rocket-inference --no-default-features --bin decision_video_probe
+$CARGO_TARGET_DIR/release/decision_video_probe --model-dir /tmp/opencode/d3/models/d3-lite \
+    --video /tmp/opencode/d3/models/d3-lite/assets/example-video.mp4 \
+    --out /tmp/opencode/d3/probe-video-example
+/tmp/opencode/d3/venv/bin/python tools/vision_parity.py \
+    --ref /tmp/opencode/d3/dump-videos-lite-f32 \
+    --probe /tmp/opencode/d3/probe-video-example --stem video-example__direction
+
+# end to end (one case per process), then the expanded prompts/token counts
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures_videos.json \
+    --ref /tmp/opencode/d3/ref_videos_lite_f32.json \
+    --out /tmp/opencode/d3/parity_videos.json
+$CARGO_TARGET_DIR/release/rocket-inference decide --model-dir /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures_videos.json --dump-prompts DIR --out DIR/answers.json
+```
+
+The video dump also writes `frames.{i}.npy` (uint8 `[frames, height, width, 3]`, the
+reference's own OpenCV decode) and `video_metadata.json` (fps, total frames, sampled
+indices) per case, so a probe can be scored on three levels: the frames (exact), the
+patches (`pixel_values_videos`, `max|Δ| <= 1e-6`) and the tower output
+(`pooled_videos`, cosine `>= 0.999999`).
+
+Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01; watchdog on the 8-core box while
+another job ran, wall +-20 %):
+
+| case | clip(s) | frames | grid | tokens | top-1 | max abs Δp |
+|---|---|---|---|---|---|---|
+| video-example/direction | example-video | 8 | [4, 20, 36] | 868 (720 video) | right | 2.67e-06 |
+| video-example/color_change | example-video | 8 | [4, 20, 36] | 852 (720) | true | 1.23e-06 |
+| video-testcard/content | test.mp4 | 8 | [4, 22, 30] | 813 (660) | test_card | 6.52e-08 |
+| video-testcard/counter | test.mp4 | 8 | [4, 22, 30] | 798 (660) | true | 2.62e-06 |
+| video-longer/rate | example-video | 8 | [4, 20, 36] | 860 (720) | level 2 | 6.8e-07 |
+| video-with-image/total | receipt + example-video | 8 | [4, 20, 36] | 1787 (720) | 100_to_150 | 1.09e-06 |
+| video-with-image/direction | receipt + example-video | 8 | [4, 20, 36] | 1745 (720) | right | 1.42e-06 |
+| video-two-clips/which | both | 8 + 8 | [4, 20, 36], [4, 22, 30] | 1569 (1380) | second | 3.97e-06 |
+| video-two-clips/both_tests | both | 8 + 8 | [4, 20, 36], [4, 22, 30] | 1551 (1380) | true | 7.61e-07 |
+
+End to end: **9/9 questions top-1 (100 %)**, max |Δp| **3.97e-06**
+(`video-two-clips/which`; choice 3.97e-06, noul 2.62e-06, score 6.82e-07), 94.4 s as 5
+processes (87.98 s for all five in one process, model load included), **10,843** planned
+tokens. The expanded prompt of every question is **byte-identical** to the reference
+dump's `expanded_text` (9/9, 9,243-21,433 characters) and `usage.input_tokens` matches
+(1720 / 1611 / 860 / 3532 / 3120).
+
+Tower (`decision_video_probe` + `vision_parity.py`, 3 runs over the two clips and both
+together): sampled frames **max|Δ| 0** on every frame (ffmpeg == OpenCV, 5,529,600 and
+4,147,200 values), `pixel_values_videos` **max|Δ| 0** (bit-identical smart_resize +
+normalize + pair patchify), pooled cosine **0.999999999-1.000000000** with
+`max|Δ| 1.7e-04..1.7e-03` at a pooled peak of 2.4-3.1 (the same attention-kernel residual
+as the image path, not a tower change), grids `[4, 20, 36]` / `[4, 22, 30]` and token
+counts exact, sampled indices/fps/total exact. Probe wall 3.3 s for the 720-token clip
+(0.08 s decode, 3.3 s encode, 2880 patches).
+
+Two ephemeral edge cases (not committed as fixtures) match as well: a **2.5 s** clip
+samples 5 indices, duplicates the last (`[0, 5, 10, 14, 19, 19]`, 6 frames, grid
+`[3, 22, 30]`, 495 video tokens, timestamps 0.3/1.5/2.4, prompt byte-identical, max |dp|
+**1.38e-08**) and a **40-second** clip clamps to 32 frames (grid `[16, 22, 30]`, 2,640
+video tokens, 16 timestamps, prompt byte-identical, max |dp| **3.71e-07**); the probe
+scores both at frames `max|Δ| 0`, patches `max|Δ| 0`, pooled cosine 1.0.
+
+Text and image requests are unchanged (see the numbers below): the text path never builds
+a media prompt, and an image request takes `encode` on `[1, H, W]`, which is
+`encode_video`'s T = 1 case with the same per-frame loop.
+
+### Deviations, named
+
+- **CLI videos are local paths.** `MediaMode::Paths` opens a file; an `http(s)` URL is
+  `videos[i]: no video file at <url>`, where the runtime's in-process loader would
+  download it. The server never downloads either (data URLs only), like `d3_server.py`.
+- **`--dump-prompts` and images in a video request.** The reference's video path feeds
+  `replace_image_token`'s *expanded* image placeholder to its tokenizer while its image
+  path leaves one placeholder per image; the model builds one placeholder per image in
+  both cases (the ids are identical) and `--dump-prompts` writes the reference's own
+  rendering (`model::dump_prompt`), so the dumped text matches in both paths.
+- **A container without `nb_frames`.** OpenCV counts the frames (with the 300-second
+  guard); this side asks `ffprobe -count_frames`, which decodes the stream once. Both use
+  the count the same way; no fixture exercises it.
+- **A frame ffmpeg cannot decode.** OpenCV skips it (`retrieve()` false) and keeps the
+  others; this side fails the video (`no frame of the video could be decoded`). A clip
+  with a broken frame is not answered here where the reference might answer with fewer
+  frames.
+
+Re-verified after phase 3 (dev host, f32 d3-lite, 2026-11-01): text parity **67/67**,
+max |Δp| **2.36e-06** (47 cases, 76,829 planned tokens, 583 s); image parity **8/8**,
+max |Δp| **7.70e-06** (147.9 s); the image prompt dump is still byte-identical
+(`image-cat__animal`, 740 tokens). Server smoke on `/v1/systemone` (d3-lite, port 8399):
+a data-URL video answers in 9.2 s (802 tokens, `test_card` at 0.967), two videos 16.7 s,
+an image + video 27.6 s (3014 tokens); a local path, an `https` URL, an empty entry, a
+`gif` subtype and a non-base64 data URL are each `422 videos[0]: <reason>`; a 32,000,001
+byte payload is `422 the decoded data has 32,000,001 bytes, over the 32,000,000 byte
+limit`; a 305-second clip is `422 each video must be at most 300 seconds long`; seven
+16-second clips (18,480 video tokens) are `422 the videos take 18,480 input tokens, over
+the 16,384 tokens a request may spend on videos; send fewer or shorter videos`; an
+unknown question type is the usual `422 {"invalid_questions": ...}`.
