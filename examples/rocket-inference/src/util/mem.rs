@@ -1,11 +1,35 @@
 //! Process memory readout and heap release.
 
-/// Anonymous resident set size (`RssAnon`), MiB.
-pub fn rss_mib() -> f64 {
+/// Resident set split from `/proc/self/status`, MiB.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rss {
+    /// Anonymous resident pages (heap, stacks, tables).
+    pub anon_mib: f64,
+    /// File-backed resident pages (mapped checkpoint files, page cache).
+    pub file_mib: f64,
+    /// Shared-memory resident pages. Kernel-dependent: the DRM buffer objects
+    /// behind the NPU scratch and weights are *not* counted here on the RK3588
+    /// board (`/proc/self/status` reads 0), so the driver's own `npu scratch`
+    /// accounting is the BO measure.
+    pub shmem_mib: f64,
+}
+
+/// Read `RssAnon`/`RssFile`/`RssShmem` in one pass over `/proc/self/status`.
+pub fn rss() -> Rss {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut out = Rss::default();
     for line in s.lines() {
-        if let Some(v) = line.strip_prefix("RssAnon:") {
-            return v
+        let (field, slot) = if line.starts_with("RssAnon:") {
+            (line, &mut out.anon_mib)
+        } else if line.starts_with("RssFile:") {
+            (line, &mut out.file_mib)
+        } else if line.starts_with("RssShmem:") {
+            (line, &mut out.shmem_mib)
+        } else {
+            continue;
+        };
+        if let Some(v) = field.split_once(':').map(|(_, v)| v) {
+            *slot = v
                 .trim()
                 .trim_end_matches(" kB")
                 .parse::<f64>()
@@ -13,7 +37,12 @@ pub fn rss_mib() -> f64 {
                 / 1024.0;
         }
     }
-    0.0
+    out
+}
+
+/// Anonymous resident set size (`RssAnon`), MiB.
+pub fn rss_mib() -> f64 {
+    rss().anon_mib
 }
 
 /// Return the allocator's free pages to the OS (glibc keeps them in its arenas,
@@ -41,13 +70,26 @@ pub fn trim_after_requests() -> bool {
     })
 }
 
+/// Scratch budget kept resident across requests, MiB (`ROCKET_KEEP_MB`, default
+/// 64; `0` clears everything). Applies to the NPU matmul + attention scratch, BO
+/// and host combined; resident weights are never part of it.
+pub fn keep_scratch_mib() -> usize {
+    static MIB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIB.get_or_init(|| {
+        std::env::var("ROCKET_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(64)
+    })
+}
+
 /// Enable the heap release at the end of every request when configured
 /// (see [`trim_after_requests`]).
 pub fn trim_after_request() {
     if trim_after_requests() {
-        // Keep the just-used matmul shape set, drop per-shape scratch from
-        // earlier requests before handing the transient heap back.
-        trim_npu_scratch();
+        // Keep the just-used set while it fits the budget, then enforce the
+        // hard cap before handing the transient heap back.
+        trim_npu_scratch_to(keep_scratch_mib());
         trim_heap();
     }
 }
@@ -57,6 +99,15 @@ pub fn trim_after_request() {
 pub fn trim_npu_scratch() {
     #[cfg(feature = "npu")]
     burn_rocket::trim_scratch();
+}
+
+/// Drop cached NPU scratch (matmul + attention) until at most `mib` MiB stay
+/// resident. A no-op without the `npu` feature.
+pub fn trim_npu_scratch_to(mib: usize) {
+    #[cfg(feature = "npu")]
+    burn_rocket::trim_scratch_to(mib * 1024 * 1024);
+    #[cfg(not(feature = "npu"))]
+    let _ = mib;
 }
 
 /// Whether `ROCKET_MEM_LOG=1` enables the per-request NPU scratch line.
@@ -116,6 +167,7 @@ fn log_npu_mem_impl() {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let rss = rss();
     tracing::info!(
         target: "npu_mem",
         weights_mib = mib(stats.weights_bytes),
@@ -126,6 +178,9 @@ fn log_npu_mem_impl() {
         slots = stats.slots.len(),
         top_slots = %top_slots,
         attn_workers = %attn,
+        rss_anon_mib = rss.anon_mib,
+        rss_file_mib = rss.file_mib,
+        rss_shmem_mib = rss.shmem_mib,
         "npu scratch"
     );
 }

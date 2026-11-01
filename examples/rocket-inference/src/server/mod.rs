@@ -94,7 +94,7 @@ impl AppState {
 
             let t0 = Instant::now();
             crate::gemma::vision::vision_stats_reset();
-            let out = f(&mut engine)?;
+            let out = f(&mut engine);
             let compute_s = t0.elapsed().as_secs_f64();
             let encode_s = crate::gemma::vision::vision_stats().total_s;
             span.record("compute_s", compute_s);
@@ -108,11 +108,12 @@ impl AppState {
             };
             // Long requests leave their transient buffers in the allocator's
             // arenas; hand them back before the next request (`ROCKET_TRIM=0`
-            // disables it). The driver trim keeps the just-used shape set and
-            // drops per-shape scratch from earlier requests.
+            // disables it). The driver trim keeps the just-used shape set while
+            // it fits `ROCKET_KEEP_MB` (default 64 MiB) and drops it otherwise;
+            // a failed request releases its scratch too.
             crate::util::trim_after_request();
             crate::util::log_npu_mem();
-            Ok((out, timing))
+            Ok((out?, timing))
         })
         .await
     }

@@ -260,6 +260,42 @@ pub fn clear_scratch() {
     let mut guard = engine();
     if let Some(e) = guard.as_mut() {
         e.ctx.clear_scratch();
+        for fa in &mut e.fa {
+            fa.fa.clear_scratch();
+            fa.clear_host();
+        }
+    }
+}
+
+/// Drop cached scratch until the engine holds at most `budget` bytes across the
+/// matmul and attention caches (BO and host combined; resident weights are not
+/// part of it).
+///
+/// Runs the steady-state trim first (keep the just-finished request's set), then
+/// evicts the oldest matmul shapes and, when they still do not fit, clears the
+/// attention geometries. A finished request that alone exceeds the budget is
+/// therefore evicted too — the next request reallocates and re-zeroes its scratch.
+/// Integer overflow is not a concern: `budget` comes from MiB and the totals are
+/// far below `usize::MAX`.
+pub fn trim_scratch_to(budget: usize) {
+    let mut guard = engine();
+    if let Some(e) = guard.as_mut() {
+        e.ctx.trim_scratch();
+        for fa in &mut e.fa {
+            fa.fa.trim_scratch();
+            fa.trim_host();
+        }
+        e.ctx.trim_to_budget(budget);
+        let mut left = budget.saturating_sub(e.ctx.scratch_bytes());
+        for fa in &mut e.fa {
+            let used = fa.bytes();
+            if used > left {
+                fa.fa.clear_scratch();
+                fa.clear_host();
+            } else {
+                left -= used;
+            }
+        }
     }
 }
 
@@ -416,6 +452,43 @@ impl FaState {
                 buf.shrink_to(need);
             }
         }
+    }
+
+    /// Drop the host matrices and every cached mask, and force the next call to
+    /// rebuild them (`n = 0` takes the resize branch). The driver-side BOs are
+    /// released separately through [`RocketFaCtx::clear_scratch`].
+    fn clear_host(&mut self) {
+        self.n = 0;
+        self.n_k = 0;
+        self.mask = Vec::new();
+        self.win = usize::MAX;
+        self.win_mask = Vec::new();
+        self.cw = usize::MAX;
+        self.cw_mask = Vec::new();
+        self.wb = None;
+        self.wb_mask = Vec::new();
+        self.cb = None;
+        self.cb_mask = Vec::new();
+        self.q = Vec::new();
+        self.k = Vec::new();
+        self.v = Vec::new();
+        self.out = Vec::new();
+    }
+
+    /// Live bytes of this geometry: the driver's BOs and worker host scratch (from
+    /// its own mem stats) plus the host q/k/v/out and the cached masks.
+    fn bytes(&self) -> usize {
+        let m = self.fa.mem_stats();
+        let host = self.q.capacity()
+            + self.k.capacity()
+            + self.v.capacity()
+            + self.out.capacity()
+            + self.mask.capacity()
+            + self.win_mask.capacity()
+            + self.cw_mask.capacity()
+            + self.wb_mask.capacity()
+            + self.cb_mask.capacity();
+        m.bo_bytes + m.host_bytes + host * std::mem::size_of::<f16>()
     }
 }
 

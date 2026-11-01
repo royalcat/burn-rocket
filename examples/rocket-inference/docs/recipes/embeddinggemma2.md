@@ -32,12 +32,21 @@ placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=C
 ```
 
 The GGUF deployment shape (the live service's checkpoint) is the same flags
-with `-hf`:
+with `-hf`, plus the memory-round settings measured in log-gemma §23:
 
 ```sh
-rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu \
-    --defer-towers --port 8383 --max-tokens 8192
+ROCKET_MATMUL_CHUNK_M=1024 rocket-inference serve \
+    -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu \
+    --defer-towers --attn-chunk 512 --port 8383 --max-tokens 8192
 ```
+
+`ROCKET_MATMUL_CHUNK_M=1024` bounds the per-call matmul input pack (8k matmul
+scratch 681 → 235 MiB, wall neutral or slightly better) and `--attn-chunk 512`
+halves the full-layer attention scratch (424 → 245 MiB, wall neutral). The
+default `ROCKET_KEEP_MB=64` then drops whatever the finished request left above
+64 MiB (matmul + attention, BO and host), so an 8k request returns the process
+to its weights instead of keeping ~1 GiB of BOs. Lower-memory option:
+`--npu-threads 3` (−131 MiB, +12 % wall at 8k).
 
 A text-only service never loads the towers, so `--defer-towers` costs nothing
 there. Add `--quant q8` only if the CPU-resident audio tower's RAM matters:
@@ -124,6 +133,12 @@ Numerics vs the same binary's CPU f32 (text 512 tokens, image 2,394 patches):
 
 ## Tuning notes
 
+- Serving memory (log-gemma §23): `ROCKET_KEEP_MB` (default 64, `0` = clear all)
+  caps the matmul + attention scratch after every request; resident weights are
+  excluded. `ROCKET_MATMUL_CHUNK_M=1024` and `--attn-chunk 512` bound the peak
+  (8k text: 1431 → 807 MiB of BO in-request, 379 MiB retained after it).
+  `ROCKET_TABLE_F16=0` keeps the f32 token table (+256 MiB); f32 bodies default
+  to an f16 table with the rows cast back per forward.
 - `--attn-chunk <n>` (default 1024) is the query-chunk width of the chunked
   banded attention; keep it below the 8k class. `--vision-attn-kernel
   fused|blocked` selects the CPU vision-attention kernel when the vision

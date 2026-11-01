@@ -2224,3 +2224,232 @@ $CARGO_TARGET_DIR/release/rocket-inference gemma gen \
     --gen-model-dir /mnt/hub/models/gemma-4-E2B-it-qat-mobile --f16 --defer-towers \
     --image data/cat.jpeg --text "Describe this image briefly. <|image|>" --max-new-tokens 12
 ```
+
+## 23. Serving memory round: scratch budget, chunking, f16 table (2026-11-01)
+
+The 8k text serving footprint was dominated by *retained scratch*, not weights:
+the matmul cache kept one full-M input pack per worker and the attention cache
+kept its last-chunk matrices, and nothing released either while the service
+idled. This round adds a post-request byte budget, re-measures the existing
+chunk/thread knobs at the serving shapes, and halves the token table.
+
+Board: `rocket-inference` aarch64 NPU build, GGUF Q8_0 (`-hf
+unsloth/embeddinggemma-2-GGUF:Q8_0`), `--device npu --defer-towers`, taskset
+4-7, 600 MHz module. Perf runs with `home-llm-gateway-embed-1` stopped (restored
+afterwards, healthy); validation runs with it up. `RssAnon`/`RssFile`/`RssShmem`
+come from `/proc/self/status` in the `npu scratch` line; the DRM BOs show up in
+that line's `weights/matmul/attn` fields but **not** in `RssShmem` on this
+kernel (it reads 0 MiB), so the BO columns are the shmem measure.
+
+### 23.1 What the budget does
+
+`ROCKET_KEEP_MB` (default **64**, `0` = clear everything, large = the old
+behaviour) caps the matmul + attention scratch after every request, BO and host
+combined; resident weights are never part of it.
+
+- `matmul::Context::trim_to_budget` evicts cached shape sets oldest-first until
+  the cache fits. The just-finished request's set is evicted too when it does
+  not fit (the old `trim_scratch` kept it unconditionally).
+- `attn::Attention::clear_scratch` drops every worker's `ScratchCache` entries,
+  chained `MmBatch` packs, tile scratch, host q/k/v/score matrices and the host
+  softmax buffer, keeping the fds.
+- `ext::trim_scratch_to` runs the steady-state trim first, then the matmul
+  budget, then clears attention geometries while they do not fit;
+  `burn_rocket::clear_scratch` now covers attention and the `FaState` host
+  side (q/k/v/out and all five mask caches) too.
+- `serve` runs it after every request, successful or not, and the `npu scratch`
+  line now carries the three RSS fields.
+
+### 23.2 Text, 7,757 tokens (`data/long8k.txt`)
+
+| config | matmul BO/host | attn BO/host | BO total | `RssAnon` | wall |
+|---|---|---|---|---|---|
+| old (keep, chunk 8192, attn 1024) | 680.6 / 284.7 | 423.6 / 213.2 | 1431 MiB | 870 MiB | 43.7 s |
+| old + `ROCKET_KEEP_MB=64` | 0 / 0 | 0 / 0 | 327 MiB | 530 MiB | 43.1 s |
+| chunk 1024, keep | 235.1 / 59.7 | 423.6 / 213.2 | 985 MiB | 646 MiB | 41.5 s |
+| chunk 1024 + `--attn-chunk 512`, keep | 235.1 / 59.7 | 244.8 / 74.4 | 807 MiB | 502 MiB | 41.6 s |
+| chunk 1024 + attn 512 + budget 64 | 52.4 / 6.3 | 0 / 0 | 379 MiB | 475-533 MiB | 44.3 → 41.6 s |
+| chunk 1024 + attn 512 + `--npu-threads 3` | 163.7 / 77.6 | 167.2 / 55.8 | 676 MiB | 500 MiB | 46.4 s |
+
+The two requests of the budget arm are 44.3 s and 41.6 s with the same retained
+52 MiB, so the re-allocation of the dropped attention scratch is inside board
+noise. `--npu-threads 3` saves another 131 MiB but costs **+12 %** wall (it also
+grows the packed weights 327 → 345 MiB) and is not a default; it is the
+low-memory option.
+
+2,587 tokens (`data/one_long.txt`): old 297.2/95.4 + 273.1/89.8 = 897 MiB BO,
+`RssAnon` 568, 11.76 s; new defaults + budget 52.4/6.1 + 0 = 379 MiB,
+`RssAnon` 413-429, 11.83 s (two requests, both 11.83 s).
+
+### 23.3 Media
+
+One image (`data/cat.jpeg`, 2,394 patches) with the new defaults: the deferred
+vision half loads and packs on the request (weights 326.8 → 712.7 MiB BO,
++385.9 for the tower pack), the request's scratch is 44.2/3.8 MiB and the
+attention geometries are cleared by the budget, `RssAnon` 454.9 MiB,
+`encode 9.6 s` / `compute 18.8 s`. The tower pack is a resident weight and
+stays; only scratch is reclaimed.
+
+### 23.4 f16 token table for f32 bodies
+
+`--dtype f32` (including a Q8_0 GGUF, whose `native_dtype` is F32) now keeps
+`embed_tokens` in f16; the gathered rows are cast back per forward
+(`TextModel::embed_tokens_scaled`), so the body's arithmetic is unchanged.
+`ROCKET_TABLE_F16=0` restores the f32 table for an A/B, and native bf16
+checkpoints keep their table dtype.
+
+| arm | resident after load | after a 2,587-token request | cosine vs f32 table |
+|---|---|---|---|
+| GGUF Q8_0, f16 table | 388 MiB | 459.5 MiB | 0.99999947 (max_abs 1.17e-4) |
+| GGUF Q8_0, f32 table | 644 MiB | 716.6 MiB | — |
+| image, f16 table | — | 454.9 MiB | 0.99999988 (max_abs 6.6e-5) |
+| image, f32 table | — | 709.9 MiB | — |
+
+Dev host (safetensors, `--dtype f32`): text cosine 1 − 5e-13 vs the f32 table,
+image bit-identical.
+
+### 23.5 Gates
+
+- The budget is numerics-neutral: `ROCKET_KEEP_MB=100000` vs `64` at 2,587
+  tokens is **768/768 components bit-identical** (cosine 1.0, max_abs 0).
+- Table: cosine ≥ 0.9999994 on the Q8_0 GGUF and 1.0 on safetensors; both far
+  above the deployment's q8 floor (0.9994 text).
+- Board wall (2587) is unchanged: 11.76 s old vs 11.83 s new, and the 8k wall
+  moved 43.7 → 41.6 s; the board load varied (11-13) through the window, so
+  read the ratios, not the seconds.
+
+### 23.6 Reproduce
+
+```sh
+# new binary, live service stopped for timing runs / kept up for numerics
+EXTRA="--attn-chunk 512" REPS=2 /tmp/kb-run.sh m-idle data/long8k.txt \
+    ROCKET_KEEP_MB=64 ROCKET_MATMUL_CHUNK_M=1024
+# old behaviour (keep the whole set, no chunking)
+ROCKET_KEEP_MB=100000 ./rocket-inference-kb serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 \
+    --device npu --defer-towers --port 8399 --max-tokens 8192
+# table A/B
+ROCKET_TABLE_F16=0 ... serve ...   # f32 table, +256 MiB
+```
+
+## 23. Serving memory: scratch budget and table dtype (2026-11-01)
+
+The scratch-memory round (§15) bounds the *working set* of one request, and
+§14/§22 bound the load-time and tower halves. What remained was that the cache
+kept the just-finished request's set by design: after one 8k-token request the
+process held 1.43 GiB of NPU BOs (matmul 681 + attention 424 + weights 327) and
+~0.5 GiB of host scratch indefinitely. Those BO pages are not reclaimable and,
+per the P2a note in the root AGENTS.md, the driver's BOs are not charged to the
+process cgroup, so the cost is board-global memory. This round adds a hard
+post-request budget, measures the shape/chunk knobs that set the *peak*, and
+halves the embedding table.
+
+Board (`rock-5b-plus`, GGUF `unsloth/embeddinggemma-2-GGUF:Q8_0` + `mmproj`,
+`--device npu --defer-towers`, 600 MHz NPU, live service stopped for the runs,
+board load 11-13 from the other stacks, so wall is ±10-20 %; the memory numbers
+are exact). `RssShmem` reads 0 for the DRM mappings on this kernel, so the BO
+accounting is the driver's own `npu scratch` line; `rss_anon` is the host side.
+
+### 23.1 Post-request scratch budget (`ROCKET_KEEP_MB`)
+
+`ROCKET_KEEP_MB` (default **64** MiB, `0` = clear everything) caps matmul +
+attention scratch, BO and host combined, after every served request. The
+existing keep-the-just-used-set trim runs first; then the oldest matmul shape
+sets are evicted until they fit, and the attention geometries are cleared in
+turn when the remainder cannot hold them. Resident weights are never part of
+the cache. `ROCKET_TRIM=0` still disables the whole post-request release, and a
+failed request now trims too (the release used to be skipped on an error path).
+
+API: `Context::trim_to_budget` (oldest-first eviction, the just-used set
+included when it does not fit), `Attention::clear_scratch` (worker host
+matrices, `qk`/`av`/tiled caches, chained group buffers, batch contexts) and
+`FaState::clear_host` (q/k/v/out plus every cached dense/block mask and the
+shape keys, so the next call rebuilds them). `burn_rocket::clear_scratch` now
+covers attention too; `burn_rocket::trim_scratch_to(bytes)` is the budget form.
+
+Numerics are unchanged by construction (it only evicts caches): the 2,587-token
+vector is **bit-identical** between `ROCKET_KEEP_MB=64` and `100000`
+(768/768 components equal, max|d| 0). Cost: the first request after a large one
+reallocates and re-zeroes its scratch; with the defaults in 23.2/23.3 the
+second 8k request measured 41.6 s vs 44.3 s for the first, i.e. no measurable
+penalty.
+
+### 23.2 Matmul chunk sets the peak (`ROCKET_MATMUL_CHUNK_M`)
+
+At 7,757 tokens the matmul cache is 681 MiB BO + 285 MiB host. The cause is the
+per-worker input pack: the N-split gives every worker the full A, so 5 workers ×
+~88 MiB of `in_all` + ~40 MiB of `okacc`/`pong` each. `ROCKET_MATMUL_CHUNK_M`
+(existing, default 8192 = off at this length) splits M into row chunks; with
+**1024** the cache is 235 MiB + 60 MiB (2.9x smaller, 14 slots: the 1024 class
+plus the 640-row tail) and the wall does not regress (41.5 s vs 43.7 s in this
+window; both are noise-level at 2,587 tokens too: 11.76 vs 11.83 s). The split
+is numerics-neutral: the planner returns the same `Mt=256 / Kt=512 / Nt=128`
+for M = 8192/2048/1024 on the emb2 shapes, so the K accumulation order is
+unchanged.
+
+The value is deployment-specific, so it stays an env knob (the library default
+is unchanged). The emb2 recipe passes `ROCKET_MATMUL_CHUNK_M=1024`.
+
+### 23.3 Attention chunk (`--attn-chunk 512`)
+
+The full layers' key axis is the whole sequence, so the last query chunk's
+`[Tp, Kn]` score/probability scratch dominates: at 7,757 tokens the cache is
+424 MiB BO + 213 MiB host at the default 1024. `--attn-chunk 512` halves the
+query tile (the last chunk is 77 padded rows): 245 MiB BO + 74 MiB host
+(-42 % / -65 %), wall unchanged (41.6 vs 41.5 s). The sliding layers shrink with
+it (592x1120 -> 80x608).
+
+`--npu-threads 3` was measured as the low-memory option: matmul 235 -> 164 MiB,
+attention 245 -> 167 MiB, but the wall rose 41.5 -> 46.4 s (+12 %; the weights
+also grow 327 -> 345 MiB because the N tiling is coarser). Rejected as a
+default.
+
+### 23.4 Embedding table f16 for f32 bodies
+
+A f32 body (the GGUF path's native dtype, and `--dtype f32` on safetensors)
+used to keep the 262,144 × 512 token table at f32 = 512 MiB anon, even under
+`--quant q8` (which uses the table as-is). The loader now keeps an f16 copy
+when the resolved dtype is f32 (`ROCKET_TABLE_F16=0` restores f32) and
+`embed_tokens_scaled` casts the gathered rows back to the model dtype: -256 MiB
+resident, one `[B,S,512]` cast per forward (the qwen3 low-RAM path does the
+same). Native bf16 checkpoints already hold it at 16 bits and are untouched.
+
+Numerics: at 2,587 tokens the vector changes by cosine 0.99999947 / max|d|
+1.2e-4 (the GGUF table is Q8_0-dequantized, so f16 rounds that f32 value);
+image 0.99999988 / 6.6e-5. On the dev host with the bf16 safetensors the text
+cosine is 1 - 5e-13 and the image vector is bit-identical. Both are orders
+below the deployed q8 floor (text 0.9994 vs f32, §12).
+
+### 23.5 Measured
+
+7,757-token text (`data/long8k.txt`), one process per row, `npu scratch` after
+the request:
+
+| config | matmul BO/host | attn BO/host | rss_anon | wall |
+|---|---|---|---|---|
+| previous behaviour (`KEEP_MB=100000`, chunk 8192, attn 1024) | 681 / 285 | 424 / 213 | 870 | 43.7 s |
+| budget 64, same shapes | 0 / 0 | 0 / 0 | 530 | 43.1 s |
+| chunk 1024 | 235 / 60 | 424 / 213 | 646 | 41.5 s |
+| chunk 1024 + attn 512 | 235 / 60 | 245 / 74 | 502 | 41.6 s |
+| chunk 1024 + attn 512 + threads 3 | 164 / 78 | 167 / 56 | 500 | 46.4 s |
+| **chunk 1024 + attn 512 + budget 64 (deployed shape)** | **52 / 6** | **0 / 0** | **475-533** | **41.6-44.3 s** |
+
+Peak BO over the request: 1,431 MiB (previous) -> 807 MiB (chunk+attn) -> 379 MiB
+idle. Host scratch 498 -> 134 MiB peak / 6 MiB idle. Text at 2,587 tokens:
+897 MiB BO -> 379 MiB idle, rss_anon 568 -> 413-429 MiB, wall 11.76 vs 11.83 s.
+Image (2,394 patches): text+vision pack 713 MiB weights, scratch 44 + 4 MiB,
+attention cleared, rss_anon 455 MiB (vs 710 with a f32 table), encode 9.6 s.
+
+### 23.6 Reproduce
+
+```sh
+# serve with the deployed shape (service stopped for the numbers)
+HF_HOME=/mnt/nvme/huggingface ROCKET_MEM_LOG=1 ROCKET_MATMUL_CHUNK_M=1024 \
+  taskset -c 4-7 ./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 \
+  --device npu --defer-towers --attn-chunk 512 --port 8399 --max-tokens 8192
+# per-request memory line (now carries the RSS split)
+#   npu scratch weights_mib=... matmul_bo_mib=... attn_bo_mib=... rss_anon_mib=... rss_shmem_mib=...
+# the budget: default 64, 0 = clear all, 100000 = the old keep-the-set behaviour
+ROCKET_KEEP_MB=100000 ...   # previous behaviour for the A/B
+# the table A/B
+ROCKET_TABLE_F16=0 ...      # f32 table
+```

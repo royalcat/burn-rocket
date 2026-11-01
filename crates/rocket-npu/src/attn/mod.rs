@@ -552,6 +552,13 @@ impl ScratchCache {
     fn drop_key_axis_at_least(&mut self, kn: usize) {
         self.entries.retain(|s| s.plan.n < kn && s.plan.k < kn);
     }
+
+    /// Drop every entry, BOs and CPU buffers included. The next [`ScratchCache::get`]
+    /// reallocates; [`ScratchCache::current_mut`] assumes a `get` happened first.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.last_trim = self.clock;
+    }
 }
 
 struct Worker {
@@ -615,6 +622,38 @@ impl Worker {
             shape: (self.tp, self.kn),
             tile: self.tile_w,
         }
+    }
+
+    /// Drop every shape class, host matrix and device BO this worker holds, keeping
+    /// only the open fd. The next [`Worker::prepare`] reallocates.
+    ///
+    /// The per-request trim keeps the just-used class on purpose; this is the escape
+    /// hatch a serving loop uses when the finished request was large enough that its
+    /// scratch must not stay resident while the process idles.
+    fn clear_scratch(&mut self) {
+        self.qk.clear();
+        self.av.clear();
+        self.bqk = None;
+        self.bav = None;
+        self.tqk = None;
+        self.tav = None;
+        self.grp.release();
+        self.tiles = TileScratch::default();
+        self.qh = Vec::new();
+        self.kh = Vec::new();
+        self.vh = Vec::new();
+        self.p = Vec::new();
+        self.scores = Vec::new();
+        self.ctx = Vec::new();
+        self.out = Vec::new();
+        self.sm = RowSoftmax::new();
+        self.qk_batch = false;
+        self.av_batch = false;
+        self.tile_w = 0;
+        self.head_dim = 0;
+        self.dv = 0;
+        self.tp = 0;
+        self.kn = 0;
     }
 
     fn new(dev: Device) -> Result<Self> {
@@ -1204,6 +1243,20 @@ impl Attention {
                     b.trim();
                 }
             }
+        }
+    }
+
+    /// Drop every cached scratch set, host matrices and per-geometry BOs included,
+    /// keeping the worker contexts (the open fds). The next call reallocates and
+    /// pays the BO zeroing again; resident weights are unaffected (they are not
+    /// part of this context).
+    ///
+    /// [`Attention::trim_scratch`] is the steady-state policy (keep the just-used
+    /// class); this is the hard reset a serving loop uses once the finished request
+    /// no longer fits its scratch budget.
+    pub fn clear_scratch(&mut self) {
+        for w in &mut self.workers {
+            w.clear_scratch();
         }
     }
 

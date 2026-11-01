@@ -39,7 +39,7 @@ pub use ext::{
     stats, stats_reset,
 };
 #[cfg(feature = "npu")]
-pub use ext::{clear_scratch, mem_stats, trim_scratch};
+pub use ext::{clear_scratch, mem_stats, trim_scratch, trim_scratch_to};
 
 /// One entry of the matmul per-shape scratch cache.
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,6 +91,9 @@ pub fn trim_scratch() {}
 
 #[cfg(not(feature = "npu"))]
 pub fn clear_scratch() {}
+
+#[cfg(not(feature = "npu"))]
+pub fn trim_scratch_to(_budget: usize) {}
 
 pub use half;
 use half::f16;
@@ -255,6 +258,17 @@ impl RocketCtx {
         self.inner.trim_scratch();
     }
 
+    /// Evict cached scratch sets, oldest first, until at most `budget` bytes
+    /// (BOs + CPU buffers) remain; `0` clears the cache.
+    pub fn trim_to_budget(&mut self, budget: usize) {
+        self.inner.trim_to_budget(budget);
+    }
+
+    /// Total live scratch bytes of the per-shape cache.
+    pub fn scratch_bytes(&self) -> usize {
+        self.inner.scratch_bytes()
+    }
+
     /// Drop every cached matmul shape set.
     pub fn clear_scratch(&mut self) {
         self.inner.clear_scratch();
@@ -316,6 +330,11 @@ impl RocketFaCtx {
     /// Drop scratch classes from an earlier, much larger request.
     pub fn trim_scratch(&mut self) {
         self.inner.trim_scratch();
+    }
+
+    /// Drop every cached attention scratch set (host matrices and BOs).
+    pub fn clear_scratch(&mut self) {
+        self.inner.clear_scratch();
     }
 }
 

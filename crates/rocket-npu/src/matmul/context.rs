@@ -347,6 +347,30 @@ impl Context {
         self.last_trim = self.clock;
     }
 
+    /// Evict cached scratch sets, oldest first, until at most `budget` bytes
+    /// (BOs + CPU buffers) remain. `budget == 0` clears the cache.
+    ///
+    /// Unlike [`Context::trim_scratch`], which keeps the just-finished request's
+    /// shape set, this also evicts it when the set alone exceeds the budget — the
+    /// serving-loop policy for a scratch-bound deployment. The next call at that
+    /// shape replans and reallocates (a padded capacity class, so the cost is the
+    /// BO allocation and its zero fill, not a numerics change).
+    pub fn trim_to_budget(&mut self, budget: usize) {
+        while self.scratch_bytes() > budget && !self.slots.is_empty() {
+            let oldest = self
+                .slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.stamp)
+                .map(|(i, _)| i)
+                .expect("checked non-empty");
+            self.slots.remove(oldest);
+        }
+        if self.slots.is_empty() {
+            self.last_trim = self.clock;
+        }
+    }
+
     fn build_slot(&self, m: usize, k: usize, n: usize, split: bool) -> Result<Slot> {
         let nstep = fanout_step(n, self.threads, 16);
         let mstep = fanout_step(m, self.threads, 4);

@@ -80,6 +80,19 @@ pub fn load_model(
         )
     })?;
     crate::util::store::check_load_report(&result, |_| false)?;
+    // A f32 body keeps the token table at f16: the gathered rows are cast back
+    // per forward, so the body's arithmetic is unchanged, and it halves a 512 MiB
+    // table (the same policy qwen3's low-RAM path uses). Native bf16 checkpoints
+    // already hold it at 16 bits. `ROCKET_TABLE_F16=0` keeps the f32 table for an
+    // A/B.
+    if dtype == DType::F32
+        && std::env::var("ROCKET_TABLE_F16")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
+        model.embed_table_to_f16();
+        println!("token table: f16 (f32 body; ROCKET_TABLE_F16=0 keeps f32)");
+    }
     println!(
         "loaded {} text tensors as {:?} from {} in {:.2}s (resident {:.0} MiB anon)",
         result.applied.len(),

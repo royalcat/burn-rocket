@@ -595,6 +595,13 @@ impl Emb2Model {
         &mut self.language_model
     }
 
+    /// Keep only an f16 copy of the token-embedding table (f32 body; the gathered
+    /// rows are cast back per forward). Native 16-bit checkpoints already hold it
+    /// that way. Releases the freed pages to the OS.
+    pub fn embed_table_to_f16(&mut self) {
+        self.language_model.embed_table_to_f16();
+    }
+
     /// Soft tokens for one prepared image: `[num_soft_tokens, text_hidden]`.
     pub fn image_soft_tokens(
         &self,
@@ -776,7 +783,27 @@ impl TextModel {
     /// The scaled token embedding (`x * sqrt(hidden)`).
     pub fn embed_tokens_scaled(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
         let scale = (self.spec.hidden_size as f64).sqrt();
-        self.embed_tokens.forward(input_ids).mul_scalar(scale)
+        let x = self.embed_tokens.forward(input_ids);
+        // The table may be kept f16 while the body computes f32 (see
+        // [`TextModel::embed_table_to_f16`]); the cast costs one `[B, S, D]` pass.
+        let dt = crate::gemma::layers::model_dtype();
+        let x = if x.dtype() == dt { x } else { x.cast(dt) };
+        x.mul_scalar(scale)
+    }
+
+    /// Keep only an f16 copy of the token-embedding table (f32 body), then release
+    /// the freed pages. The rows are cast back per forward in
+    /// [`TextModel::embed_tokens_scaled`], so the body's arithmetic is unchanged.
+    pub fn embed_table_to_f16(&mut self) {
+        self.embed_tokens.weight = self
+            .embed_tokens
+            .weight
+            .clone()
+            .map(|tensor| tensor.cast(DType::F16));
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
+        }
     }
 
     pub fn embedding_dim(&self) -> usize {

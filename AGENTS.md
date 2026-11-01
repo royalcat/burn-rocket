@@ -329,6 +329,38 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   pre-round binary; 8k driver BO 1.27 GiB + host 0.56 GiB (pre-fix Rust: 2.8 GiB
   shmem + anon; C: 2.1 GiB shmem); a 3-token request after it trims to 11.5 MiB
   scratch + 514 MiB anon.
+- **Serving memory round** (2026-11-01, log-gemma §23): the post-request scratch
+  policy is now a hard budget, and the peak is set by the chunk knobs. `ROCKET_KEEP_MB`
+  (default **64**, `0` = clear all, `ROCKET_TRIM=0` still disables the whole release)
+  caps matmul + attention scratch, BO and host, after every request — a failed one
+  included; resident weights are excluded. API: `matmul::Context::trim_to_budget`
+  (oldest-first eviction, the just-used set included when it does not fit),
+  `attn::Attention::clear_scratch` (host matrices, `qk`/`av`/tiled caches, group
+  buffers, batch contexts; keeps the fds), `FaState::clear_host` (q/k/v/out and all
+  five mask caches plus the shape keys), `burn_rocket::trim_scratch_to(bytes)`, and
+  `burn_rocket::clear_scratch` now covers attention too. The `npu scratch` line
+  carries `rss_anon_mib`/`rss_file_mib`/`rss_shmem_mib`; the DRM BOs read 0 in
+  `RssShmem` on this kernel, so the line's own `weights/matmul/attn` fields are the
+  shmem measure. Board (GGUF Q8_0, `--device npu --defer-towers`, live service
+  stopped; load 11-13, wall ±10-20 %): 7,757-token text 1,431 -> 807 MiB of BO
+  in-request with `ROCKET_MATMUL_CHUNK_M=1024` + `--attn-chunk 512` (matmul
+  681 -> 235, attention 424 -> 245) and **379 MiB retained** after the request
+  (326.8 weights + 52 matmul; attention 0), `RssAnon` 870 -> 475-533; 2,587 tokens
+  897 -> 379 MiB and 568 -> 413-429 MiB at the same wall (11.76 vs 11.83 s). The
+  budget is numerics-neutral (2,587-token vector bit-identical to
+  `ROCKET_KEEP_MB=100000`), and the next 8k request after a large one shows no
+  measurable realloc penalty (41.6 vs 44.3 s). `--npu-threads 3` saves another
+  131 MiB but costs +12 % wall at 8k (and grows the weights 327 -> 345 MiB):
+  low-memory option, not a default. Media: the image request's scratch is cleared
+  the same way while the vision tower pack (386 MiB BO) stays resident.
+  **Token table**: a f32 body (the GGUF path's native dtype and `--dtype f32`)
+  now keeps `embed_tokens` at f16 (`TextModel::embed_table_to_f16`, the rows cast
+  back per forward in `embed_tokens_scaled`; `ROCKET_TABLE_F16=0` is the A/B
+  switch), -256 MiB anon: 2,587-token text cosine 0.99999947 on the Q8_0 GGUF
+  (1 - 5e-13 and a bit-identical image vector on safetensors), image 0.99999988.
+  The emb2 recipe carries the deployed shape
+  (`ROCKET_MATMUL_CHUNK_M=1024 ... --attn-chunk 512`); the library defaults for
+  the chunk size and `--npu-threads` are unchanged.
 - **Vision tower round** (2026-10-24, log-gemma §18): the tower now has phase
   timers (`vision_stats`, `encode=` in `gemma embed|bench`, `encode_s` +
   `vision_attn` in serve; `ROCKET_VISION_LOG=1` prints one line per forward and,
@@ -1684,21 +1716,22 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - **Live service**: OpenViking's embedding backend, container
   `home-llm-gateway-embed-1` in the `home-llm-gateway` Komodo stack
   (`/home/komodo/.komodo/stacks/home-llm-gateway/compose.yaml`, service `embed`;
-  historically `openviking-embed-1` in the `openviking` stack). As observed on
-  2026-10-24 it runs `ghcr.io/royalcat/rocket-inference:latest` (= `94f99bd`,
-  2026-10-22, which includes the 2026-10-21 scratch-memory round, log-gemma §15)
-  with `serve --backend flex --npu --npu-attn npu --attn-chunk 1024 --port 8383
-  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`
-  (the pre-refactor flags; the equivalent current command is
-  `serve --cpu-backend flex --device npu --attn-chunk 1024 --port 8383
-  --max-tokens 8192 --defer-towers -hf unsloth/embeddinggemma-2-GGUF:Q8_0`),
-  CPUs 4-7, NPU, `mem_limit` 8g. It predates the S1/S2 round (log-gemma §19/§20):
-  a redeploy from `main` brings the fast host softmax to the text path
-  (qwen3 2777-token −11 % wall / −26 % CPU; emb2 2594-token attention −17 %) and
-  the NPU vision-attention default for media; the text-only config needs no flag
-  change and the deployed service never calls `/embed`. It also predates the
-  2026-10-24 ffmpeg install (log-gemma §21), so `input_video` blocks and non-WAV
-  audio fail in that container until a redeploy. The previous C/GGUF image
+  historically `openviking-embed-1` in the `openviking` stack). Observed on
+  2026-11-01 (`ghcr.io/royalcat/rocket-inference:latest`, newer than the
+  `94f99bd` 2026-10-22 image that included the 2026-10-21 scratch-memory round,
+  log-gemma §15) it runs
+  `serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu --defer-towers
+  --port 8383 --max-tokens 8192 --video-max-frames 50 --model-name
+  embeddinggemma-2`, CPUs 4-7, NPU, `mem_limit` 8g. A redeploy from `main`
+  adds the serving-memory round (log-gemma §23): `ROCKET_KEEP_MB=64` is the new
+  binary default, and the deployed shape should also set
+  `ROCKET_MATMUL_CHUNK_M=1024` and `--attn-chunk 512` (8k text peak 1,431 ->
+  807 MiB of BO and 379 MiB retained, `RssAnon` 870 -> ~480 MiB). Earlier
+  images predate the S1/S2 round (log-gemma §19/§20), which brought the fast
+  host softmax (qwen3 2777-token −11 % wall / −26 % CPU; emb2 2594-token
+  attention −17 %) and the NPU vision-attention default for media, and the
+  2026-10-24 ffmpeg install (log-gemma §21) that makes `input_video` and
+  non-WAV audio work. The previous C/GGUF image
   `a986d54` predates the 2026-10-17 `gemma4` tokenizer fix; the documents indexed
   in the GGUF-era window may need re-embedding (their vectors and queries were
   self-consistent but up to ~0.016 cosine off the reference on German text). The
@@ -2378,6 +2411,20 @@ curl -s localhost:8399/embed -H 'Content-Type: application/json' -d '{"audio":"d
 # RssAnon of the q8 text-only process is ~510 MiB; the image request grows it by
 # ~275 MiB (vision) and the audio request by ~373 MiB more (log-gemma §22)
 awk '/RssAnon/{print $2}' /proc/$(pgrep -x rocket-inferenc | head -1)/status
+# serving memory round (log-gemma §23): post-request scratch budget + the peak knobs.
+# `ROCKET_KEEP_MB=64` (the default) leaves weights + <=64 MiB after a request;
+# 100000 is the old keep-the-whole-set behaviour, 0 clears everything. The
+# `npu scratch` line ends in rss_anon_mib/rss_file_mib/rss_shmem_mib (the DRM BOs
+# read 0 in RssShmem on this kernel, so its weights/matmul/attn fields are the BO
+# measure). The 8k build is ROCKET_MATMUL_CHUNK_M=1024 + --attn-chunk 512.
+HF_HOME=/mnt/nvme/huggingface ROCKET_MEM_LOG=1 ROCKET_MATMUL_CHUNK_M=1024 \
+  taskset -c 4-7 ./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 \
+  --device npu --defer-towers --attn-chunk 512 --port 8399 --max-tokens 8192 &
+# A/B: the 2587-token embedding must be bit-identical with 64 vs 100000
+ROCKET_KEEP_MB=100000 ... ; ROCKET_KEEP_MB=64 ...   # compare the /tmp JSON vectors
+# table dtype: f32 bodies keep the token table f16 (rows cast back per forward);
+# ROCKET_TABLE_F16=0 restores the f32 table (+256 MiB anon)
+ROCKET_TABLE_F16=0 ./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 ...
 # OpenRouter multimodal /v1/embeddings (embeddinggemma): one embedding per
 # block, N images per block, URLs/data URIs/paths, audio+video one each
 curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
