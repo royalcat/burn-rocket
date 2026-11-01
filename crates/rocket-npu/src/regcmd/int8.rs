@@ -10,7 +10,9 @@ use crate::knobs;
 use crate::log::log_error;
 
 use super::desc::*;
-use super::fp16::{CnaDesc, CoreDesc, DpuDesc, MatmulParams, emit_task, feature_surf_stride};
+use super::fp16::{
+    CnaDesc, CoreDesc, DpuDesc, MatmulParams, emit_task, feature_surf_stride, stream_weight_banks,
+};
 
 pub fn emit(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<usize> {
     let start = ops.len();
@@ -59,8 +61,19 @@ fn emit_int8(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
     if cna.weight_bytes_per_kernel as usize > CBUF_BANK_SIZE {
         return Err(Error::tiling("gen_matmul_int8/weight-kernel"));
     }
-    cna.data_bank = (fd_banks + 1) as u32;
-    cna.weight_bank = (CBUF_BANKS - (fd_banks + 1)) as u32;
+    // A weight cube past its banks is streamed: the fp16 floor plus one bank. With the
+    // weight banks equal to the atom's bank count and the atom not a whole number of
+    // banks, int8 tasks ran to the watchdog and wrote nothing; one more bank was exact.
+    let data_bank = fd_banks + 1;
+    let wbanks = CBUF_BANKS - data_bank;
+    if cna.weight_bytes as usize > wbanks * CBUF_BANK_SIZE
+        && (wbanks < stream_weight_banks(cna.weight_bytes_per_kernel as usize) + 1
+            || params.weight_reuse)
+    {
+        return Err(Error::tiling("gen_matmul_int8/weight-stream"));
+    }
+    cna.data_bank = data_bank as u32;
+    cna.weight_bank = wbanks as u32;
     cna.weight_reuse = params.weight_reuse;
     cna.data_reuse = params.data_reuse;
     cna.data_entries = (cna.datain_width * cna.datain_channel).div_ceil(64);

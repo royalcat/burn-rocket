@@ -306,7 +306,7 @@ mod tests {
         // Ragged on both axes: 264 rows (a 256-row tile plus 8) and 272 columns (128-wide
         // tiles plus a 16-wide last one). The short last m-tile means the slot's `H` is
         // the live tile height, not `Mt`, which is what the lane math must follow.
-        let p = Plan::new(264, 1024, 272).unwrap();
+        let p = Plan::derive(264, 1024, 272, 256, 512, 128);
         assert!(p.nmt > 1 && p.nnt > 1);
         assert!(p.m_tile(p.nmt - 1) < p.mt && p.n_tile(p.nnt - 1) < p.nt);
 

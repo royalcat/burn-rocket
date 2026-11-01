@@ -324,7 +324,7 @@ fn main() -> ExitCode {
             "usage: regcmd_dump plan|plan-int8|plan-int8-gw|plan-int4|plan-tf32|plan-bf16 M K N [GROUP]"
         );
         eprintln!(
-            "       regcmd_dump emit|emit-int8|emit-int4|emit-tf32|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]"
+            "       regcmd_dump emit|emit-int8|emit-int4|emit-tf32|emit-bf16 M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA] [A_ROW_ATOMS] [C_ROW_ATOMS]"
         );
         eprintln!("       regcmd_dump recip K");
         eprintln!("       regcmd_dump pool C H W");
@@ -499,6 +499,12 @@ fn main() -> ExitCode {
             }
             if let Some(v) = args.get(10) {
                 p.add_dma = dma(v);
+            }
+            if let Some(v) = args.get(11) {
+                p.a_row_atoms = v.parse().unwrap_or(0);
+            }
+            if let Some(v) = args.get(12) {
+                p.c_row_atoms = v.parse().unwrap_or(0);
             }
             emit_program(mode, &p)
         }

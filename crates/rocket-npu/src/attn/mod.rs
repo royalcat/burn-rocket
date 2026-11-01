@@ -104,12 +104,15 @@ use std::thread;
 use half::f16;
 
 use crate::Device;
+use crate::device::Bo;
 use crate::device::affinity;
 use crate::error::{Error, Result};
 use crate::knobs;
+use crate::log::log_debug;
 
 use crate::matmul::Config;
 use crate::matmul::MmBatch;
+use crate::matmul::bos;
 use crate::matmul::bos::Bos;
 use crate::matmul::plan::Plan;
 use crate::matmul::run::{compute_cpu, compute_kacc};
@@ -298,18 +301,28 @@ struct GroupBufs {
 }
 
 impl GroupBufs {
-    /// Grow to `heads` heads of the `(tp, kn, dk, dv)` shape.
-    fn ensure(&mut self, heads: usize, tp: usize, kn: usize, dk: usize, dv: usize) {
+    /// Grow to `heads` heads of the `(tp, kn, dk, dv)` shape. `scores` sizes the two
+    /// full-key-axis matrices; the row handoff keeps those in its BOs instead (C
+    /// `fa_batch_ensure(..., !rows)`).
+    fn ensure(&mut self, heads: usize, tp: usize, kn: usize, dk: usize, dv: usize, scores: bool) {
         for (buf, need) in [
             (&mut self.qh, heads * tp * dk),
             (&mut self.kh, heads * kn * dk),
             (&mut self.vh, heads * dv * kn),
-            (&mut self.sc, heads * tp * kn),
-            (&mut self.p, heads * tp * kn),
             (&mut self.ctx, heads * tp * dv),
         ] {
             if buf.len() < need {
                 buf.resize(need, f16::ZERO);
+            }
+        }
+        if scores {
+            for (buf, need) in [
+                (&mut self.sc, heads * tp * kn),
+                (&mut self.p, heads * tp * kn),
+            ] {
+                if buf.len() < need {
+                    buf.resize(need, f16::ZERO);
+                }
             }
         }
         self.cap = self.cap.max(heads);
@@ -567,10 +580,15 @@ struct Worker {
     /// for a shape whose plan splits K, and any group of one.
     qk: ScratchCache,
     av: ScratchCache,
-    /// The chained path's persistent batch contexts (one shape each), created on first
-    /// use so the per-head path allocates neither.
-    bqk: Option<MmBatch>,
-    bav: Option<MmBatch>,
+    /// The chained path's persistent batch contexts and the row handoff's BOs, one per
+    /// 4x class of `Tp x Kn` (C `qk[FA_BCLS]`, `av[FA_BCLS]`, `rows[FA_BCLS]`,
+    /// `prows[FA_BCLS]`). A short call after a long one then pays for at most its own
+    /// class instead of syncing the long call's buffers.
+    bqk: [Option<MmBatch>; FA_BCLS],
+    bav: [Option<MmBatch>; FA_BCLS],
+    /// Scores as plain rows (or per-N-tile blocks), and P where the scores are blocked.
+    rows: [Option<Bo>; FA_BCLS],
+    prows: [Option<Bo>; FA_BCLS],
     /// The tiled long-context path's per-tile matmul scratch, one cache per operand
     /// shape, created on first tiled use. Two entries each hold the full tile width and
     /// the (narrower) last tile, so a head range reuses both across heads and calls.
@@ -612,12 +630,14 @@ impl Worker {
             + self.ctx.capacity()
             + self.out.capacity()
             + self.grp.host_elems();
-        let batch = self.bqk.as_ref().map_or(0, MmBatch::bytes)
-            + self.bav.as_ref().map_or(0, MmBatch::bytes);
+        let batch = self.bqk.iter().flatten().map(MmBatch::bytes).sum::<usize>()
+            + self.bav.iter().flatten().map(MmBatch::bytes).sum::<usize>();
+        let rows = self.rows.iter().flatten().map(Bo::len).sum::<usize>()
+            + self.prows.iter().flatten().map(Bo::len).sum::<usize>();
         let tiled = self.tqk.as_ref().map_or(0, ScratchCache::bo_bytes)
             + self.tav.as_ref().map_or(0, ScratchCache::bo_bytes);
         ScratchMem {
-            bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes() + batch + tiled,
+            bo_bytes: self.qk.bo_bytes() + self.av.bo_bytes() + batch + tiled + rows,
             host_bytes: host * size_of::<f16>() + self.tiles.host_bytes() + self.sm.bytes(),
             shape: (self.tp, self.kn),
             tile: self.tile_w,
@@ -633,8 +653,10 @@ impl Worker {
     fn clear_scratch(&mut self) {
         self.qk.clear();
         self.av.clear();
-        self.bqk = None;
-        self.bav = None;
+        self.bqk = std::array::from_fn(|_| None);
+        self.bav = std::array::from_fn(|_| None);
+        self.rows = std::array::from_fn(|_| None);
+        self.prows = std::array::from_fn(|_| None);
         self.tqk = None;
         self.tav = None;
         self.grp.release();
@@ -664,8 +686,10 @@ impl Worker {
             dev,
             qk,
             av,
-            bqk: None,
-            bav: None,
+            bqk: std::array::from_fn(|_| None),
+            bav: std::array::from_fn(|_| None),
+            rows: std::array::from_fn(|_| None),
+            prows: std::array::from_fn(|_| None),
             tqk: None,
             tav: None,
             grp: GroupBufs::default(),
@@ -746,10 +770,10 @@ impl Worker {
         self.av.drop_key_axis_at_least(self.kn);
         if self.grp.key_axis_at_least(self.kn) {
             self.grp.release();
-            if let Some(b) = &mut self.bqk {
+            for b in self.bqk.iter_mut().flatten() {
                 b.trim();
             }
-            if let Some(b) = &mut self.bav {
+            for b in self.bav.iter_mut().flatten() {
                 b.trim();
             }
         }
@@ -846,6 +870,44 @@ impl Worker {
         } else {
             self.run_per_head(t, kv, heads, gqa, scale, softcap, q, k, v, mask)
         }
+    }
+
+    /// Set up the row handoff for this shape (C `fa_rows_bos`): the score/P BOs of this
+    /// 4x class, grown, with the block width — or `None` when the handoff does not apply
+    /// here (the knob is off, QK plans more than one K tile, or a BO cannot be had), all
+    /// of which leave the cube handoff.
+    fn row_handoff(&mut self, tp: usize, kn: usize, dk: usize, g: usize) -> Option<RowHandoff> {
+        if !rowmajor() {
+            return None;
+        }
+        // A row-major C takes each element from one tile, so QK must be one K tile.
+        let plan = Plan::new(tp, dk, kn).ok()?;
+        if plan.kt < dk {
+            return None;
+        }
+        let blocked = (kn as i64) * 2 > rm_max_row() && plan.nnt > 1;
+        let cls = bcls(tp, kn);
+        let p_bytes = g.checked_mul(tp)?.checked_mul(kn)?.checked_mul(2)?;
+        let s_bytes = if blocked {
+            g * tp * plan.nnt * plan.nt * 2
+        } else {
+            p_bytes
+        };
+        if rows_grow(&self.dev, &mut self.rows[cls], s_bytes).is_err() {
+            return None;
+        }
+        if blocked && rows_grow(&self.dev, &mut self.prows[cls], p_bytes).is_err() {
+            return None;
+        }
+        log_debug!(
+            "attn: row handoff class {cls} Tp={tp} Kn={kn} seg={} blocked={blocked}",
+            if blocked { plan.nt } else { kn }
+        );
+        Some(RowHandoff {
+            cls,
+            seg: if blocked { plan.nt } else { kn },
+            blocked,
+        })
     }
 
     /// `ROCKET_FA_TILE_KV`: the key axis in tiles of [`Worker::tile_w`] keys, carrying
@@ -966,6 +1028,7 @@ impl Worker {
             self.qk
                 .current_mut()
                 .matmul(&self.qh, &self.kh, &mut self.scores)?;
+            let sat = softmax::scores_saturated(&self.scores, kv);
             self.sm.run(
                 &self.dev,
                 &self.scores,
@@ -978,6 +1041,9 @@ impl Worker {
                 scale,
                 softcap,
             )?;
+            if sat {
+                return Err(Error::new(crate::Status::Range, "attn/score-range", 0));
+            }
             self.av
                 .current_mut()
                 .matmul(&self.p, &self.vh, &mut self.ctx)?;
@@ -1013,15 +1079,32 @@ impl Worker {
         let tp = self.tp;
         let kn = self.kn;
         let (qd, kd, tk, cd) = (tp * dk, kn * dk, tp * kn, tp * dv);
-        self.grp.ensure(gmax, tp, kn, dk, dv);
+        // The row handoff needs QK's batch context (one K tile, so its scores fit a
+        // row-major C) and the host softmax, the one softmax that reads blocked scores
+        // and rewrites a row in place. AV may still take its per-head path (a K-split
+        // AV keeps the fp16 KACC accumulation) and read P straight out of the BO.
+        let rh = if self.qk_batch && host_softmax() {
+            self.row_handoff(tp, kn, dk, gmax)
+        } else {
+            None
+        };
+        // The row handoff keeps the scores/P in its BOs, so the group's host matrices
+        // are only needed by the cube handoff.
+        self.grp.ensure(gmax, tp, kn, dk, dv, rh.is_none());
+        let sk = match rh {
+            Some(r) if r.blocked => tp * kn.div_ceil(r.seg) * r.seg,
+            _ => tk,
+        };
         // Split the fields the group loop drives: the batch contexts, the group scratch,
-        // the per-head fallback scratch and the output are disjoint.
+        // the row BOs, the per-head fallback scratch and the output are disjoint.
         let Worker {
             dev,
             qk,
             av,
             bqk,
             bav,
+            rows,
+            prows,
             grp,
             sm,
             out,
@@ -1029,6 +1112,7 @@ impl Worker {
             av_batch,
             ..
         } = self;
+        let mut sat = false;
         for (gi, range) in heads.chunks(gmax).enumerate() {
             let g = range.len();
             let base = gi * gmax;
@@ -1042,8 +1126,29 @@ impl Worker {
             if *qk_batch {
                 let a: Vec<&[f16]> = grp.qh.chunks_exact(qd).take(g).collect();
                 let b: Vec<&[f16]> = grp.kh.chunks_exact(kd).take(g).collect();
-                let mut c: Vec<&mut [f16]> = grp.sc.chunks_exact_mut(tk).take(g).collect();
-                batch_context(bqk, dev)?.run(tp, dk, kn, &a, &b, &mut c)?;
+                match rh {
+                    Some(rh) => {
+                        // QK writes the scores as rows into the resident BO; the host
+                        // softmax reads them and rewrites P there (or into `prows`).
+                        let bo = rows[rh.cls].as_mut().expect("grown by row_handoff");
+                        batch_context_at(bqk, tp, kn, dev)?.run_rows(
+                            tp,
+                            dk,
+                            kn,
+                            g,
+                            Some(&a),
+                            None,
+                            &b,
+                            None,
+                            Some(bo),
+                            rh.blocked,
+                        )?;
+                    }
+                    None => {
+                        let mut c: Vec<&mut [f16]> = grp.sc.chunks_exact_mut(tk).take(g).collect();
+                        batch_context_at(bqk, tp, kn, dev)?.run(tp, dk, kn, &a, &b, &mut c)?;
+                    }
+                }
             } else {
                 for i in 0..g {
                     qk.current_mut().matmul(
@@ -1058,36 +1163,137 @@ impl Worker {
             // full-key-axis row softmax per head (exactly like the per-head path), so
             // the on-NPU placement applies here too — the C `fa_heads_range_batched`
             // passes its `host_sm` through the same loop.
-            for i in 0..g {
-                sm.run(
-                    dev,
-                    &grp.sc[i * tk..][..tk],
-                    &mut grp.p[i * tk..][..tk],
-                    mask,
-                    t,
-                    kv,
-                    tp,
-                    kn,
-                    scale,
-                    softcap,
-                )?;
+            match rh {
+                Some(rh) => {
+                    for i in 0..g {
+                        if rh.blocked {
+                            let sc = bos::f16_words_ref(
+                                rows[rh.cls].as_ref().expect("grown by row_handoff"),
+                            );
+                            let p = bos::f16_words(
+                                prows[rh.cls].as_mut().expect("grown by row_handoff"),
+                            );
+                            sat |= sm.run_blocked(
+                                &sc[i * sk..][..sk],
+                                &mut p[i * tk..][..tk],
+                                rh.seg,
+                                mask,
+                                t,
+                                kv,
+                                tp,
+                                kn,
+                                scale,
+                                softcap,
+                            );
+                        } else {
+                            let data = bos::f16_words(
+                                rows[rh.cls].as_mut().expect("grown by row_handoff"),
+                            );
+                            sat |= sm.run_in_place(
+                                &mut data[i * tk..][..tk],
+                                mask,
+                                t,
+                                kv,
+                                tp,
+                                kn,
+                                scale,
+                                softcap,
+                            );
+                        }
+                    }
+                    // Hand P back to the device on every exit, a refusal included: the
+                    // next QK may write these rows, and a dirty line evicted over them
+                    // would corrupt it. Blocked scores were only read, so they hold no
+                    // dirty line.
+                    if rh.blocked {
+                        prows[rh.cls].as_mut().expect("grown").fini()?;
+                    } else {
+                        rows[rh.cls].as_mut().expect("grown").fini()?;
+                    }
+                }
+                None => {
+                    for i in 0..g {
+                        sat |= softmax::scores_saturated(&grp.sc[i * tk..][..tk], kv);
+                        sm.run(
+                            dev,
+                            &grp.sc[i * tk..][..tk],
+                            &mut grp.p[i * tk..][..tk],
+                            mask,
+                            t,
+                            kv,
+                            tp,
+                            kn,
+                            scale,
+                            softcap,
+                        )?;
+                    }
+                }
+            }
+            if sat {
+                return Err(Error::new(crate::Status::Range, "attn/score-range", 0));
             }
 
             for (i, &h) in range.iter().enumerate() {
                 gather_v(&mut grp.vh[i * kd..][..kd], v, h / gqa, kv, dv, kn);
             }
             if *av_batch {
-                let a: Vec<&[f16]> = grp.p.chunks_exact(tk).take(g).collect();
                 let b: Vec<&[f16]> = grp.vh.chunks_exact(kd).take(g).collect();
                 let mut c: Vec<&mut [f16]> = grp.ctx.chunks_exact_mut(cd).take(g).collect();
-                batch_context(bav, dev)?.run(tp, kn, dv, &a, &b, &mut c)?;
+                match rh {
+                    Some(rh) => {
+                        // AV reads its K slices of P as rows, at the full `kn` pitch.
+                        let p = if rh.blocked {
+                            prows[rh.cls].as_ref().expect("grown")
+                        } else {
+                            rows[rh.cls].as_ref().expect("grown")
+                        };
+                        batch_context_at(bav, tp, kn, dev)?.run_rows(
+                            tp,
+                            kn,
+                            dv,
+                            g,
+                            None,
+                            Some(p),
+                            &b,
+                            Some(&mut c),
+                            None,
+                            false,
+                        )?;
+                    }
+                    None => {
+                        let a: Vec<&[f16]> = grp.p.chunks_exact(tk).take(g).collect();
+                        batch_context_at(bav, tp, kn, dev)?.run(tp, kn, dv, &a, &b, &mut c)?;
+                    }
+                }
             } else {
-                for i in 0..g {
-                    av.current_mut().matmul(
-                        &grp.p[i * tk..][..tk],
-                        &grp.vh[i * kd..][..kd],
-                        &mut grp.ctx[i * cd..][..cd],
-                    )?;
+                match rh {
+                    Some(rh) => {
+                        // A K-split AV keeps the per-head fp16 KACC path (bit-identical
+                        // to the cube handoff's AV); it reads the row-major P straight
+                        // from the BO's host mapping, which holds the same bits the
+                        // cube path has in `grp.p` after the in-place rewrite.
+                        let p = if rh.blocked {
+                            bos::f16_words_ref(prows[rh.cls].as_ref().expect("grown"))
+                        } else {
+                            bos::f16_words_ref(rows[rh.cls].as_ref().expect("grown"))
+                        };
+                        for i in 0..g {
+                            av.current_mut().matmul(
+                                &p[i * tk..][..tk],
+                                &grp.vh[i * kd..][..kd],
+                                &mut grp.ctx[i * cd..][..cd],
+                            )?;
+                        }
+                    }
+                    None => {
+                        for i in 0..g {
+                            av.current_mut().matmul(
+                                &grp.p[i * tk..][..tk],
+                                &grp.vh[i * kd..][..kd],
+                                &mut grp.ctx[i * cd..][..cd],
+                            )?;
+                        }
+                    }
                 }
             }
 
@@ -1119,6 +1325,76 @@ fn batch_context<'a>(slot: &'a mut Option<MmBatch>, dev: &Device) -> Result<&'a 
         *slot = Some(MmBatch::new(dev)?);
     }
     Ok(slot.as_mut().expect("created above"))
+}
+
+/// The 4x size classes of the chained path's contexts and row BOs (C `FA_BCLS`).
+const FA_BCLS: usize = 8;
+
+/// The size class of `Tp x Kn`: one per 4x (C `fa_bcls`).
+fn bcls(tp: usize, kn: usize) -> usize {
+    let mut c = 0;
+    let mut e = tp * kn;
+    while e > 4096 && c < FA_BCLS - 1 {
+        e >>= 2;
+        c += 1;
+    }
+    c
+}
+
+/// The class of this shape's batch contexts and row BOs, created on first use.
+fn batch_context_at<'a>(
+    slots: &'a mut [Option<MmBatch>; FA_BCLS],
+    tp: usize,
+    kn: usize,
+    dev: &Device,
+) -> Result<&'a mut MmBatch> {
+    let c = bcls(tp, kn);
+    batch_context(&mut slots[c], dev)
+}
+
+/// `ROCKET_FA_ROWMAJOR` (default ON): hand the scores and P between the chained QK and
+/// AV jobs as rows (C `fa_rowmajor`).
+fn rowmajor() -> bool {
+    knobs::boolean("ROCKET_FA_ROWMAJOR").unwrap_or(true)
+}
+
+/// `ROCKET_FA_RM_MAX_ROW` (default 4096): the widest score row, in bytes, QK writes as
+/// plain rows. Past it a row-major C costs the device more, so QK writes each N tile as
+/// its own block of rows and P goes to a second BO (C `fa_rm_max_row`).
+fn rm_max_row() -> i64 {
+    knobs::int("ROCKET_FA_RM_MAX_ROW").unwrap_or(4096)
+}
+
+/// Where the chained path's score/P handoff runs this call.
+#[derive(Debug, Clone, Copy)]
+struct RowHandoff {
+    /// The 4x class whose BOs hold the scores/P.
+    cls: usize,
+    /// The keys one block of scores holds: `kn` for plain rows, the QK N tile when
+    /// blocked.
+    seg: usize,
+    /// The scores are per-N-tile blocks and P is a second plain-row BO.
+    blocked: bool,
+}
+
+/// Grow a row BO to at least `bytes` (C `fa_rows_grow`); a new BO is synced once both
+/// ways so it enters its first run with no dirty line.
+fn rows_grow(dev: &Device, slot: &mut Option<Bo>, bytes: usize) -> Result<()> {
+    match slot {
+        Some(bo) => {
+            if bo.ensure32(bytes)? {
+                bo.prep(0)?;
+                bo.fini()?;
+            }
+        }
+        None => {
+            let mut bo = dev.alloc_bo32(bytes)?;
+            bo.prep(0)?;
+            bo.fini()?;
+            *slot = Some(bo);
+        }
+    }
+    Ok(())
 }
 
 /// The tiled path's matmul scratch for one tile width, created on first use.
@@ -1236,10 +1512,10 @@ impl Attention {
             // just-used group (a steady request stream never reallocates).
             if w.grp.oversized(w.tp, w.kn) {
                 w.grp.release();
-                if let Some(b) = &mut w.bqk {
+                for b in w.bqk.iter_mut().flatten() {
                     b.trim();
                 }
-                if let Some(b) = &mut w.bav {
+                for b in w.bav.iter_mut().flatten() {
                     b.trim();
                 }
             }
@@ -1339,6 +1615,21 @@ mod tests {
     const M: u64 = 1 << 20;
 
     #[test]
+    fn batch_classes_span_four_x() {
+        assert_eq!(bcls(64, 64), 0, "Tp*Kn at the floor is class 0");
+        assert_eq!(bcls(65, 64), 1);
+        assert_eq!(bcls(128, 128), 1, "16384 is one 4x step up");
+        assert_eq!(bcls(256, 4096), 4);
+        for tp in [4usize, 64, 512, 4096] {
+            for kn in [32usize, 512, 2048, 8192] {
+                let c = bcls(tp, kn);
+                assert!(c < FA_BCLS);
+                assert!(tp * kn <= 4096 << (2 * c.min(FA_BCLS - 1)));
+            }
+        }
+    }
+
+    #[test]
     fn group_size_is_the_budget_over_one_score_matrix() {
         // The budget divides by one head's padded [Tp,Kn] score matrix.
         assert_eq!(group_size(32 * M, 1024, 1024, 8), 8, "32 heads fit in 32M");
@@ -1369,7 +1660,7 @@ mod tests {
         assert!(batch_matches_per_head(true, Ok(one)));
         assert!(batch_matches_per_head(false, Ok(one)));
         // A split K axis: KACC rounds per-tile, so only the no-KACC path may batch.
-        let many = Plan::new(264, 1024, 512).unwrap();
+        let many = Plan::derive(264, 1024, 512, 256, 512, 128);
         assert!(many.nkt > 1);
         assert!(!batch_matches_per_head(true, Ok(many)));
         assert!(batch_matches_per_head(false, Ok(many)));

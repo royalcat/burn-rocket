@@ -439,6 +439,7 @@ impl HeadScratch {
         gather_head_rows(&mut self.kh, k, n_tokens, d, off, dh);
         gather_head_t_cols(&mut self.vh, v, n_tokens, d, off, dh, tn);
         one_shot(dev, tp, dh, tn, &self.qh, &self.kh, &mut self.sc)?;
+        let sat = super::softmax::scores_saturated(&self.sc, n_tokens);
         self.sm.run(
             dev,
             &self.sc,
@@ -451,6 +452,9 @@ impl HeadScratch {
             scale,
             0.0,
         )?;
+        if sat {
+            return Err(Error::new(crate::Status::Range, "mha_self/score-range", 0));
+        }
         one_shot(dev, tp, tn, dh, &self.p, &self.vh, &mut self.ctx)?;
         Ok(&self.ctx[..n_tokens * dh])
     }

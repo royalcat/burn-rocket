@@ -138,7 +138,11 @@ them with an autodiff context panics inside Burn. The driver contexts are not
 thread-safe; the extension routes every call through one global engine behind a mutex
 (`burn_rocket::stats()` reports accumulated convert/NPU time). Resident weights use
 the canonical tiling (`M >= 4`; `ROCKET_CTX_CANONICAL=0` restores the legacy
-`M >= 256` padding).
+`M >= 256` padding). The planner's default is the **CBUF weight-streaming** plan
+(`ROCKET_MM_STREAM=0` restores the whole-tile plan): one task covers a whole N slice
+with the weights cycling through the banks the input tile leaves, and a resident
+weight is packed on the streamed max-tile plan so it still serves every `M`. The
+KACC EW stride is the tile's own row count, so every M tile accumulates on the NPU.
 
 ## Features
 
@@ -255,8 +259,9 @@ board** (`ab_compare.py` again: RMSNorm with a real and a unit weight, LayerNorm
 and without beta, BatchNorm/GroupNorm/InstanceNorm/L2-Normalize over two `[N,C,P]`
 shapes, GeGLU in both GELU and SiLU form, `ffn`, `ffn_fused` and `mlp_fused` with and
 without the fc1 bias, at 4x256x1024 and 64x512x2048, plus two shapes that force the
-fused entries' host-handoff fallback — `M = 1` and the `M = 260` KACC EW-stride
-refusal — so both sides have to make the same fallback decision). The encoder block is
+fused entries' host-handoff fallback — `M = 1` (the `M % 4` pin refusal; the old
+`M = 260` KACC EW-stride case now accumulates on the NPU since the 2026-11-02 round) —
+so both sides have to make the same fallback decision). The encoder block is
 the only case that is not bit-identical (198/512 and 2040/8192 elements exact): its
 attention sublayer is `attn::mha_self`, whose host fast softmax is the documented
 deviation from the C's on-NPU softmax (set `ROCKET_ATTN_HOST_SOFTMAX=0` for the on-NPU
@@ -278,7 +283,7 @@ The fused FFN/MLP are **cube-resident**, exactly as `rocket_ffn.c`: `gate`/`up` 
 gated product / bias / activation run element-wise over the cube's fp16 bytes (the
 C's `mm_scatter_bias_cube` + `rocket_ew_add_fp16` for the non-gated bias) and the
 down/fc2 matmul reads the product cube directly as its A operand
-(`compute_kacc_from`, with `compute_cpu_from` on the tiny-M sentinel), so no `[M,I]`
+(`compute_kacc_from`, with `compute_cpu_from` on a `Tiling` refusal), so no `[M,I]`
 intermediate is de-tiled and re-packed. An `A/B` against the previous binary on
 identical raw fixtures is **bit-identical for every case** (`ffn`, `ffn_fused`,
 `mlp_fused` with and without the fc1 bias at 4x256x1024 and 64x512x2048, and both
@@ -360,6 +365,27 @@ tile 512, causal): tiled cosine 0.99999994 vs the f64 reference (materialized
 512x8,192 170.8+140.4 → 58.8+45.4 MiB (2.9x) at wall 1.09x, i.e. the same trade as the
 `dv == dk` path (memory for submits, never faster below the crossover). A `dv == dk`
 geometry is bit-for-bit unaffected by the change.
+
+### Row-major score/P handoff (`ROCKET_FA_ROWMAJOR`)
+
+The chained path's QK and AV jobs exchange the score matrix through the NPU's cube
+layout by default, which costs two host passes over it (QK's de-tile and P's pack).
+With the row-major handoff (the default, `ROCKET_FA_ROWMAJOR=0` restores the cube
+handoff) QK writes the scores as plain rows into a resident BO through the matmul's
+row-major C form, the host softmax rewrites them as P in place, and AV reads its K
+slices as rows. Past `ROCKET_FA_RM_MAX_ROW` bytes a score row (default 4096, i.e. 2048
+keys) QK writes each N tile as its own block of rows and P lands in a second BO. The
+two handoffs produce the same f16 bits (the row-form programs are byte-identical to the
+cube programs except the stride fields), and the board A/B confirms it: 0 differing
+values of 524,288 at 512x4096 (8 heads), 1,838,592 at the vision-tower shape
+(2394x2400, 12 heads) and 524,288 at 512x8192 (the blocked form). At 512x4096 it also
+drops the attention scratch from 146.6 to 26.5 MiB of BO and 31.0 to 15.0 MiB of host
+memory per worker, because the cube's `BATCH`-slot output BO and the group's host
+score/P matrices are never allocated. An AV whose K axis does not fit one K tile keeps
+the per-head fp16 KACC path (so `ROCKET_FA_CHAIN=0` vs `1` stays bit-identical) and
+reads P out of the row BO. The score surface itself saturates at ±65504: a real key
+whose raw score reaches that is reported as `ROCKET_E_RANGE` (`-6`) instead of being
+softmaxed as a tied row (`attn_selftest --sat`).
 
 ### Softmax placement: host vs on-NPU (`ROCKET_ATTN_HOST_SOFTMAX`)
 

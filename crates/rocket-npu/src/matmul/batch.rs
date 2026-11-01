@@ -28,7 +28,7 @@
 use half::f16;
 
 use crate::device::uapi::{DRM_ROCKET_JOB_BATCHED, DrmRocketTask};
-use crate::device::{Bo, Handle};
+use crate::device::{Bo, BoRange, Handle};
 use crate::error::{Error, Result};
 use crate::log::log_error;
 use crate::regcmd::desc::{BATCH, CBUF_BANK_SIZE, NpuOp, RC_STRIDE};
@@ -86,6 +86,8 @@ pub struct MmBatch {
     in_all: Option<Bo>,
     wt_all: Option<Bo>,
     out_all: Option<Bo>,
+    /// The completion-wait BO of a row-major C (C `b->fence`).
+    fence: Option<Bo>,
     /// The resident `in_all`/`wt_all` are zero AND match `last`.
     prezeroed: bool,
     last: Option<Layout>,
@@ -108,6 +110,7 @@ impl MmBatch {
             in_all: None,
             wt_all: None,
             out_all: None,
+            fence: None,
             prezeroed: false,
             last: None,
             acc: Vec::new(),
@@ -126,6 +129,7 @@ impl MmBatch {
         self.in_all = None;
         self.wt_all = None;
         self.out_all = None;
+        self.fence = None;
         self.prezeroed = false;
         self.last = None;
         self.acc = Vec::new();
@@ -135,7 +139,7 @@ impl MmBatch {
     /// in/wt/out BOs).
     pub fn bytes(&self) -> usize {
         let mut n = self.guard.len() + self.regcmd.len();
-        for bo in [&self.in_all, &self.wt_all, &self.out_all] {
+        for bo in [&self.in_all, &self.wt_all, &self.out_all, &self.fence] {
             n += bo.as_ref().map_or(0, Bo::len);
         }
         n
@@ -176,14 +180,104 @@ impl MmBatch {
             // The C shim, including the height-1 pad that lives in `one_shot`.
             return one_shot(&self.dev, m, k, n, a[0], b[0], &mut c[0][..m * n]);
         }
+        self.run_impl(m, k, n, nbatch, Some(a), None, b, Some(c), None, false)
+    }
+
+    /// `rocket_mm_batch_run_rows`: A read from and/or C written to a caller's BO as
+    /// plain rows, so a caller that hands one batched matmul's output to the next (flash
+    /// attention: QK's scores, rewritten as P in place by the host softmax, are AV's A)
+    /// pays neither the de-tile nor the pack.
+    ///
+    /// Pass exactly one of `a` / `a_bo` and one of `c` / `c_bo`. Item i of a row-major A
+    /// is `[M][K]` at element `i*M*K` of `a_bo`. Item i of a C is `[M][N]` at element
+    /// `i*M*N` when `c_block` is false; with `c_block` set it is the plan's `nNt` N
+    /// tiles, each a `[M][Nt]` block at element `(i*nNt + j)*M*Nt` (the last block at
+    /// the `Nt` pitch too). A `c_bo` needs a plan with one K tile.
+    ///
+    /// Contract with the cache: `c_bo` holds no dirty line at entry (the caller's last
+    /// write was followed by [`Bo::fini`]), and on success it is synced for the CPU over
+    /// the live bytes. `a_bo` must have been passed to [`Bo::fini`] after the CPU last
+    /// wrote it. Neither BO is synced otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_rows(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        nbatch: usize,
+        a: Option<&[&[f16]]>,
+        a_bo: Option<&Bo>,
+        b: &[&[f16]],
+        c: Option<&mut [&mut [f16]]>,
+        c_bo: Option<&mut Bo>,
+        c_block: bool,
+    ) -> Result<()> {
+        if a.is_some() == a_bo.is_some() || c.is_some() == c_bo.is_some() {
+            return Err(Error::shape("mm_batch/rows-operands"));
+        }
+        if let Some(a) = a
+            && a.iter().any(|ai| ai.len() != m * k)
+        {
+            return Err(Error::shape("mm_batch/input"));
+        }
+        if let Some(c) = &c
+            && c.iter().any(|ci| ci.len() < m * n)
+        {
+            return Err(Error::shape("mm_batch/output"));
+        }
+        self.run_impl(m, k, n, nbatch, a, a_bo, b, c, c_bo, c_block)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_impl(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        nbatch: usize,
+        a_host: Option<&[&[f16]]>,
+        a_bo: Option<&Bo>,
+        b: &[&[f16]],
+        mut c_host: Option<&mut [&mut [f16]]>,
+        mut c_bo: Option<&mut Bo>,
+        c_block: bool,
+    ) -> Result<()> {
+        if nbatch == 0
+            || b.len() != nbatch
+            || a_host.is_some_and(|a| a.len() != nbatch)
+            || c_host.as_ref().is_some_and(|c| c.len() != nbatch)
+        {
+            return Err(Error::shape("mm_batch/nbatch"));
+        }
+        if b.iter().any(|bi| bi.len() != n * k) {
+            return Err(Error::shape("mm_batch/weights"));
+        }
 
         let plan = Plan::new(m, k, n)?;
+        let c_pitch = if c_block { plan.nt } else { n };
+        let c_item = m
+            .checked_mul(if c_block { plan.nnt * plan.nt } else { n })
+            .ok_or_else(|| Error::shape("mm_batch/c-item"))?;
+        if c_bo.is_some() && plan.nkt != 1 {
+            return Err(Error::shape("mm_batch/rows-k-tiles"));
+        }
+        if let Some(bo) = a_bo {
+            let need = bytes_of(nbatch, m * k, "mm_batch/a-rows")?;
+            if bo.len() < need || bo.dma_address() + bo.len() as u64 > (1u64 << 32) {
+                return Err(Error::shape("mm_batch/a-rows-bo"));
+            }
+        }
+        if let Some(bo) = c_bo.as_ref() {
+            let need = bytes_of(nbatch, c_item, "mm_batch/c-rows")?;
+            if bo.len() < need || bo.dma_address() + bo.len() as u64 > (1u64 << 32) {
+                return Err(Error::shape("mm_batch/c-rows-bo"));
+            }
+        }
         let in_item = plan.input_elems();
         let wt_item = plan.nnt * plan.nkt * plan.wt_slot;
         let in_sz = bytes_of(nbatch, in_item, "mm_batch/in-size")? + CBUF_BANK_SIZE;
         let wt_sz = bytes_of(nbatch, wt_item, "mm_batch/wt-size")? + CBUF_BANK_SIZE;
         let out_sz = BATCH * plan.out_slot * 2 + CBUF_BANK_SIZE;
-
         // A single K-tile needs no accumulation: the cube already holds this item's final
         // f16 result, so the readback stores it straight into the caller's output (what
         // `compute_kacc` does too) instead of round-tripping through the fp32
@@ -199,22 +293,32 @@ impl MmBatch {
         // reads it below.
         let prezeroed = self.prezeroed;
         self.prezeroed = false;
-        let grew_in = ensure(&self.dev, &mut self.in_all, in_sz)?;
+        let grew_in = if a_bo.is_some() {
+            false
+        } else {
+            ensure(&self.dev, &mut self.in_all, in_sz)?
+        };
         let grew_wt = ensure(&self.dev, &mut self.wt_all, wt_sz)?;
-        // out_all is never pre-zeroed: the NPU writes it and only live slots are read.
-        ensure(&self.dev, &mut self.out_all, out_sz)?;
+        // A row-major C needs the small fence BO for its completion wait instead of the
+        // rolling cube `out_all`; out_all is never pre-zeroed (the NPU writes it and only
+        // live slots are read).
+        if c_bo.is_some() {
+            ensure(&self.dev, &mut self.fence, 4096)?;
+        } else {
+            ensure(&self.dev, &mut self.out_all, out_sz)?;
+        }
 
         let layout = Layout { m, k, n, nbatch };
         let need_zero = zero_needed(grew_in || grew_wt, self.last, prezeroed, layout);
 
-        {
+        if a_bo.is_none() {
             let bo = self.in_all.as_mut().expect("grown above");
             bo.prep(0)?;
             let words = bos::f16_words(bo);
             if need_zero {
                 words.fill(f16::ZERO);
             }
-            for (it, ai) in a.iter().enumerate() {
+            for (it, ai) in a_host.expect("host A checked").iter().enumerate() {
                 bos::scatter_input(&plan, &mut words[it * in_item..], ai);
             }
             bo.fini()?;
@@ -239,7 +343,7 @@ impl MmBatch {
         let acc_n = nbatch
             .checked_mul(m * n)
             .ok_or_else(|| Error::shape("mm_batch/acc"))?;
-        if !direct_out {
+        if c_bo.is_none() && !direct_out {
             if self.acc.len() < acc_n {
                 self.acc.resize(acc_n, 0.0);
             }
@@ -270,13 +374,36 @@ impl MmBatch {
                 let item = j / jobs;
                 let (mi, ni, ki) = plan.tile_of(j % jobs);
 
-                let input = self.in_all.as_ref().expect("grown above").dma_address()
-                    + ((item * in_item + (mi * plan.nkt + ki) * plan.in_slot) * 2) as u64;
+                let input = match a_bo {
+                    Some(bo) => {
+                        bo.dma_address()
+                            + ((item * m * k + mi * plan.mt * k + ki * plan.kt) * 2) as u64
+                    }
+                    None => {
+                        self.in_all.as_ref().expect("grown above").dma_address()
+                            + ((item * in_item + (mi * plan.nkt + ki) * plan.in_slot) * 2) as u64
+                    }
+                };
                 let weights = self.wt_all.as_ref().expect("grown above").dma_address()
                     + ((item * wt_item + (ni * plan.nkt + ki) * plan.wt_slot) * 2) as u64;
                 let out_off = (j - done) * plan.out_slot;
-                let output = self.out_all.as_ref().expect("grown above").dma_address()
-                    + (out_off * 2) as u64;
+                let output = match c_bo.as_ref() {
+                    Some(bo) => {
+                        // A row-major operand is addressed at the tile's first element,
+                        // with the line at one row of the item's whole A (C).
+                        let c_at = item * c_item
+                            + if c_block {
+                                ni * m * c_pitch + mi * plan.mt * c_pitch
+                            } else {
+                                mi * plan.mt * c_pitch + ni * plan.nt
+                            };
+                        bo.dma_address() + (c_at * 2) as u64
+                    }
+                    None => {
+                        self.out_all.as_ref().expect("grown above").dma_address()
+                            + (out_off * 2) as u64
+                    }
+                };
                 let mut p = MatmulParams::new(
                     plan.m_tile(mi) as u32,
                     plan.k_tile(ki) as u32,
@@ -286,6 +413,16 @@ impl MmBatch {
                     output as u32,
                 );
                 p.fp32_to_fp16 = true;
+                p.a_row_atoms = if a_bo.is_some() {
+                    (k * 2 / 16) as u32
+                } else {
+                    0
+                };
+                p.c_row_atoms = if c_bo.is_some() {
+                    (c_pitch * 2 / 16) as u32
+                } else {
+                    0
+                };
                 ops.clear();
                 let count = emit(&p, &mut ops)?;
                 if count > RC_STRIDE {
@@ -330,22 +467,35 @@ impl MmBatch {
                 }
             }
             self.regcmd.fini()?;
-            {
+            if c_bo.is_none() {
                 let bo = self.out_all.as_mut().expect("grown above");
                 bo.prep(0)?;
                 bo.fini()?;
             }
 
             let in_handles: [Handle; 3] = [
-                self.in_all.as_ref().expect("grown above").handle(),
+                match a_bo {
+                    Some(bo) => bo.handle(),
+                    None => self.in_all.as_ref().expect("grown above").handle(),
+                },
                 self.wt_all.as_ref().expect("grown above").handle(),
                 self.regcmd.handle(),
             ];
-            let out_handles = [self.out_all.as_ref().expect("grown above").handle()];
             let flags = if chained { DRM_ROCKET_JOB_BATCHED } else { 0 };
+            let out_handles: Vec<Handle> = match c_bo.as_ref() {
+                Some(bo) => vec![
+                    bo.handle(),
+                    self.fence.as_ref().expect("grown above").handle(),
+                ],
+                None => vec![self.out_all.as_ref().expect("grown above").handle()],
+            };
             self.dev.submit(&tasks, &in_handles, &out_handles, flags)?;
-
-            if let Err(e) = self.out_all.as_mut().expect("grown above").prep(wait_ns()) {
+            let wait = if c_bo.is_some() {
+                self.fence.as_mut().expect("grown above").prep(wait_ns())
+            } else {
+                self.out_all.as_mut().expect("grown above").prep(wait_ns())
+            };
+            if let Err(e) = wait {
                 // A mis-chained group is exactly what shows up here, so name the layout.
                 log_error!(
                     "mm_batch: group fence failed after {} ms (M={m} K={k} N={n} \
@@ -354,33 +504,49 @@ impl MmBatch {
                 );
                 return Err(e);
             }
-            {
-                let bo = self.out_all.as_ref().expect("grown above");
-                let words = bos::f16_words_ref(bo);
-                for t in &tiles {
-                    let slot = &words[t.out_off..t.out_off + plan.out_slot];
-                    if direct_out {
-                        layout::detile_store(
-                            &mut c[t.item][..m * n],
-                            n,
-                            slot,
-                            t.m0,
-                            t.n0,
-                            t.mtile,
-                            t.ntile,
-                        );
-                    } else {
-                        let acc = &mut self.acc[t.item * m * n..(t.item + 1) * m * n];
-                        layout::detile_accum(acc, n, slot, t.m0, t.n0, t.mtile, t.ntile);
+            if let Some(bo) = c_bo.as_mut() {
+                // The rows are already in place; the last job hands C to the CPU with one
+                // sync of its live bytes.
+                self.fence.as_mut().expect("grown above").fini()?;
+                if done + g == total {
+                    let live = BoRange {
+                        offset: 0,
+                        size: (nbatch * c_item * 2) as u64,
+                    };
+                    bo.prep_ranges(&[live], 0)?;
+                }
+            } else {
+                {
+                    let bo = self.out_all.as_ref().expect("grown above");
+                    let words = bos::f16_words_ref(bo);
+                    for t in &tiles {
+                        let slot = &words[t.out_off..t.out_off + plan.out_slot];
+                        let ch = c_host.as_mut().expect("host C checked");
+                        if direct_out {
+                            layout::detile_store(
+                                &mut ch[t.item][..m * n],
+                                n,
+                                slot,
+                                t.m0,
+                                t.n0,
+                                t.mtile,
+                                t.ntile,
+                            );
+                        } else {
+                            let acc = &mut self.acc[t.item * m * n..(t.item + 1) * m * n];
+                            layout::detile_accum(acc, n, slot, t.m0, t.n0, t.mtile, t.ntile);
+                        }
                     }
                 }
+                self.out_all.as_mut().expect("grown above").fini()?;
             }
-            self.out_all.as_mut().expect("grown above").fini()?;
 
             done += g;
         }
 
-        if !direct_out {
+        if let Some(c) = c_host.as_mut()
+            && !direct_out
+        {
             for (it, ci) in c.iter_mut().enumerate() {
                 layout::narrow_f32_to_f16(&mut ci[..m * n], &self.acc[it * m * n..][..m * n]);
             }
@@ -470,7 +636,7 @@ mod tests {
     fn tile_order_is_item_major_with_ki_innermost() {
         // The global job index `run` walks decodes to (item, mi, ni, ki), item-major,
         // with ki innermost within each output tile.
-        let plan = Plan::new(264, 1024, 512).unwrap();
+        let plan = Plan::derive(264, 1024, 512, 256, 512, 128);
         assert!(
             plan.nmt > 1 && plan.nnt > 1 && plan.nkt > 1,
             "the decode test must not be vacuous: {plan:?}"
@@ -500,7 +666,7 @@ mod tests {
         // The property the fp32 accumulation order depends on: within one (item, mi, ni)
         // the ki run is contiguous and ascending, so each output tile's K-partials are
         // added in the same order `compute_cpu` adds them.
-        let plan = Plan::new(264, 1024, 512).unwrap();
+        let plan = Plan::derive(264, 1024, 512, 256, 512, 128);
         assert!(plan.nkt > 1, "the shape must split K");
         let mut prev: Option<(usize, usize, usize)> = None;
         for j in 0..plan.jobs() {

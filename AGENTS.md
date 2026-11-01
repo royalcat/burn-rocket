@@ -92,8 +92,10 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 `crates/rocket-npu/src/lib.rs` ("Surface covered and deliberately missing") and
 `README.md` ("Missing surface") rather than re-deriving the surface.
 
-- **Reference + gate**: the C source is pinned at commit `b43a9ae`; the read-only copy
-  used for the port was `/tmp/opencode/ref-rocket-userspace` (ephemeral). Re-sync it
+- **Reference + gate**: the C source is pinned at commit `88cae6d` (2026-10-29; the
+  RK3588 port itself was validated against `b43a9ae` and the later 2026-11-02 round
+  ported the RK3588-relevant deltas — see "Upstream re-pin round" below); the read-only
+  copy used for the port was `/tmp/opencode/ref-rocket-userspace` (ephemeral). Re-sync it
   and build the host oracle with `tools/c-oracle/README.md` (the oracle needs a host
   build of `librocketnpu`; `tools/c-oracle/build.sh <src> <host-build> [out]`).
   `python3 tools/c-oracle/parity.py` must print `RESULT: PASS`: byte-identical plans
@@ -130,6 +132,87 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   library has no variant (its `rocket_bf16_stream.c` re-scatters both operands per
   call) — so there is no C A/B for it, only the f64 reference, the C-shaped stream and
   the canonical-tiling stream (`bf16_selftest`).
+
+### Upstream re-pin round (2026-11-02)
+
+Upstream (`gregordinary/rocket-userspace`) moved from `b43a9ae` (2026-09-26) to
+`88cae6d` (2026-10-29), seven commits and ~14.5k inserted lines, most of it RK3576
+(which this port excludes). The port already carried several of the later fixes
+(`geometry_fits`, `ROCKET_MM_DIM_MAX`, the batch direct de-tile, lazy
+`wt_all`/`out_all`, canonical tiling + split-M plumbing, any-`w_zp` depthwise int8,
+prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these deltas:
+
+- **CBUF weight streaming** (`ROCKET_MM_STREAM`, fp16 default on; int8 opt-in with
+  `ROCKET_MM_STREAM_INT8=1`): `plan::plan_stream`, the C cost model
+  (`MM_STREAM_NT_MAX` 4096, `STREAM_XM` 128, `STREAM_HOSTW` 8.0, `ROCKET_MM_STREAM_KT`
+  debug), the emitter's `stream_weight_banks` floor and refusal
+  (`gen_matmul_fp16/weight-stream`, int8's +1-bank variant), the `out_bytes` cap
+  (`min(jobs, BATCH)` slots) and `kacc_rmode`'s degradation of WEIGHT_REUSE on a
+  streamed tile. `Plan::canonical` needs no signature change: the streamed max-tile
+  plan is the new pin, so resident weights are packed with whole-N slices at load.
+  `Plan::pinned` (the fused FFN/MLP's `Nt = Kt = 256` contract) does not consult the
+  streaming planner, and any `ROCKET_MM_MT`/`NT`/`KT` override bypasses it, both as in
+  C. The legacy matrix still passes byte-identically with `ROCKET_MM_STREAM=0`.
+- **Any-M exactness + KACC at every M tile**: the emitter's `feature_surf_stride` is
+  `line*(H-4)/4` as a 28-bit two's complement (identical at H%4==0), the fp16 EW
+  stride is `M` (no `MAX(M,12)`), and `guard_kacc_m` is gone — a 4- or 8-row last
+  M-tile accumulates on the NPU instead of falling back to the host. The fused FFN's
+  `M=260` case now runs KACC (its old A/B pinned the fallback); the remaining `Tiling`
+  fallbacks are the one-batch cube guard and a no-scratch plan.
+- **Row-major matmul + attention handoff**: `MatmulParams` gains
+  `a_row_atoms`/`c_row_atoms` (`GROUP_LINE_OFF`, the line stride, `surf_stride 0`, the
+  DPU notch pair and `dst_surf_stride 1`; cube programs byte-identical) and
+  `MmBatch::run_rows` reads A from / writes C to a caller's BO as plain rows (with
+  per-N-tile blocks for C and the small fence BO). `attn::Attention`'s chained path
+  uses it for QK's scores and AV's P (`ROCKET_FA_ROWMAJOR`, default on;
+  `ROCKET_FA_RM_MAX_ROW`, default 4096) and now keeps its batch contexts and row BOs
+  per 4x `Tp*Kn` class, as the C's `FA_BCLS` does. An AV whose K axis does not fit one
+  K tile keeps the per-head fp16 KACC path (so the chain-vs-per-head bit-identity
+  survives) and reads P straight out of the row BO; a one-K-tile AV takes the batched
+  row-major form. The C measured 0.64-0.69x at a ViT layer and 0.73-0.82x at LLM
+  prefill shapes for the full handoff; this port's partial form has host gates only
+  (board: bit-identical at 4096/8192 keys and the vision shape).
+- **Score saturation**: a real key whose raw f16 score reaches ±65504 (or is not
+  finite) is reported as `Status::Range` (`ROCKET_E_RANGE`, -6) by every attention
+  path, host or on-NPU softmax; `Status::Io` moved off -6 to -7.
+- **Requant carry fix**: `regcmd::conv::requant_params` is the corrected
+  `npu_out_cvt_pair` (implicit bit + top 14 mantissa bits, the rounded `0x8000` carry
+  renormalized to `0x4000` at one less shift). Mesa's form halved or negated one
+  scale in 16,384. The int8 depthwise entry now refuses a scale whose 6-bit shift
+  leaves 1-63, as the C does.
+- **Out of scope this round**: RK3576 entries, `conv2d_int8_q`/`_q_perc`/`dw_int8_perc`
+  (int8-out direct + per-channel), the resident im2col conv and ConvTranspose, the
+  channel-planes resident matmul, ModernBERT, the SigLIP resident-path changes, and
+  create-time worker pinning.
+- **Gate**: `parity.py` PASSes both the default (streamed) matrix and the
+  `--env ROCKET_MM_STREAM=0` legacy matrix, the new `--kind rowmajor` section (4
+  programs) and the pool/conv/int8conv sections; `cargo test -p rocket-npu` 268 pass,
+  host and aarch64 clippy clean. Board (2026-11-02, load ~16 from other services,
+  cores 0-3): the row handoff is **bit-identical** to the cube handoff, 0 differing
+  values, at 512x4096/QK-8-heads (plain rows, `seg=4096`), 2394x2400/12-heads (the
+  vision tower shape) and 512x8192 (`blocked=true`, `seg=4096`); the row handoff also
+  cuts that shape's attention scratch from 146.6 to 26.5 MiB BO and 31.0 to 15.0 MiB
+  host per worker (the cube `out_all` and the group's `sc`/`p` matrices are not
+  allocated); the row BOs and per-class batch contexts are counted in `mem_stats`, so
+  the app's `ROCKET_KEEP_MB` path clears them (`Attention::clear_scratch`) when a
+  finished request no longer fits, while `trim_scratch` keeps the just-used class;
+  `--sat` answers `ROCKET_E_RANGE`; `selftest` 512x2560x4096 cosine
+  0.99999995 streamed (0.99999994 stream off), resident canonical 256x1024x512
+  0.99999998 (and 0.99999998 at M=4), 260x2080x320 0.99999997; `conv_selftest
+  --int8-dw` bit-exact (the corrected requant); `ops_selftest --ffn --encoder` PASS.
+  qwen3 3,633-token bench on the busy board: 77.2 s warmup / 87.9 s (47.1/41.3 tok/s)
+  streamed, 91.1/90.6 s (40.1/39.9) with `ROCKET_MM_STREAM=0`, and 104.1 s (34.9) for
+  the pre-round binary in the same window — directional only.
+- **Artifacts and follow-ups**: the board binaries (`rocket-inference`,
+  `attn_selftest` with `--rowmajor-ab`/`--sat`, `selftest`, `int8_selftest`,
+  `conv_selftest`, `ops_selftest`) and a `data` symlink live in
+  `/root/rocket-upstream-1102/`; the live service was not touched. The idle-board app
+  figures elsewhere in this file predate the streamed planner and row handoff — re-run
+  them on an idle board before quoting. A redeploy needs no flag change (resident
+  weights are repacked with the streamed layout at load; the numerics shift within
+  fp16 noise, as the 8-token cosine 0.9999976 vs the pre-round binary shows). The
+  parity oracle must be rebuilt from `88cae6d` (`tools/c-oracle/README.md`); the old
+  `b43a9ae` tree no longer matches the emitters.
 
 ## Status (2026-10-06, extended 2026-10-07/08)
 
@@ -918,6 +1001,8 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   shim; `M = 2` is refused by *both* libraries, so it is not a state the APIs accept)
   and `M = 260` (the KACC EW-stride floor: `Mt = 256` leaves a 4-row last tile) — which
   is what proves the two sides make the same fallback decision, not just the same plan.
+  (2026-11-02: the EW-stride floor is gone — the stride is `M`, so `M = 260` now
+  accumulates on the NPU. The M=1 refusal is the remaining forced fallback.)
   The encoder's two MLP routes are also bit-identical to each other on the measured
   shapes (`ROCKET_ENCODER_NOFUSE` vs the fused default: 512/512 and 8192/8192 exact),
   because the pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`.
@@ -1226,8 +1311,8 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   cube as its A operand. `mlp_fused` inserts the C's cube bias: `scatter_bias_cube` +
   `ew_add` over `cube_elems` (skipped when `b1` is `None`) before the activation.
   Everything the C keys off the *matched-tiling gate* is unchanged, and so is the
-  `goto fb` fallback (pin refusal, unmatched tiling, more tiles than one batch, KACC
-  EW-stride refusal, any device error).
+  `goto fb` fallback (pin refusal, unmatched tiling, more tiles than one batch, any
+  device error; the KACC EW-stride refusal existed until the 2026-11-02 round).
   Gates: `ops_selftest` before/after on identical raw fixtures is **bit-identical for
   every case** (`ffn`, `ffn_fused` and `mlp_fused` with/without the fc1 bias at
   4x256x1024 and 64x512x2048, and both encoder blocks — `encoder_block` inherits the
@@ -1461,7 +1546,7 @@ aarch64+`npu` clippy are clean; `cargo fmt --all -- --check` is clean.
 | `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
 | `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
 | `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
-| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
+| `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, `--rowmajor-ab` for the row-handoff-vs-cube bit-identity gate, `--sat` for the planted score-saturation refusal, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
 | `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
@@ -1857,7 +1942,8 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   `[N, K/group]` — matches the library's `rocket_prepacked_int8.c`) and scatters the
   codes into NPU BOs once; `matmul` routes by `WeightId` to
   `rocket_matmul_int8_prepacked_gw`, quantizing A per row per group and padding rows
-  to `M % 4` (an unaligned M miscomputes on HW — the library rejects it). The int8
+  to `M % 4` (the library's tiling rule — the generator itself is exact at any M; an
+  unaligned M is still refused by the planner). The int8
   ctx owns its own fds (created lazily at the first int8 pack).
 - Fused CPU glue (2026-10-08 emb2, extended to qwen3 2026-10-09):
   `burn_rocket::{gelu_mul, silu_mul, rms_norm, rms_norm_noscale, rope_apply}` are host
@@ -2184,14 +2270,19 @@ cargo test -p rocket-npu
 # dtype parity vs the C oracle: plan + every regcmd word, all six dtypes, plus the
 # PPU pool section (20 decomposition plans + 19 reciprocals + 22 pool programs, the
 # int8/uint8 geometries included), the conv section (23 plans + 18 direct/depthwise/
-# deconv programs + 6 fused-act programs) and the int8conv section (11 direct + 9
-# depthwise int8 programs over a shape/zero-point/scale matrix)
+# deconv programs + 6 fused-act programs), the int8conv section (11 direct + 9
+# depthwise int8 programs over a shape/zero-point/scale matrix) and the rowmajor
+# section (4 row-major operand programs). The default run uses the streamed fp16
+# plan; `--env ROCKET_MM_STREAM=0` must pass byte-identically too (the legacy matrix)
 cargo build -p rocket-npu --bin regcmd_dump
 python3 tools/c-oracle/parity.py
+python3 tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
 # ... or just one section:
 python3 tools/c-oracle/parity.py --kind pool
 python3 tools/c-oracle/parity.py --kind conv --verbose
 python3 tools/c-oracle/parity.py --kind int8conv --verbose
+python3 tools/c-oracle/parity.py --kind rowmajor --verbose
+python3 tools/c-oracle/parity.py --kind int8 --env ROCKET_MM_STREAM_INT8=1
 # activation/elementwise: LUT + epilogue and program byte-parity vs the C builder
 # (a throwaway C dumper in /tmp links build-host/librocketnpu.a and prints
 # `rocket_lut_epilogue_build` for kinds 0..=18 plus `gen_lut_activation_fp16` for a
@@ -2546,6 +2637,17 @@ taskset -c 0-3 ./attn_selftest 256 1024 8 2 --dk 64 --sm-ab --mt 4 --mask causal
 #   bit-identical under either)
 taskset -c 0-3 ./attn_selftest 257 257 8 2 --dk 64 --host-sm 0 --mask causal --reps 2
 taskset -c 0-3 ./attn_selftest 82 82 2 2 --dk 32 --mha --host-sm 0 --reps 2
+# the row-major handoff A/B (`ROCKET_FA_ROWMAJOR`, default on): `--rowmajor-ab` runs the
+# same chained case with the cube handoff and with rows and compares the raw outputs.
+# They must agree bit for bit for a multi-head group (a lone head in a chained group is
+# the C's documented exception: its AV keeps the batch's fp32 K-accumulation).
+taskset -c 0-3 ./attn_selftest 512 4096 8 2 --dk 128 --mask causal --rowmajor-ab
+taskset -c 0-3 ./attn_selftest 2394 2400 12 12 --dk 64 --dv 64 --mask none --rowmajor-ab
+# ... and the blocked (past ROCKET_FA_RM_MAX_ROW) form at 8192 keys
+taskset -c 0-3 ./attn_selftest 512 8192 8 2 --dk 128 --mask causal --rowmajor-ab
+# saturation: a planted ±65504 score must answer ROCKET_E_RANGE (-6), not a wrong row
+# (the shipped models never reach it; the check is the score-surface contract)
+taskset -c 0-3 ./attn_selftest 256 256 4 1 --dk 64 --sat
 # C-vs-Rust A/B for the on-NPU softmax: ab_board grew `flash` / `mha` families with the
 # same argument layout as `attn_selftest --io` (floats as f32 hex bit patterns, `-` =
 # NULL). The script sets ROCKET_ATTN_HOST_SOFTMAX per side: the C `mha_self` treats the

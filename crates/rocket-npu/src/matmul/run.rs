@@ -8,6 +8,7 @@ use half::f16;
 use crate::device::uapi::{DRM_ROCKET_JOB_BATCHED, DrmRocketTask};
 use crate::device::{Bo, Handle, MemRef};
 use crate::error::{Error, Result};
+use crate::hw;
 use crate::knobs;
 use crate::log::log_error;
 use crate::regcmd::fp16::{MatmulParams, emit};
@@ -129,8 +130,8 @@ pub fn one_shot(
 /// K-accumulation routing for the cross-op cube API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KaccPolicy {
-    /// KACC first, CPU accumulation when the EW stride floor refuses the shape
-    /// (`rocket_matmul_fp16`); honours `ROCKET_NO_KACC`.
+    /// KACC first, CPU accumulation when the plan needs it (no scratch, or the
+    /// one-batch cube guard refuses it); honours `ROCKET_NO_KACC`.
     Auto,
     /// KACC first regardless of `ROCKET_NO_KACC`, CPU accumulation on a `Tiling`
     /// refusal — the C fused path's down projection, which calls the KACC primitive
@@ -378,31 +379,17 @@ pub(crate) fn compute_cpu_from(
 
 // ── NPU-side K-accumulation (the KACC family) ──────────────────────────────────
 
-/// The KACC EW-stride floor: the C `mm_compute_kacc`'s tiny-M guards.
-///
-/// The accumulation job runs its EW add with a `MAX(M,12)` stride floor, so a last M-tile
-/// below 12 rows would read a mis-strided operand. Both refusals are the `Tiling` routing
-/// sentinel of the C library — not a hard error: the caller (and the fused FFN/MLP) treats
-/// it as "fall back to the CPU-accumulation oracle for this shape".
-fn guard_kacc_m(plan: &Plan) -> Result<()> {
-    let last_m = plan.m - (plan.nmt - 1) * plan.mt;
-    if last_m < 12 && last_m != plan.m {
-        return Err(Error::tiling("kacc/last-m"));
-    }
-    if plan.m < 12 && plan.nmt == 1 && plan.nkt > 1 {
-        return Err(Error::tiling("kacc/tiny-m"));
-    }
-    Ok(())
-}
-
 /// The device-free part of [`compute_kacc_cube`]'s contract.
 ///
 /// The whole cube must be written by ONE NPU batch (`nMt*nNt <= BATCH`), because the
 /// ping-pong scratch is sized for one batch and the de-tiling path is what normally reads
 /// each batch's tiles back before the next batch reuses the buffers. `cube_bytes` is the
 /// BO's size in bytes (the C's `cube->size` check, `ROCKET_E_NOMEM`).
+///
+/// There is no M floor: the EW read's surface stride is the partial's own row count, so
+/// every M tile a plan can produce accumulates on the NPU (the C's old `lastM < 12`
+/// refusal is gone).
 fn guard_kacc_cube(plan: &Plan, cube_bytes: usize) -> Result<()> {
-    guard_kacc_m(plan)?;
     let n_tiles = plan.nmt * plan.nnt;
     if n_tiles > BATCH {
         return Err(Error::tiling("kacc-cube/batch"));
@@ -416,12 +403,29 @@ fn guard_kacc_cube(plan: &Plan, cube_bytes: usize) -> Result<()> {
 /// `ROCKET_REUSE` resolved for this shape: 0 = no CBUF operand reuse, 1 = weight-major
 /// tile order, 2 = data-major (the canonical) order. AUTO picks the deeper consecutive
 /// run, `mi` innermost when the plan has fewer M-tiles than N-tiles, as the C does.
+///
+/// A streamed weight tile is never in the CBUF whole, so WEIGHT_REUSE would read the
+/// last atom as the whole tile; that mode degrades to off (the C's `reuse_mode_plan`).
 fn kacc_rmode(plan: &Plan) -> u8 {
-    match knobs::int("ROCKET_REUSE") {
+    let mode = match knobs::int("ROCKET_REUSE") {
         Some(v) => v.clamp(0, 2) as u8,
         None if plan.nnt >= plan.nmt => 2,
         None => 1,
+    };
+    if mode == 1 && plan_streams(plan) {
+        0
+    } else {
+        mode
     }
+}
+
+/// Whether an fp16 plan's weight tile is streamed: larger than the CBUF banks its input
+/// tile leaves, so a task holds only one weight atom at a time.
+fn plan_streams(plan: &Plan) -> bool {
+    let profile = hw::current();
+    let bank = profile.cbuf_bank_size as i64;
+    let in_banks = (plan.mt as i64 * plan.kt as i64 * 2 + bank - 1) / bank;
+    plan.nt as i64 * plan.kt as i64 * 2 > (profile.cbuf_banks as i64 - in_banks) * bank
 }
 
 /// The `(mi, ni)` a KACC job's tile takes: the C's two compatible orderings.
@@ -561,8 +565,9 @@ fn kacc_job(
     Ok(meta)
 }
 
-/// NPU-side K-accumulation (fp16 eltwise add ping-pong). Returns a `Tiling` error as
-/// a routing sentinel for shapes the EW stride floor cannot serve.
+/// NPU-side K-accumulation (fp16 eltwise add ping-pong). Returns a `Tiling` error when
+/// the plan has no KACC scratch; any M tile accumulates (the EW stride is the tile's own
+/// row count).
 pub fn compute_kacc(plan: &Plan, bos: &mut Bos, wt: MemRef, c: &mut [f16]) -> Result<()> {
     let input = AOperand::scratch(bos);
     compute_kacc_from(plan, bos, wt, input, c)
@@ -582,7 +587,6 @@ pub(crate) fn compute_kacc_from(
     input: AOperand,
     c: &mut [f16],
 ) -> Result<()> {
-    guard_kacc_m(plan)?;
     if bos.okacc0.is_none() || bos.pong.is_none() {
         return Err(Error::tiling("kacc/no-scratch"));
     }
@@ -655,8 +659,6 @@ pub(crate) fn compute_kacc_from(
 /// Contract, all of it the C's:
 /// - `nMt*nNt <= BATCH`: every tile of the cube must co-exist, so the whole cube has to be
 ///   one NPU batch.
-/// - the tiny-M EW stride floor of [`guard_kacc_m`], as a `Tiling` sentinel the caller
-///   answers with [`compute_cpu_from`] (the C's `mm_compute` fallback).
 /// - `cube` holds at least `nMt*nNt*out_slot` fp16 — [`alloc_cube`] is the sized-to-fit
 ///   (and zeroed) allocator for exactly this.
 ///
@@ -907,36 +909,30 @@ mod tests {
     }
 
     #[test]
-    fn kacc_guards_refuse_the_c_tiny_m_shapes() {
-        // A last M-tile below the EW stride floor with M spanning more than one tile.
-        let ragged = Plan::new(264, 1024, 512).unwrap();
+    fn kacc_accepts_every_m_tile() {
+        // The EW stride is the partial's own row count, so the C's old lastM < 12
+        // refusals are gone: a ragged 8-row last tile and a whole M below 12 both run.
+        let ragged = Plan::derive(264, 1024, 512, 256, 512, 128);
         assert!(ragged.nmt > 1 && ragged.m_tile(ragged.nmt - 1) == 8);
-        assert_eq!(
-            guard_kacc_m(&ragged).unwrap_err().status(),
-            crate::Status::Tiling
-        );
-        // A whole M below the floor is fine with one K-tile (nothing to accumulate) and
-        // refuses with more than one (the C's `pl->M < 12 && nMt == 1 && nKt > 1`).
-        let tiny_one_kt = Plan::new(8, 8192, 16).unwrap();
-        assert!(tiny_one_kt.nmt == 1 && tiny_one_kt.nkt == 1);
-        assert!(guard_kacc_m(&tiny_one_kt).is_ok());
-        let tiny = Plan::new(8, 32768, 16).unwrap();
+        assert!(guard_kacc_cube(&ragged, usize::MAX).is_ok());
+
+        let tiny = Plan::derive(8, 32768, 16, 8, 16384, 16);
         assert!(tiny.nmt == 1 && tiny.nkt > 1);
-        assert_eq!(
-            guard_kacc_m(&tiny).unwrap_err().status(),
-            crate::Status::Tiling
-        );
-        // A ragged last tile at or above the floor is served.
-        let ok = Plan::new(280, 1024, 512).unwrap();
+        assert!(guard_kacc_cube(&tiny, usize::MAX).is_ok());
+        let tiny_one_kt = Plan::derive(8, 8192, 16, 8, 8192, 16);
+        assert!(tiny_one_kt.nmt == 1 && tiny_one_kt.nkt == 1);
+        assert!(guard_kacc_cube(&tiny_one_kt, usize::MAX).is_ok());
+
+        let ok = Plan::derive(280, 1024, 512, 256, 512, 128);
         assert_eq!(ok.m_tile(ok.nmt - 1), 24);
-        assert!(guard_kacc_m(&ok).is_ok());
+        assert!(guard_kacc_cube(&ok, usize::MAX).is_ok());
     }
 
     #[test]
     fn a_cube_job_must_fit_one_batch_and_a_whole_cube() {
         // 2 M-tiles x 64 N-tiles: the cube cannot be one NPU batch, so no ping-pong
         // arrangement could keep every tile alive — the C's `ROCKET_E_TILING`.
-        let wide = Plan::new(512, 64, 16384).unwrap();
+        let wide = Plan::derive(512, 64, 16384, 256, 64, 256);
         assert!(wide.nmt * wide.nnt > BATCH);
         assert_eq!(
             guard_kacc_cube(&wide, usize::MAX).unwrap_err().status(),
@@ -960,7 +956,7 @@ mod tests {
 
     #[test]
     fn kacc_decodes_cover_every_tile_once() {
-        let p = Plan::new(512, 1024, 512).unwrap();
+        let p = Plan::derive(512, 1024, 512, 128, 512, 128);
         assert!(p.nmt > 1 && p.nnt > 1);
         for rmode in [0u8, 1, 2] {
             let mut seen = vec![false; p.nmt * p.nnt];
@@ -985,7 +981,7 @@ mod tests {
 
     #[test]
     fn a_operand_tile_addresses_walk_mi_then_ki() {
-        let p = Plan::new(512, 1024, 256).unwrap();
+        let p = Plan::derive(512, 1024, 256, 64, 512, 128);
         assert!(p.nmt > 1 && p.nkt > 1);
         let a = AOperand::of(mem(0x1000, 7));
         assert_eq!(a.handle(), 7);
@@ -1007,7 +1003,7 @@ mod tests {
         // two buffer addresses and their programs must be byte for byte identical: the
         // cube variant differs only in where the buffers live and in skipping the de-tile,
         // which is why its output is the same f16 values the de-tiled path produces.
-        let p = Plan::new(256, 1152, 256).unwrap();
+        let p = Plan::derive(256, 1152, 256, 256, 384, 256);
         assert_eq!((p.nmt, p.nnt, p.nkt), (1, 1, 3));
         assert_eq!((p.nkt - 1) & 1, 0);
         let wt = mem(0x4000, 2);

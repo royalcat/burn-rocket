@@ -22,9 +22,15 @@ The parity harness is pinned to:
 | field | value |
 |---|---|
 | repo | `rocket-userspace` (the C `librocketnpu`) |
-| commit | `b43a9ae1b6364ab0833747fac105b8474c1c0482` (2026-09-26) |
+| commit | `88cae6d37367bcf65e467524a0a15b89dec01d0d` (2026-10-29) |
 | local checkout | `/tmp/opencode/ref-rocket-userspace` |
 | host build | `/tmp/opencode/ref-rocket-userspace/build-host` |
+
+The earlier port was pinned at `b43a9ae1b6364ab0833747fac105b8474c1c0482`
+(2026-09-26); the current head adds the CBUF weight-streaming planner (the fp16
+default), the row-major matmul operand form, exact any-M feature strides, KACC at
+every M tile, the corrected `npu_out_cvt_pair`, and the RK3576/ModernBERT/conv
+work this port does not cover. Everything below the pin table applies unchanged.
 
 Sync the tree from the board (the board's copy is the one the deployed driver
 was validated against):
@@ -33,7 +39,7 @@ was validated against):
 rsync -a root@rock-5b-plus.lan:/root/npu-poc/rocket-userspace/ \
     /tmp/opencode/ref-rocket-userspace/
 cd /tmp/opencode/ref-rocket-userspace
-git rev-parse HEAD   # expect b43a9ae1b6364ab0833747fac105b8474c1c0482
+git rev-parse HEAD   # expect 88cae6d37367bcf65e467524a0a15b89dec01d0d
 ```
 
 Build it host-side (no NPU device needed):
@@ -66,7 +72,7 @@ oracle plan-int8-gw M K N [GROUP]                # int8 gw     rocket_matmul_pla
 oracle plan-int4    M K N                        # int4        rocket_matmul_plan_int4
 oracle plan-tf32    M K N                        # tf32        rocket_matmul_plan_tf32
 oracle plan-bf16    M K N                        # bf16        rocket_matmul_plan_bf16
-oracle emit         M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA]   # gen_matmul_fp16
+oracle emit         M K N IN WT OUT [FP32TOFP16] [ACCUMULATE] [ADD_DMA] [A_ROW_ATOMS] [C_ROW_ATOMS]   # gen_matmul_fp16
 oracle emit-int8    ...                          # gen_matmul_int8
 oracle emit-int4    ...                          # gen_matmul_int4
 oracle emit-tf32    ...                          # gen_matmul_tf32
@@ -78,9 +84,12 @@ the task count, then one `%016llx` per NPUOP word, or `-1`.
 
 **The emitters take the tile dims (`Mt Kt Nt`), not the full problem dims.** The
 planner produces those dims; `parity.py` plans first and then emits the tile.
-`FP32TOFP16` defaults to 1, `ACCUMULATE` to 0, `ADD_DMA` to 0 (the fp16
-`emit`'s long-standing defaults). int8 group-wise shares `emit-int8`: the group
-scale is applied host-side on readback, so the program is dense-int8's.
+`FP32TOFP16` defaults to 1, `ACCUMULATE` to 0, `ADD_DMA` to 0, and the two row
+atoms to 0 (the cube form). A non-zero `A_ROW_ATOMS`/`C_ROW_ATOMS` selects the
+row-major operand form (A read / C written as plain rows); the pitches are the
+FULL problem's `K*2/16` and `N*2/16` atoms, not the tile's. The other dtypes
+ignore both fields. int8 group-wise shares `emit-int8`: the group scale is
+applied host-side on readback, so the program is dense-int8's.
 
 ## Run the parity harness
 
@@ -89,6 +98,8 @@ cargo build -p rocket-npu --bin regcmd_dump     # debug profile is enough
 python3 tools/c-oracle/parity.py                # oracle + newest regcmd_dump
 python3 tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
 python3 tools/c-oracle/parity.py --kind fp16,int8-gw
+# The legacy whole-tile plan matrix (pre-streaming): byte-identical too.
+python3 tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
 ```
 
 Options:
@@ -98,7 +109,8 @@ Options:
 | `--oracle` | oracle binary (default `/tmp/opencode/c-oracle/oracle`) |
 | `--dump` | `regcmd_dump` binary (default: `$CARGO_TARGET_DIR` or repo `target`, newest of `debug`/`release`) |
 | `--profile` | `auto` (newest binary), `debug` or `release`; ignored with `--dump` |
-| `--kind` | dtype filter, repeatable or comma-separated: `fp16`, `int8`, `int8-gw`, `int4`, `tf32`, `bf16` |
+| `--kind` | dtype filter, repeatable or comma-separated: `fp16`, `int8`, `int8-gw`, `int4`, `tf32`, `bf16`, `pool`, `conv`, `int8conv`, `rowmajor` |
+| `--env` | `KEY=VALUE` for both binaries, repeatable (e.g. `ROCKET_MM_STREAM=0`) |
 | `--verbose` | print every plan/emit case and its result |
 
 For each dtype the harness runs a shape matrix with that dtype's alignments
@@ -151,6 +163,10 @@ cd /root/rocket-npu-selftest
 # attention: short causal and long causal
 ./attn_selftest 82
 ./attn_selftest 2587 2587 8 8
+# the row handoff A/B and the saturation refusal
+./attn_selftest 512 4096 8 2 --dk 128 --mask causal --rowmajor-ab
+./attn_selftest 512 8192 8 2 --dk 128 --mask causal --rowmajor-ab   # blocked scores
+./attn_selftest 256 256 4 1 --dk 64 --sat
 ```
 
 The matrix mirrors `parity.py`'s shapes so a structural PASS plus these cosines

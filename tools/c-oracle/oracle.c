@@ -14,7 +14,7 @@
  *   oracle plan-int4    M K N
  *   oracle plan-tf32    M K N
  *   oracle plan-bf16    M K N
- *   oracle emit         M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
+ *   oracle emit         M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA] [A_ROW_ATOMS] [C_ROW_ATOMS]
  *   oracle emit-int8    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
  *   oracle emit-int4    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
  *   oracle emit-tf32    M K N IN_DMA WT_DMA OUT_DMA [FP32TOFP16] [ACCUMULATE] [ADD_DMA]
@@ -359,6 +359,8 @@ int main(int argc, char **argv)
     p.fp32tofp16 = argc > 8 ? (uint8_t)(atoi(argv[8]) != 0) : 1;
     p.accumulate = argc > 9 ? (uint8_t)(atoi(argv[9]) != 0) : 0;
     p.add_dma = argc > 10 ? (uint32_t)strtoul(argv[10], NULL, 0) : 0;
+    p.a_row_atoms = argc > 11 ? (uint32_t)strtoul(argv[11], NULL, 0) : 0;
+    p.c_row_atoms = argc > 12 ? (uint32_t)strtoul(argv[12], NULL, 0) : 0;
 
     uint64_t ops[ORACLE_MAX_OPS] = {0};
     p.tasks = ops;

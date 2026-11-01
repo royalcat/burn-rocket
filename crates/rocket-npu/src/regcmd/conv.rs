@@ -39,6 +39,37 @@ use crate::error::{Error, Result};
 use crate::knobs;
 use crate::log::log_error;
 
+/// The DPU output convertor's scale → register pair (the C `npu_out_cvt_pair`, the
+/// library's one derivation; the host models and the emitters must not drift from it).
+///
+/// Returns `(mul, shift)` with `shift` the **register** value (already pre-decremented),
+/// so the hardware computes `sat8(round_half_even(acc * mul >> shift) + out_zp)`.
+///
+/// `MUL` is 15 bits: the scale's implicit bit and its top 14 mantissa bits, rounded up
+/// by one. A rounded carry-out (`0x8000`) reads as a negative multiplier on the part, so
+/// it renormalizes to `0x4000` at one less shift — the same gain. Mesa's adaptation
+/// masks the exponent's low bit into bit 14 and then forces bit 14, which halves or
+/// negates one scale in 16384; this is the fixed derivation.
+///
+/// The caller must refuse a scale whose `shift` falls outside the register's 1-63 field.
+pub fn requant_params(conv_scale: f32) -> (u32, u32) {
+    let bits = conv_scale.to_bits();
+    let mut mul = ((1u32 << 14) | ((bits >> 9) & 0x3FFF)) + 1;
+    // 127 + 31 - 32 - exp + 16 - 1, in the C's unsigned arithmetic.
+    let mut shift = 141u32.wrapping_sub(bits >> 23);
+    if mul == (1u32 << 15) {
+        // A shift of zero is a scale near 2^14, which no requant reaches. The largest
+        // positive multiplier is the nearest gain the field holds there.
+        if shift != 0 {
+            mul = 1u32 << 14;
+            shift -= 1;
+        } else {
+            mul = 0x7FFF;
+        }
+    }
+    (mul, shift)
+}
+
 use crate::ops::activation::LutEpilogue;
 
 use super::desc::*;
@@ -919,20 +950,19 @@ fn fill_int8(p: &mut ConvInt8Params, depthwise: bool, ops: &mut Vec<NpuOp>) -> R
             dpu.size_e_0 = 3;
             dpu.surf_add = dpu.dst_surf_stride * 4;
 
-            // The OUT_CVT requant triple, derived exactly as Mesa (QNNPACK
-            // requantization.h): conv_scale bits -> shift 126 - exp + 16 - 1, an odd
-            // 15-bit mantissa forced into [2^14, 2^15), offset = out_zp - 0x80.
+            // The OUT_CVT requant triple: one shared derivation (`npu_out_cvt_pair`),
+            // offset = out_zp - 0x80.
             let conv_scale = (p.in_scale * p.w_scale) / p.out_scale;
-            let bits = conv_scale.to_bits();
-            // C unsigned arithmetic: an exponent above 126 wraps, exactly as it does
-            // in the reference emitter.
-            let shift = (127u32 + 31 - 32).wrapping_sub(bits >> 23).wrapping_add(16);
-            let mut scale = ((bits >> 9) & 0x7FFF) + 1;
-            if scale < (1 << 14) {
-                scale |= 1 << 14;
+            let (scale, shift) = requant_params(conv_scale);
+            if !conv_scale.is_finite() || conv_scale <= 0.0 || !(1..=63).contains(&shift) {
+                log_error!(
+                    "gen_conv2d_dw_int8: requant scale {conv_scale} is outside the \
+                     OUT_CVT's range"
+                );
+                return Err(Error::unsupported("gen_conv2d_dw_int8/requant"));
             }
             dpu.out_cvt_scale = scale & 0xFFFF;
-            dpu.out_cvt_shift = shift.wrapping_sub(1);
+            dpu.out_cvt_shift = shift;
             dpu.out_cvt_offset = (p.output_zero_point - 0x80) as u32;
 
             // The per-OC int32 bias add in the BS ALU, fetched by BRDMA.

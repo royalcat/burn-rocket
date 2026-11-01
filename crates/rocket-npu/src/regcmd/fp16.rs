@@ -32,6 +32,12 @@ pub struct MatmulParams {
     pub ew_op: u32,
     pub weight_reuse: bool,
     pub data_reuse: bool,
+    /// Row-major A (gen_matmul_fp16 only): one row of the full A is this many 16-byte
+    /// atoms (`K_full * 2 / 16`); `input_dma` points at the task's first element.
+    pub a_row_atoms: u32,
+    /// Row-major C: one row of the full C is this many atoms (`N_full * 2 / 16` at fp16
+    /// out, `N_full * 4 / 16` at fp32); `output_dma` points at `(m0, n0)`.
+    pub c_row_atoms: u32,
 }
 
 impl MatmulParams {
@@ -50,6 +56,8 @@ impl MatmulParams {
             ew_op: 0,
             weight_reuse: false,
             data_reuse: false,
+            a_row_atoms: 0,
+            c_row_atoms: 0,
         }
     }
 }
@@ -57,6 +65,8 @@ impl MatmulParams {
 #[derive(Default, Clone)]
 pub(crate) struct CnaDesc {
     pub(crate) conv_mode: u32,
+    /// Row-major A: `CNA_CONV_CON1` GROUP_LINE_OFF (bit 29).
+    pub(crate) group_line_off: u32,
     pub(crate) in_precision: u32,
     pub(crate) proc_precision: u32,
     pub(crate) kernel_groups: u32,
@@ -122,6 +132,8 @@ pub(crate) struct DpuDesc {
     pub(crate) proc_precision: u32,
     pub(crate) dst_base_addr: u32,
     pub(crate) dst_surf_stride: u32,
+    /// `DPU_DATA_CUBE_NOTCH_ADDR`, both halves (row-major C's row pitch minus one).
+    pub(crate) notch: u16,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) channel: u32,
@@ -205,16 +217,26 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
 
     let fd_bytes = cna.datain_width * cna.datain_height * cna.datain_channel * 2;
     let fd_banks = (fd_bytes as usize).div_ceil(CBUF_BANK_SIZE);
-    let weight_bytes = cna.weight_bytes as usize;
-    let weight_banks = weight_bytes.div_ceil(CBUF_BANK_SIZE);
     if fd_banks > CBUF_BANKS - 1 {
         return Err(Error::tiling("gen_matmul_fp16/cbuf"));
     }
     if cna.weight_bytes_per_kernel as usize > CBUF_BANK_SIZE {
         return Err(Error::tiling("gen_matmul_fp16/weight-kernel"));
     }
-    cna.weight_bank = (CBUF_BANKS - fd_banks) as u32;
-    let _ = weight_banks;
+    /* A weight cube larger than its banks is STREAMED: the input stays resident and the
+     * CNA fetches the kernel groups through the weight banks, so one task covers all of
+     * N. That needs at least two weight banks and one whole 32-kernel atom: with one bank
+     * and an atom smaller than it (K 384) the task never completes, and an atom past the
+     * banks does the same. A WEIGHT_REUSE bit would read a CBUF holding only the last
+     * atoms as the whole tile. Both refuse. */
+    let weight_banks = CBUF_BANKS - fd_banks;
+    if cna.weight_bytes as usize > weight_banks * CBUF_BANK_SIZE
+        && (weight_banks < stream_weight_banks(cna.weight_bytes_per_kernel as usize)
+            || params.weight_reuse)
+    {
+        return Err(Error::tiling("gen_matmul_fp16/weight-stream"));
+    }
+    cna.weight_bank = weight_banks as u32;
     cna.data_bank = fd_banks as u32;
     cna.weight_reuse = params.weight_reuse;
     cna.data_reuse = params.data_reuse;
@@ -236,6 +258,15 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
     cna.data_burst_len = 0xF;
     cna.line_stride = cna.datain_width * 4;
     cna.surf_stride = feature_surf_stride(cna.line_stride, cna.datain_height);
+    // Row-major A: one line is one row of the full A, and no surfaces.
+    if params.a_row_atoms != 0 {
+        if params.a_row_atoms > 0x0FFF_FFFF {
+            return Err(Error::shape("gen_matmul_fp16/a-row-atoms"));
+        }
+        cna.group_line_off = 1;
+        cna.line_stride = params.a_row_atoms;
+        cna.surf_stride = 0;
+    }
     cna.dma_width = cna.datain_width;
     cna.dma_height = cna.datain_height;
     cna.dma_channel = cna.datain_channel;
@@ -296,6 +327,15 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
     dpu.width_wdma = core.dataout_width;
     dpu.height_wdma = core.dataout_height;
     dpu.channel_wdma = core.dataout_channel;
+    // Row-major C: one atom from one channel group's run to the next, the notch from one
+    // row to the next, and SURF_ADD below one output group's bytes.
+    if params.c_row_atoms != 0 {
+        if params.c_row_atoms > 0x2000 {
+            return Err(Error::shape("gen_matmul_fp16/c-row-atoms"));
+        }
+        dpu.dst_surf_stride = 1;
+        dpu.notch = (params.c_row_atoms - 1) as u16;
+    }
     dpu.surf_add = if params.fp32_to_fp16 {
         dpu.dst_surf_stride * 2
     } else {
@@ -307,7 +347,10 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
     dpu.ew_accumulate = params.accumulate;
     {
         let m = params.m;
-        let mut ew_stride = m.max(12);
+        // The EW read's surface stride is the partial's own row count. The old
+        // MAX(M,12) floor misread every M < 12 with N > 16; the M >= 12 guards that
+        // used to route those plans to the host are gone.
+        let mut ew_stride = m;
         let mut base_off = m * 16;
         if let Some(v) = knobs::u32_auto("ROCKET_EW_SURF") {
             ew_stride = v;
@@ -354,8 +397,19 @@ fn emit_fp16(params: &MatmulParams, ops: &mut Vec<NpuOp>) -> Result<()> {
 }
 
 pub(crate) fn feature_surf_stride(line_stride: u32, datain_height: u32) -> u32 {
-    let s = line_stride as i64 * ((datain_height / 4) as i64 - 1);
-    if s < 0 { 0 } else { s as u32 }
+    // The CNA reads a packed cube in lines of four rows; a surface of H packed rows
+    // needs width*(H - 4), negative below four rows and written as a 28-bit two's
+    // complement (the emitter masks it). The old truncating line*(H/4 - 1) form was
+    // wrong at every H % 4 != 0; it agrees at every H % 4 == 0.
+    ((line_stride as i64 * (datain_height as i64 - 4)) / 4) as u32
+}
+
+/// The fewest CBUF weight banks a streamed weight cube (one larger than its banks) runs
+/// in: one whole 32-kernel atom, and never fewer than two. Below that the task does not
+/// complete.
+pub(crate) fn stream_weight_banks(weight_bytes_per_kernel: usize) -> usize {
+    let atom = (weight_bytes_per_kernel * 32).div_ceil(CBUF_BANK_SIZE);
+    atom.max(2)
 }
 
 pub(crate) fn geometry_fits(cna: &CnaDesc, dpu: &DpuDesc) -> bool {
@@ -396,8 +450,10 @@ pub(crate) fn emit_task(
     push(DPU, DPU_S_POINTER, 0xE);
     push(DPU_RDMA, DPU_RDMA_S_POINTER, 0xE);
 
-    let value =
-        ((cna.proc_precision & 0x7) << 7) | ((cna.in_precision & 0x7) << 4) | (cna.conv_mode & 0xF);
+    let value = ((cna.group_line_off & 1) << 29)
+        | ((cna.proc_precision & 0x7) << 7)
+        | ((cna.in_precision & 0x7) << 4)
+        | (cna.conv_mode & 0xF);
     push(CNA, CNA_CONV_CON1, value);
     let value = ((cna.kernel_groups & 0xFF) << 16) | ((cna.feature_grains & 0x3FF) << 4);
     push(CNA, CNA_CONV_CON2, value);
@@ -540,7 +596,11 @@ pub(crate) fn emit_task(
     );
     push(DPU, DPU_DATA_CUBE_WIDTH, dpu.width & 0x1FFF);
     push(DPU, DPU_DATA_CUBE_HEIGHT, dpu.height & 0x1FFF);
-    push(DPU, DPU_DATA_CUBE_NOTCH_ADDR, 0);
+    push(
+        DPU,
+        DPU_DATA_CUBE_NOTCH_ADDR,
+        ((dpu.notch as u32) << 16) | dpu.notch as u32,
+    );
     push(
         DPU,
         DPU_DATA_CUBE_CHANNEL,
@@ -740,5 +800,55 @@ mod tests {
         // K=64 KiB per kernel overflows the 64 KiB weight-tile rule.
         let mut ops = Vec::new();
         assert!(emit(&params(4, 32768, 16), &mut ops).is_err());
+    }
+
+    #[test]
+    fn row_major_operands_only_move_the_stride_fields() {
+        let mut cube = Vec::new();
+        emit(&params(64, 512, 128), &mut cube).unwrap();
+
+        let mut p = params(64, 512, 128);
+        // A row of the full A is K*2/16 atoms; a row of C is N*2/16.
+        p.a_row_atoms = 64;
+        p.c_row_atoms = 16;
+        let mut rows = Vec::new();
+        emit(&p, &mut rows).unwrap();
+        assert_eq!(cube.len(), rows.len());
+
+        // Exactly the five row-form fields move: CNA CONV_CON1 bit 29 (GROUP_LINE_OFF),
+        // the line stride, the surface stride (0), the DPU notch pair and the output
+        // surface stride (1, and with it SURF_ADD).
+        let moved = |reg: u32| {
+            [
+                CNA_CONV_CON1,
+                CNA_DMA_CON1,
+                CNA_DMA_CON2,
+                DPU_DATA_CUBE_NOTCH_ADDR,
+                DPU_DST_SURF_STRIDE,
+                DPU_SURFACE_ADD,
+            ]
+            .contains(&reg)
+        };
+        for (a, b) in cube.iter().zip(rows.iter()) {
+            assert_eq!(a.target(), b.target());
+            assert_eq!(a.reg(), b.reg());
+            if !moved(a.reg()) {
+                assert_eq!(a.value(), b.value(), "reg {:#x} changed", a.reg());
+            }
+        }
+        let get = |ops: &[NpuOp], target: u64, reg: u32| {
+            ops.iter()
+                .find(|op| op.target() == target && op.reg() == reg)
+                .unwrap()
+                .value()
+        };
+        assert_ne!(get(&rows, CNA, CNA_CONV_CON1) & (1 << 29), 0);
+        assert_eq!(get(&rows, CNA, CNA_DMA_CON1), 64);
+        assert_eq!(get(&rows, CNA, CNA_DMA_CON2), 0);
+        assert_eq!(
+            get(&rows, DPU, DPU_DATA_CUBE_NOTCH_ADDR),
+            (15u32 << 16) | 15
+        );
+        assert_eq!(get(&rows, DPU, DPU_DST_SURF_STRIDE) >> 4, 1);
     }
 }

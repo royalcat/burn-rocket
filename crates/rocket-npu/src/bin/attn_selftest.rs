@@ -4,7 +4,8 @@
 //!
 //! Usage: `attn_selftest [tokens] [kv] [heads] [kv_heads] [--dk N] [--dv N]
 //! [--chain 0|1] [--reps N] [--ref 0|1] [--mem] [--oneshot] [--mt N] [--mha]
-//! [--softcap F] [--mask none|causal|window] [--tile KBP] [--tile-min KV] [--tile-only]`
+//! [--softcap F] [--mask none|causal|window] [--tile KBP] [--tile-min KV] [--tile-only]
+//! [--sat] [--rowmajor-ab]`
 //!
 //! `ROCKET_FA_CHAIN` (the `--chain` flag) selects the per-head path (`0`) or the chained
 //! group batching (`1`). With no `--chain` the default mode runs BOTH — interleaved, so
@@ -38,7 +39,9 @@
 //!
 //! `--dk`/`--dv` pick the head geometry (default 128/128; the embedding model's vision
 //! tower is 64/64 at 2394 patches). `--softcap` and `--mask` pick the score post-
-//! processing (`window` is a bidirectional band of `tokens/8` keys).
+//! processing (`window` is a bidirectional band of `tokens/8` keys). `--sat` plants
+//! scores far past the f16 surface and asserts the call answers `ROCKET_E_RANGE` (-6)
+//! instead of softmaxing tied ±65504 rows (the C `FA_SAT` contract).
 
 use std::time::Instant;
 
@@ -707,6 +710,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tile_only = false;
     let mut host_sm: Option<bool> = None;
     let mut sm_ab = false;
+    let mut sat = false;
+    let mut rowmajor_ab = false;
     let mut i = 0;
     while i < argv.len() {
         let arg = argv[i].as_str();
@@ -733,12 +738,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--tile-only" => tile_only = true,
             "--host-sm" => host_sm = Some(value()?.trim() != "0"),
             "--sm-ab" => sm_ab = true,
+            "--sat" => sat = true,
+            "--rowmajor-ab" => rowmajor_ab = true,
             "--help" | "-h" => {
                 println!(
                     "usage: attn_selftest [tokens] [kv] [heads] [kv_heads] \
                      [--dk N] [--dv N] [--chain 0|1] [--reps N] [--ref 0|1] [--mem] \
                      [--oneshot] [--mt N] [--mha] [--softcap F] [--mask none|causal|window] \
-                     [--tile KBP] [--tile-min KV] [--tile-only] [--host-sm 0|1] [--sm-ab]"
+                     [--tile KBP] [--tile-min KV] [--tile-only] [--host-sm 0|1] [--sm-ab] [--sat] [--rowmajor-ab]"
                 );
                 return Ok(());
             }
@@ -862,6 +869,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
     let mut attn = Attention::new(attn_threads)?;
+    if rowmajor_ab {
+        // The row handoff against the cube handoff: the C documents them bit-identical
+        // except a lone head in a chained group (its AV keeps the batch's fp32
+        // K-accumulation), so a multi-head group must agree exactly.
+        let mut arms = [
+            vec![f16::ZERO; case.out_len()],
+            vec![f16::ZERO; case.out_len()],
+        ];
+        for (i, on) in [false, true].iter().enumerate() {
+            unsafe {
+                std::env::set_var("ROCKET_FA_ROWMAJOR", if *on { "1" } else { "0" });
+            }
+            case.run(&mut attn, &mut arms[i])?;
+        }
+        let diff = arms[0].iter().zip(&arms[1]).filter(|(a, b)| a != b).count();
+        println!(
+            "row-major A/B: {diff} differing f16 value(s) of {} (T={} kv={} dk={} heads={})",
+            arms[0].len(),
+            case.t,
+            case.kv,
+            case.dk,
+            case.heads
+        );
+        if diff == 0 {
+            println!("RESULT: PASS");
+            return Ok(());
+        }
+        println!("RESULT: FAIL");
+        return Err("row-major and cube handoffs differ".into());
+    }
+    if sat {
+        // Planted scores far past the f16 surface: every QK output ties at ±65504, and
+        // the attention must refuse with ROCKET_E_RANGE instead of returning a finite,
+        // full, wrong row (the C's FA_SAT contract).
+        let big = 300.0f32;
+        let qs = vec![f16::from_f32(big); q.len()];
+        let ks = vec![f16::from_f32(big); k.len()];
+        let vs = vec![f16::ZERO; v.len()];
+        let planted = Case {
+            t,
+            kv,
+            dk,
+            dv,
+            heads,
+            hkv,
+            scale,
+            softcap: 0.0,
+            q: &qs,
+            k: &ks,
+            v: &vs,
+            mask: None,
+        };
+        let mut out = vec![f16::ZERO; planted.out_len()];
+        return match planted.run(&mut attn, &mut out) {
+            Err(e) if e.status() == rocket_npu::Status::Range => {
+                println!("RESULT: PASS (a saturated score answers ROCKET_E_RANGE)");
+                Ok(())
+            }
+            other => {
+                println!("RESULT: FAIL (saturation not reported: {other:?})");
+                Err("saturation was not reported".into())
+            }
+        };
+    }
     if tile > 0 {
         let opts = TileOpts {
             kbp: tile,

@@ -766,6 +766,46 @@ def check_conv_int8(
     return direct, dwise
 
 
+def check_rowmajor(
+    oracle: Path, dump: Path, failures: list[Failure], verbose: bool
+) -> int:
+    """The fp16 row-major operand form: A read and C written as plain rows.
+
+    The tile dims come from the plan; the row pitches are the FULL problem's
+    (`K*2/16` atoms for A, `N*2/16` for an fp16 C), which is exactly what the
+    attention handoff passes.
+    """
+    dtype = Dtype("rowmajor", "emit", "emit", n_align=16, k_align=32)
+    checks = 0
+    for m, k, n in (
+        (64, 256, 128),
+        (260, 2080, 320),
+        (512, 2560, 4096),
+        (128, 768, 768),
+    ):
+        plan = run(oracle, ["plan", str(m), str(k), str(n)])
+        tile = parse_plan(plan.stdout)
+        if tile is None:
+            continue
+        mt, kt, nt = tile
+        a_row = k * 2 // 16
+        c_row = n * 2 // 16
+        if a_row == 0 or c_row == 0 or c_row > 0x2000:
+            continue
+        args = [
+            "emit", str(mt), str(kt), str(nt), IN_DMA, WT_DMA, OUT_DMA,
+            "1", "0", "0", str(a_row), str(c_row),
+        ]
+        case = " ".join(args)
+        c_proc = run(oracle, args)
+        r_proc = run(dump, args)
+        checks += 1
+        if compare(failures, dtype, case, c_proc, r_proc) and verbose:
+            words = c_proc.stdout.splitlines()
+            print(f"  {case:<52} -> {words[0] if words else '?'} words")
+    return checks
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare the Rust rocket-npu planner/emitters against the C oracle.",
@@ -780,7 +820,17 @@ def main() -> int:
                         help="dtype filter, repeatable or comma-separated "
                              f"({', '.join(d.name for d in DTYPES)})")
     parser.add_argument("--verbose", action="store_true", help="print every case and its output")
+    parser.add_argument("--env", action="append", default=None, metavar="KEY=VALUE",
+                        help="set an environment variable for both binaries (repeatable); "
+                             "e.g. --env ROCKET_MM_STREAM=0 for the pre-streaming plan matrix")
     args = parser.parse_args()
+
+    for item in args.env or ():
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            print(f"error: --env wants KEY=VALUE, got {item!r}", file=sys.stderr)
+            return 2
+        os.environ[key] = value
 
     oracle = Path(args.oracle)
     dump = Path(args.dump) if args.dump else default_dump(args.profile)
@@ -796,7 +846,7 @@ def main() -> int:
         wanted: list[str] = []
         for chunk in args.kind:
             wanted.extend(part.strip() for part in chunk.split(",") if part.strip())
-        known = {d.name for d in DTYPES} | {"pool", "conv", "int8conv"}
+        known = {d.name for d in DTYPES} | {"pool", "conv", "int8conv", "rowmajor"}
         unknown = [k for k in wanted if k not in known]
         if unknown:
             print(f"error: unknown --kind {', '.join(unknown)}; known: {', '.join(sorted(known))}",
@@ -809,11 +859,13 @@ def main() -> int:
         pool_selected = "pool" in wanted
         conv_selected = "conv" in wanted
         int8conv_selected = "int8conv" in wanted
+        rowmajor_selected = "rowmajor" in wanted
     else:
         selected = DTYPES
         pool_selected = True
         conv_selected = True
         int8conv_selected = True
+        rowmajor_selected = True
 
     print(f"oracle: {oracle}")
     print(f"dump:   {dump}")
@@ -837,6 +889,10 @@ def main() -> int:
     if int8conv_selected:
         int8conv_counts = check_conv_int8(oracle, dump, failures, args.verbose)
 
+    rowmajor_checks: int | None = None
+    if rowmajor_selected:
+        rowmajor_checks = check_rowmajor(oracle, dump, failures, args.verbose)
+
     print()
     names = [len(d.name) for d in selected]
     if pool_counts is not None:
@@ -845,6 +901,8 @@ def main() -> int:
         names.append(len("conv"))
     if int8conv_counts is not None:
         names.append(len("int8conv"))
+    if rowmajor_checks is not None:
+        names.append(len("rowmajor"))
     width = max(names)
     for dtype, status, plan_checks, emit_checks in results:
         if status == "pending":
@@ -866,6 +924,9 @@ def main() -> int:
         status = "fail" if any(f.dtype == "int8conv" for f in failures) else "pass"
         print(f"{'int8conv':<{width}}  {status.upper():<5}  "
               f"direct {direct}, depthwise {dwise}")
+    if rowmajor_checks is not None:
+        status = "fail" if any(f.dtype == "rowmajor" for f in failures) else "pass"
+        print(f"{'rowmajor':<{width}}  {status.upper():<5}  emit {rowmajor_checks}")
 
     if failures:
         print()
@@ -896,6 +957,10 @@ def main() -> int:
         print(
             f"int8conv: {int8conv_counts[0]} direct + {int8conv_counts[1]} depthwise "
             f"program(s) compared, all byte-identical"
+        )
+    if rowmajor_checks is not None:
+        print(
+            f"rowmajor: {rowmajor_checks} row-major program(s) compared, all byte-identical"
         )
     print("RESULT: PASS")
     return 0

@@ -121,6 +121,8 @@ pub enum SoftmaxMode {
 pub struct Softmax {
     /// f32 working row (the scores, then their exponentials).
     row: Vec<f32>,
+    /// One row gathered out of a blocked score matrix (the row handoff).
+    lines: Vec<f16>,
     mode: SoftmaxMode,
 }
 
@@ -147,6 +149,7 @@ impl Softmax {
     pub fn with_mode(mode: SoftmaxMode) -> Self {
         Softmax {
             row: Vec::new(),
+            lines: Vec::new(),
             mode,
         }
     }
@@ -276,9 +279,109 @@ impl Softmax {
         }
     }
 
+    /// The attention row handoff, plain rows: softmax `[tp, kn]` scores **in place**
+    /// and return whether a real key's raw score reached the f16 saturation limit.
+    ///
+    /// This is the C `fa_softmax_fused`'s in-place arm (`seg == Kn`): one pass per row
+    /// from the score buffer to the probability buffer, with no de-tile/pack around it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_in_place(
+        &mut self,
+        data: &mut [f16],
+        mask: Option<&[f16]>,
+        n_tokens: usize,
+        n_kv: usize,
+        tp: usize,
+        kn: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> bool {
+        if tp == 0 || kn == 0 {
+            return false;
+        }
+        self.row.resize(kn, 0.0);
+        let mut sat = false;
+        for i in 0..tp {
+            let range = i * kn..(i + 1) * kn;
+            let mrow = mask
+                .filter(|_| i < n_tokens)
+                .map(|m| &m[i * n_kv..i * n_kv + n_kv]);
+            let sum = {
+                let srow = &data[range.clone()];
+                sat |= scores_saturated(srow, n_kv);
+                let mx = fill_row(
+                    &mut self.row[..kn],
+                    srow,
+                    mrow,
+                    n_kv,
+                    kn,
+                    scale,
+                    softcap,
+                    self.mode,
+                );
+                exp_sum(&mut self.row[..kn], mx, self.mode)
+            };
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            kern::row_write(&self.row[..kn], &mut data[range], inv);
+        }
+        sat
+    }
+
+    /// The attention row handoff, blocked scores: read each row across `seg`-key blocks
+    /// at the `tp*seg` pitch and write plain `[tp, kn]` probability rows to `p`.
+    ///
+    /// This is the C `fa_softmax_fused`'s blocked arm (`seg < Kn`): a row of scores that
+    /// would be more than [`RM_MAX_ROW`](super::rm_max_row) bytes is written as
+    /// per-N-tile blocks, and P is a second plain-row BO.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_blocked(
+        &mut self,
+        sc: &[f16],
+        p: &mut [f16],
+        seg: usize,
+        mask: Option<&[f16]>,
+        n_tokens: usize,
+        n_kv: usize,
+        tp: usize,
+        kn: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> bool {
+        if tp == 0 || kn == 0 {
+            return false;
+        }
+        debug_assert!(seg > 0 && n_kv <= kn);
+        self.row.resize(kn, 0.0);
+        self.lines.resize(n_kv, f16::ZERO);
+        let mut sat = false;
+        for i in 0..tp {
+            for (j, slot) in self.lines[..n_kv].iter_mut().enumerate() {
+                *slot = sc[(i + tp * (j / seg)) * seg + j % seg];
+            }
+            let mrow = mask
+                .filter(|_| i < n_tokens)
+                .map(|m| &m[i * n_kv..i * n_kv + n_kv]);
+            sat |= scores_saturated(&self.lines, n_kv);
+            let mx = fill_row(
+                &mut self.row[..kn],
+                &self.lines[..n_kv],
+                mrow,
+                n_kv,
+                kn,
+                scale,
+                softcap,
+                self.mode,
+            );
+            let sum = exp_sum(&mut self.row[..kn], mx, self.mode);
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            kern::row_write(&self.row[..kn], &mut p[i * kn..(i + 1) * kn], inv);
+        }
+        sat
+    }
+
     /// Live bytes of the reusable row buffer.
     pub fn bytes(&self) -> usize {
-        self.row.capacity() * size_of::<f32>()
+        self.row.capacity() * size_of::<f32>() + self.lines.capacity() * size_of::<f16>()
     }
 }
 
@@ -295,6 +398,80 @@ pub enum SoftmaxPlacement {
     /// scores narrow to f16, then the DPU `EXP` LUT, the feature-axis row sum (fp32)
     /// and the per-row scale run on the NPU, with the row max and `1/sum` on the host.
     Npu,
+}
+
+/// Fill `row[..kn]` with the scaled/masked/soft-capped scores and return the row max.
+///
+/// `srow` holds the row's `n_kv` real scores (a plain row or a gathered blocked one);
+/// the pad columns `n_kv..kn` clamp to [`PAD_KEY_SCORE`].
+#[allow(clippy::too_many_arguments)]
+fn fill_row(
+    row: &mut [f32],
+    srow: &[f16],
+    mask_row: Option<&[f16]>,
+    n_kv: usize,
+    kn: usize,
+    scale: f32,
+    softcap: f32,
+    mode: SoftmaxMode,
+) -> f32 {
+    debug_assert!(row.len() >= kn && srow.len() >= n_kv);
+    let row = &mut row[..kn];
+    match mode {
+        SoftmaxMode::Fast => match (mask_row, softcap != 0.0) {
+            (None, false) => kern::row_scores_plain(srow, row, n_kv, scale),
+            (Some(m), false) => kern::row_scores_masked(srow, row, m, n_kv, scale),
+            (m, true) => kern::row_scores_softcap(srow, row, m, n_kv, scale, softcap),
+        },
+        SoftmaxMode::Exact => {
+            let mut mx = PAD_KEY_SCORE;
+            for j in 0..n_kv {
+                let mut s = srow[j].to_f32() * scale;
+                if softcap != 0.0 {
+                    s = softcap * (s / softcap).tanh();
+                }
+                if let Some(m) = mask_row {
+                    s += m[j].to_f32();
+                }
+                let s = s.max(PAD_KEY_SCORE);
+                row[j] = s;
+                mx = mx.max(s);
+            }
+            row[n_kv..].fill(PAD_KEY_SCORE);
+            mx
+        }
+    }
+}
+
+/// Replace `row[..kn]` with `exp(row - mx)` and return the sum.
+fn exp_sum(row: &mut [f32], mx: f32, mode: SoftmaxMode) -> f32 {
+    match mode {
+        SoftmaxMode::Fast => kern::row_exp(row, mx),
+        SoftmaxMode::Exact => {
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                let e = (*v - mx).exp();
+                *v = e;
+                sum += e;
+            }
+            sum
+        }
+    }
+}
+
+/// Whether a real key's raw f16 score reached the score surface's saturation limit.
+///
+/// The QK contraction accumulates in fp32 and the DPU writes the scores as f16: a score
+/// past 65504 is written as ±65504, not as inf, so the keys past it tie and the softmax
+/// returns a finite, full, wrong row. The attention paths answer
+/// [`Status::Range`](crate::Status::Range) for it, and the caller recomputes at full
+/// precision. A score of exactly 65504 that did not overflow is reported too: that costs
+/// a recompute and never a wrong answer.
+pub(crate) fn scores_saturated(srow: &[f16], n_kv: usize) -> bool {
+    srow[..n_kv].iter().any(|v| {
+        let x = v.to_f32();
+        !x.is_finite() || x.abs() >= 65504.0
+    })
 }
 
 impl SoftmaxPlacement {
@@ -448,6 +625,43 @@ impl RowSoftmax {
     /// Live host bytes of both arms.
     pub fn bytes(&self) -> usize {
         self.host.bytes() + self.masked.capacity() * size_of::<f16>()
+    }
+
+    /// The attention row handoff, plain rows: softmax in place
+    /// (see [`Softmax::run_in_place`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_in_place(
+        &mut self,
+        data: &mut [f16],
+        mask: Option<&[f16]>,
+        n_tokens: usize,
+        n_kv: usize,
+        tp: usize,
+        kn: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> bool {
+        self.host
+            .run_in_place(data, mask, n_tokens, n_kv, tp, kn, scale, softcap)
+    }
+
+    /// The attention row handoff, blocked scores (see [`Softmax::run_blocked`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_blocked(
+        &mut self,
+        sc: &[f16],
+        p: &mut [f16],
+        seg: usize,
+        mask: Option<&[f16]>,
+        n_tokens: usize,
+        n_kv: usize,
+        tp: usize,
+        kn: usize,
+        scale: f32,
+        softcap: f32,
+    ) -> bool {
+        self.host
+            .run_blocked(sc, p, seg, mask, n_tokens, n_kv, tp, kn, scale, softcap)
     }
 
     /// Release the on-NPU arm's matrix when the working shape has shrunk well below it
@@ -1353,6 +1567,73 @@ mod tests {
         masked_scores(&sc3, &mut out3, None, 1, 2, 1, 2, 1.0, 30.0);
         let capped = out3[0].to_f32();
         assert!(capped < 30.0 && capped > 29.9, "{capped}");
+    }
+
+    #[test]
+    fn the_row_handoff_matches_the_plain_softmax() {
+        let (tp, kn, n_kv) = (8usize, 64usize, 50usize);
+        let sc: Vec<f16> = (0..tp * kn)
+            .map(|i| f16::from_f32(((i * 37) % 101) as f32 / 10.0 - 5.0))
+            .collect();
+        let mask: Vec<f16> = (0..tp * n_kv)
+            .map(|i| f16::from_f32(-((i % 7) as f32)))
+            .collect();
+        for mode in [SoftmaxMode::Fast, SoftmaxMode::Exact] {
+            let mut want = vec![f16::ZERO; tp * kn];
+            Softmax::with_mode(mode).run(&sc, &mut want, Some(&mask), tp, n_kv, tp, kn, 0.7, 0.0);
+
+            let mut got = sc.clone();
+            Softmax::with_mode(mode).run_in_place(
+                &mut got,
+                Some(&mask),
+                tp,
+                n_kv,
+                tp,
+                kn,
+                0.7,
+                0.0,
+            );
+            assert_eq!(got, want, "in place, {mode:?}");
+
+            // The scores as `seg`-key blocks at the `tp*seg` pitch.
+            let seg = 16usize;
+            let nnt = kn.div_ceil(seg);
+            let mut blocked = vec![f16::ZERO; tp * nnt * seg];
+            for i in 0..tp {
+                for j in 0..kn {
+                    blocked[(i + tp * (j / seg)) * seg + j % seg] = sc[i * kn + j];
+                }
+            }
+            let mut got = vec![f16::ZERO; tp * kn];
+            Softmax::with_mode(mode).run_blocked(
+                &blocked,
+                &mut got,
+                seg,
+                Some(&mask),
+                tp,
+                n_kv,
+                tp,
+                kn,
+                0.7,
+                0.0,
+            );
+            assert_eq!(got, want, "blocked, {mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_saturated_score_is_reported() {
+        let (tp, kn) = (2usize, 4usize);
+        let mut d = vec![f16::ZERO; tp * kn];
+        d[1] = f16::from_f32(65504.0);
+        assert!(Softmax::new().run_in_place(&mut d, None, tp, kn, tp, kn, 1.0, 0.0));
+
+        let mut d = vec![f16::ZERO; tp * kn];
+        d[1] = f16::INFINITY;
+        assert!(Softmax::new().run_in_place(&mut d, None, tp, kn, tp, kn, 1.0, 0.0));
+
+        let mut d = vec![f16::from_f32(1.0); tp * kn];
+        assert!(!Softmax::new().run_in_place(&mut d, None, tp, kn, tp, kn, 1.0, 0.0));
     }
 
     #[test]

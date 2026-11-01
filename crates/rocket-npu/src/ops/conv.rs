@@ -97,6 +97,9 @@ use crate::ops::reduce::feature_data;
 use crate::regcmd::conv::{ConvAct, ConvParams, gen_conv2d_dw_fp16, gen_conv2d_fp16};
 use crate::regcmd::desc::CBUF_BANK_SIZE;
 
+/// The requant pair's one derivation lives with the emitters (`npu_out_cvt_pair`).
+pub use crate::regcmd::conv::requant_params;
+
 /// Slices a fused conv waits for the output BO (the C's hardcoded 2 s).
 const CONV_WAIT_NS: u64 = 2_000_000_000;
 
@@ -3026,21 +3029,6 @@ pub fn conv2d_int8_mt(
 // PART 6 — native int8 DEPTHWISE conv (int8-out, on-chip requant)
 // ############################################################################
 
-/// The DPU output convertor's scale → register pair (`requant_params` in the C test's
-/// `requant_model.h`, the QNNPACK derivation the generator programs).
-///
-/// Returns `(mul, shift)` with `shift` the **register** value (already pre-decremented),
-/// so the hardware computes `sat8(round_half_even(acc * mul >> shift) + out_zp)`.
-pub fn requant_params(conv_scale: f32) -> (u32, u32) {
-    let bits = conv_scale.to_bits();
-    let shift = (127u32 + 31 - 32).wrapping_sub(bits >> 23) + 16 - 1;
-    let mut mul = ((bits >> 9) & 0x7FFF) + 1;
-    if mul < (1 << 14) {
-        mul |= 1 << 14;
-    }
-    (mul, shift)
-}
-
 /// The host model of the DPU's rounding shift: nearest, ties to **even** (measured on
 /// hardware — not the arithmetic-shift `(x + half) >> shift`, which takes ties toward
 /// +inf, and not round-half-away-from-zero).
@@ -3336,6 +3324,18 @@ fn conv2d_dw_int8_run(
         -4 => return Err(Error::tiling("rocket_conv2d_dw_int8/cbuf")),
         _ => return Err(Error::shape("rocket_conv2d_dw_int8")),
     }
+    // The OUT_CVT carries the scale as a 15-bit multiplier and a 6-bit shift, 141 minus
+    // the scale's biased exponent: a scale whose shift leaves that field is not
+    // programmable on the part.
+    let conv_scale = (in_scale * w_scale) / out_scale;
+    let (_, shift) = requant_params(conv_scale);
+    if !conv_scale.is_finite() || conv_scale <= 0.0 || !(1..=63).contains(&shift) {
+        log_error!(
+            "rocket_conv2d_dw_int8: requant scale {conv_scale} is outside the OUT_CVT's \
+             range"
+        );
+        return Err(Error::unsupported("rocket_conv2d_dw_int8/requant"));
+    }
     // The fold carries in_zp * sum(w); a weight zero point would add w_zp * sum(x),
     // which depends on the input and cannot be folded. TFLite's int8 weights are
     // symmetric (the C refuses a non-zero w_zp on the device path only).
@@ -3389,9 +3389,9 @@ fn conv2d_dw_int8_run(
 ///
 /// The caller passes the **raw model tensors**: `in [C][IH][IW]`, `w [C][KH][KW]`,
 /// `bias_q [C]` int32 (optional), `out [C][OH][OW]`, all in the model's int8 domain,
-/// plus the per-tensor scales and the model-domain zero points. `w_zp != 0` is
-/// [`crate::Status::Unsupported`] (the fold cannot carry a weight zero point), and `C`
-/// must be a multiple of 16 (the `C2` feature-cube grain).
+/// plus the per-tensor scales and the model-domain zero points. `w_zp != 0` is refused
+/// on the NPU path (the bias fold cannot carry a weight zero point), and `C` must be a
+/// multiple of 16 (the `C2` feature-cube grain).
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_dw_int8(
     dev: &Device,
@@ -3937,7 +3937,7 @@ mod tests {
         // derivation; pin both against the C test's `requant_model.h` numbers.
         let (mul, shift) = requant_params(0.0213 * 0.00347 / 0.0925);
         assert_eq!((mul, shift), (0x68bc, 25));
-        // ... and the emitter writes exactly that (scale, shift-1 register).
+        // ... and the emitter writes exactly that pair.
         let mut p = crate::regcmd::conv::ConvInt8Params::new(64, 8, 8, 64, 8, 8, 3, 3, 0, 0, 0);
         p.pad_top = 1;
         p.pad_left = 1;
@@ -3983,6 +3983,17 @@ mod tests {
         assert_eq!(requant_apply(1 << 40, 0x4000, 14), 127);
         assert_eq!(requant_apply(-(1 << 40), 0x4000, 14), -128);
         assert_eq!(requant_apply_zp(0, 0x4000, 14, 5), 5);
+    }
+
+    #[test]
+    fn a_requant_carry_keeps_the_gain_positive() {
+        // Mantissa bits [22:9] all set: the rounded 15-bit multiplier carries out to
+        // 0x8000, which the part reads as -32768. The shared derivation renormalizes it
+        // to 0x4000 at one less shift (Mesa's would return 0x8000 and negate the layer).
+        let scale = f32::from_bits(0x3FFF_FE00);
+        assert_eq!(requant_params(scale), (0x4000, 13));
+        // The ordinary scale in the register test above has no carry: unchanged pair.
+        assert_eq!(requant_params(0.0213 * 0.00347 / 0.0925), (0x68BC, 25));
     }
 
     #[test]

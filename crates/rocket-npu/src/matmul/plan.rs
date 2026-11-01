@@ -35,6 +35,14 @@ pub struct Geometry {
     pub asym_nt: bool,
     pub pick_nt: bool,
     pub grouped: bool,
+    /// Bytes per output element; read by the streaming planner only.
+    pub obytes: usize,
+    /// Weight banks a streamed task needs past its atom's.
+    pub wspare: usize,
+    /// The weight-streaming plan applies (see [`plan_stream`]).
+    pub stream: bool,
+    /// A K split's partials accumulate on the NPU when [`kacc_on`] (fp16 only).
+    pub kacc: bool,
 }
 
 pub const FP16: Geometry = Geometry {
@@ -50,6 +58,10 @@ pub const FP16: Geometry = Geometry {
     asym_nt: true,
     pick_nt: false,
     grouped: false,
+    obytes: 2,
+    wspare: 0,
+    stream: true,
+    kacc: true,
 };
 
 /// int8 dense geometry (`gen_matmul_int8`): 1 byte, N/K align 32, one bank of
@@ -67,6 +79,10 @@ pub const INT8: Geometry = Geometry {
     asym_nt: false,
     pick_nt: false,
     grouped: false,
+    obytes: 4,
+    wspare: 1,
+    stream: true,
+    kacc: false,
 };
 
 /// Group-wise int8: Kt must divide the quant group; pick the smallest Nt that
@@ -84,6 +100,10 @@ pub const INT8_GW: Geometry = Geometry {
     asym_nt: false,
     pick_nt: true,
     grouped: true,
+    obytes: 4,
+    wspare: 1,
+    stream: false,
+    kacc: false,
 };
 
 /// bf16 shares the int16/fp16 2-byte geometry (N16, K32) and the fp32 output cube.
@@ -100,6 +120,10 @@ pub const BF16: Geometry = Geometry {
     asym_nt: false,
     pick_nt: false,
     grouped: false,
+    obytes: 4,
+    wspare: 0,
+    stream: false,
+    kacc: false,
 };
 
 /// int4 dense geometry (`gen_matmul_int4`): half a byte per element, N align 64
@@ -117,6 +141,10 @@ pub const INT4: Geometry = Geometry {
     asym_nt: false,
     pick_nt: false,
     grouped: false,
+    obytes: 4,
+    wspare: 0,
+    stream: false,
+    kacc: false,
 };
 
 /// tf32 geometry (`gen_matmul_tf32`): 4 B per element in an fp32 container, N align
@@ -136,6 +164,10 @@ pub const TF32: Geometry = Geometry {
     asym_nt: false,
     pick_nt: false,
     grouped: false,
+    obytes: 4,
+    wspare: 0,
+    stream: false,
+    kacc: false,
 };
 
 /// A resolved tiling plan plus its per-tile slot sizes, counted in the dtype's own
@@ -333,6 +365,159 @@ fn asym_on() -> bool {
     }
 }
 
+/// The C `kacc_on()`: NPU-side K-accumulation, on unless opted out.
+///
+/// Read per call (the C caches it once per process); a caller that changes the knob
+/// between packing and running must keep its plan and its BO provisioning in step.
+pub(crate) fn kacc_on() -> bool {
+    match knobs::int("ROCKET_KACC") {
+        Some(v) => v != 0,
+        None => !knobs::present("ROCKET_NO_KACC"),
+    }
+}
+
+/// `ROCKET_MM_STREAM`: the weight-streaming plan, on by default.
+fn stream_on() -> bool {
+    match knobs::int("ROCKET_MM_STREAM") {
+        Some(v) => v > 0,
+        None => true,
+    }
+}
+
+/// Whether a geometry's plan streams. int8 streams only when
+/// `ROCKET_MM_STREAM_INT8=1` too (the C: detector 1x1 convs route to the same entry
+/// and those shapes are unmeasured).
+fn stream_on_geom(geom: &Geometry) -> bool {
+    if !geom.stream || !stream_on() {
+        return false;
+    }
+    if geom.obytes != 4 {
+        return true;
+    }
+    match knobs::int("ROCKET_MM_STREAM_INT8") {
+        Some(v) => v > 0,
+        None => false,
+    }
+}
+
+/// `ROCKET_MM_STREAM_KT` (debug): restrict a streamed plan to this `Kt`, rounded down
+/// to the K granularity. 0 = the full search.
+fn stream_kt_force() -> usize {
+    match knobs::int("ROCKET_MM_STREAM_KT") {
+        Some(v) if v > 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// The widest streamed N tile. 4096 is the widest measured; the DPU channel field is
+/// 13 bits, and an external userspace reports an 8192-wide int4 task that corrupts the
+/// job after it, so nothing past what was measured.
+const MM_STREAM_NT_MAX: usize = 4096;
+
+/// Rows an M tile must reach to hide its weight re-read (the cost fit's crossover).
+const STREAM_XM: usize = 128;
+/// A host-read K pass's cost, in bytes-equivalents of its output tile.
+const STREAM_HOSTW: f64 = 8.0;
+
+/// `mm_plan_stream`: choose `(Mt, Kt, Nt)` for a streamed plan, or `None` when none
+/// fits.
+///
+/// The whole-tile rule ([`fits`]) makes the weight tile share the CBUF with the input
+/// tile, which caps `Nt` and multiplies the task count. A streamed program instead
+/// cycles a weight cube larger than its banks through the banks the input tile leaves,
+/// so one task covers a whole N slice. Its cost, in DRAM-byte equivalents over one
+/// `max_tile`-row slice, is the weight stream (the larger of its bytes and `STREAM_XM`
+/// rows' MACs), the input once per N tile, and the partial C each K pass writes (read
+/// back by the next pass when KACC accumulates on the NPU, at `STREAM_HOSTW` times its
+/// bytes when the host sums every pass).
+///
+/// The slice is `min(M, max_tile)`, not all of `M`, so every M at or above the cap
+/// plans the same `(Kt, Nt)` and a resident weight packed at one M serves every M.
+fn plan_stream(
+    geom: &Geometry,
+    m: usize,
+    k: usize,
+    n: usize,
+    budget: usize,
+    max_mt: usize,
+) -> Option<(usize, usize, usize)> {
+    let profile = hw::current();
+    let eb = geom.elem_num as f64 / geom.elem_den as f64;
+    let ka = geom.k_align;
+    let devacc = geom.kacc && kacc_on();
+    let bank = profile.cbuf_bank_size as i64;
+    let ms = m.min(max_mt);
+    let nt = pick_nt(n, MM_STREAM_NT_MAX, geom.n_align);
+    let nn = n.div_ceil(nt);
+    let mut best_mt = 0usize;
+    let mut best_kt = 0usize;
+    let mut best = 0.0f64;
+    let force = stream_kt_force() / ka * ka;
+
+    for pass in if force > 0 { 0..2 } else { 1..2 } {
+        let mut prev_kt = 0usize;
+        let mut found = false;
+        for nk in 1..=k / ka {
+            let kt = rup(k.div_ceil(nk), ka);
+            if kt > geom.kt_ceil || kt == prev_kt {
+                continue;
+            }
+            prev_kt = kt;
+            if pass == 0 && kt != force {
+                continue;
+            }
+            let atom = crate::regcmd::fp16::stream_weight_banks(kt * geom.elem_num / geom.elem_den)
+                + geom.wspare;
+            if atom >= budget {
+                continue;
+            }
+            let rows = (budget - atom) as i64 * bank * geom.elem_den as i64
+                / (kt as i64 * geom.elem_num as i64);
+            let mut mt = rows.min(ms as i64) as usize;
+            mt &= !3;
+            if mt < 4 {
+                continue;
+            }
+            let nkp = k.div_ceil(kt);
+            let mut tasks = 0.0f64;
+            let mut m0 = 0usize;
+            while m0 < ms {
+                let tile = (ms - m0).min(mt);
+                tasks += if tile > STREAM_XM {
+                    tile as f64 / STREAM_XM as f64
+                } else {
+                    1.0
+                };
+                m0 += mt;
+            }
+            let cost = tasks * (n * k) as f64 * eb
+                + (ms * k) as f64 * eb * nn as f64
+                + (ms * n) as f64
+                    * geom.obytes as f64
+                    * if devacc {
+                        (2 * nkp - 1) as f64
+                    } else {
+                        STREAM_HOSTW * nkp as f64
+                    };
+            if best_mt == 0 || cost < best {
+                best = cost;
+                best_mt = mt;
+                best_kt = kt;
+                found = true;
+            }
+            // The first Kt that holds the whole slice ends the search: a deeper split
+            // moves the same weight bytes in more passes and more tasks.
+            if mt == (ms & !3) {
+                break;
+            }
+        }
+        if found {
+            return Some((best_mt, best_kt, nt));
+        }
+    }
+    None
+}
+
 /// `matmul_plan_pin`: the pinned-tile planner behind [`Plan::pinned`].
 ///
 /// `pin_nt`/`pin_kt` (`None` = free) follow the C's rules: a pinned dimension is
@@ -453,7 +638,20 @@ pub fn plan_geom(
     }
 
     let mut kt;
-    if geom.grouped {
+    let mut streamed = false;
+    if stream_on_geom(geom)
+        && !geom.grouped
+        && !knobs::present("ROCKET_MM_MT")
+        && !knobs::present("ROCKET_MM_NT")
+        && !knobs::present("ROCKET_MM_KT")
+        && let Some((smt, skt, snt)) = plan_stream(geom, m, k, n, budget, max_tile)
+    {
+        // the streamed plan; see `plan_stream`
+        mt = smt;
+        kt = skt;
+        nt = snt;
+        streamed = true;
+    } else if geom.grouped {
         loop {
             let mut found = None;
             let mut d = group;
@@ -507,7 +705,7 @@ pub fn plan_geom(
             }
         }
     }
-    if !fits(geom, mt, nt, kt, budget) {
+    if !streamed && !fits(geom, mt, nt, kt, budget) {
         return Err(Error::shape("plan/cbuf"));
     }
 
@@ -537,10 +735,13 @@ mod tests {
     #[test]
     fn large_shape_tiles() {
         let p = Plan::new(512, 2560, 4096).unwrap();
-        assert!(p.mt <= 256 && p.nt <= 256);
+        // The streaming plan (the default) covers a whole N slice per task, so `nt`
+        // may exceed the 256-row tile cap; `mt` and the alignments do not move.
+        assert!(p.mt <= 256 && p.mt.is_multiple_of(4));
+        assert!(p.nt >= 16 && p.nt <= 4096);
         assert_eq!(p.kt % 32, 0);
+        assert!(p.nmt > 1);
         assert_eq!(p.jobs(), p.nmt * p.nnt * p.nkt);
-        assert_eq!(p.mt % 4, 0);
     }
 
     #[test]
@@ -586,7 +787,7 @@ mod tests {
             let got: Vec<_> = (0..p.jobs()).map(|j| p.tile_of(j)).collect();
             assert_eq!(got, want, "M={m} K={k} N={n}");
         }
-        let p = Plan::new(264, 1024, 512).unwrap();
+        let p = Plan::derive(264, 1024, 512, 256, 512, 128);
         assert!(
             p.nmt > 1 && p.nnt > 1 && p.nkt > 1,
             "the decode test must not be vacuous: {p:?}"

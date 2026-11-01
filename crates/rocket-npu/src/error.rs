@@ -19,6 +19,9 @@ pub enum Status {
     Device,
     /// A request the port does not implement (`ROCKET_E_UNSUPPORTED`, -5).
     Unsupported,
+    /// A value left the range of an fp16 output (`ROCKET_E_RANGE`, -6): the attention
+    /// score surface saturated, so the output is not valid.
+    Range,
     /// A plain I/O or argument failure outside the C status set.
     Io,
 }
@@ -31,7 +34,8 @@ impl Status {
             Status::NoMem => -3,
             Status::Device => -4,
             Status::Unsupported => -5,
-            Status::Io => -6,
+            Status::Range => -6,
+            Status::Io => -7,
         }
     }
 
@@ -42,7 +46,8 @@ impl Status {
             -3 => Some(Status::NoMem),
             -4 => Some(Status::Device),
             -5 => Some(Status::Unsupported),
-            -6 => Some(Status::Io),
+            -6 => Some(Status::Range),
+            -7 => Some(Status::Io),
             _ => None,
         }
     }
@@ -153,6 +158,7 @@ impl fmt::Display for Error {
             Status::NoMem => "out of memory",
             Status::Device => "device failure",
             Status::Unsupported => "unsupported feature",
+            Status::Range => "output out of range",
             Status::Io => "I/O failure",
         };
         write!(f, "{}: {what}", self.op)?;
@@ -188,12 +194,14 @@ mod tests {
         assert_eq!(Status::NoMem.code(), -3);
         assert_eq!(Status::Device.code(), -4);
         assert_eq!(Status::Unsupported.code(), -5);
+        assert_eq!(Status::Range.code(), -6);
         for s in [
             Status::Shape,
             Status::Tiling,
             Status::NoMem,
             Status::Device,
             Status::Unsupported,
+            Status::Range,
             Status::Io,
         ] {
             assert_eq!(Status::from_code(s.code()), Some(s));

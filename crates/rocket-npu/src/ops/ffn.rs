@@ -28,7 +28,7 @@
 //! projection in a full `[nMt][nNt]` cube (`compute_kacc_cube`, no de-tile), the
 //! element-wise passes run over the cube's fp16 bytes, and `consume_cube` runs the
 //! down/fc2 matmul with the product cube as its input tile for tile
-//! (`compute_kacc_from`, `compute_cpu_from` on the tiny-M sentinel — the C's
+//! (`compute_kacc_from`, `compute_cpu_from` on a `Tiling` refusal — the C's
 //! `mm_compute_kacc` then `mm_compute`). The activation/EW ops still copy their operands
 //! through their own BOs, exactly as C does, so the win over the row-major form is the
 //! **de-tile + re-pack removal** the C's `RESIDENT-FUSION NOTE` describes, not the
@@ -44,7 +44,7 @@
 //! reproduced faithfully, so [`ffn_fused`] and [`ffn`] can differ in the last bits — see
 //! the module tests.
 //!
-//! Shapes the pinned tiling cannot express (or that the KACC EW stride floor refuses)
+//! Shapes the pinned tiling cannot express (or that the one-batch cube guard refuses)
 //! fall back to the host-handoff block internally, exactly as the C does (`goto fb`).
 
 use std::f64::consts::FRAC_1_SQRT_2;
@@ -304,7 +304,7 @@ fn projection_cube(dev: &Device, plan: &Plan, x: &[f16], w: &[f16]) -> Result<Bo
 
 /// The consumer half: `c = cube · W^T` where `cube` is the producer's output cube read as
 /// this plan's input cube (the C's `bn.in_all = cube`, `mm_compute_kacc` then `mm_compute`
-/// on the tiny-M sentinel).
+/// on a `Tiling` refusal).
 ///
 /// `plan` must be the matched-tiling partner of the producer (`out_slot == in_slot`,
 /// `nNt(producer) == nKt(consumer)`, same `nMt`/`Mt`), which is the caller's gate.
@@ -341,9 +341,9 @@ fn store_cube(cube: &mut Bo, src: &[f16]) -> Result<()> {
 /// reads the product cube directly as its input (see the module docs).
 ///
 /// Falls back to [`ffn`] whenever the pinned tiling cannot express the shape — a
-/// source-level shape the planner refuses, a tiling that does not match, more
-/// projection tiles than one NPU batch, or a KACC EW-stride refusal — exactly as the C
-/// does (`goto fb`), including for a genuine device error on the pinned attempt.
+/// source-level shape the planner refuses, a tiling that does not match, or more
+/// projection tiles than one NPU batch — exactly as the C does (`goto fb`), including
+/// for a genuine device error on the pinned attempt.
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_fused(
     dev: &Device,

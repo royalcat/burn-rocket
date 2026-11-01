@@ -20,12 +20,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Config {
-        let kacc = match crate::knobs::int("ROCKET_KACC") {
-            Some(v) => v != 0,
-            None => !crate::knobs::present("ROCKET_NO_KACC"),
-        };
         Config {
-            kacc,
+            kacc: crate::matmul::plan::kacc_on(),
             pipe: crate::knobs::present("ROCKET_MM_PIPE"),
         }
     }
@@ -37,8 +33,13 @@ pub fn wt_bytes(plan: &Plan) -> usize {
 }
 
 /// Bytes of the CPU-accumulation output scratch for `plan`.
+///
+/// One slot per tile of a job, and a job never holds more tiles than the plan has. A
+/// streamed plan's tile is a whole N slice wide, so `BATCH` slots of it would be tens
+/// of MB no job can fill.
 pub fn out_bytes(plan: &Plan) -> usize {
-    BATCH * plan.out_slot * 2 + CBUF_BANK_SIZE
+    let tiles = plan.jobs().min(BATCH);
+    tiles * plan.out_slot * 2 + CBUF_BANK_SIZE
 }
 
 /// All BOs of one tiled matmul.

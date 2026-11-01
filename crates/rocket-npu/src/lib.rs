@@ -55,10 +55,15 @@
 //!   `pack_at`, `verify`, `group_chained`;
 //! - fp16: one-shot, one-shot multi-fd (`_mt`) and fp32-output (`_f32out`), streaming,
 //!   resident and segmented-resident matmul, canonical and legacy tiling, KACC and
-//!   CPU-accumulation, per-shape scratch cache;
+//!   CPU-accumulation, per-shape scratch cache. The **CBUF weight-streaming plan**
+//!   (`ROCKET_MM_STREAM`, the C default) lets one task cover a whole N slice with the
+//!   weights cycling through the banks the input tile leaves, and the KACC EW stride is
+//!   the partial's own row count, so every M tile accumulates on the NPU;
 //! - fp16 batching: [`matmul::MmBatch`] (the persistent `rocket_mm_batch_*` context,
-//!   pack-once/resident BOs) and the one-shot [`matmul::batch()`]
-//!   (`rocket_matmul_fp16_batch`);
+//!   pack-once/resident BOs), the one-shot [`matmul::batch()`]
+//!   (`rocket_matmul_fp16_batch`), and the **row-major operand form**
+//!   (`rocket_mm_batch_run_rows`): A read from and/or C written to a caller's BO as
+//!   plain rows, which is how the attention hands its scores/P between QK and AV;
 //! - int8: dense `int8 x int8 -> int32` one-shot ([`matmul::one_shot_int8`], host
 //!   int64 K-accumulation), the one-shot group-wise
 //!   [`matmul::one_shot_int8_groupwise`], the int8 planner ([`matmul::plan_int8`]), and
@@ -175,7 +180,9 @@
 //!   [`ops::conv::conv2d_dw_int8`] with the on-chip requant (the BS ALU bias add from
 //!   BRDMA and the three-field OUT_CVT), its host model
 //!   [`ops::conv::conv2d_dw_int8_model`] (nearest, ties to even — the DPU's measured
-//!   rule) and the `requant_*` helpers, plus [`ops::conv::ConvContext::conv2d_int8`] /
+//!   rule) and the `requant_*` helpers (the corrected `npu_out_cvt_pair` derivation:
+//!   a rounded multiplier carry renormalizes instead of negating the layer), plus
+//!   [`ops::conv::ConvContext::conv2d_int8`] /
 //!   `conv2d_dw_int8` and the pure tiler ([`ops::conv::conv_int8_tile_plan`]). Its
 //!   opt-in batched submit (`ROCKET_CONV_BATCH=1`, the C's `conv2d_int8_batch_tiles`)
 //!   coalesces a run of tiles into **one** multi-task job — one ioctl, one IOMMU
@@ -247,7 +254,14 @@
 //!   one [`matmul::MmBatch`] job per group (`ROCKET_FA_CHAIN`, default on, the port of
 //!   the C `fa_heads_range_batched`; `ROCKET_FA_CHAIN_ELEMS` bounds the group, and a
 //!   shape that needs more than one fp16 K-accumulation tile stays on the per-head path
-//!   so the two remain bit-identical). The long-context path
+//!   so the two remain bit-identical). On that path the **row handoff**
+//!   (`ROCKET_FA_ROWMAJOR`, default on, the C `fa_rowmajor`) writes QK's scores as plain
+//!   rows into a resident BO, rewrites them as P in place and reads P as AV's row-major
+//!   A, so neither a de-tile out of the cube nor a pack back into one runs; past
+//!   `ROCKET_FA_RM_MAX_ROW` bytes a row QK writes per-N-tile blocks and P goes to a
+//!   second BO. A real key whose raw f16 score reached ±65504 saturates the surface and
+//!   every attention entry answers [`Status::Range`](crate::Status::Range) (`-6`), as
+//!   the C does. The long-context path
 //!   ([`attn::tile_kv_width`], `ROCKET_FA_TILE_KV`) walks the key axis in tiles and
 //!   carries the online softmax ([`attn::Online`]) instead of materializing the
 //!   `[Tp, Kn]` score matrix, so the attention scratch stops growing with the key
