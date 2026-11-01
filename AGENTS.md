@@ -1453,14 +1453,16 @@ redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
 
 ### Tests
 
-`cargo test -p rocket-inference --no-default-features` = **180** tests. The CLI
+`cargo test -p rocket-inference --no-default-features` = **181** tests. The CLI
 refactor's 53 cover flag parsing, the auto/CPU/NPU stage resolution including
 the NPU-build case, family-scoped flag rejection, int8 dependencies and
 `--keep-cpu-weights` rules; the decision family adds its contract, readout,
-mRoPE, splice and media-guard tests (see below), and the intent loader's
+mRoPE, splice and media-guard tests (see below), the intent loader's
 `a_bf16_text_body_is_half_the_bytes_and_exact` pins M5's storage path against the
 checkpoint's own f32 read (`/tmp/opencode/d3/models/d3-lite`, skipped when
-absent). `cargo clippy -p
+absent), and `the_streamed_int8_quantizer_matches_the_whole_table_one` pins
+M5b's block-wise table quantizer against the whole-table form (block sizes
+0/1/3/rows/4x rows over bf16, f16 and f32). `cargo clippy -p
 rocket-inference --no-default-features` and the aarch64+`npu` clippy are clean;
 `cargo fmt --all -- --check` is clean.
 
@@ -1530,13 +1532,15 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   deployment (the NPU never holds it) and a prompt only reads its own rows, so the
   decision family stores it as **per-row symmetric int8** — `scale = max|row|/127`,
   round half away from zero, codes clamped to ±127 — behind
-  `Embed::Int8 { codes, scales }` (`qwen35_intent/model.rs`); `quantize_rows` and
-  `dequant_rows` are rayon passes, `embed_ids` dequantizes just the prompt's rows
+  `Embed::Int8 { codes, scales }` (`qwen35_intent/model.rs`); `quantize_rows_into`
+  (the loader streams the stored table through it, see M5b) and `dequant_rows`
+  are rayon passes, `embed_ids` dequantizes just the prompt's rows
   (a bandwidth-trivial pass: 8k × 1024 elements in a few ms) and only the
   generation paths' `dense_embed` read the whole
-  table (decision never does). The loader consumes the f32 checkpoint table **in
-  place** (`TensorData::try_into_vec`, no tensor copy), so the load transient also
-  drops. `--embed-int8` is the decision **default**, `--embed-f16` keeps the exact
+  table (decision never does). The M2 loader consumed the f32 checkpoint table in
+  place (`TensorData::try_into_vec`, no tensor copy); M5b replaced that read with a
+  streamed one, so the f32 table no longer exists at all. `--embed-int8` is the
+  decision **default**, `--embed-f16` keeps the exact
   table, both is an error, `Family::supports_embed_int8` is Decision-only, and the
   ready line prints `embed I8`/`F16`/`F32`. Dev host, text-only `--defer-towers`,
   resident / peak anon: d3-lite 2462 / 2583 -> **2222 / 2397** MiB, d3-nano
@@ -1623,12 +1627,42 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   full f32 `Tensor::zeros([vocab, hidden])` table (970 MiB lite / 1,940 nano) and
   the M2 load path stacks `get_stored` + `convert_dtype(F32)` + `try_into_vec` +
   the int8 codes on top of it (traced: the load ramps to ~2.4 GiB at 0.6 s, drops
-  to 0.43, then ramps to the 1,273 MiB resident body). A streaming row-block table
-  quantizer is the natural follow-up (it would take lite's 2.1k peak to ~1.5 GiB
-  and nano's to ~3.5 GiB, i.e. close to the resident figure); it is **not** done
-  here. `--npu` is unaffected by
+  to 0.43, then ramps to the 1,273 MiB resident body). That transient is
+  **M5b's** (next bullet, which did the streaming quantizer this round predicted).
+  `--npu` is unaffected by
   construction (same f32 pack inputs, shape-derived byte count in the ready line),
   but it is not device-tested on this host.
+- **Streamed int8 table load** (phase M5b, 2026-11-02): the int8 table is
+  quantized straight from the checkpoint's stored dtype in row blocks, so the load
+  never allocates a vocab-sized f32 table (the M5 note above left that open).
+  `IntentModel::new_stub_with_rows(cfg, max_seq, embed_rows, device)` builds the
+  skeleton with an `embed_rows` placeholder table and `new_stub` delegates with
+  `cfg.vocab_size` (tests unchanged); the loader always replaces the table, so it
+  passes **1** and the `Tensor::zeros([vocab, hidden])` (970 MiB lite / 1,940
+  nano) leaves both the int8 and the dense (`--embed-f16`) paths.
+  `quantize_stored_table` (`qwen35_intent/loader.rs`) reads the tensor with
+  `get_stored` (bf16 for a d3 package, f16/f32 for another export; a GGUF
+  dequantizes to f32) and `quantize_blocks` widens it to f32 `TABLE_BLOCK_ROWS =
+  1024` rows at a time (4 MiB of scratch at the 1024-wide hidden state) into
+  `quantize_rows_into`, one `quantize_row` per row — the same `max|row|/127`,
+  `round()`, clamp as before, so the codes are **bit-identical by construction**
+  (a row is quantized alone; the block size only decides which rayon pass owns
+  it). `Embed::quantize` and `quantize_rows_into` are the whole-table forms;
+  `Embed::quantize` and `new_stub` are test-only now and carry
+  `#[allow(dead_code)]`. The dense f16/f32 reads are otherwise unchanged. Gate
+  (dev host, `--device cpu`, baseline `6a16516`): the `choice-routing-short` and
+  `image-receipt-total` JSON are **byte-identical**, and so are the lite/nano 2.1k
+  and lite `--embed-f16` outputs. Load-phase peak `RssAnon` (20 ms sampling,
+  text-only `--defer-towers`, one 2,113-token case): lite **2,473 -> 1,330** MiB
+  and nano **4,796 -> 3,349** MiB (residents 1,273 / 3,186 unchanged), lite
+  `--embed-f16` 2,506 -> **1,607** (resident 1,513). Wall: load 0.79 -> 0.82 s
+  (lite) and 1.69 -> 1.64 s (nano), 2.1k prefill 12.27 -> 12.21 s and
+  16.66 -> 16.88 s (inside ±2 %). The peak is now the resident body plus one
+  stored 16-bit table; the request phase (1,554 MiB at 2.1k) is unchanged. New
+  host test `the_streamed_int8_quantizer_matches_the_whole_table_one` pins the
+  block equivalence (bf16/f16/f32 arms, block sizes 0/1/3/rows/4x rows) and the
+  documented row formula; `cargo test -p rocket-inference --no-default-features`
+  = **181**.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel

@@ -827,6 +827,12 @@ checkpoints, so the whole delta is int8):
 For the halved table: resident anon d3-lite 2,462 → **2,222** MiB and d3-nano
 6,287 → **5,804** MiB (peak 2,583 → 2,397 and 6,457 → 5,969).
 
+Those peaks were the table's *load transient*, not the model: the table is now
+quantized straight from the checkpoint's stored dtype in 1024-row blocks (phase M5b,
+no f32 table), so the startup peak is the resident figure plus one stored 16-bit table
+— after the body and table storage rounding, d3-lite **1,330** MiB and d3-nano
+**3,349** MiB against 1,273 / 3,186 resident.
+
 The phase's 2e-3 **probe** gate is exceeded by design: per-row symmetric int8 carries an
 inherent `max|row|/254` error (1.46e-4 per element at this table's median row max
 0.0747, 0.86 % of the row RMS), and even block-32 scales would only buy 1.56x. The

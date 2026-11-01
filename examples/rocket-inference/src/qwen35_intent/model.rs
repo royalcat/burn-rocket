@@ -29,6 +29,10 @@ use crate::util::rope::RopeCache;
 /// Model hyper-parameters, deserialized from the HF `config.json` `text_config`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IntentTextConfig {
+    /// The checkpoint's table rows. The loader sizes the table from the tensor
+    /// itself (it streams the stored dtype), so only [`IntentModel::new_stub`]
+    /// and the tests consume this.
+    #[allow(dead_code)]
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -1081,37 +1085,63 @@ impl Embed {
     /// Quantize a `[rows, cols]` f32 table row-wise. Values are rounded half away
     /// from zero (`f32::round`), then clamped to `[-127, 127]` (a no-op by
     /// construction: `|v| <= max|row| = 127 * scale`).
+    ///
+    /// The whole table has to be in one f32 buffer, which is exactly what the
+    /// loader avoids for a d3 package: it streams the stored bf16 table through
+    /// [`quantize_rows_into`] instead. This form stays for the tests and any
+    /// caller that already holds the f32 table.
+    #[allow(dead_code)]
     pub fn quantize(table: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(table.len(), rows * cols, "table shape mismatch");
-        let (codes, scales) = quantize_rows(table, rows, cols);
+        let mut codes = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows];
+        quantize_rows_into(table, rows, cols, &mut codes, &mut scales);
         Embed::Int8 { codes, scales }
     }
 }
 
-/// Per-row symmetric int8 quantization of a `[rows, cols]` f32 table (rayon over
-/// the rows): `scales[row] = max|row| / 127`, `codes = round(v / scale)`.
-pub fn quantize_rows(table: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<f32>) {
+/// One row's symmetric int8 quantization into `out`: `scale = max|row| / 127`,
+/// `codes = round(v / scale)` clamped to `[-127, 127]` (rounded half away from
+/// zero). Returns the row scale; an all-zero row keeps scale 0 and quantizes to
+/// all zeros.
+pub fn quantize_row(row: &[f32], out: &mut [i8]) -> f32 {
+    assert_eq!(row.len(), out.len(), "quantize row length mismatch");
+    let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+    if scale == 0.0 {
+        out.fill(0);
+        return 0.0;
+    }
+    let inv = 1.0 / scale;
+    for (o, &v) in out.iter_mut().zip(row) {
+        *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
+}
+
+/// Per-row symmetric int8 quantization of a `[rows, cols]` f32 table into
+/// caller-owned `codes` (`rows * cols`) and `scales` (`rows`) (rayon over the
+/// rows), one [`quantize_row`] per row. Every row is quantized on its own, so a
+/// caller may feed any block of rows at a time and still get the whole-table
+/// codes bit for bit (the loader's streaming table quantizer does).
+pub fn quantize_rows_into(
+    table: &[f32],
+    rows: usize,
+    cols: usize,
+    codes: &mut [i8],
+    scales: &mut [f32],
+) {
     use rayon::prelude::*;
-    let mut scales = vec![0f32; rows];
-    scales.par_iter_mut().enumerate().for_each(|(r, scale)| {
-        let row = &table[r * cols..(r + 1) * cols];
-        let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-        // An all-zero row keeps scale 0 and quantizes to all zeros.
-        *scale = if max > 0.0 { max / 127.0 } else { 0.0 };
-    });
-    let mut codes = vec![0i8; rows * cols];
-    codes.par_chunks_mut(cols).enumerate().for_each(|(r, out)| {
-        let scale = scales[r];
-        if scale == 0.0 {
-            return;
-        }
-        let inv = 1.0 / scale;
-        let row = &table[r * cols..(r + 1) * cols];
-        for (o, &v) in out.iter_mut().zip(row) {
-            *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
-        }
-    });
-    (codes, scales)
+    assert_eq!(table.len(), rows * cols, "table shape mismatch");
+    assert_eq!(codes.len(), rows * cols, "codes length mismatch");
+    assert_eq!(scales.len(), rows, "scales length mismatch");
+    codes
+        .par_chunks_mut(cols)
+        .zip(scales.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, (out, scale))| {
+            *scale = quantize_row(&table[r * cols..(r + 1) * cols], out);
+        });
 }
 
 /// Dequantize the rows `ids` of a per-row int8 table into `ids.len() * cols` f32
@@ -1180,8 +1210,30 @@ pub struct StageStats {
 
 impl IntentModel {
     /// Build the module skeleton with lazily-initialized projection weights; the
-    /// loader fills every tensor in place.
+    /// loader fills every tensor in place. The placeholder token table has the
+    /// config's `vocab_size` rows.
+    ///
+    /// The loader builds the same skeleton with a one-row placeholder
+    /// ([`IntentModel::new_stub_with_rows`]) because it always replaces the
+    /// table, so this full-size form is the tests' (and keeps the historical
+    /// shape for anything that builds a stub and runs it as-is).
+    #[allow(dead_code)]
     pub fn new_stub(cfg: &IntentTextConfig, max_seq: usize, device: &Device) -> Self {
+        Self::new_stub_with_rows(cfg, max_seq, cfg.vocab_size, device)
+    }
+
+    /// The same skeleton with a placeholder token table of `embed_rows` rows.
+    ///
+    /// A loader that always replaces the table ([`Embed::Dense`] or
+    /// [`Embed::Int8`]) passes `1`: the zero table would otherwise be a
+    /// vocab-sized f32 allocation (970 MiB for d3-lite, 1,940 MiB for d3-nano)
+    /// that sets the whole load's peak right before it is dropped.
+    pub fn new_stub_with_rows(
+        cfg: &IntentTextConfig,
+        max_seq: usize,
+        embed_rows: usize,
+        device: &Device,
+    ) -> Self {
         let layers = cfg
             .layer_types
             .iter()
@@ -1199,7 +1251,7 @@ impl IntentModel {
             .collect();
         Self {
             cfg: cfg.clone(),
-            embed: Embed::Dense(Tensor::zeros([cfg.vocab_size, cfg.hidden_size], device)),
+            embed: Embed::Dense(Tensor::zeros([embed_rows.max(1), cfg.hidden_size], device)),
             layers,
             norm_w: Tensor::zeros([cfg.hidden_size], device),
             rope: PartialRope::new(
@@ -1687,7 +1739,9 @@ mod tests {
     fn the_int8_table_is_within_half_a_step_of_every_row() {
         let (rows, cols) = (24usize, 17);
         let table = table_with_row_scales(rows, cols, 7);
-        let (codes, scales) = quantize_rows(&table, rows, cols);
+        let mut codes = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows];
+        quantize_rows_into(&table, rows, cols, &mut codes, &mut scales);
         for r in 0..rows {
             let row = &table[r * cols..(r + 1) * cols];
             let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -1790,7 +1844,11 @@ mod tests {
         let cfg = tiny_cfg();
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
         let table = table_with_row_scales(vocab, hidden, 13);
-        let (codes, scales) = quantize_rows(&table, vocab, hidden);
+        let quantized = Embed::quantize(&table, vocab, hidden);
+        let (codes, scales) = match &quantized {
+            Embed::Int8 { codes, scales } => (codes.clone(), scales.clone()),
+            Embed::Dense(_) => panic!("Embed::quantize builds an int8 table"),
+        };
         let ids = [1u32, 4, 7];
         let mut int8 = filled_model(&cfg, &device);
         int8.embed = Embed::Int8 {

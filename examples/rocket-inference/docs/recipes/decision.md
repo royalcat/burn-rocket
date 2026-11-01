@@ -55,10 +55,15 @@ The output is the official shape
 The tied token table (vocab 248,320 × hidden) is CPU resident in both
 configurations. `decide` and `serve` store it as **per-row symmetric int8** by
 default (`--embed-int8`): it halves the table (d3-lite 2,462 -> 2,222 MiB
-resident, d3-nano 6,287 -> 5,804; peak anon 2,583 -> 2,397 and 6,457 -> 5,969 on
-a text-only `--defer-towers` run) and only the current prompt's rows are
-dequantized per forward. `--embed-f16` keeps the previous table — bit-exact for
-these bf16 checkpoints — and the two flags are mutually exclusive.
+resident, d3-nano 6,287 -> 5,804 on the round that added it) and only the current
+prompt's rows are dequantized per forward. `--embed-f16` keeps the previous
+table — bit-exact for these bf16 checkpoints — and the two flags are mutually
+exclusive.
+
+The table is quantized **from the checkpoint's stored dtype in 1024-row blocks**,
+so the load never holds a vocab-sized f32 copy (lite and nano startup peaked at
+2,473 / 4,796 MiB before that, and 1,330 / 3,349 MiB with the body and table
+stored in 16 bits; see the two sections below for the current residents).
 
 int8 costs probability, not answers: over the full fixture sets
 (`tools/decision_fixtures*.json`, f16 vs int8, 32k cap) top-1 is unchanged
@@ -86,7 +91,8 @@ and are gone (exact: the `decide` JSON is byte-identical before/after at 2.1k an
   decode step that never comes (24.5 KiB/token: 194 MiB at 8k, ~800 MiB at the
   32k cap). `IntentModel.keep_kv = false` in the decision loader skips it.
 
-Dev host (`d3-lite`, text-only `--defer-towers`, resident 2,222 MiB, `RssAnon`
+Dev host (M4 round: `d3-lite`, text-only `--defer-towers`, resident 2,222 MiB at
+the time — the body and table storage below bring it to 1,273 MiB — `RssAnon`
 sampled at 20 ms):
 
 | prompt tokens | peak anon before | peak anon after | transient after | wall |
@@ -113,12 +119,13 @@ body per prefill: the 6-case text gate 90.9 -> 96.3 s (**+6.0 %**), image
 show). A rayon widen of the same conversion measured slower (97.9 s median), so
 the plain `cast` stays.
 
-The **peak** of a short text run does not follow the resident drop for lite
-(2,465 -> 2,460 MiB) because it is set by the int8 token-table load transient
-(`new_stub`'s f32 zeros table + the f32 read/convert/Vec of the M2 path), not by
-the body; nano's peak does improve, 6,086 -> 4,865 MiB. A board deployment should
-budget nano's *startup* against ~4.9 GiB, and roughly the resident figure
-afterwards.
+The **startup peak** follows the resident figure now that the int8 table is
+quantized from the stored dtype in row blocks (no f32 zeros table, no f32 read):
+lite 2,473 -> **1,330** MiB against a 1,273 MiB resident and nano 4,796 ->
+**3,349** MiB against 3,186 (text-only `--defer-towers`, one 2,113-token case,
+`RssAnon` sampled at 20 ms). `--embed-f16` lite loads at 1,607 MiB for its
+1,513 MiB resident. A board deployment should budget nano's *startup* against
+~3.4 GiB, and roughly the resident figure afterwards.
 
 
 ## Serve

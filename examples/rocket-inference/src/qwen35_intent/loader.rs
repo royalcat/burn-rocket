@@ -16,10 +16,10 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use burn::module::Param;
 use burn::prelude::*;
-use burn::tensor::{DType, TensorData};
+use burn::tensor::{DType, TensorData, bf16, f16};
 
 use crate::qwen35_intent::model::{
-    DeltaNet, Embed, GatedAttention, IntentModel, IntentTextConfig, Mixer,
+    DeltaNet, Embed, GatedAttention, IntentModel, IntentTextConfig, Mixer, quantize_rows_into,
 };
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::proj::Proj;
@@ -130,6 +130,110 @@ fn read1(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Tensor<
 fn read_norm1(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Tensor<1>> {
     let t = read1(ckpt, key, device)?;
     Ok(if ckpt.format() == "gguf" { t - 1.0 } else { t })
+}
+
+/// One tensor in the dtype the checkpoint stores it in (**no** conversion): a
+/// safetensors file hands out its own bf16/f16/f32 values, a GGUF dequantizes to
+/// its native float dtype (f32).
+fn read_stored(ckpt: &mut AnyCheckpoint, key: &str) -> Result<TensorData> {
+    let stored = match ckpt {
+        AnyCheckpoint::Safetensors(c) => c.get_stored(key)?,
+        AnyCheckpoint::Gguf(c) => c.get(key, c.native_dtype())?,
+    };
+    stored.ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))
+}
+
+/// Rows per block of the streaming int8 table quantizer: 4 MiB of f32 scratch at
+/// d3's 1024-wide hidden state.
+const TABLE_BLOCK_ROWS: usize = 1024;
+
+/// Per-row symmetric int8 quantization of a stored `[rows, cols]` table, read in
+/// [`TABLE_BLOCK_ROWS`]-row blocks: each block is widened into a small f32 scratch
+/// buffer and quantized with [`quantize_rows_into`], so the codes and scales are
+/// bit-identical to [`Embed::quantize`] of the whole f32 table while the load
+/// never materializes one (nor a second 16-bit copy of it).
+fn quantize_stored_table(ckpt: &mut AnyCheckpoint, key: &str) -> Result<Embed> {
+    let data = read_stored(ckpt, key)?;
+    if data.shape().num_dims() != 2 {
+        bail!("{key}: expected a 2-D tensor, got {:?}", data.shape());
+    }
+    let [rows, cols] = data.shape().dims::<2>();
+    if rows == 0 || cols == 0 {
+        bail!("{key}: empty token table [{rows}, {cols}]");
+    }
+    let mut codes = vec![0i8; rows * cols];
+    let mut scales = vec![0f32; rows];
+    let block_rows = TABLE_BLOCK_ROWS;
+    match data.dtype() {
+        DType::F32 => quantize_blocks(
+            data.as_slice::<f32>()?,
+            rows,
+            cols,
+            block_rows,
+            |v| v,
+            &mut codes,
+            &mut scales,
+        ),
+        DType::BF16 => quantize_blocks(
+            data.as_slice::<bf16>()?,
+            rows,
+            cols,
+            block_rows,
+            f32::from,
+            &mut codes,
+            &mut scales,
+        ),
+        DType::F16 => quantize_blocks(
+            data.as_slice::<f16>()?,
+            rows,
+            cols,
+            block_rows,
+            f32::from,
+            &mut codes,
+            &mut scales,
+        ),
+        other => bail!("{key}: cannot quantize a {other:?} token table (f32, f16 or bf16)"),
+    }
+    Ok(Embed::Int8 { codes, scales })
+}
+
+/// The block loop of [`quantize_stored_table`]: widen `rows * cols` stored values
+/// of `E` to f32 `block_rows` rows at a time and quantize each block into its
+/// slice of `codes`/`scales`. The per-row arithmetic is [`quantize_rows_into`]'s,
+/// so the result does not depend on the block size.
+fn quantize_blocks<E: Copy + Send + Sync>(
+    src: &[E],
+    rows: usize,
+    cols: usize,
+    block_rows: usize,
+    to_f32: impl Fn(E) -> f32 + Sync,
+    codes: &mut [i8],
+    scales: &mut [f32],
+) {
+    use rayon::prelude::*;
+    assert_eq!(src.len(), rows * cols, "token table shape mismatch");
+    let block_rows = block_rows.clamp(1, rows);
+    let mut block = vec![0f32; block_rows * cols];
+    for r0 in (0..rows).step_by(block_rows) {
+        let n = block_rows.min(rows - r0);
+        let widened = &mut block[..n * cols];
+        widened
+            .par_chunks_mut(cols)
+            .enumerate()
+            .for_each(|(r, dst)| {
+                let row = &src[(r0 + r) * cols..(r0 + r + 1) * cols];
+                for (d, &v) in dst.iter_mut().zip(row) {
+                    *d = to_f32(v);
+                }
+            });
+        quantize_rows_into(
+            widened,
+            n,
+            cols,
+            &mut codes[r0 * cols..(r0 + n) * cols],
+            &mut scales[r0..r0 + n],
+        );
+    }
 }
 
 /// Read `[N, K]` HF weights and install them as a CPU `Proj`
@@ -304,7 +408,10 @@ pub fn load_intent_model(
 
     let t0 = Instant::now();
     let max_seq = opts.rope_max_seq.unwrap_or(cfg.max_position_embeddings);
-    let mut model = IntentModel::new_stub(&cfg, max_seq, device);
+    // The token table is assigned below in every mode, so the stub's placeholder
+    // only needs one row: a vocab-sized f32 zero table would be a 970 MiB
+    // (d3-lite) / 1,940 MiB (d3-nano) transient that the load peak is set by.
+    let mut model = IntentModel::new_stub_with_rows(&cfg, max_seq, 1, device);
 
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if opts.npu {
@@ -334,18 +441,10 @@ pub fn load_intent_model(
     }
     let embed_key = format!("{prefix}embed_tokens.weight");
     model.embed = if opts.embed_int8 {
-        // Per-row symmetric int8. The f32 table is consumed in place (no tensor
-        // copy), so the load transient is the table plus the codes — less than
-        // the f16 cast's — and only the codes stay resident.
-        let data = read_tensor(ckpt, &embed_key, DType::F32)?;
-        if data.shape().num_dims() != 2 {
-            bail!("{embed_key}: expected a 2-D tensor, got {:?}", data.shape());
-        }
-        let [rows, cols] = data.shape().dims::<2>();
-        let table: Vec<f32> = data
-            .try_into_vec()
-            .map_err(|e| anyhow::anyhow!("read {embed_key} as f32: {e}"))?;
-        Embed::quantize(&table, rows, cols)
+        // Per-row symmetric int8, quantized straight from the stored dtype
+        // (bf16 for a d3 package) in row blocks: the codes are bit-identical to
+        // `Embed::quantize` of the f32 table, which never exists here.
+        quantize_stored_table(ckpt, &embed_key)?
     } else {
         let embed = read2(ckpt, &embed_key, device)?;
         if opts.embed_f16 {
@@ -611,7 +710,68 @@ pub fn load_for_serving(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qwen35_intent::model::Embed;
+    use crate::qwen35_intent::model::{Embed, quantize_rows_into};
+
+    /// Quantize `stored` ([`bf16`], [`f16`] or f32 values) at several block sizes
+    /// — 0 and `rows * 4` exercise the clamp, 3 leaves a ragged tail — and assert
+    /// every arm is the whole-table quantizer on the widened values, bit for bit,
+    /// and that this is the documented per-row formula.
+    fn streamed_is_the_whole_table<E: Copy + Send + Sync>(
+        stored: &[E],
+        rows: usize,
+        cols: usize,
+        to_f32: impl Fn(E) -> f32 + Sync,
+    ) {
+        let widened: Vec<f32> = stored.iter().map(|&v| to_f32(v)).collect();
+        let mut want_codes = vec![0i8; rows * cols];
+        let mut want_scales = vec![0f32; rows];
+        quantize_rows_into(&widened, rows, cols, &mut want_codes, &mut want_scales);
+        // The row formula, written out independently of the quantizer.
+        for r in 0..rows {
+            let row = &widened[r * cols..(r + 1) * cols];
+            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+            assert_eq!(want_scales[r], scale, "row {r}: scale = max|row| / 127");
+            for (c, &v) in row.iter().enumerate() {
+                let code = if scale == 0.0 {
+                    0
+                } else {
+                    (v * (1.0 / scale)).round().clamp(-127.0, 127.0) as i8
+                };
+                assert_eq!(want_codes[r * cols + c], code, "row {r} col {c}");
+            }
+        }
+        for block in [0usize, 1, 3, rows, rows * 4] {
+            let mut codes = vec![0i8; rows * cols];
+            let mut scales = vec![0f32; rows];
+            quantize_blocks(stored, rows, cols, block, &to_f32, &mut codes, &mut scales);
+            assert_eq!(codes, want_codes, "{block} rows per block: codes");
+            assert_eq!(scales, want_scales, "{block} rows per block: scales");
+        }
+    }
+
+    /// The streaming quantizer is the whole-table one: the loader's row blocks
+    /// change no code and no scale, so the int8 table is the one the f32 path
+    /// produced (only without the f32 table).
+    #[test]
+    fn the_streamed_int8_quantizer_matches_the_whole_table_one() {
+        let (rows, cols) = (11usize, 7);
+        // Row 0 all zero, row 1 one tiny value, the rest a ramp with mixed signs.
+        let mut values = vec![0f32; rows * cols];
+        values[cols] = 3.5e-4;
+        for r in 2..rows {
+            for c in 0..cols {
+                let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
+                values[r * cols + c] = sign * (r as f32 - 1.5) * (c as f32 + 1.0) * 1.7e-3;
+            }
+        }
+        // bf16 is what a d3 package stores; f16 and f32 are the other dtypes.
+        let narrow: Vec<bf16> = values.iter().map(|v| bf16::from_f32(*v)).collect();
+        let half: Vec<f16> = values.iter().map(|v| f16::from_f32(*v)).collect();
+        streamed_is_the_whole_table(&narrow, rows, cols, f32::from);
+        streamed_is_the_whole_table(&half, rows, cols, f32::from);
+        streamed_is_the_whole_table(&values, rows, cols, |v| v);
+    }
 
     /// The int8 branch on the real d3-lite table: the codes and scales are a
     /// finite table of the checkpoint's shape, and every sampled row dequantizes
