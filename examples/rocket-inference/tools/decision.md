@@ -809,38 +809,59 @@ fixtures' absolute asset paths), and d3-nano ships a **different** file under th
 (`4603c2c3…` vs `c6536167…`); both sides consumed the same file here, so the parity
 holds, but a run that mixed the packages' assets would not be comparable.
 
-## Token table (phase M2)
+## Token table (phases M2 and M2b)
 
 The tied token table (248,320 × hidden) is CPU resident in every deployment, and a
-prompt only reads its own rows, so the decision family stores it as per-row symmetric
-int8 by default (`--embed-int8`; `--embed-f16` keeps the dense table, and the two flags
-are mutually exclusive). What that costs is measured on the full fixture sets against
-the f16 arm (dev host, f32 body, 32k cap; the f16 table is bit-exact for these bf16
-checkpoints, so the whole delta is int8):
+prompt only reads its own rows, so the decision family stores it as **block-wise
+symmetric int8** by default (`--embed-int8`; `--embed-f16` keeps the dense table, and
+the two flags are mutually exclusive): one f32 scale per 32 hidden values
+(`scales[row * blocks + j] = max|block j| / 127`, codes `round(v / scale)` clamped to
+±127, `blocks = hidden / 32`). A package whose hidden state is not a multiple of 32 is
+refused at load with a pointer to `--embed-f16`; d3-lite (1024) has 32 blocks per row
+and d3-nano (2048) 64. The codes cost the same as per-row int8; the scales are
+`vocab * blocks * 4 B` — **30.3 MiB** on the 248,320-row table at 32 blocks (+29 MiB
+resident vs the per-row scheme it replaced) and 60.6 MiB at 64.
 
-| set | questions | top-1 | max \|Δp\| | median \|Δp\| |
+The block scales replaced per-row on 2026-11-02 (phase M2b) because the board's default
+arm sat 3 % over the deployment bar (see the board paragraph below). What they cost is
+measured on a bounded subset of the fixtures (the interactive-host rule of that round:
+the 6-case text subset, `image-receipt-total` and `video-example`), against the f16
+table — bit-exact for these bf16 checkpoints, so it stands in for the f32 reference —
+and against the same named cases of the stored per-row arm:
+
+| set | questions | top-1 | block-32 max \|Δp\| | per-row max \|Δp\| |
 |---|---|---|---|
-| text | 67 | 67/67 | 6.96e-3 | 7.3e-4 |
-| images | 8 | 8/8 | 8.36e-3 | 1.4e-4 |
-| videos | 9 | 9/9 | 3.81e-3 | 8.6e-4 |
+| text (6-case subset) | 10 | 10/10 | 1.465e-3 | 3.769e-3 |
+| images (`image-receipt-total`) | 1 | 1/1 | 1.480e-3 | 8.362e-3 |
+| videos (`video-example`) | 2 | 2/2 | 9.788e-4 | 3.334e-3 |
 
-For the halved table: resident anon d3-lite 2,462 → **2,222** MiB and d3-nano
-6,287 → **5,804** MiB (peak 2,583 → 2,397 and 6,457 → 5,969).
+Against the f32 reference on the same cases the block-32 arm reads 1.463e-3 (the
+5-question board text subset), 1.473e-3 (image) and 9.776e-4 (video), so the f16
+comparison is not hiding anything. The block scales are **2.6x** better on the text
+subset and **5.6x** on the receipt image; the M2 probe's 1.56x estimate was for a plain
+block-32 requantization, and real rows carry per-block outliers.
 
-Those peaks were the table's *load transient*, not the model: the table is now
-quantized straight from the checkpoint's stored dtype in 1024-row blocks (phase M5b,
-no f32 table), so the startup peak is the resident figure plus one stored 16-bit table
-— after the body and table storage rounding, d3-lite **1,330** MiB and d3-nano
-**3,349** MiB against 1,273 / 3,186 resident.
+The full-set numbers are the phase-M2 per-row round (the block-32 arm was only run on
+the bounded subset): text 67/67 top-1 and max |Δp| **6.96e-3**, images 8/8 and
+**8.36e-3**, videos 9/9 and **3.81e-3**, median 1.4e-4-8.6e-4. Per-row int8 carries a
+`max|row|/254` error (1.46e-4 per element at this table's median row max 0.0747, 0.86 %
+of the row RMS) and cannot meet the phase's 2e-3 probe gate; the approved deployment bar
+is **max |Δp| ≤ 1e-2 with 100 % top-1**, which both schemes meet on the dev host — but
+per-row did *not* on the board once the NPU pack was added (1.03e-2), which is what M2b
+fixes.
 
-The phase's 2e-3 **probe** gate is exceeded by design: per-row symmetric int8 carries an
-inherent `max|row|/254` error (1.46e-4 per element at this table's median row max
-0.0747, 0.86 % of the row RMS), and even block-32 scales would only buy 1.56x. The
-approved deployment bar is instead **max |Δp| ≤ 1e-2 with 100 % top-1**, which this
-passes: no answer changes on the 84 fixture questions and the largest probability move
-is 8.36e-3. `--embed-f16` restores the exact table (f16-vs-f32 max |Δp| 2.4e-6) for
-+242 MiB on d3-lite or +485 MiB on d3-nano — use it where the probabilities themselves
-have to match the f32 reference.
+On the board (`image-receipt-total`, 1,029 tokens, `--device npu --defer-towers`,
+beside the live service) the default arm moves from **1.03e-2 to 1.664e-3** against the
+f32 reference with top-1 unchanged (`100_to_150`, 0.5708 -> 0.5725); the f16 table reads
+5.24e-4 on the same case. `--embed-f16` remains the escape hatch: it restores the exact
+table (f16-vs-f32 2.4e-6) for **+211 MiB** on d3-lite or **+424 MiB** on d3-nano, for
+deployments that need the probabilities themselves to match the f32 reference.
+
+Memory (dev host, text-only `--defer-towers`, the 6-case / 10-question text run):
+resident anon **1,302** MiB against 1,273 for the per-row scheme (the scale table) and
+1,513 for the f16 table; the load peak is 1,382 MiB (per-row 1,330), the request peak
+1,666 MiB (f16 1,877). The scale table is `vocab * hidden / 32 * 4 B`, so d3-nano pays
+60.6 instead of 30.3 MiB of scales.
 
 Reproduce (from `examples/rocket-inference`; `--embed-f16` is the baseline arm):
 

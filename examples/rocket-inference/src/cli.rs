@@ -233,7 +233,8 @@ placement / model:
   --int8-group / --embed-int8 (default) / --embed-f16 / --defer-towers
     --npu-dtype int8 packs the text projections as resident int8 (opt-in,
     `--int8-group` default 32); --embed-int8 keeps the tied token table as
-    per-row int8 (the default); --embed-f16 keeps the exact table;
+    block-wise int8 (one scale per 32 values; the default); --embed-f16 keeps
+    the exact table;
     --defer-towers loads the vision tower on the first media request.
 
 See `rocket-inference help` for the shared placement flags and
@@ -622,7 +623,7 @@ impl LoadArgs {
         }
         if self.embed_int8.is_some() && !family.supports_embed_int8() {
             bail!(
-                "--embed-int8 does not apply to the {} model (it has no per-row int8 \
+                "--embed-int8 does not apply to the {} model (it has no int8 \
                  token table; only the decision family does)",
                 family.name()
             );
@@ -883,7 +884,7 @@ pub struct ResolvedLoad {
     pub vision_attn_kernel: AttnKernel,
     pub attn_chunk: usize,
     pub embed_f16: bool,
-    /// Store the tied table as per-row int8 (`--embed-int8`, the decision default).
+    /// Store the tied table as block-wise int8 (`--embed-int8`, the decision default).
     pub embed_int8: bool,
 }
 
@@ -1191,8 +1192,8 @@ mod tests {
 
     #[test]
     fn the_token_table_flags_resolve_to_one_choice() {
-        // A decision checkpoint defaults to the per-row int8 table (half of f16,
-        // and the table is CPU resident in every deployment).
+        // A decision checkpoint defaults to the block-wise int8 table (half of f16
+        // plus one scale per 32 values, and it is CPU resident in every deployment).
         let r = resolve(&[], Family::Decision).unwrap();
         assert!(r.embed_int8 && !r.embed_f16);
         // Every other family keeps its f32 table unless asked.

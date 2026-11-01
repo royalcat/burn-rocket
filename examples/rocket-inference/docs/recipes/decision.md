@@ -53,30 +53,39 @@ The output is the official shape
 ### Token table
 
 The tied token table (vocab 248,320 × hidden) is CPU resident in both
-configurations. `decide` and `serve` store it as **per-row symmetric int8** by
-default (`--embed-int8`): it halves the table (d3-lite 2,462 -> 2,222 MiB
-resident, d3-nano 6,287 -> 5,804 on the round that added it) and only the current
-prompt's rows are dequantized per forward. `--embed-f16` keeps the previous
-table — bit-exact for these bf16 checkpoints — and the two flags are mutually
-exclusive.
+configurations. `decide` and `serve` store it as **block-wise symmetric int8** by
+default (`--embed-int8`): one f32 scale per 32 hidden values (`blocks = hidden / 32`,
+`scales[row * blocks + j] = max|block j| / 127`, codes `round(v / scale)` clamped to
+±127; a hidden state that is not a multiple of 32 is refused at load with a pointer to
+`--embed-f16`). The codes halve the table and only the current prompt's rows are
+dequantized per forward; the scales add `vocab * blocks * 4 B` — **30.3 MiB** on
+d3-lite (32 blocks) and 60.6 MiB on d3-nano (64) — so d3-lite is **1,302 MiB**
+resident against 1,513 for the f16 table and 1,273 for the per-row scheme it replaced.
+`--embed-f16` keeps the exact table — bit-exact for these bf16 checkpoints — and the
+two flags are mutually exclusive.
 
-The table is quantized **from the checkpoint's stored dtype in 1024-row blocks**,
-so the load never holds a vocab-sized f32 copy (lite and nano startup peaked at
-2,473 / 4,796 MiB before that, and 1,330 / 3,349 MiB with the body and table
-stored in 16 bits; see the two sections below for the current residents).
+The table is quantized **from the checkpoint's stored dtype in 1024-row blocks**, so
+the load never holds a vocab-sized f32 copy (lite and nano startup peaked at
+2,473 / 4,796 MiB before that; M5b measured 1,330 / 3,349 MiB with the body and table
+stored in 16 bits, and the block scales add their 30 / 61 MiB on top).
 
-int8 costs probability, not answers: over the full fixture sets
-(`tools/decision_fixtures*.json`, f16 vs int8, 32k cap) top-1 is unchanged
-(text 67/67, images 8/8, videos 9/9) while the largest option probability moves
-by **6.96e-3** (text), **8.36e-3** (image) and **3.81e-3** (video), median
-1.4e-4-8.6e-4. Per-row int8's error is `max|row|/254` — 0.86 % of the row RMS at
-this table — so it cannot meet the phase's 2e-3 **probe** gate; the approved
-deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, which it passes. Use
-`--embed-f16` where the probabilities themselves must match the f32 reference: it
-restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
-(nano). On the board the bar is tight once the NPU pack is added: the text arm
-reads 4.15e-3 but the image arm lands at 1.03e-2 (table 8.36e-3 + NPU 1.95e-3),
-marginally over — see the Board section for the measured matrix.
+Block scales cost probability, not answers: on the bounded dev-host subset (the
+6-case text subset, `image-receipt-total` and `video-example`, f16 table as the
+baseline, which is exact for these checkpoints) top-1 is unchanged (10/10, 1/1, 2/2)
+while the largest option probability moves by **1.465e-3** (text), **1.480e-3**
+(image) and **9.788e-4** (video) — 2.6x, 5.6x and 3.4x better than the per-row scheme
+on the same cases (3.769e-3 / 8.362e-3 / 3.334e-3). The per-row full-set numbers were
+6.96e-3 / 8.36e-3 / 3.81e-3 with top-1 unchanged over 67 / 8 / 9 questions; the block
+arm was not swept over the full sets. Per-row int8's error is `max|row|/254` and
+cannot meet the phase's 2e-3 **probe** gate; block scales do not either, but they halve
+the distance, and the approved deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**.
+
+Use `--embed-f16` where the probabilities themselves must match the f32 reference: it
+restores the exact table (f16-vs-f32 2.4e-6) for +211 MiB (lite) / +424 MiB (nano).
+On the board the bar was tight once the NPU pack was added: with per-row scales the
+text arm read 4.15e-3 but the image arm landed at 1.03e-2 (table 8.36e-3 + NPU
+1.95e-3), marginally over. Block scales put the same image case at **1.664e-3** (the
+f16 table reads 5.24e-4 there), inside the bar — see the Board section.
 
 ### Prefill memory
 
@@ -125,7 +134,9 @@ The **startup peak** follows the resident figure now that the int8 table is
 quantized from the stored dtype in row blocks (no f32 zeros table, no f32 read):
 lite 2,473 -> **1,330** MiB against a 1,273 MiB resident and nano 4,796 ->
 **3,349** MiB against 3,186 (text-only `--defer-towers`, one 2,113-token case,
-`RssAnon` sampled at 20 ms). `--embed-f16` lite loads at 1,607 MiB for its
+`RssAnon` sampled at 20 ms; the M2b block scales add ~30 / 61 MiB of f32 scale
+table on top, so d3-lite is **1,302 resident / 1,382 startup**). `--embed-f16` lite
+loads at 1,607 MiB for its
 1,513 MiB resident. A board deployment should budget nano's *startup* against
 ~3.4 GiB, and roughly the resident figure afterwards.
 
@@ -439,7 +450,8 @@ is the blocker:
 | text | NPU int8 g512 | 5/5 | 3.39e-02 | 3.77e-02 |
 | text | NPU int8 g128 | 5/5 | 4.52e-02 | 4.63e-02 |
 | image | CPU f32 | 1/1 | 8.36e-03 | — |
-| image | NPU fp16 (default) | 1/1 | 1.03e-02 | 1.95e-03 |
+| image | NPU fp16, per-row table (M6) | 1/1 | 1.03e-02 | 1.95e-03 |
+| image | NPU fp16, block-32 table (M2b) | 1/1 | **1.664e-03** | — |
 | image | NPU fp16, `--embed-f16` | 1/1 | **5.24e-04** | — |
 | image | NPU int8 g512 | 1/1 | 4.41e-02 | 3.57e-02 |
 | video | CPU f32 | 2/2 | 1.51e-02 (decoder) | — |
@@ -461,11 +473,15 @@ same int8 table on the CPU these five cases read 3.77e-03 (text; 6.96e-3 over
 the full 67-case text set in `### Token table`) and 8.36e-03 (image, the same
 case as there), i.e. the NPU's own contribution is 3.9e-04 / 1.95e-03 — the
 same as the 2026-11-01 window (3.4e-04 / 1.63e-03) and independent of the
-table. So the default *image* arm lands at 1.03e-02, marginally over the 1e-2
-bar, while `--embed-f16` returns 3.54e-04 / 5.24e-04 for **+242 MiB resident**
-(559 vs 317) and +~0.5 GiB of load peak (1,524 vs 1,024). Text at the default
-is fine (4.15e-03). Video misses only through the board's `ffmpeg` decode
-(1.51e-2 on the CPU arm too); the same-board NPU delta is 4.2e-4.
+table. So the per-row default *image* arm landed at 1.03e-02, marginally over
+the 1e-2 bar, while `--embed-f16` returned 3.54e-04 / 5.24e-04 for **+211 MiB
+resident** (559 vs 347 with the block-32 table) and +~0.5 GiB of load peak
+(1,524 vs 1,024). **Block-32 scales (phase M2b) fixed the default**: the same
+board image case now reads **1.664e-3** with top-1 unchanged, inside the bar,
+at +30 MiB of resident scales. Text at the default was already fine (4.15e-03
+per-row; the dev-host block-32 arm reads 1.465e-3 on its 6-case subset). Video
+misses only through the board's `ffmpeg` decode (1.51e-2 on the CPU arm too);
+the same-board NPU delta is 4.2e-4.
 
 Reference note: the 2026-11-01 `ref_*_lite_f32.json` files and the modelling
 venv were gone from `/tmp`, so the reference was regenerated for exactly these
@@ -479,4 +495,27 @@ exactly. The current `main` build (`--features npu`) replaced
 as `rocket-inference.2026-11-01`); run outputs and metrics are in
 `/root/rocket-inference-decision/runs6/` (`*.json` = wall/RSS samples,
 `*-out.json` = answers, `serve-*.log` = the scratch lines).
+
+#### Token table block scales (phase M2b)
+
+The block-32 table was measured with the same protocol (one image case beside the
+live service, `taskset -c 4-7`, `--device npu --defer-towers`, load ~15). Board:
+`image-receipt-total`, 1,029 tokens, one sample (output
+`runs6/m2b-image-npu-i8block-out.json`, metrics `runs6/m2b-image-npu-i8block.json`):
+
+| arm | top-1 | max \|Δp\| vs f32 ref |
+|---|---|---|
+| NPU fp16, per-row table (M6) | 1/1 | 1.030e-2 |
+| NPU fp16, block-32 table (M2b) | 1/1 | **1.664e-3** |
+| NPU fp16, f16 table (M6) | 1/1 | 5.238e-4 |
+
+The answer stays `100_to_150` (0.5708 ref, 0.5725 ours) and the arm is now 6x
+inside the bar instead of 3 % over it. Cost: resident anon after load **317 ->
+347 MiB** (the 30.3 MiB scale table), peak anon 1,027.4 MiB against 1,057.8 for
+the per-row arm in the M6 window, and no wall change outside the board's noise
+(compute 62.9 s / wall 80.2 s / user 103.7 s, contended; M6's per-row arm read
+58.2 s compute under a lighter load). The `--embed-f16` escape hatch is now
++211 MiB rather than +242. Dev-host text-only resident 1,273 -> 1,302 MiB; the
+load peak stays near the M5b number (1,330 -> 1,382 MiB sampled at 20 ms, which
+includes the scales).
 

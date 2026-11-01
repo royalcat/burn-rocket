@@ -138,7 +138,7 @@ impl Family {
         matches!(self, Self::Intent | Self::Decision)
     }
 
-    /// The per-row int8 table: a d3 decision checkpoint's tied table is CPU
+    /// The block-wise int8 table: a d3 decision checkpoint's tied table is CPU
     /// resident in every deployment, so its default is int8.
     pub fn supports_embed_int8(self) -> bool {
         matches!(self, Self::Decision)

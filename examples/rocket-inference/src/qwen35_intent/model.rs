@@ -1015,11 +1015,16 @@ impl Layer {
 // Token table
 // ---------------------------------------------------------------------------
 
+/// Hidden values per int8 scale (the block width of [`Embed::Int8`]): one f32
+/// scale per 32 values, i.e. `vocab * hidden / 32` scales for the table.
+pub const EMBED_BLOCK: usize = 32;
+
 /// The tied token-embedding table (`[vocab, hidden]`, also the LM head).
 ///
 /// It is CPU resident in every deployment (the NPU never holds it), and a forward
 /// only reads the rows of the current prompt, so the decision family stores it as
-/// per-row symmetric int8: half of f16, and one rayon dequant pass per prompt.
+/// block-wise symmetric int8: half of f16 plus one scale per [`EMBED_BLOCK`]
+/// values, and one rayon dequant pass per prompt.
 // The dense tensor is larger than the two int8 vectors; boxing it would only add
 // indirection to the row gather for the dense path.
 #[allow(clippy::large_enum_variant)]
@@ -1027,10 +1032,17 @@ impl Layer {
 pub enum Embed {
     /// f32 or f16 `[vocab, hidden]` (the intent family's path).
     Dense(Tensor<2>),
-    /// Per-row symmetric int8: `codes[row * hidden + i] = round(v / scale[row])`
-    /// clamped to `[-127, 127]`, `scales[row] = max|row| / 127`. A value is at
-    /// most half a step (`max|row| / 254`) off; an all-zero row has scale 0.
-    Int8 { codes: Vec<i8>, scales: Vec<f32> },
+    /// Block-wise symmetric int8, [`EMBED_BLOCK`] values per scale:
+    /// `codes[row * hidden + i] = round(v / scales[row * blocks + i / 32])`
+    /// clamped to `[-127, 127]`, `scales[row * blocks + j] = max|block j| / 127`
+    /// and `blocks = hidden / 32` (the hidden state must be divisible by it). A
+    /// value is at most half a step (`max|block| / 254`) off; an all-zero block
+    /// has scale 0.
+    Int8 {
+        codes: Vec<i8>,
+        scales: Vec<f32>,
+        blocks: usize,
+    },
 }
 
 impl Embed {
@@ -1050,11 +1062,15 @@ impl Embed {
     pub fn dense(&self, device: &Device) -> Tensor<2> {
         match self {
             Embed::Dense(t) => t.clone(),
-            Embed::Int8 { codes, scales } => {
-                let rows = scales.len();
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => {
+                let rows = scales.len() / *blocks;
                 let cols = codes.len().checked_div(rows).unwrap_or(0);
                 let ids: Vec<u32> = (0..rows as u32).collect();
-                let data = dequant_rows(codes, scales, &ids, cols);
+                let data = dequant_rows(codes, scales, *blocks, &ids, cols);
                 Tensor::<2>::from_data(TensorData::new(data, [rows, cols]), device)
             }
         }
@@ -1075,16 +1091,20 @@ impl Embed {
                     rows
                 }
             }
-            Embed::Int8 { codes, scales } => {
-                let data = dequant_rows(codes, scales, ids, hidden);
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => {
+                let data = dequant_rows(codes, scales, *blocks, ids, hidden);
                 Tensor::<3>::from_data(TensorData::new(data, [1, s, hidden]), device)
             }
         }
     }
 
-    /// Quantize a `[rows, cols]` f32 table row-wise. Values are rounded half away
-    /// from zero (`f32::round`), then clamped to `[-127, 127]` (a no-op by
-    /// construction: `|v| <= max|row| = 127 * scale`).
+    /// Quantize a `[rows, cols]` f32 table block-wise (`cols % 32 == 0`). Values
+    /// are rounded half away from zero (`f32::round`), then clamped to
+    /// `[-127, 127]` (a no-op by construction: `|v| <= max|block| = 127 * scale`).
     ///
     /// The whole table has to be in one f32 buffer, which is exactly what the
     /// loader avoids for a d3 package: it streams the stored bf16 table through
@@ -1093,37 +1113,63 @@ impl Embed {
     #[allow(dead_code)]
     pub fn quantize(table: &[f32], rows: usize, cols: usize) -> Self {
         assert_eq!(table.len(), rows * cols, "table shape mismatch");
+        let blocks = blocks_of(cols);
         let mut codes = vec![0i8; rows * cols];
-        let mut scales = vec![0f32; rows];
+        let mut scales = vec![0f32; rows * blocks];
         quantize_rows_into(table, rows, cols, &mut codes, &mut scales);
-        Embed::Int8 { codes, scales }
+        Embed::Int8 {
+            codes,
+            scales,
+            blocks,
+        }
     }
 }
 
-/// One row's symmetric int8 quantization into `out`: `scale = max|row| / 127`,
-/// `codes = round(v / scale)` clamped to `[-127, 127]` (rounded half away from
-/// zero). Returns the row scale; an all-zero row keeps scale 0 and quantizes to
-/// all zeros.
-pub fn quantize_row(row: &[f32], out: &mut [i8]) -> f32 {
+/// The scale count of a `cols`-wide row: `cols / EMBED_BLOCK`.
+pub fn blocks_of(cols: usize) -> usize {
+    assert!(
+        cols > 0 && cols.is_multiple_of(EMBED_BLOCK),
+        "the int8 token table needs a hidden state divisible by {EMBED_BLOCK} (got {cols})"
+    );
+    cols / EMBED_BLOCK
+}
+
+/// One row's block-wise symmetric int8 quantization into `out` (the row's codes)
+/// and `scales` (one per [`EMBED_BLOCK`] values): per block,
+/// `scale = max|block| / 127`, `codes = round(v / scale)` clamped to
+/// `[-127, 127]` (rounded half away from zero). An all-zero block keeps scale 0
+/// and quantizes to all zeros.
+pub fn quantize_row(row: &[f32], out: &mut [i8], scales: &mut [f32]) {
     assert_eq!(row.len(), out.len(), "quantize row length mismatch");
-    let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
-    if scale == 0.0 {
-        out.fill(0);
-        return 0.0;
+    assert_eq!(
+        blocks_of(row.len()),
+        scales.len(),
+        "quantize row needs one scale per {EMBED_BLOCK} values"
+    );
+    for (j, (src, dst)) in row
+        .chunks(EMBED_BLOCK)
+        .zip(out.chunks_mut(EMBED_BLOCK))
+        .enumerate()
+    {
+        let max = src.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+        scales[j] = scale;
+        if scale == 0.0 {
+            dst.fill(0);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (o, &v) in dst.iter_mut().zip(src) {
+            *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
     }
-    let inv = 1.0 / scale;
-    for (o, &v) in out.iter_mut().zip(row) {
-        *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
-    }
-    scale
 }
 
-/// Per-row symmetric int8 quantization of a `[rows, cols]` f32 table into
-/// caller-owned `codes` (`rows * cols`) and `scales` (`rows`) (rayon over the
-/// rows), one [`quantize_row`] per row. Every row is quantized on its own, so a
-/// caller may feed any block of rows at a time and still get the whole-table
-/// codes bit for bit (the loader's streaming table quantizer does).
+/// Block-wise symmetric int8 quantization of a `[rows, cols]` f32 table into
+/// caller-owned `codes` (`rows * cols`) and `scales` (`rows * cols / 32`)
+/// (rayon over the rows), one [`quantize_row`] per row. Every row is quantized on
+/// its own, so a caller may feed any block of rows at a time and still get the
+/// whole-table codes bit for bit (the loader's streaming table quantizer does).
 pub fn quantize_rows_into(
     table: &[f32],
     rows: usize,
@@ -1134,31 +1180,49 @@ pub fn quantize_rows_into(
     use rayon::prelude::*;
     assert_eq!(table.len(), rows * cols, "table shape mismatch");
     assert_eq!(codes.len(), rows * cols, "codes length mismatch");
-    assert_eq!(scales.len(), rows, "scales length mismatch");
+    let blocks = blocks_of(cols);
+    assert_eq!(scales.len(), rows * blocks, "scales length mismatch");
     codes
         .par_chunks_mut(cols)
-        .zip(scales.par_iter_mut())
+        .zip(scales.par_chunks_mut(blocks))
         .enumerate()
         .for_each(|(r, (out, scale))| {
-            *scale = quantize_row(&table[r * cols..(r + 1) * cols], out);
+            quantize_row(&table[r * cols..(r + 1) * cols], out, scale);
         });
 }
 
-/// Dequantize the rows `ids` of a per-row int8 table into `ids.len() * cols` f32
-/// values, in `ids` order (rayon over the rows).
-pub fn dequant_rows(codes: &[i8], scales: &[f32], ids: &[u32], cols: usize) -> Vec<f32> {
+/// Dequantize the rows `ids` of a block-wise int8 table into `ids.len() * cols`
+/// f32 values, in `ids` order (rayon over the rows).
+pub fn dequant_rows(
+    codes: &[i8],
+    scales: &[f32],
+    blocks: usize,
+    ids: &[u32],
+    cols: usize,
+) -> Vec<f32> {
     use rayon::prelude::*;
-    let rows = scales.len();
+    assert!(
+        blocks > 0 && blocks * EMBED_BLOCK == cols,
+        "dequant needs {blocks} scales for a {cols}-wide row"
+    );
+    let rows = scales.len() / blocks;
     let mut out = vec![0f32; ids.len() * cols];
     out.par_chunks_mut(cols)
         .zip(ids.par_iter())
         .for_each(|(dst, &id)| {
             let row = id as usize;
             assert!(row < rows, "token id {id} is outside the {rows}-row table");
-            let scale = scales[row];
             let src = &codes[row * cols..(row + 1) * cols];
-            for (d, &c) in dst.iter_mut().zip(src) {
-                *d = c as f32 * scale;
+            let row_scales = &scales[row * blocks..(row + 1) * blocks];
+            for (j, (d, c)) in dst
+                .chunks_mut(EMBED_BLOCK)
+                .zip(src.chunks(EMBED_BLOCK))
+                .enumerate()
+            {
+                let scale = row_scales[j];
+                for (d, &c) in d.iter_mut().zip(c) {
+                    *d = c as f32 * scale;
+                }
             }
         });
     out
@@ -1718,67 +1782,84 @@ mod tests {
     // ---- int8 token table ----
 
     /// A `[rows, cols]` table whose rows differ in magnitude (row 0 is all zeros,
-    /// the last row is the widest) so the per-row scales are all different.
-    fn table_with_row_scales(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+    /// the last row is the widest) and whose 32-value blocks within a row differ
+    /// too (every other block is 64x smaller), so neither the row scales nor the
+    /// block scales repeat.
+    fn table_with_block_scales(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
         let mut out = values(rows * cols, seed);
         for (r, row) in out.chunks_mut(cols).enumerate() {
             let gain = if r == 0 { 0.0 } else { r as f32 * 0.5 };
             for (i, v) in row.iter_mut().enumerate() {
-                *v = *v * gain
+                let block_gain = if (i / EMBED_BLOCK) % 2 == 0 {
+                    1.0
+                } else {
+                    1.0 / 64.0
+                };
+                *v = (*v * gain
                     + if i % 3 == 0 {
                         gain * 0.001
                     } else {
                         -gain * 0.002
-                    };
+                    })
+                    * block_gain;
             }
         }
         out
     }
 
     #[test]
-    fn the_int8_table_is_within_half_a_step_of_every_row() {
-        let (rows, cols) = (24usize, 17);
-        let table = table_with_row_scales(rows, cols, 7);
+    fn the_int8_table_is_within_half_a_step_of_every_block() {
+        let (rows, cols) = (24usize, 64);
+        let blocks = blocks_of(cols);
+        let table = table_with_block_scales(rows, cols, 7);
         let mut codes = vec![0i8; rows * cols];
-        let mut scales = vec![0f32; rows];
+        let mut scales = vec![0f32; rows * blocks];
         quantize_rows_into(&table, rows, cols, &mut codes, &mut scales);
         for r in 0..rows {
-            let row = &table[r * cols..(r + 1) * cols];
-            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-            if r == 0 {
-                assert_eq!(scales[r], 0.0, "an all-zero row keeps scale 0");
+            for j in 0..blocks {
+                let lo = r * cols + j * EMBED_BLOCK;
+                let block = &table[lo..lo + EMBED_BLOCK];
+                let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let scale = scales[r * blocks + j];
+                if max == 0.0 {
+                    assert_eq!(scale, 0.0, "an all-zero block keeps scale 0");
+                    assert!(
+                        codes[lo..lo + EMBED_BLOCK].iter().all(|&c| c == 0),
+                        "an all-zero block quantizes to zeros"
+                    );
+                    continue;
+                }
+                assert!(scale > 0.0);
+                let step = max / 127.0;
                 assert!(
-                    codes[r * cols..(r + 1) * cols].iter().all(|&c| c == 0),
-                    "an all-zero row quantizes to zeros"
+                    (scale - step).abs() <= step * 1e-5,
+                    "scale = max|block|/127"
                 );
-                continue;
-            }
-            assert!(scales[r] > 0.0);
-            let step = max / 127.0;
-            assert!((scales[r] - step).abs() <= step * 1e-5, "scale = max/127");
-            for (i, &v) in row.iter().enumerate() {
-                let q = codes[r * cols + i] as f32 * scales[r];
-                assert!(
-                    (q - v).abs() <= step / 2.0 * 1.0001,
-                    "row {r} col {i}: {v} quantized to {q}, step {step}"
-                );
-                assert!(
-                    (-127..=127).contains(&(codes[r * cols + i] as i16)),
-                    "codes stay in the symmetric range"
-                );
+                for (i, &v) in block.iter().enumerate() {
+                    let q = codes[lo + i] as f32 * scale;
+                    assert!(
+                        (q - v).abs() <= step / 2.0 * 1.0001,
+                        "row {r} block {j} col {i}: {v} quantized to {q}, step {step}"
+                    );
+                    assert!(
+                        (-127..=127).contains(&(codes[lo + i] as i16)),
+                        "codes stay in the symmetric range"
+                    );
+                }
             }
         }
         // The dequantized gather reproduces the rows in id order.
         let ids = [23u32, 0, 5];
-        let gathered = dequant_rows(&codes, &scales, &ids, cols);
+        let gathered = dequant_rows(&codes, &scales, blocks, &ids, cols);
         assert_eq!(gathered.len(), ids.len() * cols);
         for (k, &id) in ids.iter().enumerate() {
             let r = id as usize;
             for i in 0..cols {
                 let want = table[r * cols + i];
                 let got = gathered[k * cols + i];
+                let step = scales[r * blocks + i / EMBED_BLOCK];
                 assert!(
-                    (got - want).abs() <= scales[r] / 2.0 * 1.0001,
+                    (got - want).abs() <= step / 2.0 * 1.0001,
                     "gather order: id {id} slot {k} col {i}"
                 );
             }
@@ -1786,11 +1867,57 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "divisible by 32")]
+    fn a_hidden_state_that_is_not_a_multiple_of_32_is_refused() {
+        // The loader turns this into a load error that points at --embed-f16.
+        let _ = blocks_of(48);
+    }
+
+    #[test]
+    fn a_block_scale_keeps_a_small_block_beside_a_large_one() {
+        // One row, two blocks: 32 values at 100 and 32 at 1e-3. A per-row scale
+        // (100 / 127 ≈ 0.79) would quantize the small block to all zeros; the
+        // block scale keeps its full range, at half a step of 1e-3 / 254.
+        let mut row = vec![100f32; EMBED_BLOCK];
+        row.extend(vec![1e-3f32; EMBED_BLOCK]);
+        let mut codes = vec![0i8; row.len()];
+        let mut scales = vec![0f32; 2];
+        quantize_row(&row, &mut codes, &mut scales);
+        assert_eq!(scales[0], 100.0 / 127.0);
+        assert_eq!(scales[1], 1e-3 / 127.0);
+        // The small block uses the whole int8 range, and the dequantized values
+        // are exact to the fp32 rounding of the scale.
+        assert!(
+            codes[EMBED_BLOCK..].iter().all(|&c| c == 127),
+            "the small block quantizes to its own full range"
+        );
+        let back = dequant_rows(&codes, &scales, 2, &[0], row.len());
+        for j in 0..row.len() {
+            assert!(
+                (back[j] - row[j]).abs() <= scales[j / EMBED_BLOCK] / 2.0 * 1.0001,
+                "col {j}: {} -> {}",
+                row[j],
+                back[j]
+            );
+        }
+        // The per-row formula this replaced would have zeroed the small block.
+        let row_scale = 100.0 / 127.0;
+        let lossy: Vec<i8> = row
+            .iter()
+            .map(|v| (v / row_scale).round().clamp(-127.0, 127.0) as i8)
+            .collect();
+        assert!(
+            lossy[EMBED_BLOCK..].iter().all(|&c| c == 0),
+            "the per-row arm loses the small block (that is the M2 finding)"
+        );
+    }
+
+    #[test]
     fn an_int8_table_gathers_the_prompt_rows_in_id_order() {
         let device = Device::default();
         let cfg = tiny_cfg();
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
-        let table = table_with_row_scales(vocab, hidden, 11);
+        let table = table_with_block_scales(vocab, hidden, 11);
         let quantized = Embed::quantize(&table, vocab, hidden);
         let mut dense = filled_model(&cfg, &device);
         dense.embed = Embed::Dense(Tensor::<2>::from_data(
@@ -1808,12 +1935,15 @@ mod tests {
         let mut max_abs = 0f32;
         for (k, &id) in ids.iter().enumerate() {
             let row = &table[id as usize * hidden..(id as usize + 1) * hidden];
-            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
             for i in 0..hidden {
                 let d = (got[k * hidden + i] - want[k * hidden + i]).abs();
                 max_abs = max_abs.max(d);
+                // The tolerance is the value's own 32-block's half step.
+                let lo = i - i % EMBED_BLOCK;
+                let block = &row[lo..lo + EMBED_BLOCK];
+                let block_max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
                 assert!(
-                    d <= max / 254.0 * 1.0001,
+                    d <= block_max / 254.0 * 1.0001,
                     "id {id} slot {k} col {i}: dense {} vs int8 {}",
                     want[k * hidden + i],
                     got[k * hidden + i]
@@ -1843,22 +1973,29 @@ mod tests {
         let device = Device::default();
         let cfg = tiny_cfg();
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
-        let table = table_with_row_scales(vocab, hidden, 13);
+        let table = table_with_block_scales(vocab, hidden, 13);
         let quantized = Embed::quantize(&table, vocab, hidden);
-        let (codes, scales) = match &quantized {
-            Embed::Int8 { codes, scales } => (codes.clone(), scales.clone()),
+        let (codes, scales, blocks) = match &quantized {
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => (codes.clone(), scales.clone(), *blocks),
             Embed::Dense(_) => panic!("Embed::quantize builds an int8 table"),
         };
+        assert_eq!(blocks, blocks_of(hidden));
         let ids = [1u32, 4, 7];
         let mut int8 = filled_model(&cfg, &device);
         int8.embed = Embed::Int8 {
             codes: codes.clone(),
             scales: scales.clone(),
+            blocks,
         };
         // The dense table the int8 one stands for.
         let dequant: Vec<f32> = dequant_rows(
             &codes,
             &scales,
+            blocks,
             &(0..vocab as u32).collect::<Vec<_>>(),
             hidden,
         );

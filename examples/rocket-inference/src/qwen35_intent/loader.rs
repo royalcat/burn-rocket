@@ -19,7 +19,8 @@ use burn::prelude::*;
 use burn::tensor::{DType, TensorData, bf16, f16};
 
 use crate::qwen35_intent::model::{
-    DeltaNet, Embed, GatedAttention, IntentModel, IntentTextConfig, Mixer, quantize_rows_into,
+    DeltaNet, EMBED_BLOCK, Embed, GatedAttention, IntentModel, IntentTextConfig, Mixer, blocks_of,
+    quantize_rows_into,
 };
 use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::proj::Proj;
@@ -42,8 +43,9 @@ pub struct IntentLoadOptions {
     pub npu_threads: usize,
     /// Keep only an f16 copy of the tied embedding/LM-head table (saves ~0.5 GB).
     pub embed_f16: bool,
-    /// Store the tied table as per-row symmetric int8 (halves f16 again; the
-    /// decision family's default). Mutually exclusive with [`Self::embed_f16`].
+    /// Store the tied table as block-wise symmetric int8 (halves f16 again, plus
+    /// one f32 scale per 32 hidden values; the decision family's default).
+    /// Mutually exclusive with [`Self::embed_f16`].
     pub embed_int8: bool,
     /// Pack the text projections as group-wise int8 resident NPU weights (the
     /// W8A8 route: one scale per `group`-wide K block, per-row activation
@@ -147,11 +149,12 @@ fn read_stored(ckpt: &mut AnyCheckpoint, key: &str) -> Result<TensorData> {
 /// d3's 1024-wide hidden state.
 const TABLE_BLOCK_ROWS: usize = 1024;
 
-/// Per-row symmetric int8 quantization of a stored `[rows, cols]` table, read in
+/// Per-block symmetric int8 quantization of a stored `[rows, cols]` table, read in
 /// [`TABLE_BLOCK_ROWS`]-row blocks: each block is widened into a small f32 scratch
-/// buffer and quantized with [`quantize_rows_into`], so the codes and scales are
-/// bit-identical to [`Embed::quantize`] of the whole f32 table while the load
-/// never materializes one (nor a second 16-bit copy of it).
+/// buffer and quantized with [`quantize_rows_into`] (one scale per
+/// [`EMBED_BLOCK`] hidden values), so the codes and scales are bit-identical to
+/// [`Embed::quantize`] of the whole f32 table while the load never materializes
+/// one (nor a second 16-bit copy of it).
 fn quantize_stored_table(ckpt: &mut AnyCheckpoint, key: &str) -> Result<Embed> {
     let data = read_stored(ckpt, key)?;
     if data.shape().num_dims() != 2 {
@@ -161,8 +164,15 @@ fn quantize_stored_table(ckpt: &mut AnyCheckpoint, key: &str) -> Result<Embed> {
     if rows == 0 || cols == 0 {
         bail!("{key}: empty token table [{rows}, {cols}]");
     }
+    if cols % EMBED_BLOCK != 0 {
+        bail!(
+            "{key}: the int8 token table needs a hidden state divisible by {EMBED_BLOCK} \
+             (got {cols}); use --embed-f16 for this checkpoint"
+        );
+    }
+    let blocks = cols / EMBED_BLOCK;
     let mut codes = vec![0i8; rows * cols];
-    let mut scales = vec![0f32; rows];
+    let mut scales = vec![0f32; rows * blocks];
     let block_rows = TABLE_BLOCK_ROWS;
     match data.dtype() {
         DType::F32 => quantize_blocks(
@@ -194,12 +204,16 @@ fn quantize_stored_table(ckpt: &mut AnyCheckpoint, key: &str) -> Result<Embed> {
         ),
         other => bail!("{key}: cannot quantize a {other:?} token table (f32, f16 or bf16)"),
     }
-    Ok(Embed::Int8 { codes, scales })
+    Ok(Embed::Int8 {
+        codes,
+        scales,
+        blocks,
+    })
 }
 
 /// The block loop of [`quantize_stored_table`]: widen `rows * cols` stored values
 /// of `E` to f32 `block_rows` rows at a time and quantize each block into its
-/// slice of `codes`/`scales`. The per-row arithmetic is [`quantize_rows_into`]'s,
+/// slice of `codes`/`scales`. The per-block arithmetic is [`quantize_rows_into`]'s,
 /// so the result does not depend on the block size.
 fn quantize_blocks<E: Copy + Send + Sync>(
     src: &[E],
@@ -212,6 +226,7 @@ fn quantize_blocks<E: Copy + Send + Sync>(
 ) {
     use rayon::prelude::*;
     assert_eq!(src.len(), rows * cols, "token table shape mismatch");
+    let blocks = blocks_of(cols);
     let block_rows = block_rows.clamp(1, rows);
     let mut block = vec![0f32; block_rows * cols];
     for r0 in (0..rows).step_by(block_rows) {
@@ -231,7 +246,7 @@ fn quantize_blocks<E: Copy + Send + Sync>(
             n,
             cols,
             &mut codes[r0 * cols..(r0 + n) * cols],
-            &mut scales[r0..r0 + n],
+            &mut scales[r0 * blocks..(r0 + n) * blocks],
         );
     }
 }
@@ -715,35 +730,43 @@ mod tests {
     /// Quantize `stored` ([`bf16`], [`f16`] or f32 values) at several block sizes
     /// — 0 and `rows * 4` exercise the clamp, 3 leaves a ragged tail — and assert
     /// every arm is the whole-table quantizer on the widened values, bit for bit,
-    /// and that this is the documented per-row formula.
+    /// and that this is the documented per-block formula.
     fn streamed_is_the_whole_table<E: Copy + Send + Sync>(
         stored: &[E],
         rows: usize,
         cols: usize,
         to_f32: impl Fn(E) -> f32 + Sync,
     ) {
+        let blocks = blocks_of(cols);
         let widened: Vec<f32> = stored.iter().map(|&v| to_f32(v)).collect();
         let mut want_codes = vec![0i8; rows * cols];
-        let mut want_scales = vec![0f32; rows];
+        let mut want_scales = vec![0f32; rows * blocks];
         quantize_rows_into(&widened, rows, cols, &mut want_codes, &mut want_scales);
-        // The row formula, written out independently of the quantizer.
+        // The block formula, written out independently of the quantizer.
         for r in 0..rows {
-            let row = &widened[r * cols..(r + 1) * cols];
-            let max = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
-            assert_eq!(want_scales[r], scale, "row {r}: scale = max|row| / 127");
-            for (c, &v) in row.iter().enumerate() {
-                let code = if scale == 0.0 {
-                    0
-                } else {
-                    (v * (1.0 / scale)).round().clamp(-127.0, 127.0) as i8
-                };
-                assert_eq!(want_codes[r * cols + c], code, "row {r} col {c}");
+            for j in 0..blocks {
+                let lo = r * cols + j * EMBED_BLOCK;
+                let block = &widened[lo..lo + EMBED_BLOCK];
+                let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+                assert_eq!(
+                    want_scales[r * blocks + j],
+                    scale,
+                    "row {r} block {j}: scale = max|block| / 127"
+                );
+                for (i, &v) in block.iter().enumerate() {
+                    let code = if scale == 0.0 {
+                        0
+                    } else {
+                        (v * (1.0 / scale)).round().clamp(-127.0, 127.0) as i8
+                    };
+                    assert_eq!(want_codes[lo + i], code, "row {r} block {j} col {i}");
+                }
             }
         }
         for block in [0usize, 1, 3, rows, rows * 4] {
             let mut codes = vec![0i8; rows * cols];
-            let mut scales = vec![0f32; rows];
+            let mut scales = vec![0f32; rows * blocks];
             quantize_blocks(stored, rows, cols, block, &to_f32, &mut codes, &mut scales);
             assert_eq!(codes, want_codes, "{block} rows per block: codes");
             assert_eq!(scales, want_scales, "{block} rows per block: scales");
@@ -755,14 +778,17 @@ mod tests {
     /// produced (only without the f32 table).
     #[test]
     fn the_streamed_int8_quantizer_matches_the_whole_table_one() {
-        let (rows, cols) = (11usize, 7);
-        // Row 0 all zero, row 1 one tiny value, the rest a ramp with mixed signs.
+        let (rows, cols) = (11usize, 64);
+        // Row 0 all zero, row 1 one tiny value, the rest a ramp with mixed signs;
+        // the 64-wide rows are two 32-value scale blocks with different gains.
         let mut values = vec![0f32; rows * cols];
         values[cols] = 3.5e-4;
         for r in 2..rows {
             for c in 0..cols {
                 let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
-                values[r * cols + c] = sign * (r as f32 - 1.5) * (c as f32 + 1.0) * 1.7e-3;
+                let block_gain = if c < EMBED_BLOCK { 1.0 } else { 0.125 };
+                values[r * cols + c] =
+                    sign * (r as f32 - 1.5) * (c as f32 + 1.0) * 1.7e-3 * block_gain;
             }
         }
         // bf16 is what a d3 package stores; f16 and f32 are the other dtypes.
@@ -796,16 +822,25 @@ mod tests {
         let model = load_intent_model(&mut ckpt, &device, &opts).unwrap();
         assert_eq!(model.embed.mode(), "I8", "the ready line reports the mode");
         match &model.embed {
-            Embed::Int8 { codes, scales } => {
-                assert_eq!(scales.len(), cfg.vocab_size, "one scale per row");
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => {
+                assert_eq!(*blocks, cfg.hidden_size / EMBED_BLOCK);
+                assert_eq!(
+                    scales.len(),
+                    cfg.vocab_size * blocks,
+                    "one scale per 32 values"
+                );
                 assert_eq!(codes.len(), cfg.vocab_size * cfg.hidden_size);
                 assert!(
                     scales.iter().all(|s| s.is_finite() && *s >= 0.0),
                     "scales are finite and non-negative"
                 );
                 assert!(
-                    scales.iter().filter(|s| **s > 0.0).count() > cfg.vocab_size / 2,
-                    "nearly every row is non-zero"
+                    scales.iter().filter(|s| **s > 0.0).count() > cfg.vocab_size * blocks / 2,
+                    "nearly every block is non-zero"
                 );
             }
             Embed::Dense(_) => panic!("expected an int8 table"),

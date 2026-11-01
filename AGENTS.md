@@ -1453,7 +1453,7 @@ redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
 
 ### Tests
 
-`cargo test -p rocket-inference --no-default-features` = **181** tests. The CLI
+`cargo test -p rocket-inference --no-default-features` = **183** tests. The CLI
 refactor's 53 cover flag parsing, the auto/CPU/NPU stage resolution including
 the NPU-build case, family-scoped flag rejection, int8 dependencies and
 `--keep-cpu-weights` rules; the decision family adds its contract, readout,
@@ -1501,6 +1501,15 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   attention stage); `RssAnon` 943.6 -> 1,034.3 MiB, the BOs not being charged to
   the process. The three deployment profiles collapse to `--device npu` vs
   `--device cpu`.
+- **Later board windows (2026-11-02, beside the live service, load 15-21)**:
+  the M1/M2/M5b rounds keep the text-only service at **317 MiB** anon resident
+  (bf16 body + streamed int8 table; weights BO 966.0 MiB), the vision tower at
+  +195.6 MiB when deferred, and reject `--npu-dtype int8` for d3 (+6.5 % wall, text
+  max |Δp| 3.4e-2). The M2b block-32 table then puts the default image arm at
+  **1.664e-3** against the f32 reference (was 1.03e-2 per-row, top-1 unchanged;
+  the f16 table reads 5.24e-4) with 347 MiB resident (+30 for the scales). All
+  walls there are contended; the per-window tables are in
+  `examples/rocket-inference/docs/recipes/decision.md`.
 - **Deferred tower + bf16 tower storage** (phase M1): the `visual.*` matmul
   weights are read in the checkpoint's own dtype (bf16 for every shipped package)
   and widened per linear — exact, and the widening goes through the stored
@@ -1528,35 +1537,41 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   request, so a package that declares `vision_config` but lacks the `visual.*`
   tensors starts healthy and returns 500 per media request, where an eager load
   fails at startup.
-- **Int8 token table** (phase M2): the tied table is CPU resident in **every**
+- **Int8 token table** (phases M2 + M2b): the tied table is CPU resident in **every**
   deployment (the NPU never holds it) and a prompt only reads its own rows, so the
-  decision family stores it as **per-row symmetric int8** — `scale = max|row|/127`,
-  round half away from zero, codes clamped to ±127 — behind
-  `Embed::Int8 { codes, scales }` (`qwen35_intent/model.rs`); `quantize_rows_into`
-  (the loader streams the stored table through it, see M5b) and `dequant_rows`
-  are rayon passes, `embed_ids` dequantizes just the prompt's rows
-  (a bandwidth-trivial pass: 8k × 1024 elements in a few ms) and only the
-  generation paths' `dense_embed` read the whole
-  table (decision never does). The M2 loader consumed the f32 checkpoint table in
-  place (`TensorData::try_into_vec`, no tensor copy); M5b replaced that read with a
-  streamed one, so the f32 table no longer exists at all. `--embed-int8` is the
-  decision **default**, `--embed-f16` keeps the exact
-  table, both is an error, `Family::supports_embed_int8` is Decision-only, and the
-  ready line prints `embed I8`/`F16`/`F32`. Dev host, text-only `--defer-towers`,
-  resident / peak anon: d3-lite 2462 / 2583 -> **2222 / 2397** MiB, d3-nano
-  6287 / 6457 -> **5804 / 5969** (the expected -242 / -485 resident). Numerics on
-  the full fixture sets against the f16 table — which is **bit-exact** for these
-  bf16 checkpoints (f16 has more mantissa, and the values fit its range), so the
-  whole delta is int8: top-1 is unchanged (67/67, 8/8, 9/9) and max |Δp| is
-  **6.96e-3** text / **8.36e-3** image / **3.81e-3** video (median 1.4e-4-8.6e-4).
-  That exceeds the phase's 2e-3 **probe** gate, which is expected — per-row int8's
-  error is `max|row|/254` (1.46e-4 at the table's median row max 0.0747, 0.86 % of
-  the row RMS) and block-32 scales would only buy 1.56x — so the **approved
-  deployment bar is max |Δp| ≤ 1e-2 with 100 % top-1**, which this passes with no
-  answer changed on the 84 fixture questions. `--embed-f16` is the escape hatch:
-  it restores the exact table (f16-vs-f32 2.4e-6) for +242 MiB (lite) / +485 MiB
-  (nano) resident, for deployments that need the probabilities themselves to
-  match the f32 reference.
+  decision family stores it as **block-wise symmetric int8** —
+  `scales[row * blocks + j] = max|block j|/127` over 32-value hidden blocks
+  (`blocks = hidden / 32`; a package whose hidden state is not a multiple of 32 is
+  refused at load with a pointer to `--embed-f16`), round half away from zero, codes
+  clamped to ±127 — behind `Embed::Int8 { codes, scales, blocks }`
+  (`qwen35_intent/model.rs`). `EMBED_BLOCK` and `blocks_of` own the width,
+  `quantize_row`/`quantize_rows_into` (the loader streams the stored table through
+  them, see M5b) and `dequant_rows` are rayon passes, `embed_ids` dequantizes just the
+  prompt's rows (a bandwidth-trivial pass: 8k × 1024 elements in a few ms) and only
+  the generation paths' `dense_embed` read the whole table (decision never does). The
+  M2 loader consumed the f32 checkpoint table in place (`TensorData::try_into_vec`, no
+  tensor copy); M5b replaced that read with a streamed one, so the f32 table no longer
+  exists at all. `--embed-int8` is the decision **default**, `--embed-f16` keeps the
+  exact table, both is an error, `Family::supports_embed_int8` is Decision-only, and
+  the ready line prints `embed I8`/`F16`/`F32`. Memory (dev host, text-only
+  `--defer-towers`, lite): f16 table 1,513 resident / 1,607 load peak / 1,877 request
+  peak -> block-32 int8 **1,302 / 1,382 / 1,666** MiB; the scale table is
+  `vocab * blocks * 4 B` (30.3 MiB lite, 60.6 nano), i.e. **+29 MiB** over the per-row
+  scheme M2b replaced, which turns M2's -242/-485 into **-211 / -424** against f16.
+  Numerics, bounded M2b subset (the 6-case text subset, `image-receipt-total`,
+  `video-example`) against the f16 table — **bit-exact** for these bf16 checkpoints
+  (f16 has more mantissa, and the values fit its range), so the whole delta is int8:
+  top-1 unchanged (10/10, 1/1, 2/2) and max |Δp| **1.465e-3** text / **1.480e-3**
+  image / **9.788e-4** video, against the per-row arm's 3.769e-3 / 8.362e-3 / 3.334e-3
+  on the same cases (2.6x / 5.6x / 3.4x) and 1.463e-3 / 1.473e-3 / 9.776e-4 against
+  the f32 reference. The per-row full-set round measured 67/67, 8/8, 9/9 with
+  6.96e-3 / 8.36e-3 / 3.81e-3; M2's "block-32 buys 1.56x" probe undershot because
+  real rows carry per-block outliers. The **approved deployment bar is max |Δp| ≤ 1e-2
+  with 100 % top-1**: per-row passed on the dev host but missed on the board once the
+  NPU pack was added (image 1.03e-2), which is why block scales are the default; the
+  board image case now reads **1.664e-3**. `--embed-f16` stays the escape hatch
+  (exact, f16-vs-f32 2.4e-6) where the probabilities themselves must match the f32
+  reference.
 - **Prefill memory round** (phase M4): a d3 request is one prefill per question and
   never decodes, so two prompt-proportional retentions were removed, both exact
   (byte-identical JSON at 2.1k and 7,893 tokens). (1) **`cache.conv` kept a view**:
@@ -1661,8 +1676,11 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   stored 16-bit table; the request phase (1,554 MiB at 2.1k) is unchanged. New
   host test `the_streamed_int8_quantizer_matches_the_whole_table_one` pins the
   block equivalence (bf16/f16/f32 arms, block sizes 0/1/3/rows/4x rows) and the
-  documented row formula; `cargo test -p rocket-inference --no-default-features`
-  = **181**.
+  documented block formula; `cargo test -p rocket-inference --no-default-features`
+  = **181** at the time. M2b later replaced the per-row scale with block-32 scales
+  (`EMBED_BLOCK`, `blocks_of`, `quantize_row(row, out, scales)`), so the per-row
+  figures above move: lite resident/load peak **1,302 / 1,382** MiB (+30 for the
+  scales), and the suite is **183**.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel
