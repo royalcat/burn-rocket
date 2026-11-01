@@ -2,6 +2,10 @@
 //! `model.language_model.*` (ignoring the vision tower and any MTP head) from an
 //! [`AnyCheckpoint`] (safetensors or GGUF) and, in NPU mode, packs the projection
 //! groups straight into resident NPU memory (`pack`/`pack2`/`pack3`, pack-and-drop).
+//!
+//! The same loader serves the `decision` family (a d3 checkpoint whose text
+//! backbone sits at the unprefixed `language_model.*` keys) through
+//! [`IntentLoadOptions::prefix`].
 
 use std::path::Path;
 use std::time::Instant;
@@ -16,6 +20,7 @@ use crate::util::checkpoint::{AnyCheckpoint, Checkpoint};
 use crate::util::proj::Proj;
 use tokenizers::Tokenizer;
 
+#[derive(Debug, Clone)]
 pub struct IntentLoadOptions {
     /// Any stage runs on the NPU (creates the engine).
     pub npu: bool,
@@ -32,6 +37,13 @@ pub struct IntentLoadOptions {
     pub npu_threads: usize,
     /// Keep only an f16 copy of the tied embedding/LM-head table (saves ~0.5 GB).
     pub embed_f16: bool,
+    /// Checkpoint key prefix of the text backbone (`model.language_model.` for the
+    /// intent SFT, `language_model.` for a d3 decision checkpoint).
+    pub prefix: &'static str,
+    /// Family label for the ready line.
+    pub label: &'static str,
+    /// Rotary-table length cap (`None` = the checkpoint's `max_position_embeddings`).
+    pub rope_max_seq: Option<usize>,
 }
 
 impl Default for IntentLoadOptions {
@@ -43,11 +55,12 @@ impl Default for IntentLoadOptions {
             keep_cpu_weights: true,
             npu_threads: 5,
             embed_f16: false,
+            prefix: "model.language_model.",
+            label: "intent",
+            rope_max_seq: None,
         }
     }
 }
-
-const PREFIX: &str = "model.language_model.";
 
 fn read_tensor(ckpt: &mut AnyCheckpoint, key: &str) -> Result<TensorData> {
     ckpt.get(key, DType::F32)?
@@ -144,7 +157,8 @@ pub fn load_intent_model(
     }
 
     let t0 = Instant::now();
-    let mut model = IntentModel::new_stub(&cfg, cfg.max_position_embeddings, device);
+    let max_seq = opts.rope_max_seq.unwrap_or(cfg.max_position_embeddings);
+    let mut model = IntentModel::new_stub(&cfg, max_seq, device);
 
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if opts.npu {
@@ -157,18 +171,19 @@ pub fn load_intent_model(
     }
 
     let mut packed = 0usize;
+    let prefix = opts.prefix;
 
     // Global tensors.
-    let embed = read2(ckpt, &format!("{PREFIX}embed_tokens.weight"), device)?;
+    let embed = read2(ckpt, &format!("{prefix}embed_tokens.weight"), device)?;
     model.embed = if opts.embed_f16 {
         embed.cast(DType::F16)
     } else {
         embed
     };
-    model.norm_w = read_norm1(ckpt, &format!("{PREFIX}norm.weight"), device)?;
+    model.norm_w = read_norm1(ckpt, &format!("{prefix}norm.weight"), device)?;
 
     for (i, layer) in model.layers.iter_mut().enumerate() {
-        let p = |s: &str| format!("{PREFIX}layers.{i}.{s}");
+        let p = |s: &str| format!("{prefix}layers.{i}.{s}");
         layer.input_norm_w = read_norm1(ckpt, &p("input_layernorm.weight"), device)?;
         layer.post_norm_w = read_norm1(ckpt, &p("post_attention_layernorm.weight"), device)?;
 
@@ -205,7 +220,8 @@ pub fn load_intent_model(
     }
 
     println!(
-        "intent model ready in {:.2}s ({} layers, embed {:?}{})",
+        "{} model ready in {:.2}s ({} layers, embed {:?}{})",
+        opts.label,
         t0.elapsed().as_secs_f64(),
         cfg.num_hidden_layers,
         model.embed.dtype(),

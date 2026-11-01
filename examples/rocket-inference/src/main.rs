@@ -6,9 +6,10 @@
 //!
 //! | command | models |
 //! |---|---|
-//! | `serve` | any detected family (embedding and/or chat routes) |
+//! | `serve` | any detected family (embedding, chat or decision routes) |
 //! | `embed`, `bench` | qwen3 (Qwen3-Embedding-0.6B), embeddinggemma |
 //! | `gen` | intent (Qwen3.5-0.8B), gemma4 (Gemma 4 E2B-it) |
+//! | `decide` | decision (vllm-sr d3, `d3-code-readout-v1`) |
 //! | `tokenize` | any detected family |
 //! | `gemm` | no model (flex matmul microbenchmark) |
 //!
@@ -16,6 +17,7 @@
 
 mod cli;
 mod commands;
+mod decision;
 mod family;
 mod gemma;
 mod qwen35_intent;
@@ -38,7 +40,10 @@ fn main() -> Result<()> {
             Some(name) => match cli::command_usage(&name) {
                 Some(text) => println!("{text}"),
                 None => {
-                    bail!("no help for '{name}' (commands: serve|embed|bench|gen|tokenize|gemm)")
+                    bail!(
+                        "no help for '{name}' \
+                         (commands: serve|embed|bench|gen|decide|tokenize|gemm)"
+                    )
                 }
             },
         }
@@ -46,10 +51,11 @@ fn main() -> Result<()> {
     }
     if !matches!(
         cmd.as_str(),
-        "serve" | "embed" | "bench" | "gen" | "tokenize" | "gemm"
+        "serve" | "embed" | "bench" | "gen" | "decide" | "tokenize" | "gemm"
     ) {
         bail!(
-            "unknown command '{cmd}' (expected serve|embed|bench|gen|tokenize|gemm)\n\n{}",
+            "unknown command '{cmd}' \
+             (expected serve|embed|bench|gen|decide|tokenize|gemm)\n\n{}",
             cli::USAGE
         );
     }
@@ -71,6 +77,7 @@ fn main() -> Result<()> {
         "embed" => commands::embed::run(it),
         "bench" => commands::bench::run(it),
         "gen" => commands::generate::run(it),
+        "decide" => commands::decide::run(it),
         "tokenize" => commands::tokenize::run(it),
         "gemm" => commands::gemm::run(it),
         _ => unreachable!("validated above"),

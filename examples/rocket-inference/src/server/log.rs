@@ -125,3 +125,32 @@ pub(crate) fn chat(
 fn as_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
+
+/// `/v1/systemone`: one line per decision request. `questions` counts the
+/// questions that were answered (a per-question error still counts as a 200 but
+/// not as a prompt); `tokens` is `usage.input_tokens`, matching the same set.
+pub(crate) fn decision(state: &AppState, questions: usize, tokens: usize, timing: &RequestTiming) {
+    let tok_s = round(tokens as f64 / timing.compute_s.max(1e-9), 10.0);
+    let rss = rss_mib();
+
+    let span = tracing::Span::current();
+    span.set_attribute("rocket.endpoint", "/v1/systemone");
+    span.set_attribute("questions", as_i64(questions));
+    span.set_attribute("tokens", as_i64(tokens));
+    span.set_attribute("queue_s", timing.queue_s);
+    span.set_attribute("compute_s", timing.compute_s);
+    span.set_attribute("tok_s", tok_s);
+    span.set_attribute("rss_mib", rss);
+
+    info!(
+        endpoint = "/v1/systemone",
+        model = %state.settings.model_name,
+        questions,
+        tokens,
+        queue_s = round(timing.queue_s, 1000.0),
+        compute_s = round(timing.compute_s, 1000.0),
+        tok_s,
+        rss_mib = round(rss, 10.0),
+        "decision request"
+    );
+}

@@ -16,6 +16,7 @@ mod log;
 mod multimodal;
 mod ollama;
 mod openai;
+mod systemone;
 pub(crate) mod telemetry;
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -152,6 +153,9 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     if capabilities.chat {
         app = app.route("/v1/chat/completions", post(openai::chat_completions));
         app = app.merge(ollama::router());
+    }
+    if capabilities.decisions {
+        app = app.route("/v1/systemone", post(systemone::systemone));
     }
     // Base64 images (data URIs) and multi-image batches exceed axum's 2 MiB
     // default JSON body limit.

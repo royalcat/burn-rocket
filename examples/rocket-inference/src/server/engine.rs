@@ -10,6 +10,8 @@ use tokenizers::Tokenizer;
 
 pub use crate::family::Family;
 
+use crate::decision::model::DecisionModel;
+use crate::decision::request::DecisionRequest;
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
 use crate::gemma::gemma4::loader::load_towers;
@@ -32,6 +34,8 @@ pub struct Capabilities {
     pub embeddings: bool,
     pub multimodal: bool,
     pub chat: bool,
+    /// `/v1/systemone` (the d3 decision family).
+    pub decisions: bool,
 }
 
 impl Capabilities {
@@ -45,6 +49,9 @@ impl Capabilities {
         }
         if self.chat {
             names.push("chat");
+        }
+        if self.decisions {
+            names.push("decisions");
         }
         names
     }
@@ -148,6 +155,7 @@ pub enum Engine {
     Emb2(Box<Emb2Engine>),
     Intent(Box<IntentEngine>),
     Gemma4(Box<Gemma4Engine>),
+    Decision(Box<DecisionEngine>),
 }
 
 #[derive(Debug)]
@@ -210,6 +218,23 @@ pub struct Gemma4Engine {
     pub attn_chunk: usize,
     pub image_soft_tokens: usize,
     pub video_soft_tokens: usize,
+}
+
+/// A loaded d3 decision model (`/v1/systemone`).
+#[derive(Debug)]
+pub struct DecisionEngine {
+    pub model: DecisionModel,
+    /// Per-question prompt-token cap (the server's `--max-tokens`).
+    pub max_tokens: usize,
+}
+
+/// What one decision request produced, in the terms the log line reports.
+pub struct DecisionOutcome {
+    pub response: serde_json::Value,
+    /// Questions that were actually answered.
+    pub questions: usize,
+    /// Prompt tokens of those questions (`usage.input_tokens`).
+    pub tokens: usize,
 }
 
 /// A multimodal block after resolution: text with one placeholder per media
@@ -317,7 +342,7 @@ impl Engine {
         match self {
             Self::Qwen3(engine) => engine.embed_texts(req),
             Self::Emb2(engine) => engine.embed_texts(req),
-            Self::Intent(_) | Self::Gemma4(_) => Err(ApiError::bad_request(
+            Self::Intent(_) | Self::Gemma4(_) | Self::Decision(_) => Err(ApiError::bad_request(
                 "this model does not produce embeddings",
             )),
         }
@@ -336,9 +361,23 @@ impl Engine {
         match self {
             Self::Intent(engine) => engine.chat(turn),
             Self::Gemma4(engine) => engine.chat(turn),
-            Self::Qwen3(_) | Self::Emb2(_) => {
+            Self::Qwen3(_) | Self::Emb2(_) | Self::Decision(_) => {
                 Err(ApiError::bad_request("this model does not generate text"))
             }
+        }
+    }
+
+    /// `/v1/systemone`: one typed decision per question.
+    pub fn decisions(
+        &mut self,
+        model: &str,
+        req: DecisionRequest,
+    ) -> Result<DecisionOutcome, ApiError> {
+        match self {
+            Self::Decision(engine) => engine.decide(model, req),
+            _ => Err(ApiError::bad_request(
+                "this model does not answer decision requests",
+            )),
         }
     }
 }
@@ -679,6 +718,20 @@ impl IntentEngine {
             prompt_eval_ms: stats.prefill_s * 1000.0,
             eval_ms: stats.decode_s * 1000.0,
             done_reason,
+        })
+    }
+}
+
+impl DecisionEngine {
+    fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionOutcome, ApiError> {
+        let (response, tokens, questions) = self
+            .model
+            .system_one(model, req, self.max_tokens)
+            .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        Ok(DecisionOutcome {
+            response,
+            questions,
+            tokens,
         })
     }
 }

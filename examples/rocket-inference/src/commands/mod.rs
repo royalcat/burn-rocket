@@ -3,6 +3,7 @@
 //! loader and forward path instead of being nested under a family command.
 
 pub mod bench;
+pub mod decide;
 pub mod embed;
 pub mod embed_input;
 pub mod gemm;
@@ -45,10 +46,13 @@ pub fn require_embedding(family: Family, command: &str) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`{command}` needs an embedding model, but the checkpoint is the {} \
-         ({}) model; `gen` is the chat command",
+        "`{command}` needs an embedding model, but the checkpoint is the {} model; {}",
         family.name(),
-        if family.is_chat() { "chat" } else { "unknown" }
+        if family == Family::Decision {
+            "`decide` is the decision command"
+        } else {
+            "`gen` is the chat command"
+        }
     )
 }
 
@@ -58,8 +62,24 @@ pub fn require_chat(family: Family) -> Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`gen` needs a chat model, but the checkpoint is the {} embedding model; \
-         `embed` is the embedding command",
+        "`gen` needs a chat model, but the checkpoint is the {} model; {}",
+        family.name(),
+        if family == Family::Decision {
+            "`decide` is the decision command"
+        } else {
+            "`embed` is the embedding command"
+        }
+    )
+}
+
+/// `decide` needs a decision model (a d3 checkpoint).
+pub fn require_decision(family: Family) -> Result<()> {
+    if family == Family::Decision {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "`decide` needs a decision model (a d3 checkpoint with decision_config.json \
+         and readout.safetensors), but the checkpoint is the {} model",
         family.name()
     )
 }

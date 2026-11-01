@@ -19,16 +19,18 @@ rocket-inference - Burn inference on the RK3588 (flex CPU backend, per-stage NPU
 usage: rocket-inference <command> [flags]
 
 commands:
-  serve      HTTP server for the detected checkpoint (embedding and/or chat routes)
+  serve      HTTP server for the detected checkpoint (embedding, chat or decision routes)
   embed      one embedding for text and/or media (embedding models)
   bench      embedding throughput over repeated forwards (embedding models)
   gen        one chat completion (chat models)
+  decide     typed System One decisions (decision models)
   tokenize   tokenize text with the checkpoint's tokenizer
   gemm       flex matmul microbenchmark (no model)
   help       this text; `rocket-inference help <command>` for one command
 
-The model family is detected from --model-dir (config.json `model_type`, or the
-GGUF architecture of a local *.gguf); --family overrides the detection.
+The model family is detected from --model-dir (config.json `model_type`, a
+decision_config.json readout head, or the GGUF architecture of a local *.gguf);
+--family overrides the detection.
 --model-dir <dir> is required (or `-hf <owner>/<name>:<quant>`).
 
 Every stage runs on the CPU unless it is placed on the NPU:
@@ -54,6 +56,7 @@ pub fn command_usage(cmd: &str) -> Option<&'static str> {
         "embed" => EMBED_USAGE,
         "bench" => BENCH_USAGE,
         "gen" => GEN_USAGE,
+        "decide" => DECIDE_USAGE,
         "tokenize" => TOKENIZE_USAGE,
         "gemm" => GEMM_USAGE,
         _ => return None,
@@ -188,6 +191,37 @@ placement / model / memory:
 
 See `rocket-inference help` for the shared placement flags and docs/recipes/
 for balanced, full-offload and speed command lines.";
+
+const DECIDE_USAGE: &str = "\
+rocket-inference decide - typed System One decisions
+
+usage: rocket-inference decide --model-dir <dir> (--requests <file> | --request <json>)
+
+Valid for decision models (vllm-sr d3, `d3-code-readout-v1`: a Qwen3.5 text
+backbone plus a 255-code readout head). One noncausal forward per question; the
+answer is a probability for every option. This phase serves the text path only:
+images/videos are refused.
+
+input:
+  --requests <path>            a JSON array of cases
+                               [{\"name\", \"state\", \"questions\"}, ...]
+  --request <json>             one case as a JSON object
+  --max-state-tokens <n>       per-question prompt cap (default 8192)
+
+output:
+  --out <path>                 write the JSON result (default: stdout)
+  --model-name <name>          reported model name (default: the model dir name)
+
+  --requests writes {\"schema\": \"d3-decision-v1\", \"model\", \"cases\":
+  [{\"name\", \"response\"}]}; --request writes the bare response
+  {\"model\", \"answers\", \"usage\"}.
+
+placement / model:
+  --device / --text-device auto|cpu|npu
+  --model-dir / -hf / --family / --cpu-backend / --npu-threads / --embed-f16
+
+See `rocket-inference help` for the shared placement flags and
+examples/rocket-inference/tools/decision.md for the format contract.";
 
 const TOKENIZE_USAGE: &str = "\
 rocket-inference tokenize - tokenize text with the checkpoint's tokenizer
@@ -820,6 +854,17 @@ impl ResolvedLoad {
                     "CPU".to_string()
                 }
             ),
+            // One noncausal forward per question; the 255-code readout is tiny and
+            // always runs on the CPU. The CPU body is always f32 (the loader reads
+            // the backbone in f32), so the checkpoint's native dtype does not apply.
+            Family::Decision => {
+                let text = if text_npu {
+                    format!("NPU({})", self.npu_dtype.name())
+                } else {
+                    "CPU(f32)".to_string()
+                };
+                format!("placement: text={text} readout=CPU(f32)")
+            }
         }
     }
 }

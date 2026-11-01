@@ -66,23 +66,37 @@ d3-lite f32 173 s; d3-nano bf16 101 s for four cases (a 6,307-token case alone t
 
 ## Parity
 
-The future CLI contract is `<bin> decide --model-dir DIR --requests ONE_CASE.json --out OUT.json`
-writing `{"schema": "d3-decision-v1", "cases": [{"name", "questions": {qid:
-{"type", "options", "codes", "probabilities"}}}]}` (`options`/`codes` optional, filled
-from the reference; probabilities in option order or as a label map).
+The CLI contract is `<bin> decide --model-dir DIR (--requests CASES.json | --request OBJECT)
+[--out OUT.json] [--max-state-tokens N]` (`rocket-inference help decide`). `--requests`
+writes `{"schema": "d3-decision-v1", "model", "cases": [{"name", "response"}]}` where each
+`response` is the official `{"model", "answers", "usage"}` object; `--request` writes the
+bare response. The parity script reads the answers either from that official shape or from
+`cases[].questions` (`options`/`codes`/`probabilities` in prompt order).
+
+Implementation: `examples/rocket-inference/src/decision/` (the `d3_format.py` contract, the
+readout head, the prompt/answer path) on the intent family's Qwen3.5 backbone
+(`src/qwen35_intent/`), with `IntentModel::full_attn_causal = false` for the checkpoint's
+`noncausal_full_attention` mode. Phase 1 is the text path: `images`/`videos` are refused
+with a 400 until the vision tower lands.
 
 ```sh
 /tmp/opencode/d3/venv/bin/python tools/decision_parity.py \
     --bin target/release/rocket-inference \
     --model-dir /tmp/opencode/d3/models/d3-lite \
     --requests tools/decision_fixtures.json \
-    --ref /tmp/opencode/d3/ref_text_lite.json \
+    --ref /tmp/opencode/d3/ref_text_lite_f32.json \
     --out /tmp/opencode/d3/parity_report.json
 ```
 
 It runs the CLI once per case, prints the top-1 match rate, the largest probability
 delta and per-type stats, and exits 1 when top-1 < `--min-top1` (default 100%) or
-max |dp| > `--max-dp` (default 2e-3).
+max |dp| > `--max-dp` (default 2e-3). `--limit N` runs a prefix; `--arg FLAG` forwards an
+extra CLI flag.
+
+Measured (dev host, 32 cores, f32, 2026-11-01): d3-lite **67/67 top-1**, max |dp|
+**2.36e-06** (choice 2.36e-06, noul 1.91e-06, score 1.32e-06) over 47 cases / 76,829
+prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` process take
+428 s (model load included).
 
 ## Fixtures
 

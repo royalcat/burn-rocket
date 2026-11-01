@@ -661,6 +661,7 @@ impl GatedAttention {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: Tensor<3>,
@@ -669,6 +670,7 @@ impl GatedAttention {
         rope: &PartialRope,
         start: usize,
         npu: bool,
+        causal_full: bool,
     ) -> Tensor<3> {
         let [b, s, _] = x.dims();
         let (nh, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
@@ -729,7 +731,8 @@ impl GatedAttention {
         cache.kv[idx] = Some((k_all.clone(), v_all.clone()));
 
         let o = if s > 1 {
-            // Prefill: backend fused causal attention (GQA native).
+            // Prefill: backend fused attention (GQA native). Causal for generation,
+            // bidirectional for a d3 decision prompt (`noncausal_full_attention`).
             attention(
                 q.swap_dims(1, 2),
                 k_all,
@@ -739,7 +742,7 @@ impl GatedAttention {
                 AttentionModuleOptions {
                     scale: Some(1.0 / (d as f64).sqrt()),
                     softcap: None,
-                    is_causal: true,
+                    is_causal: causal_full,
                 },
             )
         } else {
@@ -840,12 +843,13 @@ impl Layer {
         start: usize,
         chunk: usize,
         npu: bool,
+        causal_full: bool,
     ) -> Tensor<3> {
         let residual = x.clone();
         let h = zc_norm3(x, &self.input_norm_w, self.eps);
         let h = match &self.mixer {
             Mixer::Linear(dn) => dn.forward(h, cache, idx, chunk, npu),
-            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, start, npu),
+            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, start, npu, causal_full),
         } + residual;
 
         let residual = h.clone();
@@ -872,6 +876,10 @@ pub struct IntentModel {
     pub npu_decode: bool,
     /// No CPU projection copies exist: every projection must go through the NPU.
     pub npu_only: bool,
+    /// The full-attention layers are causal (a decoder, the default) or
+    /// bidirectional (`noncausal_full_attention`, the d3 decision prompt). The
+    /// Gated DeltaNet layers are always causal.
+    pub full_attn_causal: bool,
     pub stage: StageStats,
 }
 
@@ -921,6 +929,7 @@ impl IntentModel {
             chunk: 64,
             npu_decode: false,
             npu_only: false,
+            full_attn_causal: true,
             stage: StageStats::default(),
         }
     }
@@ -943,9 +952,10 @@ impl IntentModel {
         }
     }
 
-    /// Forward `ids`; appends to the cache. Returns logits for the last position
-    /// `[1, vocab]`. Multi-token input is only allowed for a fresh cache (prefill).
-    pub fn forward_logits(&mut self, ids: &[u32]) -> Tensor<2> {
+    /// Forward `ids`; appends to the cache. Returns the final-normed hidden state
+    /// at the last position `[1, hidden]`. Multi-token input is only allowed for a
+    /// fresh cache (prefill).
+    pub fn forward_last_normed(&mut self, ids: &[u32]) -> Tensor<2> {
         let s = ids.len();
         assert!(
             self.cache.len == 0 || s == 1,
@@ -956,6 +966,7 @@ impl IntentModel {
         let chunk = self.chunk;
         let eps = self.cfg.rms_norm_eps;
         let npu = self.npu_only || self.npu_decode || s > 1;
+        let causal_full = self.full_attn_causal;
         let mut h = self.embed_ids(ids);
         let IntentModel {
             layers,
@@ -964,12 +975,18 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, start, chunk, npu);
+            h = layer.forward(h, cache, i, rope, start, chunk, npu, causal_full);
         }
         let h = zc_norm3(h, &self.norm_w, eps);
         self.cache.len += s;
         let hidden = self.cfg.hidden_size;
-        let last = h.slice(s![.., s - 1..s, ..]).reshape([1, hidden]);
+        h.slice(s![.., s - 1..s, ..]).reshape([1, hidden])
+    }
+
+    /// Forward `ids`; appends to the cache. Returns logits for the last position
+    /// `[1, vocab]`. Multi-token input is only allowed for a fresh cache (prefill).
+    pub fn forward_logits(&mut self, ids: &[u32]) -> Tensor<2> {
+        let last = self.forward_last_normed(ids);
         let table = self.embed.clone();
         if table.dtype() == DType::F16 {
             last.cast(DType::F16)
@@ -987,6 +1004,7 @@ impl IntentModel {
         self.cache.reset();
         let chunk = self.chunk;
         let npu = self.npu_only || self.npu_decode || ids.len() > 1;
+        let causal_full = self.full_attn_causal;
         let mut h = self.embed_ids(ids);
         let mut out = vec![h.clone()];
         let IntentModel {
@@ -996,7 +1014,7 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, 0, chunk, npu);
+            h = layer.forward(h, cache, i, rope, 0, chunk, npu, causal_full);
             out.push(h.clone());
         }
         out
@@ -1112,4 +1130,184 @@ fn pick_token(logits: &[f32], temperature: f32, rng: &mut u64) -> u32 {
         }
     }
     (probs.len() - 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::proj::Proj;
+    use burn::module::Param;
+    use burn::nn::Linear;
+
+    /// A tiny two-layer hybrid (a full-attention layer feeding a delta-rule one)
+    /// that exercises every weight without loading a checkpoint. The full layer
+    /// goes first so a bidirectional mask reaches the last position through the
+    /// (causal) delta layer
+    fn tiny_cfg() -> IntentTextConfig {
+        IntentTextConfig::from_value(serde_json::json!({
+            "text_config": {
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 64,
+                "layer_types": ["full_attention", "linear_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "partial_rotary_factor": 0.5,
+                "rope_parameters": {"rope_theta": 10000.0},
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Small deterministic pseudo-random values (a fixed LCG, `u` in `[-0.1, 0.1)`).
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = (state >> 40) as f32 / (1u64 << 24) as f32;
+                (u - 0.5) * 0.2
+            })
+            .collect()
+    }
+
+    fn tensor2(rows: usize, cols: usize, seed: u64, device: &Device) -> Tensor<2> {
+        Tensor::<2>::from_data(
+            TensorData::new(values(rows * cols, seed), [rows, cols]),
+            device,
+        )
+    }
+
+    fn tensor1(n: usize, seed: u64, device: &Device) -> Tensor<1> {
+        Tensor::<1>::from_data(TensorData::new(values(n, seed), [n]), device)
+    }
+
+    fn proj(input: usize, output: usize, seed: u64, device: &Device) -> Proj {
+        // `Linear.weight` is `[in, out]`; the values themselves are arbitrary.
+        Proj::Cpu(Linear {
+            weight: Param::from_tensor(tensor2(input, output, seed, device)),
+            bias: None,
+        })
+    }
+
+    fn filled_model(cfg: &IntentTextConfig, device: &Device) -> IntentModel {
+        let mut model = IntentModel::new_stub(cfg, 64, device);
+        model.embed = tensor2(cfg.vocab_size, cfg.hidden_size, 1, device);
+        model.norm_w = tensor1(cfg.hidden_size, 2, device);
+        for (i, layer) in model.layers.iter_mut().enumerate() {
+            let seed = 10 + i as u64 * 10;
+            layer.input_norm_w = tensor1(cfg.hidden_size, seed, device);
+            layer.post_norm_w = tensor1(cfg.hidden_size, seed + 1, device);
+            layer.mlp.gate_proj = proj(cfg.hidden_size, cfg.intermediate_size, seed + 2, device);
+            layer.mlp.up_proj = proj(cfg.hidden_size, cfg.intermediate_size, seed + 3, device);
+            layer.mlp.down_proj = proj(cfg.intermediate_size, cfg.hidden_size, seed + 4, device);
+            match &mut layer.mixer {
+                Mixer::Linear(dn) => {
+                    dn.in_proj_qkv = proj(cfg.hidden_size, cfg.conv_dim(), seed + 5, device);
+                    dn.in_proj_z = proj(cfg.hidden_size, cfg.value_dim(), seed + 6, device);
+                    dn.in_proj_b = proj(
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        seed + 7,
+                        device,
+                    );
+                    dn.in_proj_a = proj(
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        seed + 8,
+                        device,
+                    );
+                    dn.out_proj = proj(cfg.value_dim(), cfg.hidden_size, seed + 9, device);
+                    dn.conv_w = tensor2(
+                        cfg.conv_dim(),
+                        cfg.linear_conv_kernel_dim,
+                        seed + 10,
+                        device,
+                    );
+                    dn.dt_bias = tensor1(cfg.linear_num_value_heads, seed + 11, device);
+                    dn.a_log = tensor1(cfg.linear_num_value_heads, seed + 12, device);
+                    dn.norm_w = tensor1(cfg.linear_value_head_dim, seed + 13, device);
+                }
+                Mixer::Full(fa) => {
+                    let d = cfg.head_dim;
+                    fa.q_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_attention_heads * d * 2,
+                        seed + 5,
+                        device,
+                    );
+                    fa.k_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_key_value_heads * d,
+                        seed + 6,
+                        device,
+                    );
+                    fa.v_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_key_value_heads * d,
+                        seed + 7,
+                        device,
+                    );
+                    fa.o_proj = proj(
+                        cfg.num_attention_heads * d,
+                        cfg.hidden_size,
+                        seed + 8,
+                        device,
+                    );
+                    fa.q_norm_w = tensor1(d, seed + 9, device);
+                    fa.k_norm_w = tensor1(d, seed + 10, device);
+                }
+            }
+        }
+        model
+    }
+
+    fn rows(tensor: Tensor<2>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
+    }
+
+    #[test]
+    fn forward_logits_is_the_normed_last_hidden_through_the_tied_table() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut logits_model = filled_model(&cfg, &device);
+        let logits = rows(logits_model.forward_logits(&ids));
+        let mut hidden_model = filled_model(&cfg, &device);
+        let hidden = hidden_model.forward_last_normed(&ids);
+        let expected = rows(hidden.matmul(hidden_model.embed.clone().transpose()));
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert_eq!(
+            logits, expected,
+            "forward_logits must be the readout of the hidden"
+        );
+    }
+
+    #[test]
+    fn the_full_attention_mask_defaults_to_causal_and_is_wired() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut causal = filled_model(&cfg, &device);
+        assert!(causal.full_attn_causal, "decoders stay causal by default");
+        let causal = rows(causal.forward_last_normed(&ids));
+        let mut noncausal = filled_model(&cfg, &device);
+        noncausal.full_attn_causal = false;
+        let noncausal = rows(noncausal.forward_last_normed(&ids));
+        assert!(
+            causal.iter().zip(&noncausal).any(|(a, b)| a != b),
+            "noncausal_full_attention must change the full-attention layer's mask"
+        );
+    }
 }
