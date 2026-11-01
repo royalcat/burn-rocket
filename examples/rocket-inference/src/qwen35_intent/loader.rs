@@ -50,6 +50,12 @@ pub struct IntentLoadOptions {
     /// quantization; the group must be a multiple of 32 and divide K). `None` =
     /// fp16, the default everywhere. Independent of [`Self::embed_int8`].
     pub npu_int8: Option<usize>,
+    /// Dtype the CPU text-body projections are stored in (`None` = f32, the
+    /// historical behaviour). A checkpoint stores bf16, so `Some(DType::BF16)`
+    /// halves the body's resident bytes: the widen at matmul time is exact (bf16
+    /// is a truncated f32), which is what the decision family uses. The NPU pack
+    /// widens to f32 first, so this never changes the packed device bytes.
+    pub text_storage: Option<DType>,
     /// Checkpoint key prefix of the text backbone (`model.language_model.` for the
     /// intent SFT, `language_model.` for a d3 decision checkpoint).
     pub prefix: &'static str,
@@ -70,6 +76,7 @@ impl Default for IntentLoadOptions {
             embed_f16: false,
             embed_int8: false,
             npu_int8: None,
+            text_storage: None,
             prefix: "model.language_model.",
             label: "intent",
             rope_max_seq: None,
@@ -77,21 +84,41 @@ impl Default for IntentLoadOptions {
     }
 }
 
-fn read_tensor(ckpt: &mut AnyCheckpoint, key: &str) -> Result<TensorData> {
-    ckpt.get(key, DType::F32)?
+impl IntentLoadOptions {
+    /// The dtype the CPU text-body projections are stored in ([`Self::text_storage`],
+    /// f32 when unset).
+    fn text_dtype(&self) -> DType {
+        self.text_storage.unwrap_or(DType::F32)
+    }
+}
+
+fn read_tensor(ckpt: &mut AnyCheckpoint, key: &str, dtype: DType) -> Result<TensorData> {
+    ckpt.get(key, dtype)?
         .ok_or_else(|| anyhow::anyhow!("missing tensor {key}"))
 }
 
-fn read2(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Tensor<2>> {
-    let data = read_tensor(ckpt, key)?;
+fn read2_at(
+    ckpt: &mut AnyCheckpoint,
+    key: &str,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor<2>> {
+    let data = read_tensor(ckpt, key, dtype)?;
     if data.shape().num_dims() != 2 {
         bail!("{key}: expected a 2-D tensor, got {:?}", data.shape());
     }
-    Ok(Tensor::<2>::from_data(data, device))
+    // A bare `&Device` would resolve to the backend's default float dtype (f32) and
+    // silently upcast a bf16 body; the tensor keeps the dtype it was read in.
+    let dtype = data.dtype();
+    Ok(Tensor::<2>::from_data(data, (device, dtype)))
+}
+
+fn read2(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Tensor<2>> {
+    read2_at(ckpt, key, DType::F32, device)
 }
 
 fn read1(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Tensor<1>> {
-    let data = read_tensor(ckpt, key)?;
+    let data = read_tensor(ckpt, key, DType::F32)?;
     if data.shape().num_dims() != 1 {
         bail!("{key}: expected a 1-D tensor, got {:?}", data.shape());
     }
@@ -107,8 +134,11 @@ fn read_norm1(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Te
 
 /// Read `[N, K]` HF weights and install them as a CPU `Proj`
 /// (`Linear.weight` is `[in, out]`, so the checkpoint layout is transposed).
-fn cpu_proj(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<Proj> {
-    let w = read2(ckpt, key, device)?;
+///
+/// The weight keeps the stored dtype ([`IntentLoadOptions::text_storage`]); the
+/// model widens a bf16 weight per matmul (`proj3`), which is exact.
+fn cpu_proj(ckpt: &mut AnyCheckpoint, key: &str, storage: DType, device: &Device) -> Result<Proj> {
+    let w = read2_at(ckpt, key, storage, device)?;
     Ok(Proj::Cpu(burn::nn::Linear {
         weight: Param::from_tensor(w.swap_dims(0, 1)),
         bias: None,
@@ -170,25 +200,26 @@ fn cat_group(parts: Vec<Tensor<2>>) -> Tensor<2> {
 }
 
 /// Pack one `[N, K]` (HF convention) weight: group-wise int8 under
-/// `--npu-dtype int8`, else fp16.
+/// `--npu-dtype int8`, else fp16. The stored tensor is widened to f32 first, so
+/// the resident bytes never depend on [`IntentLoadOptions::text_storage`].
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn npu_pack(
     ckpt: &mut AnyCheckpoint,
     key: &str,
     device: &Device,
-    int8: Option<usize>,
+    opts: &IntentLoadOptions,
     packed: &mut Packed,
 ) -> Result<burn_rocket::WeightId> {
-    let w = read2(ckpt, key, device)?;
+    let w = read2_at(ckpt, key, opts.text_dtype(), device)?.cast(DType::F32);
     let [n, k] = w.shape().dims::<2>();
-    let id = match int8 {
+    let id = match opts.npu_int8 {
         Some(group) => {
             check_int8_pack(key, n, k, group)?;
             burn_rocket::pack_i8(w, group)
         }
         None => burn_rocket::pack(w),
     };
-    packed.add(n, k, int8);
+    packed.add(n, k, opts.npu_int8);
     Ok(id)
 }
 
@@ -200,25 +231,25 @@ fn npu_pack2(
     a: &str,
     b: &str,
     device: &Device,
-    int8: Option<usize>,
+    opts: &IntentLoadOptions,
     packed: &mut Packed,
 ) -> Result<burn_rocket::WeightId> {
-    let wa = read2(ckpt, a, device)?;
-    let wb = read2(ckpt, b, device)?;
+    let wa = read2_at(ckpt, a, opts.text_dtype(), device)?.cast(DType::F32);
+    let wb = read2_at(ckpt, b, opts.text_dtype(), device)?.cast(DType::F32);
     let [na, k] = wa.shape().dims::<2>();
     let [nb, kb] = wb.shape().dims::<2>();
     if k != kb {
         bail!("fused group {a} + {b}: K differs ({k} vs {kb})");
     }
     let n = na + nb;
-    let id = match int8 {
+    let id = match opts.npu_int8 {
         Some(group) => {
             check_int8_pack(&format!("{a} + {b}"), n, k, group)?;
             burn_rocket::pack_i8(cat_group(vec![wa, wb]), group)
         }
         None => burn_rocket::pack2(wa, wb),
     };
-    packed.add(n, k, int8);
+    packed.add(n, k, opts.npu_int8);
     Ok(id)
 }
 
@@ -231,12 +262,12 @@ fn npu_pack3(
     b: &str,
     c: &str,
     device: &Device,
-    int8: Option<usize>,
+    opts: &IntentLoadOptions,
     packed: &mut Packed,
 ) -> Result<burn_rocket::WeightId> {
-    let wa = read2(ckpt, a, device)?;
-    let wb = read2(ckpt, b, device)?;
-    let wc = read2(ckpt, c, device)?;
+    let wa = read2_at(ckpt, a, opts.text_dtype(), device)?.cast(DType::F32);
+    let wb = read2_at(ckpt, b, opts.text_dtype(), device)?.cast(DType::F32);
+    let wc = read2_at(ckpt, c, opts.text_dtype(), device)?.cast(DType::F32);
     let [na, k] = wa.shape().dims::<2>();
     let [nb, kb] = wb.shape().dims::<2>();
     let [nc, kc] = wc.shape().dims::<2>();
@@ -244,14 +275,14 @@ fn npu_pack3(
         bail!("fused group {a} + {b} + {c}: K differs ({k} vs {kb} vs {kc})");
     }
     let n = na + nb + nc;
-    let id = match int8 {
+    let id = match opts.npu_int8 {
         Some(group) => {
             check_int8_pack(&format!("{a} + {b} + {c}"), n, k, group)?;
             burn_rocket::pack_i8(cat_group(vec![wa, wb, wc]), group)
         }
         None => burn_rocket::pack3(wa, wb, wc),
     };
-    packed.add(n, k, int8);
+    packed.add(n, k, opts.npu_int8);
     Ok(id)
 }
 
@@ -287,6 +318,9 @@ pub fn load_intent_model(
 
     let mut packed = Packed::default();
     let prefix = opts.prefix;
+    // The stored dtype of the CPU text-body projections (`f32` unless the family
+    // asks for the checkpoint's own bf16).
+    let storage = opts.text_dtype();
 
     // Global tensors.
     if opts.embed_f16 && opts.embed_int8 {
@@ -303,7 +337,7 @@ pub fn load_intent_model(
         // Per-row symmetric int8. The f32 table is consumed in place (no tensor
         // copy), so the load transient is the table plus the codes — less than
         // the f16 cast's — and only the codes stay resident.
-        let data = read_tensor(ckpt, &embed_key)?;
+        let data = read_tensor(ckpt, &embed_key, DType::F32)?;
         if data.shape().num_dims() != 2 {
             bail!("{embed_key}: expected a 2-D tensor, got {:?}", data.shape());
         }
@@ -335,16 +369,10 @@ pub fn load_intent_model(
                 &p("mlp.gate_proj.weight"),
                 &p("mlp.up_proj.weight"),
                 device,
-                opts.npu_int8,
+                opts,
                 &mut packed,
             )?;
-            let down = npu_pack(
-                ckpt,
-                &p("mlp.down_proj.weight"),
-                device,
-                opts.npu_int8,
-                &mut packed,
-            )?;
+            let down = npu_pack(ckpt, &p("mlp.down_proj.weight"), device, opts, &mut packed)?;
             layer.mlp.gateup_fused = Some(gateup);
             layer.mlp.down_fused = Some(down);
         }
@@ -355,9 +383,9 @@ pub fn load_intent_model(
                 layer.mlp.down_proj = cpu_proj_f16(ckpt, &p("mlp.down_proj.weight"), device)?;
             }
         } else {
-            layer.mlp.gate_proj = cpu_proj(ckpt, &p("mlp.gate_proj.weight"), device)?;
-            layer.mlp.up_proj = cpu_proj(ckpt, &p("mlp.up_proj.weight"), device)?;
-            layer.mlp.down_proj = cpu_proj(ckpt, &p("mlp.down_proj.weight"), device)?;
+            layer.mlp.gate_proj = cpu_proj(ckpt, &p("mlp.gate_proj.weight"), storage, device)?;
+            layer.mlp.up_proj = cpu_proj(ckpt, &p("mlp.up_proj.weight"), storage, device)?;
+            layer.mlp.down_proj = cpu_proj(ckpt, &p("mlp.down_proj.weight"), storage, device)?;
         }
 
         match &mut layer.mixer {
@@ -379,14 +407,29 @@ pub fn load_intent_model(
     } else {
         String::new()
     };
+    // Only reported when the family asks for a non-f32 body (the decision family's
+    // bf16 storage); the intent family's line is unchanged.
+    let text_body = match opts.text_storage {
+        Some(dtype) => format!(", text body {}", storage_label(dtype)),
+        None => String::new(),
+    };
     println!(
-        "{} model ready in {:.2}s ({} layers, embed {}{resident})",
+        "{} model ready in {:.2}s ({} layers, embed {}{text_body}{resident})",
         opts.label,
         t0.elapsed().as_secs_f64(),
         cfg.num_hidden_layers,
         model.embed.mode(),
     );
     Ok(model)
+}
+
+/// The ready line's label for a stored body dtype.
+fn storage_label(dtype: DType) -> &'static str {
+    match dtype {
+        DType::BF16 => "bf16",
+        DType::F16 => "f16",
+        _ => "f32",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,8 +442,11 @@ fn load_linear(
     packed: &mut Packed,
 ) -> Result<()> {
     let _ = &packed;
+    let storage = opts.text_dtype();
+    // The conv taps and the tiny a/b gates stay f32: a few thousand elements, and
+    // the depthwise conv wants an f32 kernel.
     dn.conv_w = {
-        let data = read_tensor(ckpt, &p("linear_attn.conv1d.weight"))?;
+        let data = read_tensor(ckpt, &p("linear_attn.conv1d.weight"), DType::F32)?;
         // Safetensors stores [conv_dim, 1, kernel]; GGUF (reversed) gives the
         // equivalent 2-D [conv_dim, kernel].
         match data.shape().num_dims() {
@@ -420,9 +466,10 @@ fn load_linear(
         dn.a_log = dn.a_log.clone().neg().log();
     }
     dn.norm_w = read1(ckpt, &p("linear_attn.norm.weight"), device)?;
-    // a/b are tiny; they always run on the CPU.
-    dn.in_proj_a = cpu_proj(ckpt, &p("linear_attn.in_proj_a.weight"), device)?;
-    dn.in_proj_b = cpu_proj(ckpt, &p("linear_attn.in_proj_b.weight"), device)?;
+    // a/b are tiny; they always run on the CPU (stored like the other CPU
+    // projections, at the body's dtype).
+    dn.in_proj_a = cpu_proj(ckpt, &p("linear_attn.in_proj_a.weight"), storage, device)?;
+    dn.in_proj_b = cpu_proj(ckpt, &p("linear_attn.in_proj_b.weight"), storage, device)?;
 
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if opts.text {
@@ -432,14 +479,14 @@ fn load_linear(
             &p("linear_attn.in_proj_qkv.weight"),
             &p("linear_attn.in_proj_z.weight"),
             device,
-            opts.npu_int8,
+            opts,
             packed,
         )?;
         let out_id = npu_pack(
             ckpt,
             &p("linear_attn.out_proj.weight"),
             device,
-            opts.npu_int8,
+            opts,
             packed,
         )?;
         dn.qkvz_fused = Some(qkvz);
@@ -452,9 +499,9 @@ fn load_linear(
             dn.out_proj = cpu_proj_f16(ckpt, &p("linear_attn.out_proj.weight"), device)?;
         }
     } else {
-        dn.in_proj_qkv = cpu_proj(ckpt, &p("linear_attn.in_proj_qkv.weight"), device)?;
-        dn.in_proj_z = cpu_proj(ckpt, &p("linear_attn.in_proj_z.weight"), device)?;
-        dn.out_proj = cpu_proj(ckpt, &p("linear_attn.out_proj.weight"), device)?;
+        dn.in_proj_qkv = cpu_proj(ckpt, &p("linear_attn.in_proj_qkv.weight"), storage, device)?;
+        dn.in_proj_z = cpu_proj(ckpt, &p("linear_attn.in_proj_z.weight"), storage, device)?;
+        dn.out_proj = cpu_proj(ckpt, &p("linear_attn.out_proj.weight"), storage, device)?;
     }
     Ok(())
 }
@@ -469,6 +516,7 @@ fn load_full(
     packed: &mut Packed,
 ) -> Result<()> {
     let _ = &packed;
+    let storage = opts.text_dtype();
     fa.q_norm_w = read_norm1(ckpt, &p("self_attn.q_norm.weight"), device)?;
     fa.k_norm_w = read_norm1(ckpt, &p("self_attn.k_norm.weight"), device)?;
 
@@ -480,16 +528,10 @@ fn load_full(
             &p("self_attn.k_proj.weight"),
             &p("self_attn.v_proj.weight"),
             device,
-            opts.npu_int8,
+            opts,
             packed,
         )?;
-        let o_id = npu_pack(
-            ckpt,
-            &p("self_attn.o_proj.weight"),
-            device,
-            opts.npu_int8,
-            packed,
-        )?;
+        let o_id = npu_pack(ckpt, &p("self_attn.o_proj.weight"), device, opts, packed)?;
         fa.qkv_fused = Some(qkv);
         fa.o_fused = Some(o_id);
     }
@@ -501,10 +543,10 @@ fn load_full(
             fa.o_proj = cpu_proj_f16(ckpt, &p("self_attn.o_proj.weight"), device)?;
         }
     } else {
-        fa.q_proj = cpu_proj(ckpt, &p("self_attn.q_proj.weight"), device)?;
-        fa.k_proj = cpu_proj(ckpt, &p("self_attn.k_proj.weight"), device)?;
-        fa.v_proj = cpu_proj(ckpt, &p("self_attn.v_proj.weight"), device)?;
-        fa.o_proj = cpu_proj(ckpt, &p("self_attn.o_proj.weight"), device)?;
+        fa.q_proj = cpu_proj(ckpt, &p("self_attn.q_proj.weight"), storage, device)?;
+        fa.k_proj = cpu_proj(ckpt, &p("self_attn.k_proj.weight"), storage, device)?;
+        fa.v_proj = cpu_proj(ckpt, &p("self_attn.v_proj.weight"), storage, device)?;
+        fa.o_proj = cpu_proj(ckpt, &p("self_attn.o_proj.weight"), storage, device)?;
     }
     Ok(())
 }
@@ -617,6 +659,53 @@ mod tests {
         assert_eq!(rows.len(), ids.len() * cfg.hidden_size);
         assert!(rows.iter().all(|v| v.is_finite()), "rows are finite");
         assert!(rows.iter().any(|v| *v != 0.0), "rows are not all zero");
+    }
+
+    /// A bf16 text body stores the projection at half the bytes, and widening it
+    /// back is exact: the f32 values and the `[in, out]` operand layout are the ones
+    /// an f32 load produces. Skips when the checkpoint is not on this host.
+    #[test]
+    fn a_bf16_text_body_is_half_the_bytes_and_exact() {
+        let dir = Path::new("/tmp/opencode/d3/models/d3-lite");
+        if !dir.join("config.json").exists() {
+            eprintln!("skipping: {} is not on this host", dir.display());
+            return;
+        }
+        let device = Device::default();
+        let mut ckpt = crate::util::checkpoint::open_in_dir(dir).unwrap();
+        // The d3 package's own key layout (`language_model.*`).
+        let key = "language_model.layers.0.mlp.gate_proj.weight";
+        let narrow = match cpu_proj(&mut ckpt, key, DType::BF16, &device).unwrap() {
+            Proj::Cpu(lin) => lin.weight.val(),
+            #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+            Proj::Npu(_) => panic!("cpu_proj builds a CPU linear"),
+        };
+        assert_eq!(
+            narrow.dtype(),
+            DType::BF16,
+            "the body keeps the file's dtype"
+        );
+        let [input, output] = narrow.dims();
+        // The model's widen: through the stored `[out, in]` orientation, so the
+        // operand keeps the f32 load's layout.
+        let wide = narrow.swap_dims(0, 1).cast(DType::F32).swap_dims(0, 1);
+        assert_eq!(wide.dtype(), DType::F32);
+        assert_eq!(wide.dims(), [input, output]);
+
+        // Every widened value is the checkpoint's own f32 read, bit for bit.
+        let reference: Vec<f32> = ckpt
+            .get(key, DType::F32)
+            .unwrap()
+            .unwrap()
+            .try_into_vec()
+            .unwrap();
+        let widened: Vec<f32> = wide
+            .swap_dims(0, 1)
+            .into_data()
+            .try_to_vec()
+            .expect("f32 rows");
+        assert_eq!(widened.len(), reference.len());
+        assert_eq!(widened, reference, "the widen is exact");
     }
 
     /// The W8A8 driver takes one scale per `group`-wide K block, stores the codes

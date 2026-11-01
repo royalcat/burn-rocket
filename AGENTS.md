@@ -1453,11 +1453,14 @@ redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
 
 ### Tests
 
-`cargo test -p rocket-inference --no-default-features` = **167** tests. The CLI
+`cargo test -p rocket-inference --no-default-features` = **180** tests. The CLI
 refactor's 53 cover flag parsing, the auto/CPU/NPU stage resolution including
 the NPU-build case, family-scoped flag rejection, int8 dependencies and
 `--keep-cpu-weights` rules; the decision family adds its contract, readout,
-mRoPE, splice and media-guard tests (see below). `cargo clippy -p
+mRoPE, splice and media-guard tests (see below), and the intent loader's
+`a_bf16_text_body_is_half_the_bytes_and_exact` pins M5's storage path against the
+checkpoint's own f32 read (`/tmp/opencode/d3/models/d3-lite`, skipped when
+absent). `cargo clippy -p
 rocket-inference --no-default-features` and the aarch64+`npu` clippy are clean;
 `cargo fmt --all -- --check` is clean.
 
@@ -1579,6 +1582,53 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   `malloc_trim` per layer and a fixed `MALLOC_MMAP_THRESHOLD_`) and does not
   accumulate across prefills, which is why the two-prefill test is the right
   plateau check.
+- **Bf16 text-body storage** (phase M5, 2026-11-02): the d3 text body (498M
+  params lite = 1,900 MiB f32, 1,373M nano = 5,239 MiB) is stored in the
+  checkpoint's own **bf16** and widened to f32 per projection — half the resident
+  bytes, **bit-identical** output. `IntentLoadOptions::text_storage:
+  Option<DType>` (`None` = f32, the historical behaviour) is set to
+  `Some(DType::BF16)` by `decision::load::load_decision_model` only, so the intent
+  family is untouched (every other constructor uses `..IntentLoadOptions::default()`
+  with `None`); `cpu_proj` builds its `Linear` at that dtype and `proj3`'s new
+  `DType::BF16` arm widens **through the stored `[out, in]` orientation**
+  (`w.swap_dims(0,1).cast(F32).swap_dims(0,1)`) so the matmul gets the same
+  `[in, out]` operand layout the f32 load produced — the same rule the vision
+  tower's `weight_f32` documents. Two traps found: (a) `Tensor::from_data(data,
+  &device)` **resolves the backend's default float dtype (f32)** and silently
+  upcasts, so `read2_at` passes `(device, dtype)` — with the bare device the
+  whole change is a no-op that still prints `text body bf16`; (b) the **NPU pack
+  widens to f32 first** (`read2_at(...).cast(DType::F32)` inside
+  `npu_pack`/`npu_pack2`/`npu_pack3`), which keeps the resident BO bytes identical
+  *and* keeps `ROCKET_BF16_STREAM=1` from rerouting a bf16 weight into the bf16
+  stream (passing the stored bf16 tensor straight to `pack` would have been
+  numerically identical otherwise). `cpu_proj_f16` (intent decode copy), the conv
+  taps and the tiny `in_proj_a/b` gates are unchanged/f32; the ready line gains
+  `, text body bf16` when active. Gate (dev host, `--device cpu`, baseline
+  `02ad196`): the 6-case text subset (choice / noul / score / JSON state / long
+  state, 17,123 prompt tokens) and the `image-receipt-total` + `video-example`
+  fixtures are **byte-identical JSON**, plus the nano 2.1k case. Memory (text-only
+  `--defer-towers`, one 2,113-token case): lite resident 2,222 -> **1,273** MiB
+  (−949, the predicted half of 1,900), nano 5,804 -> **3,186** (−2,618 = half of
+  5,239); peak anon lite 2,465 -> 2,460 (unchanged!) and nano 6,086 -> **4,865**,
+  2.1k prefill lite 11.88 -> 12.09 s, nano 17.13 -> **16.79 s**. Wall on the
+  6-case text subset: 90.9 (two f32 runs: 90.45/91.26) -> **96.3 s (+6.0 %; four
+  bf16 runs: 96.01/96.04/96.59/96.93)**; image 9.97 -> 10.2-10.5 s, video 12.35 ->
+  13.4-13.6 s. The cost is the per-prefill widen (0.95 GiB read
+  + 1.9 GiB written for lite, ~0.5-0.7 s per prefill) — **a rayon widen was tried
+  and rejected**: the same conversion in one parallel pass measured 97.9 s
+  (1.5 % *slower* than flex's `cast`, which LLVM already vectorizes; the cost is
+  the fresh f32 allocation/page faults, and it also sails past the `into_data`
+  copy). The lite peak does not move because a 2.1k run's peak is now bounded by
+  the **int8 token-table load transient**, not the body: `new_stub` allocates a
+  full f32 `Tensor::zeros([vocab, hidden])` table (970 MiB lite / 1,940 nano) and
+  the M2 load path stacks `get_stored` + `convert_dtype(F32)` + `try_into_vec` +
+  the int8 codes on top of it (traced: the load ramps to ~2.4 GiB at 0.6 s, drops
+  to 0.43, then ramps to the 1,273 MiB resident body). A streaming row-block table
+  quantizer is the natural follow-up (it would take lite's 2.1k peak to ~1.5 GiB
+  and nano's to ~3.5 GiB, i.e. close to the resident figure); it is **not** done
+  here. `--npu` is unaffected by
+  construction (same f32 pack inputs, shape-derived byte count in the ready line),
+  but it is not device-tested on this host.
 - **Caveat — board video parity is decoder-version sensitive**: the video arms
   miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
   board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel

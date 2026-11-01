@@ -91,6 +91,12 @@ pub fn load_decision_model(
         prefix: DECISION_PREFIX,
         label: "decision",
         rope_max_seq: Some(max_tokens),
+        // The body is stored in the checkpoint's own bf16 and widened per projection
+        // (exact): half the resident bytes for the 498M-param lite / 1.37B-param
+        // nano backbone, which is the difference between the CPU profile fitting on
+        // the board beside its services or not. The NPU path widens before packing,
+        // so the resident device BO is unchanged.
+        text_storage: Some(DType::BF16),
         ..opts.clone()
     };
     let mut backbone: IntentModel = load_intent_model(&mut ckpt, device, &opts)?;

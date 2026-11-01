@@ -99,6 +99,27 @@ MLP/attention activations, so a long prompt now fits a board that could not host
 the old 8k peak. Blocking the chunk dimension was not needed (it does not touch
 the conv term) and is not implemented.
 
+### Text body storage
+
+The text backbone's projections are stored in the checkpoint's own **bf16** and
+widened per matmul (exact: bf16 is a truncated f32), which halves the body:
+resident `RssAnon` d3-lite **2,222 -> 1,273 MiB**, d3-nano **5,804 -> 3,186**
+(text-only `--defer-towers`, one 2,113-token case). Output is byte-identical; the
+`placement:` line keeps saying `text=CPU(f32)` because the *compute* dtype is
+still f32 (the ready line adds `, text body bf16`). It costs one pass over the
+body per prefill: the 6-case text gate 90.9 -> 96.3 s (**+6.0 %**), image
+9.97 -> 10.2-10.5 s, video 12.35 -> 13.4-13.6 s; nano's 2.1k prefill is
+17.13 -> 16.79 s (its f32 body is cache-hostile enough that the widen does not
+show). A rayon widen of the same conversion measured slower (97.9 s median), so
+the plain `cast` stays.
+
+The **peak** of a short text run does not follow the resident drop for lite
+(2,465 -> 2,460 MiB) because it is set by the int8 token-table load transient
+(`new_stub`'s f32 zeros table + the f32 read/convert/Vec of the M2 path), not by
+the body; nano's peak does improve, 6,086 -> 4,865 MiB. A board deployment should
+budget nano's *startup* against ~4.9 GiB, and roughly the resident figure
+afterwards.
+
 
 ## Serve
 
@@ -126,7 +147,7 @@ into two configurations:
 | balanced | `--device npu` (text projections packed as resident fp16) |
 | full offload | `--device npu` (same: there is nothing else to move) |
 | speed | `--device npu` (same: the compute is the same command) |
-| CPU fallback | `--device cpu` (f32 body) |
+| CPU fallback | `--device cpu` (f32 compute, bf16-stored body widened per projection) |
 
 The vision tower, the backbone attention and the readout head run on the CPU in
 both configurations: d3 has no `--text-attn-device`, `--vision-device`,
@@ -267,7 +288,12 @@ Reading the table:
   62.1 -> 40.8 s (1.5x), while user CPU still drops 1.3-1.9x.
 - **Memory**: the CPU body is f32 and ~2.9 GiB resident; the NPU config keeps
   ~1.0 GiB anon (embeddings, vision tower, readout) plus the ~1.0 GiB weights
-  BO. Peak anon drops from 3.3-3.9 GiB to ~2.5 GiB on every input class.
+  BO. Peak anon drops from 3.3-3.9 GiB to ~2.5 GiB on every input class. These
+  board numbers predate the bf16 text-body storage (§ Text body storage): the CPU
+  arm's resident figure is now about 1.0 GiB lower (dev-host −949 MiB for lite),
+  and its wall carries the per-prefill widen (+2-4 % on a 1k-token question whose
+  prefill is ~40 s on the board). The NPU arm is unchanged — it packs f16 and
+  drops the CPU copy.
 - **Board noise**: the other services keep the load at ~8-10, so wall/CPU spread
   by ±20-30 % between samples. The runs in the table were taken with the
   embedding service stopped; the two samples of each config are the pre-restore

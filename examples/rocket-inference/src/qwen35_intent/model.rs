@@ -317,9 +317,24 @@ fn proj_sel(cpu: &Proj, id: &NpuId, x: Tensor<3>, npu: bool) -> Tensor<3> {
     proj3(cpu, x, false)
 }
 
-/// Run one projection: a resident NPU weight (prefill) or a CPU copy (f16 or
-/// f32). The CPU copy exists so single-token decode never pays the NPU's
+/// Run one projection: a resident NPU weight (prefill) or a CPU copy (f16, bf16
+/// or f32). The CPU copy exists so single-token decode never pays the NPU's
 /// `M >= 256` padding.
+///
+/// Three storage dtypes meet here. An f16 weight casts the *activations* down (the
+/// intent family's decode copy). A bf16 weight is the decision family's text-body
+/// storage: the checkpoint's own bf16, widened per call — exact, and half the
+/// resident bytes. The widen goes through the stored `[out, in]` orientation, so
+/// the matmul receives the same `[in, out]` operand layout an f32 load produced
+/// (see the long note on the vision tower's `weight_f32`).
+///
+/// The widen costs one pass over the body per prefill (0.95 GiB read, 1.9 GiB
+/// written for d3-lite), which measured **+6.0 %** wall over the f32 body on the
+/// 6-case text gate (90.9 -> 96.3 s) — the price of the −949 MiB resident. A
+/// rayon widen (the same conversion, in one parallel pass) was tried and is 1.5 %
+/// *slower*: flex's loop is already vectorized and the cost is the fresh f32
+/// allocation (page faults), not the elementwise conversion, so it stays a plain
+/// `cast`.
 fn proj3(p: &Proj, x: Tensor<3>, npu: bool) -> Tensor<3> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if npu && let Proj::Npu(id) = p {
@@ -330,10 +345,18 @@ fn proj3(p: &Proj, x: Tensor<3>, npu: bool) -> Tensor<3> {
     match p {
         Proj::Cpu(lin) => {
             let w = lin.weight.val();
-            if w.dtype() == DType::F16 {
-                burn::tensor::module::linear(x.cast(DType::F16), w, None).cast(DType::F32)
-            } else {
-                burn::tensor::module::linear(x, w, lin.bias.as_ref().map(|b| b.val()))
+            let bias = lin.bias.as_ref().map(|b| b.val());
+            match w.dtype() {
+                DType::F16 => {
+                    burn::tensor::module::linear(x.cast(DType::F16), w, None).cast(DType::F32)
+                }
+                DType::BF16 => {
+                    // Widen through the stored `[out, in]` orientation so the matmul
+                    // receives the f32 load's operand layout.
+                    let w = w.swap_dims(0, 1).cast(DType::F32).swap_dims(0, 1);
+                    burn::tensor::module::linear(x, w, bias)
+                }
+                _ => burn::tensor::module::linear(x, w, bias),
             }
         }
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
