@@ -16,7 +16,12 @@
 //! * the source fps is the container's rate, and an unknown or implausible one
 //!   (`< 0.1` or `> 1000`, or not finite) is 24;
 //! * the total comes from the container; a container that does not say gets its
-//!   frames counted (the server stops counting at `300 * fps`).
+//!   frames counted (the server stops counting at `300 * fps`);
+//! * a truncated clip keeps only the frames that decode, **with their actual
+//!   source indices** (`_decode_video` appends `kept`), so the pair count, grid and
+//!   timestamps come from those frames; no decoded frame at all is
+//!   [`NO_FRAME`], an unreadable container is [`COULD_NOT_OPEN`] — the reference's
+//!   own texts, without the decoder's stderr (which can name a temporary upload).
 //!
 //! The frames themselves come from `ffmpeg` (see [`crate::gemma::media`]); a probe
 //! over the repo's two fixtures showed `ffmpeg`'s `rgb24` output **bit-identical**
@@ -49,6 +54,10 @@ pub const MAX_SOURCE_PIXELS: u64 = 8_294_400;
 pub const MAX_BYTES: usize = 32_000_000;
 /// The data-URL subtypes the server accepts (`VIDEO_FORMATS`).
 pub const FORMATS: [&str; 4] = ["mp4", "webm", "quicktime", "x-matroska"];
+/// `d3_runtime._decode_video`'s refusal of a clip that does not open.
+pub const COULD_NOT_OPEN: &str = "the video could not be opened";
+/// `d3_runtime._decode_video`'s refusal of a clip none of whose frames decode.
+pub const NO_FRAME: &str = "no frame of the video could be decoded";
 
 /// One decoded video: the sampled frames, in order, and their source metadata.
 #[derive(Debug, Clone)]
@@ -190,15 +199,24 @@ fn ffprobe(path: &Path, count: bool) -> Result<Probe, String> {
         ])
         .arg(path)
         .output()
-        .map_err(|error| format!("run ffprobe (is ffmpeg installed?): {error}"))?;
+        .map_err(|error| {
+            tracing::warn!(%error, "ffprobe could not be run");
+            COULD_NOT_OPEN.to_string()
+        })?;
     if !out.status.success() {
-        return Err(format!(
-            "the video could not be opened ({})",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        // The reference (OpenCV) reports only that the clip did not open, and
+        // ffprobe's stderr names the file it read — which for a `data:video/...`
+        // upload is our temporary upload path. Log it, return the reference's text.
+        tracing::warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "ffprobe rejected the video"
+        );
+        return Err(COULD_NOT_OPEN.to_string());
     }
-    let json: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|error| format!("read ffprobe output ({error})"))?;
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|error| {
+        tracing::warn!(%error, "ffprobe output is not JSON");
+        COULD_NOT_OPEN.to_string()
+    })?;
     let stream = &json["streams"][0];
     let number = |value: &serde_json::Value| -> Option<usize> {
         value
@@ -243,12 +261,6 @@ pub fn decode(path: &Path, strict: bool) -> Result<DecodedVideo, String> {
             MAX_SECONDS as u64
         ));
     }
-    let mut indices = sample_indices(total, fps);
-    // `_video`: an odd sample repeats its last frame, so every frame is part of a
-    // temporal pair and every pair has a timestamp.
-    if !indices.len().is_multiple_of(2) {
-        indices.push(*indices.last().expect("sample_indices is nonempty"));
-    }
     let info = VideoInfo {
         width,
         height,
@@ -256,18 +268,18 @@ pub fn decode(path: &Path, strict: bool) -> Result<DecodedVideo, String> {
         total_frames: total,
         duration: total as f64 / fps,
     };
-    let frames = media::extract_frames(path, &info, &indices)
-        .map_err(|error| format!("no frame of the video could be decoded ({error:#})"))?;
-    if frames.is_empty() {
-        return Err("no frame of the video could be decoded".to_string());
+    let mut decoded = decode_sampled(path, &info, &sample_indices(total, fps));
+    if decoded.is_empty() {
+        return Err(NO_FRAME.to_string());
     }
-    if frames.len() != indices.len() {
-        return Err(format!(
-            "the video decoder returned {} of {} sampled frames",
-            frames.len(),
-            indices.len()
-        ));
+    // `_video`: an odd decode repeats its last frame **and its index**, so every
+    // frame belongs to a temporal pair and every pair has a timestamp. The count is
+    // the number of frames the file actually yielded, which a truncated clip can
+    // make smaller than the plan (`_decode_video` keeps the ones OpenCV retrieved).
+    if !decoded.len().is_multiple_of(2) {
+        decoded.push(decoded.last().expect("nonempty").clone());
     }
+    let (indices, frames) = decoded.into_iter().unzip();
     Ok(DecodedVideo {
         frames,
         indices,
@@ -276,6 +288,70 @@ pub fn decode(path: &Path, strict: bool) -> Result<DecodedVideo, String> {
         width,
         height,
     })
+}
+
+/// The sampled frames the file actually yields, with their source indices.
+///
+/// `d3_runtime._decode_video` keeps a frame only when OpenCV retrieves it, so a
+/// truncated clip decodes fewer frames than were planned and the prompt is built
+/// from the ones that came back — with their **actual** indices, not the planned
+/// ones. One `ffmpeg` pass covers the whole list; when it comes back short the
+/// decoder is probed per index, which is the only way to learn which planned frame
+/// numbers survived (the bulk `select` output does not say).
+fn decode_sampled(path: &Path, info: &VideoInfo, planned: &[usize]) -> Vec<(usize, RgbImage)> {
+    match media::extract_frames(path, info, planned) {
+        Ok(frames) if frames.len() == planned.len() => {
+            return planned.iter().copied().zip(frames).collect();
+        }
+        Ok(frames) => tracing::warn!(
+            decoded = frames.len(),
+            planned = planned.len(),
+            "the video yields fewer frames than were sampled; probing each index"
+        ),
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "ffmpeg frame extraction failed; probing each index"
+        ),
+    }
+    let mut kept = Vec::new();
+    for &index in planned {
+        match extract_frame(path, info, index) {
+            Some(frame) => kept.push((index, frame)),
+            None => tracing::warn!(index, "a sampled frame did not decode"),
+        }
+    }
+    kept
+}
+
+/// One source frame by native index, or `None` when it does not decode.
+fn extract_frame(path: &Path, info: &VideoInfo, index: usize) -> Option<RgbImage> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            &format!("select='eq(n\\,{index})'"),
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    let frame_bytes = info.width * info.height * 3;
+    if out.stdout.len() < frame_bytes {
+        return None;
+    }
+    RgbImage::from_raw(
+        info.width as u32,
+        info.height as u32,
+        out.stdout[..frame_bytes].to_vec(),
+    )
 }
 
 /// Decode a video from bytes (`data:video/...` uploads): written to a temporary
@@ -518,7 +594,100 @@ mod tests {
     #[test]
     fn a_missing_file_is_a_clean_error() {
         let error = decode(Path::new("/nonexistent/clip.mp4"), true).unwrap_err();
-        assert!(error.contains("could not be opened"), "{error}");
-        assert!(!error.contains("panicked"), "{error}");
+        assert_eq!(error, COULD_NOT_OPEN);
+    }
+
+    /// F2: a refused upload carries the reference's text, never the decoder's
+    /// stderr — which names the temporary file a `data:video/...` payload was
+    /// written to (`/tmp/rocket-inference/upload-<pid>-<nanos>.mp4`).
+    #[test]
+    fn a_refused_upload_does_not_leak_the_temporary_path() {
+        let dir = std::env::temp_dir().join("d3-video-refusals");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("upload-4242-1234.mp4");
+        std::fs::write(&path, b"this is not a video at all\n").expect("write the upload");
+        let error = decode(&path, true).unwrap_err();
+        assert_eq!(error, COULD_NOT_OPEN);
+        for leak in ["/tmp/", "upload-", dir.to_str().unwrap()] {
+            assert!(!error.contains(leak), "the detail leaks {leak:?}: {error}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F3: a truncated (but faststart) clip decodes the frames that survive,
+    /// exactly like `_decode_video`: the reference keeps `[0, 4, 9, 13]` of the
+    /// eight samples of this fixture and answers with those four frames.
+    /// A container whose media data is gone decodes nothing and is [`NO_FRAME`].
+    #[test]
+    fn a_truncated_clip_keeps_the_frames_that_decode() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test.mp4");
+        if !source.is_file() {
+            eprintln!("skipping: {} is not available", source.display());
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("d3-video-truncated-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let fast = dir.join("faststart.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&source)
+            .args(["-c", "copy", "-movflags", "+faststart"])
+            .arg(&fast)
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skipping: ffmpeg is not available");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skipping: ffmpeg could not remux the fixture");
+            return;
+        }
+        let bytes = std::fs::read(&fast).expect("read the faststart copy");
+        // Cut the media data at 55 % of the file; the header (ftyp + moov) is at the
+        // front, so the stream still opens and only the tail frames are lost.
+        let cut = dir.join("cut55.mp4");
+        std::fs::write(&cut, &bytes[..bytes.len() * 55 / 100]).expect("write the cut");
+        let video = decode(&cut, true).expect("a truncated clip still decodes its frames");
+        assert_eq!((video.fps, video.total), (8.0, 32));
+        assert!(
+            video.frames.len() >= 2 && video.frames.len() < 8,
+            "{:?} frames",
+            video.frames.len()
+        );
+        assert_eq!(video.frames.len() % 2, 0, "pairs are padded, not dropped");
+        assert_eq!(video.frames.len(), video.indices.len());
+        let planned = sample_indices(video.total, video.fps);
+        assert!(
+            video.indices.iter().all(|index| planned.contains(index)),
+            "indices {:?} are planned samples {:?}",
+            video.indices,
+            planned
+        );
+        assert!(
+            video.indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "indices stay in source order: {:?}",
+            video.indices
+        );
+        assert!(video.indices.len() < planned.len());
+        assert_eq!(video.indices[0], 0, "the head frames decode");
+
+        // The same header with no media data left: nothing decodes.
+        let mut at = 0usize;
+        let mdat = loop {
+            assert!(at + 8 <= bytes.len(), "no mdat box in the fixture");
+            let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = &bytes[at + 4..at + 8];
+            if kind == b"mdat" {
+                break at;
+            }
+            assert!(size >= 8, "bad box size at {at}");
+            at += size;
+        };
+        let head = dir.join("header-only.mp4");
+        std::fs::write(&head, &bytes[..mdat]).expect("write the header-only copy");
+        let error = decode(&head, true).unwrap_err();
+        assert_eq!(error, NO_FRAME);
+        assert!(!error.contains("/tmp/"), "{error}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

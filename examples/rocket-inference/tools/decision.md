@@ -131,8 +131,10 @@ prompt tokens; 511 s as 47 processes. The same 47 cases in one `--requests` proc
   with 4-32 frames), and every refusal is `videos[i]: <reason>`. All videos of one
   request together may not exceed 16,384 input tokens, else
   `422 {"detail": "the videos take N input tokens, over the 16,384 tokens a request may
-  spend on videos; send fewer or shorter videos"}`. The server's transport body limit is
-  48 MiB (a 32 MB video is ~42.7 MB of base64);
+  spend on videos; send fewer or shorter videos"}`. `/v1/systemone` takes bodies up to
+  **96 MiB** (the per-item ceiling is one 32 MB video plus three 8 MB images, ≈75 MB
+  once base64-encoded); every other route keeps the server's usual **32 MiB** media
+  limit, so an embedding upload of 33 MiB or more is still a `413`;
 - a question that fails validation refuses the whole request with
   `422 {"detail": {"invalid_questions": {qid: "<message>"}}}` and **nothing runs**;
 - a question over the prompt cap is *not* a refusal: it keeps its `max_length_exceeded`
@@ -381,8 +383,9 @@ is the gate: `text-literal-image-token` 109 tokens, noul 0.9643; `text-literal-v
 **A text-only package loads.** `config.json` `image_token_id`/`video_token_id` and the
 tokenizer's `<|vision_start|>` are required only when the package declares a
 `vision_config`; without one the ids are `u32::MAX`, the tower is absent and an image
-request is `422 {"detail": "image inputs are not available: this checkpoint has no vision
-tower"}` (verified with d3-lite's `config.json` minus `vision_config`/`image_token_id`:
+request is `422 {"detail": "image inputs are not available: the checkpoint has no vision
+tower (visual.* weights)"}` (verified with d3-lite's `config.json` minus
+`vision_config`/`image_token_id`:
 text answers unchanged at 107 tokens, 0.9293 for the routing case).
 
 The tower is 100.5M f32 parameters (~0.40 GB for d3-lite) and loads eagerly with the
@@ -471,6 +474,13 @@ message carries both media counts:
 `({visual} for {n} image(s) and {m} video(s))` where `visual` is the image tokens plus the
 video prompt groups' token counts (the reference's `sum(visual) + expanded`).
 
+Media are validated **images first**, like the reference (`prepare` loads `images` before
+`videos`): every image is preprocessed before the video token budget is planned, so a
+request with an unusable image *and* an over-budget video reports the image, and a
+text-only package answers an image+video request with the image reason
+(`image inputs are not available: the checkpoint has no vision tower (visual.*
+weights)`).
+
 ### Reference, probe and gate
 
 ```sh
@@ -506,6 +516,12 @@ reference's own OpenCV decode) and `video_metadata.json` (fps, total frames, sam
 indices) per case, so a probe can be scored on three levels: the frames (exact), the
 patches (`pixel_values_videos`, `max|Δ| <= 1e-6`) and the tower output
 (`pooled_videos`, cosine `>= 0.999999`).
+
+The fixtures name their media relative to `examples/rocket-inference` (`data/test.mp4`)
+or absolutely (the checkpoint's `assets/`). Both scripts resolve a relative path from
+`examples/rocket-inference` by default (`--media-base` overrides) and print the base, so
+the gate is the same whether it runs from the example directory or from the repository
+root — measured 9/9 both ways.
 
 Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01; watchdog on the 8-core box while
 another job ran, wall +-20 %):
@@ -562,10 +578,19 @@ a media prompt, and an image request takes `encode` on `[1, H, W]`, which is
 - **A container without `nb_frames`.** OpenCV counts the frames (with the 300-second
   guard); this side asks `ffprobe -count_frames`, which decodes the stream once. Both use
   the count the same way; no fixture exercises it.
-- **A frame ffmpeg cannot decode.** OpenCV skips it (`retrieve()` false) and keeps the
-  others; this side fails the video (`no frame of the video could be decoded`). A clip
-  with a broken frame is not answered here where the reference might answer with fewer
-  frames.
+- **A partially decodable clip keeps the frames that decode** (review fix F3): like
+  `_decode_video`, which appends a frame only when OpenCV retrieves it, a truncated clip
+  decodes fewer frames than were sampled and the prompt is built from those **with their
+  actual source indices** — the pair count, grid and timestamps come from the actual
+  frames, and an odd count is padded by repeating the last frame *and index*. Measured on
+  a faststart copy of `data/test.mp4` cut at 55 %: OpenCV keeps `[0, 4, 9, 13]` of the
+  eight samples and this side decodes exactly those four (grid `[2, 22, 30]`, 330 video
+  tokens, timestamps 0.2/1.4). Only a clip none of whose frames decode is
+  `no frame of the video could be decoded`.
+- **Decoder details are logged, not returned** (review fix F2): both refusals carry the
+  reference's own text (`the video could not be opened`, `no frame of the video could be
+  decoded`) instead of `ffprobe`/`ffmpeg` stderr, which names the temporary file a
+  `data:video/...` upload was written to; the stderr goes to `tracing::warn!`.
 
 Re-verified after phase 3 (dev host, f32 d3-lite, 2026-11-01): text parity **67/67**,
 max |Δp| **2.36e-06** (47 cases, 76,829 planned tokens, 583 s); image parity **8/8**,
@@ -579,3 +604,65 @@ limit`; a 305-second clip is `422 each video must be at most 300 seconds long`; 
 16-second clips (18,480 video tokens) are `422 the videos take 18,480 input tokens, over
 the 16,384 tokens a request may spend on videos; send fewer or shorter videos`; an
 unknown question type is the usual `422 {"invalid_questions": ...}`.
+
+### Review fixes (phase 3 control)
+
+**F1: `/v1/systemone` has its own body limit.** `1a57e22` raised the router-wide limit
+to 48 MiB, which let a 33 MiB `/v1/embeddings` body through where it had been a 413. The
+global limit is back to **32 MiB** (`MEDIA_BODY_LIMIT`) and only `/v1/systemone` is
+layered at **96 MiB** (`DECISION_BODY_LIMIT`; the per-item ceiling is a 32 MB video plus
+three 8 MB images, ≈75 MB of base64). Measured on the running servers: a 33 MiB and a
+49 MiB `/v1/embeddings` body → **413** (`Failed to buffer the request body: length limit
+exceeded`), 31 MiB → **400** (the transport accepted it), an **85.3 MB** two-video
+`/v1/systemone` body → **200** (`test_card` at 0.9990), a 74.7 MB media-sum body →
+**422** (`images[0]: the image could not be identified`) and a 98 MiB body → **413**
+(the route limit is real).
+
+**F2: decoder details stay out of the answer.** `ffprobe`/`ffmpeg` stderr names the
+temporary file a `data:video/...` upload is decoded from; both refusals now carry
+exactly the reference's text (`the video could not be opened`, `no frame of the video
+could be decoded`) while the stderr goes to `tracing::warn!`. Measured: an upload of
+garbage bytes answers `422 {"detail": "videos[0]: the video could not be opened"}` with
+no `/tmp/`, `upload-` or `@ 0x` in it (a unit test pins that, and the temporary upload
+file is still removed).
+
+**F3: a partially decodable clip answers.** `_decode_video` keeps only the frames
+OpenCV retrieves and hands their **actual indices** to `_video`; the decoder now does the
+same (one `ffmpeg` pass for the whole list, then a per-index probe when it comes back
+short, which is the only way to learn which planned frame numbers survived). A faststart
+copy of `data/test.mp4` cut at 55 % decodes `[0, 4, 9, 13]` — OpenCV's own subset — so
+the grid is `[2, 22, 30]` with 330 video tokens, timestamps 0.2/1.4 and **467** prompt
+tokens; the answer is `test_card` 0.9967110944 against the reference's 0.9967111287
+(max |dp| **4.05e-08**) and the prompt byte-identical. Only a clip none of whose frames
+decode is `no frame of the video could be decoded` (the same file's header without its
+media data: 422).
+
+**F4: images are validated first.** `prepare_media` now preprocesses every image
+*before* it plans the video token budget (the reference's `_prepare_videos` renders the
+images before it counts the videos), and the server checks and decodes `images` before
+`videos`. Measured: a 4000x10 PNG (aspect 400) together with seven 16-second clips
+answers `422 {"detail": "image rejected by the processor: absolute aspect ratio must be
+smaller than 200, got 400.0"}` instead of the video-budget error, while a valid cat
+image with the same clips answers the budget error (`18,480` tokens over `16,384`).
+
+**F5: the reference's tower wording.** `NO_VISION_TOWER` and `NO_VIDEO_TOWER` are the
+reference's own strings, `image inputs are not available: the checkpoint has no vision
+tower (visual.* weights)` and `video inputs are not available: …`, and a package without
+a tower reports the image reason when a request carries both. Measured on a d3-lite copy
+without `vision_config`: an image+video request gets the image text, a video-only request
+the video text.
+
+**F6: the gate runs from any directory.** The fixtures name their media relative to
+`examples/rocket-inference` (`data/test.mp4`) or absolutely (the checkpoint's `assets/`);
+`decision_parity.py` and `decision_reference.py` resolve a relative path against
+`examples/rocket-inference` (`--media-base` overrides) and print the base. The
+9-question gate was re-run from `examples/rocket-inference` and from the repository root:
+**9/9** both ways, max |dp| **3.96977e-06**, 95.0 s, 10,843 tokens.
+
+Re-verified after the review fixes (dev host, f32 d3-lite, 2026-11-01): video **9/9**,
+max |Δp| **3.96977e-06** (95.0 s, 10,843 tokens, from `examples/rocket-inference` and
+from the repository root); text **67/67**, max |Δp| **2.35687e-06** (47 cases, 597.3 s);
+image **8/8**, max |Δp| **7.69724e-06**; the literal-placeholder pair **2/2**, max |Δp|
+**1.15617e-07**; `cargo test -p rocket-inference --no-default-features` **162 passed**;
+`cargo fmt --all -- --check`, clippy (cpu and aarch64 `--features npu`) and the aarch64
+npu check clean.

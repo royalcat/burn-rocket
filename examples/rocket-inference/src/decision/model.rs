@@ -38,15 +38,29 @@ use super::vision::video::{DecodedVideo, thousands, video_replacement};
 use super::vision::{PreparedImage, VisionTower, prepare_from_rgb};
 use crate::qwen35_intent::model::IntentModel;
 
-/// Why a text-only d3 package refuses images (`d3_runtime`'s
-/// `image_unavailable` message shape).
+/// Why a text-only d3 package refuses images: the reference's own
+/// `image_unavailable` text, verbatim.
 pub const NO_VISION_TOWER: &str =
-    "image inputs are not available: this checkpoint has no vision tower";
+    "image inputs are not available: the checkpoint has no vision tower (visual.* weights)";
 
-/// Why a text-only d3 package refuses videos (the reference prefixes its video
-/// reason with `video inputs are not available:`).
+/// Why a text-only d3 package refuses videos: the reference reuses its image
+/// reason under the `video inputs are not available:` prefix.
 pub const NO_VIDEO_TOWER: &str =
-    "video inputs are not available: this checkpoint has no vision tower";
+    "video inputs are not available: the checkpoint has no vision tower (visual.* weights)";
+
+/// Why a media request cannot be served without a vision tower, images before
+/// videos: the reference loads `images` first (`d3_runtime.prepare` ->
+/// `load_images` then `load_videos`), so an image+video request on a text-only
+/// package reports the **image** reason.
+pub(crate) fn unavailable_media(images: usize, videos: usize) -> Option<&'static str> {
+    if images > 0 {
+        Some(NO_VISION_TOWER)
+    } else if videos > 0 {
+        Some(NO_VIDEO_TOWER)
+    } else {
+        None
+    }
+}
 
 /// Why [`DecisionModel::prepare`] failed, split by what the client can do about
 /// it: media the request supplied but the processor refuses is the reference's
@@ -262,20 +276,36 @@ impl DecisionModel {
             return Ok((Vec::new(), Vec::new()));
         }
         let Some(vision) = self.vision.as_ref() else {
-            return Err(PrepareError::media(if videos.is_empty() {
-                NO_VISION_TOWER
-            } else {
-                NO_VIDEO_TOWER
-            }));
+            let reason = unavailable_media(images.len(), videos.len())
+                .expect("media was checked to be nonempty");
+            return Err(PrepareError::media(reason));
         };
+        let config = &vision.config;
+        let device = &self.backbone.device;
+        // Images first: `_prepare_videos` renders (and so refuses) every image
+        // before it plans the video budget, so a request with a bad image **and**
+        // an over-budget video reports the image.
+        let mut pixels = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            // The processor's own refusals (aspect ratio, budgets) are the
+            // client's problem; they carry the reference's text.
+            let image = prepare_from_rgb(image, config, device).map_err(|error| {
+                PrepareError::media(format!("image rejected by the processor: {error:#}"))
+            })?;
+            if image.tokens == 0 {
+                return Err(PrepareError::media(format!(
+                    "images[{index}]: the processor produced no image tokens"
+                )));
+            }
+            pixels.push(image);
+        }
         if !videos.is_empty() && self.video_token_id == u32::MAX {
             return Err(PrepareError::media(
                 "video inputs are not available: the checkpoint declares no video token",
             ));
         }
-        let config = &vision.config;
-        // `_prepare_videos` plans the video token count first: all videos of one
-        // request together may not exceed 16,384 tokens.
+        // Then the video budget: all videos of one request together may not exceed
+        // 16,384 tokens.
         let mut planned = 0usize;
         for video in videos {
             planned += planned_video_tokens(video.frame_count(), video.height, video.width, config)
@@ -290,21 +320,6 @@ impl DecisionModel {
                 thousands(planned as u64),
                 thousands(VIDEO_MAX_TOKENS as u64)
             )));
-        }
-        let device = &self.backbone.device;
-        let mut pixels = Vec::with_capacity(images.len());
-        for (index, image) in images.iter().enumerate() {
-            // The processor's own refusals (aspect ratio, budgets) are the
-            // client's problem; they carry the reference's text.
-            let image = prepare_from_rgb(image, config, device).map_err(|error| {
-                PrepareError::media(format!("image rejected by the processor: {error:#}"))
-            })?;
-            if image.tokens == 0 {
-                return Err(PrepareError::media(format!(
-                    "images[{index}]: the processor produced no image tokens"
-                )));
-            }
-            pixels.push(image);
         }
         let mut prepared_images = Vec::with_capacity(pixels.len());
         if !pixels.is_empty() {
@@ -1007,6 +1022,23 @@ mod tests {
             );
         }
         prepared
+    }
+
+    /// F4/F5: images are reported before videos, with the reference's wording.
+    #[test]
+    fn the_media_unavailable_reason_names_images_first() {
+        assert_eq!(unavailable_media(0, 0), None);
+        assert_eq!(unavailable_media(1, 0), Some(NO_VISION_TOWER));
+        assert_eq!(unavailable_media(0, 1), Some(NO_VIDEO_TOWER));
+        assert_eq!(unavailable_media(2, 3), Some(NO_VISION_TOWER));
+        assert!(NO_VISION_TOWER.starts_with("image inputs are not available: "));
+        assert!(NO_VIDEO_TOWER.starts_with("video inputs are not available: "));
+        for message in [NO_VISION_TOWER, NO_VIDEO_TOWER] {
+            assert!(
+                message.ends_with("the checkpoint has no vision tower (visual.* weights)"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

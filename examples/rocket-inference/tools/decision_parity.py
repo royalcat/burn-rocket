@@ -56,12 +56,54 @@ def parse_args(argv=None):
     p.add_argument("--arg", action="append", default=[], metavar="FLAG",
                    help="extra CLI argument, repeatable (inserted before --requests)")
     p.add_argument("--command", default="decide", help="CLI subcommand (default decide)")
+    p.add_argument(
+        "--media-base",
+        default=None,
+        help="directory a case's relative images/videos paths resolve from "
+        "(default: the parent of the requests file's directory, i.e. "
+        "examples/rocket-inference)",
+    )
     p.add_argument("--timeout", type=float, default=None, help="seconds per case (default none)")
     p.add_argument("--min-top1", type=float, default=100.0,
                    help="required top-1 match percentage (default 100)")
     p.add_argument("--max-dp", type=float, default=2e-3,
                    help="largest allowed |delta probability| (default 2e-3)")
     return p.parse_args(argv)
+
+
+def media_base(args) -> Path:
+    """Where relative `images`/`videos` paths are resolved from.
+
+    The fixtures live in `examples/rocket-inference/tools/` and name their media
+    relative to `examples/rocket-inference` (`data/cat.jpeg`, `data/test.mp4`);
+    the CLI resolves a path against its own working directory, so the gate must
+    work from any cwd. The default is the parent of the requests file's directory.
+    """
+    if args.media_base:
+        return Path(args.media_base).expanduser().resolve()
+    return Path(args.requests).expanduser().resolve().parent.parent
+
+
+def resolve_media(case: dict, base: Path) -> dict:
+    """A copy of one case with its relative media paths made absolute."""
+    resolved = dict(case)
+    for field in ("images", "videos"):
+        entries = resolved.get(field)
+        if not isinstance(entries, list):
+            continue
+        paths = []
+        for entry in entries:
+            if (
+                isinstance(entry, str)
+                and entry
+                and not entry.startswith(("data:", "http://", "https://"))
+                and not Path(entry).is_absolute()
+            ):
+                paths.append(str(base / entry))
+            else:
+                paths.append(entry)
+        resolved[field] = paths
+    return resolved
 
 
 def load_json(path: Path):
@@ -147,6 +189,8 @@ def main(argv=None) -> int:
 
     fixtures = load_json(Path(args.requests))
     requests = {case["name"]: case for case in as_cases(fixtures)}
+    base = media_base(args)
+    print(f"media base: {base}")
     expected = ref["cases"]
     if args.limit is not None:
         expected = expected[: args.limit]
@@ -172,7 +216,8 @@ def main(argv=None) -> int:
         stem = f"{index:03d}-{''.join(c if c.isalnum() else '_' for c in str(name))}"
         request_file = work / f"{stem}.json"
         output_file = work / f"{stem}.out.json"
-        request_file.write_text(json.dumps([requests[name]], ensure_ascii=False, indent=2) + "\n",
+        case = resolve_media(requests[name], base)
+        request_file.write_text(json.dumps([case], ensure_ascii=False, indent=2) + "\n",
                                 encoding="utf-8")
         command = [str(binary), args.command, *args.arg, "--model-dir", str(model_dir),
                    "--requests", str(request_file), "--out", str(output_file)]

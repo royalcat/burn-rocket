@@ -736,11 +736,14 @@ impl DecisionEngine {
         // The server's media contract is the reference `d3_server.py` one: data
         // URLs only, never local paths or remote URLs. A media problem is the
         // reference's 422 `{"detail": "<reason>"}`; nothing runs.
-        if !req.videos.is_empty() && !self.model.has_vision() {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                crate::decision::model::NO_VIDEO_TOWER,
-            ));
+        // The reference loads `images` before `videos`, so a package without a
+        // tower reports an image request's reason even when the request also has
+        // videos, and an undecodable image is reported before an undecodable video.
+        if (!req.images.is_empty() || !req.videos.is_empty()) && !self.model.has_vision() {
+            let reason =
+                crate::decision::model::unavailable_media(req.images.len(), req.videos.len())
+                    .expect("the request carries media");
+            return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, reason));
         }
         let images = req
             .decode_images(MediaMode::DataUrls)
@@ -748,12 +751,6 @@ impl DecisionEngine {
         let videos = req
             .decode_videos(MediaMode::DataUrls)
             .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
-        if !images.is_empty() && !self.model.has_vision() {
-            return Err(ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                crate::decision::model::NO_VISION_TOWER,
-            ));
-        }
         // A refused image or video is the client's fault and keeps the
         // reference's 422 detail string; everything else (tokenizer, tower,
         // device) is a 500.

@@ -125,6 +125,10 @@ def parse_args(argv=None):
     p.add_argument("--threads", type=int, default=None, help="torch intra-op threads")
     p.add_argument("--verify", choices=("fast", "full", "none"), default="fast",
                    help="checkpoint manifest verification of the official loader")
+    p.add_argument("--media-base", default=None,
+                   help="directory a case's relative images/videos paths resolve from "
+                        "(default: the parent of the requests file's directory, i.e. "
+                        "examples/rocket-inference)")
     return p.parse_args(argv)
 
 
@@ -162,6 +166,35 @@ def load_requests(path: Path) -> list[dict]:
         if not isinstance(case["questions"], dict) or not case["questions"]:
             raise SystemExit(f"{path}: case {name!r} has no questions")
     return cases
+
+
+def media_base(args) -> Path:
+    """Where relative `images`/`videos` paths are resolved from (see the parity script)."""
+    if args.media_base:
+        return Path(args.media_base).expanduser().resolve()
+    return Path(args.requests).expanduser().resolve().parent.parent
+
+
+def resolve_media(case: dict, base: Path) -> dict:
+    """A copy of one case with its relative media paths made absolute."""
+    resolved = dict(case)
+    for field in ("images", "videos"):
+        entries = resolved.get(field)
+        if not isinstance(entries, list):
+            continue
+        paths = []
+        for entry in entries:
+            if (
+                isinstance(entry, str)
+                and entry
+                and not entry.startswith(("data:", "http://", "https://"))
+                and not Path(entry).is_absolute()
+            ):
+                paths.append(str(base / entry))
+            else:
+                paths.append(entry)
+        resolved[field] = paths
+    return resolved
 
 
 class ProcessorProxy:
@@ -592,6 +625,9 @@ def main(argv=None) -> int:
     )
 
     cases = load_requests(Path(args.requests))
+    base = media_base(args)
+    print(f"media base: {base}", flush=True)
+    cases = [resolve_media(case, base) for case in cases]
     if args.limit is not None:
         if args.limit < 0:
             raise SystemExit("--limit must be >= 0")
