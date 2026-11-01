@@ -5,13 +5,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use burn::prelude::*;
+use burn::tensor::{DType, TensorData};
 use tokenizers::Tokenizer;
 
 use super::config::{self, DecisionConfig};
 use super::model::DecisionModel;
+use super::vision::TensorSource;
 use crate::qwen35_intent::loader::{IntentLoadOptions, load_intent_model};
 use crate::qwen35_intent::model::IntentModel;
-use crate::util::checkpoint::{self, Checkpoint};
+use crate::util::checkpoint::{self, AnyCheckpoint, Checkpoint};
 
 /// The text-backbone key prefix of a d3 checkpoint (`language_model.layers.0...`,
 /// `language_model.embed_tokens.weight`).
@@ -25,6 +27,17 @@ pub fn manifest_model_name(model_dir: &Path) -> Option<String> {
         .get("model_name")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+/// The vision tower's `visual.*` tensors, f32, from a d3 checkpoint.
+///
+/// `super::vision::VisionTower::load` only needs these reads, so the tower stays
+/// independent of the app's checkpoint abstraction (the standalone vision probe
+/// reads the same keys from a safetensors file directly).
+impl TensorSource for AnyCheckpoint {
+    fn vision_tensor(&mut self, key: &str) -> Result<Option<TensorData>> {
+        self.get(key, DType::F32)
+    }
 }
 
 /// Load a d3 checkpoint directory.

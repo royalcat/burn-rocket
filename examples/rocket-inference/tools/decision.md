@@ -62,7 +62,10 @@ Measured on the 32-core host (no GPU, torch 2.15 CPU, `batch_size 1`): d3-lite b
 503 s for 47 cases / 67 questions / 76,829 prompt tokens (8.4 min, 1.2-56 s per case);
 d3-lite f32 173 s; d3-nano bf16 101 s for four cases (a 6,307-token case alone takes
 92 s).  Repeated runs are bit-identical (4 cases run twice, choice/noul/score and a
-41 s long case).
+41 s long case) **at a fixed thread count**: `--threads N` changes ATen's GEMM
+partition and moves probabilities by up to 1e-6, so regenerate a reference with the
+same thread setting as the run you compare against (the numbers below use torch's
+default count).
 
 ## Parity
 
@@ -76,8 +79,11 @@ bare response. The parity script reads the answers either from that official sha
 Implementation: `examples/rocket-inference/src/decision/` (the `d3_format.py` contract, the
 readout head, the prompt/answer path) on the intent family's Qwen3.5 backbone
 (`src/qwen35_intent/`), with `IntentModel::full_attn_causal = false` for the checkpoint's
-`noncausal_full_attention` mode. Phase 1 is the text path: `images`/`videos` are refused
-with a 400 until the vision tower lands.
+`noncausal_full_attention` mode. The text path is complete; the vision tower and the
+image processor landed in phase 2a (`src/decision/vision/`, gated by
+`decision_vision_probe` + `tools/vision_parity.py` below), but the multimodal RoPE
+splice and the request's `images` field are phase 2b, so requests still refuse images
+with a 400.
 
 ```sh
 /tmp/opencode/d3/venv/bin/python tools/decision_parity.py \
@@ -141,3 +147,66 @@ repo cannot carry `readout.safetensors`), and a directory with several sharded
 domains: support-ticket routing, receipt totals, sentiment, policy compliance,
 scheduling, structured account state, intent, language and audit findings.  Every
 string is newline-free; receipt totals are computed from their line items.
+
+## Images (phase 2a)
+
+`decision_fixtures_images.json`: 7 image cases / 8 questions, each with an `images` list
+of local paths the request shares across its questions.  Assets: the checkpoint's own
+`assets/{example-receipt,index-pareto,banner,serving-throughput}.png` (absolute paths
+under the model directory) plus `data/cat.jpeg`, relative to this directory — run the
+reference from `examples/rocket-inference`.  The cases cover a receipt total, a chart
+comparison, a photo, a banner, two images in one request, an image with a ticket state,
+and one image with two questions.  Rendered prompts put every image (as
+`<|vision_start|><|image_pad|><|vision_end|>`) immediately after `<|im_start|>user\n`
+with no separator, then the `State:` block.
+
+```sh
+/tmp/opencode/d3/venv/bin/python tools/decision_reference.py \
+    --model /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures_images.json \
+    --out /tmp/opencode/d3/ref_images_lite_f32.json \
+    --dump-vision /tmp/opencode/d3/dump-images-lite-f32 \
+    --backbone-dtype f32
+```
+
+`--dump-vision` writes per question the processor's `pixel_values`/`image_grid_thw` and
+the expanded prompt, the processor's `input_ids`/`mm_token_type_ids`/`attention_mask`
+rows, the tower's pooled output (`backbone.get_image_features(...).pooler_output`, the
+concatenation over images, f32), the multimodal RoPE positions
+(`compute_3d_position_ids`, `[3, 1, L]`), the final-normed hidden and the raw code
+logits.  The processor tensors are the recorded `D3.image_logits` batch (the run's own
+call, unchanged); `pooled`/`mrope` are the backbone's own methods on those tensors.
+
+Measured (dev host, 32 cores, f32, 2026-11-01, torch default thread count): d3-lite
+**53.7 s** for 7 cases / 8 questions / 10,680 planned tokens (per case 2.9-14.0 s), every
+answer intended (`100_to_150`, `decision_3`, `cat`, `lite`, `first`, `matches=true`,
+`total=100_to_150`, `payment=visa`).  d3-nano f32 (3 cases, 42.1 s) answers the same
+receipt as `over_150` -- the reference convention, not a parity problem.
+
+The Rust side is `src/decision/vision/` (tower + processor) and the standalone probe:
+
+```sh
+decision_vision_probe --model-dir /tmp/opencode/d3/models/d3-lite \
+    --image <path> [--image <path> ...] --out /tmp/opencode/d3/probe/receipt
+/tmp/opencode/d3/venv/bin/python tools/vision_parity.py \
+    --ref /tmp/opencode/d3/dump-images-lite-f32 --probe /tmp/opencode/d3/probe/receipt \
+    --stem image-receipt-total__total
+```
+
+The probe loads only `config.json` and the `visual.*` tensors (no text backbone), writes
+`pixel_values.f32` (`[patches, 1536]`), `pooled.f32` (`[tokens, out_hidden]`) and a
+`meta.json` (per image source/resized size, grid, patches, tokens, row offsets), and the
+parity script gates pixel `max|Δ| <= 1e-6`, pooled cosine `>= 0.9999` and an exact
+grid/token match.
+
+Measured (dev host, 32 cores, f32 d3-lite, 2026-11-01, 8 dumped entries): pixel
+`max|Δ|` **0** on every image (the resize/normalize/patchify are bit-identical to
+torchvision's processor), pooled cosine **0.999999961-0.999999973** (max |Δ| 1.29e-3 to
+1.48e-3 at a pooled peak of 3.7-5.5), grid/token exact; tower wall 3.4-13.1 s per probe
+run (2520-9744 patches, load 0.2 s; d3-nano 8.2-21.4 s).  d3-nano (depth 24, hidden
+1024, out 2048) gives the same 0 pixel delta and cosine 0.999999970-0.999999985 on
+receipt/pareto/cat, which is what pins the dimension-generic loader.
+
+Text behaviour is unchanged: the phase-1 parity still reports 67/67 top-1 and max
+|Δp| 2.36e-06 over the 47 text cases, and `system_one`/`decide`/`/v1/systemone` still
+refuse images (the multimodal RoPE splice and the request field are phase 2b).

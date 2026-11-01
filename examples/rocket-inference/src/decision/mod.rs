@@ -12,12 +12,17 @@
 //! checkpoint's `d3_format.py`; the checkpoint metadata and readout head are in
 //! [`config`]. `tools/decision.md` and `tools/decision_parity.py` are the
 //! reference and the parity gate.
+//!
+//! Images (Phase 2a): [`vision`] holds the Qwen3.5 vision tower and the Qwen2-VL
+//! image processor. It is not wired into the text path yet — the multimodal RoPE,
+//! the placeholder splice and the request's `images` field are Phase 2b.
 
 pub mod config;
 pub mod format;
 pub mod load;
 pub mod model;
 pub mod request;
+pub mod vision;
 
 pub use load::load_decision_model;
 pub use model::DecisionModel;
