@@ -97,9 +97,9 @@ impl Family {
         matches!(self, Self::Qwen3Embed | Self::Emb2 | Self::Gemma4)
     }
 
-    /// Resident group-wise int8 NPU weights (emb2 text backbone).
+    /// Resident group-wise int8 NPU weights (the emb2 and d3 text backbones).
     pub fn supports_int8(self) -> bool {
-        matches!(self, Self::Emb2)
+        matches!(self, Self::Emb2 | Self::Decision)
     }
 
     /// Keeping CPU copies of NPU-packed projections is meaningful for the two
@@ -239,7 +239,12 @@ mod tests {
         assert!(!d.supports_decode());
         assert!(!d.supports_dtype());
         assert!(!d.supports_quant());
-        assert!(!d.supports_int8());
+        // The d3 text backbone packs the same resident int8 weights as emb2.
+        assert!(d.supports_int8());
+        assert!(Family::Emb2.supports_int8());
+        assert!(!Family::Intent.supports_int8());
+        assert!(!Family::Qwen3Embed.supports_int8());
+        assert!(!Family::Gemma4.supports_int8());
         assert!(!d.supports_keep_cpu_weights());
         // The vision tower is a CPU stage that loads with the backbone; the flag
         // moves that load to the first media request.

@@ -233,15 +233,16 @@ placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=C
 ```
 
 Related flags: `--npu-threads` (default 5), `--npu-dtype fp16|int8` and
-`--int8-group` (EmbeddingGemma 2 text projections; int8 is a memory/fidelity
-option, not a speed one), `--keep-cpu-weights auto|yes|no` (intent/gemma4:
-whether the packed projections keep their CPU copies; `auto` keeps them exactly
-when a stage runs on the CPU, so `--decode-device npu` alone drops them),
-`--attn-kernel fused|blocked` and `--vision-attn-kernel fused|blocked` (the CPU
-attention kernels used when that attention stage is not offloaded),
-`--chunk`/`--key-block` (qwen3 blocked tiles), `--attn-chunk` (chunked attention
-width, default 1024), `--dtype`, `--quant none|q8` (Q8-resident CPU weights;
-`--quant q8` does not touch NPU-packed weights) and `--defer-towers`.
+`--int8-group` (the embeddinggemma and decision text projections; int8 is a
+memory/fidelity option, not a speed one), `--keep-cpu-weights auto|yes|no`
+(intent/gemma4: whether the packed projections keep their CPU copies; `auto`
+keeps them exactly when a stage runs on the CPU, so `--decode-device npu` alone
+drops them), `--attn-kernel fused|blocked` and `--vision-attn-kernel
+fused|blocked` (the CPU attention kernels used when that attention stage is not
+offloaded), `--chunk`/`--key-block` (qwen3 blocked tiles), `--attn-chunk`
+(chunked attention width, default 1024), `--dtype`, `--quant none|q8`
+(Q8-resident CPU weights; `--quant q8` does not touch NPU-packed weights) and
+`--defer-towers`.
 
 `--defer-towers` applies to `embeddinggemma` and `gemma4` (their vision/audio
 tower halves) and to `decision`, whose CPU vision tower otherwise loads with the

@@ -871,3 +871,15 @@ Memory, text-only `--defer-towers`, one 128-token case (`RssAnon` sampled every 
 `--embed-f16` in parentheses): d3-lite resident **2,222** (2,462) MiB, peak **2,397**
 (2,583); d3-nano resident **5,804** (6,287), peak **5,969** (6,457). The loader consumes
 the checkpoint's f32 table in place, so the int8 load also peaks lower than the f16 cast.
+
+## NPU int8 text weights (phase M3)
+
+`decide` and `serve` accept `--npu-dtype int8` for d3: the text backbone's resident
+weights are then packed as group-wise int8 (W8A8, `--int8-group <g>`, a multiple of 32
+that divides K) instead of fp16, which halves their packed bytes (`n·k` per int8 weight
+against `2·n·k` fp16; the ready line reports the packed sum — 948 MiB for d3-lite's 96
+weights, while the d3 board round measured 1,006.7 MiB of fp16 weight BO). It is
+opt-in (fp16 stays the default), requires `--device npu` / `--text-device npu` (the
+pack-and-drop load needs the packed stage), and is independent of the token table's
+`--embed-int8`. The group is chosen by the board sweep in phase M6 — **quality, wall
+time and the exact int8 BO bytes are not measured yet**; the CLI default is 32.

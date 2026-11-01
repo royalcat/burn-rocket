@@ -229,11 +229,12 @@ output:
 
 placement / model:
   --device / --text-device auto|cpu|npu
-  --model-dir / --family / --cpu-backend / --npu-threads /
-  --embed-int8 (default) / --embed-f16 / --defer-towers
-    --embed-int8 keeps the tied token table as per-row int8 (the default);
-    --embed-f16 keeps the exact table; --defer-towers loads the vision tower
-    on the first media request.
+  --model-dir / --family / --cpu-backend / --npu-threads / --npu-dtype /
+  --int8-group / --embed-int8 (default) / --embed-f16 / --defer-towers
+    --npu-dtype int8 packs the text projections as resident int8 (opt-in,
+    `--int8-group` default 32); --embed-int8 keeps the tied token table as
+    per-row int8 (the default); --embed-f16 keeps the exact table;
+    --defer-towers loads the vision tower on the first media request.
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -631,13 +632,17 @@ impl LoadArgs {
         }
         if self.npu_dtype.is_some() && !family.supports_int8() {
             bail!(
-                "--npu-dtype only applies to the embeddinggemma text backbone, \
-                 not the {} model",
+                "--npu-dtype only applies to the embeddinggemma and decision text \
+                 backbones, not the {} model",
                 family.name()
             );
         }
         if self.int8_group.is_some() && !family.supports_int8() {
-            bail!("--int8-group only applies to the embeddinggemma text backbone");
+            bail!(
+                "--int8-group only applies to the embeddinggemma and decision text \
+                 backbones, not the {} model",
+                family.name()
+            );
         }
 
         // ---- placement ----
@@ -675,21 +680,8 @@ impl LoadArgs {
         };
 
         // ---- NPU precision ----
-        let npu_dtype = self.npu_dtype.unwrap_or(NpuDtype::Fp16);
-        if npu_dtype == NpuDtype::Int8 {
-            if !placement.text {
-                bail!(
-                    "--npu-dtype int8 requires the text projections on the NPU \
-                     (`--text-device npu`)"
-                );
-            }
-            if self.int8_group.is_some() && !avail {
-                bail!("{}", npu_build_error("--int8-group"));
-            }
-        } else if self.int8_group.is_some() {
-            bail!("--int8-group requires `--npu-dtype int8`");
-        }
-        let int8_group = self.int8_group.unwrap_or(32);
+        let (npu_dtype, int8_group) =
+            resolve_npu_dtype(self.npu_dtype, self.int8_group, placement.text, avail)?;
 
         // ---- CPU copies of NPU-packed projections ----
         let keep_cpu_weights = if family.supports_keep_cpu_weights() {
@@ -774,6 +766,33 @@ fn resolve_embed_table(
         (Some(false), _) => Ok((family == Family::Decision, false)),
         (None, _) => Ok((false, family == Family::Decision)),
     }
+}
+
+/// Resolve `--npu-dtype`/`--int8-group` into the resident-precision pair.
+///
+/// int8 needs the text projections on the NPU: the loader packs them there in one
+/// pass and drops the host copies, so a CPU text stage can never use int8 weights.
+fn resolve_npu_dtype(
+    requested: Option<NpuDtype>,
+    int8_group: Option<usize>,
+    text_on_npu: bool,
+    available: bool,
+) -> Result<(NpuDtype, usize)> {
+    let npu_dtype = requested.unwrap_or(NpuDtype::Fp16);
+    if npu_dtype == NpuDtype::Int8 {
+        if !text_on_npu {
+            bail!(
+                "--npu-dtype int8 requires the text projections on the NPU \
+                 (`--text-device npu`)"
+            );
+        }
+        if int8_group.is_some() && !available {
+            bail!("{}", npu_build_error("--int8-group"));
+        }
+    } else if int8_group.is_some() {
+        bail!("--int8-group requires `--npu-dtype int8`");
+    }
+    Ok((npu_dtype, int8_group.unwrap_or(32)))
 }
 
 /// Resolve one stage: the explicit flag, else the base device, else the build
@@ -869,6 +888,13 @@ pub struct ResolvedLoad {
 }
 
 impl ResolvedLoad {
+    /// The int8 K-group for the resident NPU text weights (`--npu-dtype int8`),
+    /// else `None` (fp16). The decision loader takes it as
+    /// `IntentLoadOptions::npu_int8`; the intent family has no int8 flag.
+    pub fn npu_int8(&self) -> Option<usize> {
+        (self.npu_dtype == NpuDtype::Int8).then_some(self.int8_group)
+    }
+
     /// The one-line placement report printed before loading.
     pub fn placement_line(&self) -> String {
         let text_npu = self.placement.text;
@@ -1085,6 +1111,70 @@ mod tests {
         assert!(format!("{err:#}").contains("--text-device npu"));
         let err = resolve(&["--int8-group", "64"], Family::Emb2).unwrap_err();
         assert!(format!("{err:#}").contains("--npu-dtype int8"));
+    }
+
+    /// `--npu-dtype int8` needs the packed text stage; the group flag is only
+    /// meaningful with int8, and the default group is 32.
+    #[test]
+    fn int8_resolves_only_with_the_text_stage_on_the_npu() {
+        // An NPU build with the text stage packed resolves both flags.
+        assert_eq!(
+            resolve_npu_dtype(Some(NpuDtype::Int8), Some(128), true, true).unwrap(),
+            (NpuDtype::Int8, 128)
+        );
+        assert_eq!(
+            resolve_npu_dtype(Some(NpuDtype::Int8), None, true, true).unwrap(),
+            (NpuDtype::Int8, 32),
+            "the default group is 32"
+        );
+        assert_eq!(
+            resolve_npu_dtype(None, None, true, true).unwrap(),
+            (NpuDtype::Fp16, 32),
+            "fp16 is the default everywhere"
+        );
+        // A CPU text stage does not pack the weights, so int8 cannot apply.
+        for available in [true, false] {
+            let err = resolve_npu_dtype(Some(NpuDtype::Int8), None, false, available).unwrap_err();
+            assert!(format!("{err:#}").contains("--text-device npu"));
+        }
+        // `--int8-group` without `--npu-dtype int8` is a mistake, not a no-op.
+        let err = resolve_npu_dtype(None, Some(64), true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `--npu-dtype int8`"));
+        let err = resolve_npu_dtype(Some(NpuDtype::Fp16), Some(64), true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `--npu-dtype int8`"));
+    }
+
+    /// Only the two families whose text backbone packs resident int8 weights take
+    /// `--npu-dtype`/`--int8-group`; for the decision family the flag is accepted
+    /// and the host build refuses only the placement.
+    #[test]
+    fn int8_is_family_scoped() {
+        assert!(Family::Decision.supports_int8());
+        assert!(Family::Emb2.supports_int8());
+        for family in [Family::Intent, Family::Gemma4, Family::Qwen3Embed] {
+            assert!(!family.supports_int8());
+            let err = resolve(&["--npu-dtype", "int8"], family).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("--npu-dtype only applies"), "{message}");
+            assert!(message.contains("embeddinggemma and decision"), "{message}");
+            let err = resolve(&["--int8-group", "64"], family).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("--int8-group only applies"), "{message}");
+        }
+        // The decision family passes the family check: on a CPU-only host build
+        // the only refusal is the missing NPU, i.e. the flag itself is valid.
+        let err = resolve(
+            &["--npu-dtype", "int8", "--device", "npu"],
+            Family::Decision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("aarch64 build"));
+        let err = resolve(
+            &["--npu-dtype", "int8", "--text-device", "npu"],
+            Family::Decision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("--text-device npu requires"));
     }
 
     #[test]

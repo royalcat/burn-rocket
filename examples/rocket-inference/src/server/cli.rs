@@ -226,6 +226,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 npu_threads: load.npu_threads,
                 embed_f16: load.embed_f16,
                 embed_int8: load.embed_int8,
+                npu_int8: load.npu_int8(),
                 ..IntentLoadOptions::default()
             };
             let model =

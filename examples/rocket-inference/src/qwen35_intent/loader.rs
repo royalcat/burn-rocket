@@ -2,6 +2,9 @@
 //! `model.language_model.*` (ignoring the vision tower and any MTP head) from an
 //! [`AnyCheckpoint`] (safetensors or GGUF) and, in NPU mode, packs the projection
 //! groups straight into resident NPU memory (`pack`/`pack2`/`pack3`, pack-and-drop).
+//! [`IntentLoadOptions::npu_int8`] packs the same groups as group-wise int8 (W8A8)
+//! instead of fp16; the fused groups concatenate along N, which is the row order
+//! `pack2`/`pack3` use for fp16.
 //!
 //! The same loader serves the `decision` family (a d3 checkpoint whose text
 //! backbone sits at the unprefixed `language_model.*` keys) through
@@ -42,6 +45,11 @@ pub struct IntentLoadOptions {
     /// Store the tied table as per-row symmetric int8 (halves f16 again; the
     /// decision family's default). Mutually exclusive with [`Self::embed_f16`].
     pub embed_int8: bool,
+    /// Pack the text projections as group-wise int8 resident NPU weights (the
+    /// W8A8 route: one scale per `group`-wide K block, per-row activation
+    /// quantization; the group must be a multiple of 32 and divide K). `None` =
+    /// fp16, the default everywhere. Independent of [`Self::embed_int8`].
+    pub npu_int8: Option<usize>,
     /// Checkpoint key prefix of the text backbone (`model.language_model.` for the
     /// intent SFT, `language_model.` for a d3 decision checkpoint).
     pub prefix: &'static str,
@@ -61,6 +69,7 @@ impl Default for IntentLoadOptions {
             npu_threads: 5,
             embed_f16: false,
             embed_int8: false,
+            npu_int8: None,
             prefix: "model.language_model.",
             label: "intent",
             rope_max_seq: None,
@@ -115,23 +124,106 @@ fn cpu_proj_f16(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<
     }))
 }
 
-#[cfg(all(feature = "npu", target_arch = "aarch64"))]
-fn npu_pack(ckpt: &mut AnyCheckpoint, key: &str, device: &Device) -> Result<burn_rocket::WeightId> {
-    Ok(burn_rocket::pack(read2(ckpt, key, device)?))
+/// Resident NPU weights packed by one load: the ready line reports their count
+/// and packed bytes.
+#[derive(Debug, Default)]
+struct Packed {
+    weights: usize,
+    /// `n*k` bytes per int8 weight, `2*n*k` per fp16 weight.
+    bytes: usize,
 }
 
+#[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+impl Packed {
+    fn add(&mut self, n: usize, k: usize, int8: Option<usize>) {
+        self.weights += 1;
+        self.bytes += n * k * if int8.is_some() { 1 } else { 2 };
+    }
+}
+
+/// Validate a group-wise int8 resident pack: the W8A8 driver stores one scale per
+/// `group`-wide K block and its cube scatter pads N to 32, so the group must be a
+/// positive multiple of 32, divide K, and N must be 32-aligned.
+#[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+fn check_int8_pack(key: &str, n: usize, k: usize, group: usize) -> Result<()> {
+    if group == 0 || !group.is_multiple_of(32) {
+        bail!("--npu-dtype int8: group {group} must be a positive multiple of 32 ({key})");
+    }
+    if !k.is_multiple_of(group) {
+        bail!(
+            "--npu-dtype int8: group {group} does not divide {key}'s K={k} \
+             (a group must be a multiple of 32 that divides K)"
+        );
+    }
+    if !n.is_multiple_of(32) {
+        bail!("--npu-dtype int8: {key} has N={n}, which is not a multiple of 32");
+    }
+    Ok(())
+}
+
+/// A fused projection group's row order: the `[N_i, K]` blocks concatenated along
+/// N. `pack2`/`pack3` pack the same order for fp16 (the N blocks are
+/// independent), so an int8 fused weight keeps every consumer's slice offsets.
+#[cfg_attr(not(all(feature = "npu", target_arch = "aarch64")), allow(dead_code))]
+fn cat_group(parts: Vec<Tensor<2>>) -> Tensor<2> {
+    Tensor::cat(parts, 0)
+}
+
+/// Pack one `[N, K]` (HF convention) weight: group-wise int8 under
+/// `--npu-dtype int8`, else fp16.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn npu_pack(
+    ckpt: &mut AnyCheckpoint,
+    key: &str,
+    device: &Device,
+    int8: Option<usize>,
+    packed: &mut Packed,
+) -> Result<burn_rocket::WeightId> {
+    let w = read2(ckpt, key, device)?;
+    let [n, k] = w.shape().dims::<2>();
+    let id = match int8 {
+        Some(group) => {
+            check_int8_pack(key, n, k, group)?;
+            burn_rocket::pack_i8(w, group)
+        }
+        None => burn_rocket::pack(w),
+    };
+    packed.add(n, k, int8);
+    Ok(id)
+}
+
+/// Pack a two-block fused group (`qkv|z`, `gate|up`): one resident weight whose
+/// N is `N_a + N_b`.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn npu_pack2(
     ckpt: &mut AnyCheckpoint,
     a: &str,
     b: &str,
     device: &Device,
+    int8: Option<usize>,
+    packed: &mut Packed,
 ) -> Result<burn_rocket::WeightId> {
     let wa = read2(ckpt, a, device)?;
     let wb = read2(ckpt, b, device)?;
-    Ok(burn_rocket::pack2(wa, wb))
+    let [na, k] = wa.shape().dims::<2>();
+    let [nb, kb] = wb.shape().dims::<2>();
+    if k != kb {
+        bail!("fused group {a} + {b}: K differs ({k} vs {kb})");
+    }
+    let n = na + nb;
+    let id = match int8 {
+        Some(group) => {
+            check_int8_pack(&format!("{a} + {b}"), n, k, group)?;
+            burn_rocket::pack_i8(cat_group(vec![wa, wb]), group)
+        }
+        None => burn_rocket::pack2(wa, wb),
+    };
+    packed.add(n, k, int8);
+    Ok(id)
 }
 
+/// Pack a three-block fused group (`q|k|v`): one resident weight whose N is
+/// `N_a + N_b + N_c`.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 fn npu_pack3(
     ckpt: &mut AnyCheckpoint,
@@ -139,11 +231,28 @@ fn npu_pack3(
     b: &str,
     c: &str,
     device: &Device,
+    int8: Option<usize>,
+    packed: &mut Packed,
 ) -> Result<burn_rocket::WeightId> {
     let wa = read2(ckpt, a, device)?;
     let wb = read2(ckpt, b, device)?;
     let wc = read2(ckpt, c, device)?;
-    Ok(burn_rocket::pack3(wa, wb, wc))
+    let [na, k] = wa.shape().dims::<2>();
+    let [nb, kb] = wb.shape().dims::<2>();
+    let [nc, kc] = wc.shape().dims::<2>();
+    if k != kb || k != kc {
+        bail!("fused group {a} + {b} + {c}: K differs ({k} vs {kb} vs {kc})");
+    }
+    let n = na + nb + nc;
+    let id = match int8 {
+        Some(group) => {
+            check_int8_pack(&format!("{a} + {b} + {c}"), n, k, group)?;
+            burn_rocket::pack_i8(cat_group(vec![wa, wb, wc]), group)
+        }
+        None => burn_rocket::pack3(wa, wb, wc),
+    };
+    packed.add(n, k, int8);
+    Ok(id)
 }
 
 /// Load the intent model from a checkpoint, with its config.
@@ -176,12 +285,18 @@ pub fn load_intent_model(
         bail!("--npu requires an aarch64 build with --npu (the burn-rocket NPU feature)");
     }
 
-    let mut packed = 0usize;
+    let mut packed = Packed::default();
     let prefix = opts.prefix;
 
     // Global tensors.
     if opts.embed_f16 && opts.embed_int8 {
         bail!("the token table cannot be both f16 and int8 (pick one)");
+    }
+    if opts.npu_int8.is_some() && !opts.text {
+        bail!(
+            "npu_int8 is set but the text projections are not packed \
+             (`--npu-dtype int8` needs the text stage on the NPU)"
+        );
     }
     let embed_key = format!("{prefix}embed_tokens.weight");
     model.embed = if opts.embed_int8 {
@@ -220,11 +335,18 @@ pub fn load_intent_model(
                 &p("mlp.gate_proj.weight"),
                 &p("mlp.up_proj.weight"),
                 device,
+                opts.npu_int8,
+                &mut packed,
             )?;
-            let down = npu_pack(ckpt, &p("mlp.down_proj.weight"), device)?;
+            let down = npu_pack(
+                ckpt,
+                &p("mlp.down_proj.weight"),
+                device,
+                opts.npu_int8,
+                &mut packed,
+            )?;
             layer.mlp.gateup_fused = Some(gateup);
             layer.mlp.down_fused = Some(down);
-            packed += 2;
         }
         if opts.npu {
             if opts.keep_cpu_weights {
@@ -244,17 +366,25 @@ pub fn load_intent_model(
         }
     }
 
+    let resident = if opts.npu {
+        let kind = match opts.npu_int8 {
+            Some(group) => format!("int8 g{group}"),
+            None => "fp16".to_string(),
+        };
+        format!(
+            ", {} resident NPU weights ({kind}, {:.1} MiB)",
+            packed.weights,
+            packed.bytes as f64 / (1u64 << 20) as f64
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "{} model ready in {:.2}s ({} layers, embed {}{})",
+        "{} model ready in {:.2}s ({} layers, embed {}{resident})",
         opts.label,
         t0.elapsed().as_secs_f64(),
         cfg.num_hidden_layers,
         model.embed.mode(),
-        if opts.npu {
-            format!(", {packed} resident NPU weights")
-        } else {
-            String::new()
-        }
     );
     Ok(model)
 }
@@ -266,7 +396,7 @@ fn load_linear(
     p: &impl Fn(&str) -> String,
     device: &Device,
     opts: &IntentLoadOptions,
-    packed: &mut usize,
+    packed: &mut Packed,
 ) -> Result<()> {
     let _ = &packed;
     dn.conv_w = {
@@ -302,11 +432,18 @@ fn load_linear(
             &p("linear_attn.in_proj_qkv.weight"),
             &p("linear_attn.in_proj_z.weight"),
             device,
+            opts.npu_int8,
+            packed,
         )?;
-        let out_id = npu_pack(ckpt, &p("linear_attn.out_proj.weight"), device)?;
+        let out_id = npu_pack(
+            ckpt,
+            &p("linear_attn.out_proj.weight"),
+            device,
+            opts.npu_int8,
+            packed,
+        )?;
         dn.qkvz_fused = Some(qkvz);
         dn.out_fused = Some(out_id);
-        *packed += 2;
     }
     if opts.npu {
         if opts.keep_cpu_weights {
@@ -329,7 +466,7 @@ fn load_full(
     p: &impl Fn(&str) -> String,
     device: &Device,
     opts: &IntentLoadOptions,
-    packed: &mut usize,
+    packed: &mut Packed,
 ) -> Result<()> {
     let _ = &packed;
     fa.q_norm_w = read_norm1(ckpt, &p("self_attn.q_norm.weight"), device)?;
@@ -343,11 +480,18 @@ fn load_full(
             &p("self_attn.k_proj.weight"),
             &p("self_attn.v_proj.weight"),
             device,
+            opts.npu_int8,
+            packed,
         )?;
-        let o_id = npu_pack(ckpt, &p("self_attn.o_proj.weight"), device)?;
+        let o_id = npu_pack(
+            ckpt,
+            &p("self_attn.o_proj.weight"),
+            device,
+            opts.npu_int8,
+            packed,
+        )?;
         fa.qkv_fused = Some(qkv);
         fa.o_fused = Some(o_id);
-        *packed += 2;
     }
     if opts.npu {
         if opts.keep_cpu_weights {
@@ -473,5 +617,76 @@ mod tests {
         assert_eq!(rows.len(), ids.len() * cfg.hidden_size);
         assert!(rows.iter().all(|v| v.is_finite()), "rows are finite");
         assert!(rows.iter().any(|v| *v != 0.0), "rows are not all zero");
+    }
+
+    /// The W8A8 driver takes one scale per `group`-wide K block, stores the codes
+    /// as `[N, K/group]` and pads N to 32, so a group that does not divide K (or a
+    /// 16-aligned N) must be refused before the pack, with the tensor named.
+    #[test]
+    fn the_int8_group_must_fit_the_driver() {
+        for group in [32, 64, 128, 512, 2048] {
+            assert!(
+                check_int8_pack("mlp.down_proj", 1024, 2048, group).is_ok(),
+                "g{group} divides K=2048 and N=1024 is 32-aligned"
+            );
+        }
+        let message = |n: usize, k: usize, g: usize| {
+            format!(
+                "{:#}",
+                check_int8_pack("mlp.down_proj", n, k, g).unwrap_err()
+            )
+        };
+        assert!(message(1024, 2048, 0).contains("positive multiple of 32"));
+        assert!(message(1024, 2048, 48).contains("positive multiple of 32"));
+        // K must be a whole number of groups (a ragged last block is not packed).
+        let ragged = message(1024, 1000, 64);
+        assert!(ragged.contains("does not divide"), "{ragged}");
+        assert!(ragged.contains("K=1000"), "{ragged}");
+        // N is scattered in 32-row cubes.
+        assert!(message(16, 2048, 32).contains("not a multiple of 32"));
+    }
+
+    /// A fused group is one resident weight: the checkpoint's `[N_i, K]` blocks
+    /// concatenated along N, in the checkpoint's order, which is what `pack2`/
+    /// `pack3` do for fp16 and what the consumers' slice offsets assume.
+    #[test]
+    fn a_fused_group_concatenates_along_n_in_checkpoint_order() {
+        let device = Device::default();
+        let block = |rows: usize, k: usize, base: f32| {
+            let data: Vec<f32> = (0..rows * k).map(|i| base + i as f32).collect();
+            Tensor::<2>::from_data(TensorData::new(data, [rows, k]), (&device, DType::F32))
+        };
+        let a = block(2, 3, 0.0);
+        let b = block(1, 3, 100.0);
+        let c = block(3, 3, 200.0);
+        let fused = cat_group(vec![a.clone(), b.clone(), c.clone()]);
+        assert_eq!(fused.shape().dims::<2>(), [6, 3], "N sums, K is shared");
+        let values: Vec<f32> = fused.into_data().try_to_vec().expect("f32 rows");
+        let mut expected: Vec<f32> = Vec::new();
+        for part in [a, b, c] {
+            expected.extend(
+                part.into_data()
+                    .try_to_vec::<f32>()
+                    .expect("f32 block rows"),
+            );
+        }
+        assert_eq!(values, expected, "the rows keep the [a; b; c] block order");
+    }
+
+    /// The ready line's byte count: `n*k` bytes per int8 weight, `2*n*k` per fp16
+    /// weight, summed over the packed groups (96 for d3-lite).
+    #[test]
+    fn resident_weight_bytes_halve_with_int8() {
+        let mut fp16 = Packed::default();
+        fp16.add(3584, 1024, None);
+        fp16.add(1024, 3584, None);
+        assert_eq!(fp16.weights, 2);
+        assert_eq!(fp16.bytes, 2 * 2 * 3584 * 1024);
+
+        let mut int8 = Packed::default();
+        int8.add(3584, 1024, Some(32));
+        int8.add(1024, 3584, Some(32));
+        assert_eq!(int8.weights, fp16.weights);
+        assert_eq!(int8.bytes, fp16.bytes / 2, "int8 codes are one byte");
     }
 }
