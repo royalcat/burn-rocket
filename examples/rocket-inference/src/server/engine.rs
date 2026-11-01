@@ -22,6 +22,7 @@ use crate::gemma::media::{self, ResolvedMedia};
 use crate::gemma::vision::VisionAttn;
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
 use crate::qwen35_intent::model::IntentModel;
+use crate::server::telemetry;
 use crate::util::rope::RopeCache;
 
 use super::error::ApiError;
@@ -732,7 +733,45 @@ impl IntentEngine {
 }
 
 impl DecisionEngine {
+    /// `/v1/systemone`'s compute: validate and prepare the request, run one
+    /// forward per question, and record the outcome on the `decision` span.
+    ///
+    /// The span is the child of `inference` (the blocking closure enters it);
+    /// `answers` and `tokens` are only known after the run, so they are
+    /// declared empty and recorded here. A refused or failed request answers
+    /// nothing.
+    #[telemetry::instrument(
+        name = "decision",
+        skip_all,
+        fields(
+            questions = req.questions.len(),
+            images = req.images.len(),
+            videos = req.videos.len(),
+            tokens = tracing::field::Empty,
+            answers = tracing::field::Empty,
+        )
+    )]
     fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionReply, ApiError> {
+        let result = self.decide_request(model, req);
+        let span = tracing::Span::current();
+        match &result {
+            Ok(DecisionReply::Answered(outcome)) => {
+                span.record("answers", outcome.questions as u64);
+                span.record("tokens", outcome.tokens as u64);
+            }
+            // A refused request runs nothing, and a failed one stopped early.
+            _ => {
+                span.record("answers", 0u64);
+            }
+        }
+        result
+    }
+
+    fn decide_request(
+        &mut self,
+        model: &str,
+        req: DecisionRequest,
+    ) -> Result<DecisionReply, ApiError> {
         // The server's media contract is the reference `d3_server.py` one: data
         // URLs only, never local paths or remote URLs. A media problem is the
         // reference's 422 `{"detail": "<reason>"}`; nothing runs.

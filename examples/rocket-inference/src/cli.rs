@@ -69,13 +69,15 @@ rocket-inference serve - one HTTP server for the detected checkpoint
 usage: rocket-inference serve --model-dir <dir> [flags]
 
 Routes follow the model: /v1/embeddings (+ /embed for multimodal embedding
-models), /v1/chat/completions and the Ollama API for chat models; /health and
-/v1/models always. `--family auto` detects the loader from the checkpoint.
+models), /v1/chat/completions and the Ollama API for chat models,
+/v1/systemone for a decision model (d3); /health and /v1/models always.
+`--family auto` detects the loader from the checkpoint.
 
 server:
   --port <n>                   listen port (default 8383)
   --model-name <name>          served model name (default: the model dir name)
-  --max-tokens <n>             prompt/context cap (family default)
+  --max-tokens <n>             prompt/context cap (family default; per question
+                               on decision, default 32768)
   --max-new-tokens <n>         default generation cap (family default)
   --temperature <f>            default sampling temperature (default 0 = greedy)
   --delta-chunk <n>            delta-rule chunk width (intent, default 64)
@@ -88,8 +90,9 @@ placement:
   --npu-threads / --npu-dtype / --int8-group / --keep-cpu-weights
 
 model and memory:
-  --model-dir / -hf / --family / --cpu-backend / --dtype / --quant /
-  --defer-towers / --embed-f16 / --attn-chunk / --chunk / --key-block
+  --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision /
+  --cpu-backend / --dtype / --quant / --defer-towers / --embed-f16 /
+  --attn-chunk / --chunk / --key-block
 
 See `rocket-inference help` for the shared placement flags and README.md for
 the endpoints.";

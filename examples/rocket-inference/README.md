@@ -3,8 +3,8 @@
 Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](../..)
 library: one binary, family-agnostic commands, `flex` CPU backend by default
 with per-stage RK3588 NPU offload. The model family is detected from the
-checkpoint (`config.json` `model_type`, or the GGUF architecture) and
-`--family` overrides it.
+checkpoint (`config.json` `model_type`, a d3 package's `decision_config.json`,
+or the GGUF architecture) and `--family` overrides it.
 
 | model | checkpoint | commands | served endpoints |
 |---|---|---|---|
@@ -12,6 +12,7 @@ checkpoint (`config.json` `model_type`, or the GGUF architecture) and
 | Qwen3-Embedding-0.6B | `Qwen/Qwen3-Embedding-0.6B` | `embed`, `bench`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
 | Qwen3.5-0.8B intent/query-planner | `guoxuter/ov_intent_analysis_sft:v7_q8` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
 | Gemma 4 E2B-it chat (text/image/audio) | `google/gemma-4-E2B-it` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| Decision 3.0 (text/image/video typed decisions, prefill only) | `vllm-sr/d3-lite`, `vllm-sr/d3-nano` | `decide`, `serve` | `POST /v1/systemone`, `/v1/models`, `/health` |
 
 ```
 usage: rocket-inference <command> [flags]
@@ -20,6 +21,7 @@ usage: rocket-inference <command> [flags]
   embed      one embedding for text and/or media (embedding models)
   bench      embedding throughput over repeated forwards (embedding models)
   gen        one chat completion (chat models)
+  decide     typed System One decisions (decision models)
   tokenize   tokenize text with the checkpoint's tokenizer
   gemm       flex matmul microbenchmark (no model)
   help       this text; `help <command>` for one command
@@ -41,9 +43,10 @@ the mapping).
 | path | contents |
 |---|---|
 | `src/main.rs`, `src/cli.rs` | dispatch, shared flag parser, per-stage placement resolution, usage/help |
-| `src/family.rs` | the four families, checkpoint detection (`config.json` / GGUF architecture) and per-family stage support |
-| `src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `tokenize`, `gemm`) and the shared embedding input assembly |
-| `src/server/` | the one server: capability routing, OpenAI + multimodal + Ollama endpoints |
+| `src/family.rs` | the five families, checkpoint detection (`config.json` / GGUF architecture) and per-family stage support |
+| `src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`) and the shared embedding input assembly |
+| `src/decision/` | Decision 3.0 (d3): request contract, Qwen3.5 backbone + 255-code readout, mRoPE, vision tower + image/video splice, loader |
+| `src/server/` | the one server: capability routing, OpenAI + multimodal + Ollama endpoints, `/v1/systemone` for a decision model |
 | `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache`, the shared checkpoint trait + GGUF access + tokenizer, `hf-hub` resolution |
 | `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loader (f32/f16/bf16/Q8/NPU) |
 | `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, loader (safetensors/GGUF) + NPU pack-and-drop |
@@ -52,7 +55,7 @@ the mapping).
 | `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling |
 | `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
 | `data/` | bench/embedding fixtures, image/audio/video inputs |
-| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the video parity check (`video_parity.py`), the d3 harness (`decision_reference.py` official-runtime reference, `decision_parity.py`, `vision_parity.py`, `decision_fixtures*.json`, `decision.md` format contract) and the OTLP capture receiver (`otel_capture.py`) |
 
 ## GGUF models (`-hf`)
 
@@ -118,23 +121,25 @@ CLI f32 vector at cosine 1.000000000000 (log §21.3).
 One command serves every model:
 
 ```sh
-rocket-inference serve --model-dir <dir> [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
+rocket-inference serve --model-dir <dir> [--family auto|qwen3|embeddinggemma|intent|gemma4|decision] [flags]
 ```
 
-`--family auto` (the default) reads `config.json` `model_type` and picks the
-loader: `qwen3`, `embedding_gemma2`, `qwen3_5` or `gemma4`. Use `--family <name>`
-to override (e.g. a plain generative Qwen3 checkpoint).
+`--family auto` (the default) reads `config.json` `model_type` (a d3 package's
+`decision_config.json`) and picks the loader: `qwen3`, `embedding_gemma2`,
+`qwen3_5`, `gemma4` or `decision`. Use `--family <name>` to override (e.g. a
+plain generative Qwen3 checkpoint).
 
 The routes follow the loaded model — incompatible paths are not registered
 (404), and `/v1/models` reports a `capabilities` array:
 
-| | `qwen3` | `embeddinggemma` | `intent` | `gemma4` |
-|---|---|---|---|---|
-| `/health`, `/v1/models` | ✓ | ✓ | ✓ | ✓ |
-| `/v1/embeddings` (OpenAI + OpenRouter: string/list, token ids, `content` blocks; media parts on Gemma only) | ✓ | ✓ | — | — |
-| `/embed` (text/image/video/audio, paths or data URIs) | — | ✓ | — | — |
-| `/v1/chat/completions` (OpenAI; `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, stream=false) | — | — | ✓ | ✓ |
-| `/`, `/api/version`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` (Ollama) | — | — | ✓ | ✓ |
+| | `qwen3` | `embeddinggemma` | `intent` | `gemma4` | `decision` |
+|---|---|---|---|---|---|
+| `/health`, `/v1/models` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `/v1/embeddings` (OpenAI + OpenRouter: string/list, token ids, `content` blocks; media parts on Gemma only) | ✓ | ✓ | — | — | — |
+| `/embed` (text/image/video/audio, paths or data URIs) | — | ✓ | — | — | — |
+| `/v1/chat/completions` (OpenAI; `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, stream=false) | — | — | ✓ | ✓ | — |
+| `POST /v1/systemone` (d3 request object: `state`, typed `questions`, `images`/`videos` as `data:` URLs) | — | — | — | — | ✓ |
+| `/`, `/api/version`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` (Ollama) | — | — | ✓ | ✓ | — |
 
 ```sh
 # embedding server (OpenAI): /v1/embeddings
@@ -171,13 +176,28 @@ curl -s localhost:11434/v1/chat/completions -H 'Content-Type: application/json' 
 $B serve --model-dir ~/models/gemma-4-E2B-it --device auto --defer-towers --port 8391
 curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+
+# decision server (POST /v1/systemone): one typed answer per question
+$B serve --model-dir /root/models/d3-lite --device npu --port 8384 --max-tokens 8192
+curl -s localhost:8384/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "Customer asks for a refund of a duplicate card charge.",
+  "questions": {"route": {"type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {"returns": "Refunds, replacements and damaged deliveries",
+                 "billing": "Payments, invoices, charges and subscription price changes",
+                 "technical": "Product setup, firmware and connectivity faults"}}}
+}'
+# -> {"model": "d3-lite", "answers": {"route": {"type": "choice", "choice": "returns",
+#       "probabilities": {"returns": 0.705, "billing": 0.294, "technical": 0.001},
+#       "confidence": 0.442}}, "usage": {"input_tokens": 128, "output_tokens": 0}}
 ```
 
 Serving flags: `--model-dir` (required; or `-hf`),
-`--family auto|qwen3|embeddinggemma|intent|gemma4`, `--cpu-backend flex|cpu`,
+`--family auto|qwen3|embeddinggemma|intent|gemma4|decision`, `--cpu-backend flex|cpu`,
 `--port` (default
 8383), `--model-name` (default: the model directory name), `--max-tokens`
-(prompt/context cap), `--max-new-tokens` (default generation cap),
+(prompt/context cap; **per question** on `decision`, default 32768),
+`--max-new-tokens` (default generation cap),
 `--temperature`, `--video-fps`/`--video-max-frames`, plus the shared load flags
 below. `rocket-inference help serve` lists all of them. A flag that does not
 apply to the detected model is rejected.
@@ -194,6 +214,12 @@ Every stage runs on the CPU unless it is placed on the NPU. The base flag is
 | `--vision-device` | vision-tower projections | embeddinggemma |
 | `--vision-attn-device` | vision-tower attention | embeddinggemma |
 | `--decode-device` | single-token decode projections | intent, gemma4 |
+
+`decision` is text-only in placement terms: `--text-device` is its one NPU
+stage, and `--text-attn-device`/`--vision-device`/`--vision-attn-device`/
+`--decode-device` are rejected for it (its vision tower, backbone attention and
+readout stay on the CPU). An explicit stage flag for a stage the family does not
+have is an error, on every command.
 
 `auto` (the default) places a stage on the NPU when the build has it (aarch64 +
 the `npu` feature) and on the CPU otherwise; under `auto`, decode stays on the
@@ -217,6 +243,11 @@ attention kernels used when that attention stage is not offloaded),
 width, default 1024), `--dtype`, `--quant none|q8` (Q8-resident CPU weights;
 `--quant q8` does not touch NPU-packed weights) and `--defer-towers`.
 
+`--defer-towers` applies to `embeddinggemma` and `gemma4`, whose vision/audio
+tower halves are deferred. A `decision` checkpoint does have a vision tower but
+no tower *halves* to load on first use: its tower loads eagerly with the
+backbone, so the flag is rejected (the error says so).
+
 Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
 as before); Ollama `stream: true` returns one NDJSON content line plus the final
 `done` line; the Ollama endpoints accept any request `Content-Type`
@@ -232,7 +263,21 @@ the block's text, while audio and video are limited to one each. `input_file` is
 rejected. An `image_url.url` or media `data` value may be a local path, a
 `data:` URI or an `http(s)` URL — remote media are fetched server-side (10 s
 timeout, 20 MiB cap, `ROCKET_MEDIA_FETCH=0` disables). Request bodies are capped
-at 32 MiB, and `dimensions` is accepted as an alias of `dim`.
+at 32 MiB on the media routes (`/v1/embeddings`, `/embed`,
+`/v1/chat/completions`, the Ollama API), and `dimensions` is accepted as an
+alias of `dim`.
+
+`/v1/systemone` (the decision family) is stricter, matching the checkpoint's own
+`d3_server.py`: `images` and `videos` must be `data:` URLs (a local path or an
+`http(s)` URL is a 422), images are limited to 8,000,000 decoded bytes and
+16,000,000 pixels (PNG/JPEG/WebP), videos to 32,000,000 bytes, 8,294,400 pixels
+per frame and 300 s (MP4/WebM/QuickTime/Matroska, decoded at 2 fps), and all
+videos of one request together may not exceed 16,384 input tokens. Every refusal
+is the reference's `422 {"detail": "images[i]: ..."}` / `{"detail": "videos[i]:
+..."}`; a malformed question refuses the request with
+`422 {"detail": {"invalid_questions": {...}}}` and nothing runs. Because one
+request may carry a 32 MB video plus three 8 MB images, the route's transport
+limit is 96 MiB rather than the 32 MiB above.
 
 Every completed inference request is logged as one `tracing` line (level
 `info`, `RUST_LOG` controls it; default `info`). Embedding requests report the
@@ -307,6 +352,7 @@ The major time consumers of a request are children of `inference`:
 | `towers.load` → `towers.half` | deferred vision/audio tower halves on the first media request | `vision`/`audio`; `half`, `tensors` |
 | `forward` | the text backbone of an embedding request | `tokens`, `attn_s`, `mlp_s`, `norms_s` (`ple_s` on the Gemma families) |
 | `prefill`, `decode` | chat prefill and the token-by-token loop | `prompt_tokens`; `gen_tokens`, `tok_s`, plus the stage durations |
+| `decision` | `/v1/systemone`: the whole decision compute (validation, media, one forward per question, readout) | `questions`, `images`, `videos`; `answers` and `tokens` when answered (`answers` = 0 on a refusal or failure) |
 
 Spans are declared with `#[telemetry::instrument(...)]` (the crate re-exports
 tracing's attribute under `server::telemetry`) and exist only while trace export
@@ -768,6 +814,60 @@ decode keeps the CPU f32 copies. `--device npu` also routes decode through the
 packed weights and drops the copies. Board measurement pending an idle board (the model needs
 ~9.5 GB host + 2.1 GiB NPU; the 2026-10-07 attempt was OOM-killed on a busy
 board). Not yet done: streaming, video input.
+
+## Decision 3.0 (d3)
+
+[Decision 3.0](https://huggingface.co/vllm-sr/d3-lite) (`d3-code-readout-v1`) is
+the typed decision model: a Qwen3.5-0.8B backbone plus a 255-code readout head.
+A request is a `state` and typed `questions` (`choice`, `noul`, `score`); the
+answer is one **non-causal** forward per question and a softmax over the codes.
+Nothing is generated (`usage.output_tokens` is always 0), so the family is
+prefill-only. Both checkpoints work: `vllm-sr/d3-lite` (hidden 1024, 153 vision
+tensors) and `vllm-sr/d3-nano` (hidden 2048, 297), loaded from a local
+safetensors package (no GGUF/`-hf`).
+
+```sh
+M=/tmp/opencode/d3/models/d3-lite      # board: /root/models/d3-lite
+B=target/release/rocket-inference
+
+# a JSON array of cases: {"name", "state", "questions"[, "images", "videos"]}
+$B decide --model-dir $M --requests tools/decision_fixtures.json --out out.json
+# one request object as JSON (the /v1/systemone body, but with local media paths)
+$B decide --model-dir $M --request '{"state": "Refund request", "questions":
+  {"route": {"type": "choice", "instructions": "Which team?", "criteria":
+  {"returns": "refunds", "billing": "payments"}}}}'
+
+# CPU f32 body vs the packed text projections
+$B decide --model-dir $M --requests cases.json --device cpu --out cpu.json
+$B decide --model-dir $M --requests cases.json --device npu --out npu.json
+```
+
+`decide` takes `--requests <file>` (a JSON array of cases; the output is
+`{"schema": "d3-decision-v1", "model", "cases": [{"name", "response"}]}`) or
+`--request <json>` (one case; the bare `{"model", "answers", "usage"}` object),
+plus `--out`, `--model-name`, `--dump-prompts <dir>` and `--max-state-tokens`
+(per-question prompt cap, default 32768). `images`/`videos` entries are **local
+paths** in the CLI (the HTTP server takes `data:` URLs only, like the reference
+`d3_server.py`). Unlike the server, the CLI keeps per-question errors in the
+answer instead of refusing the batch.
+
+`serve` registers `POST /v1/systemone` for this family. The media contract is
+the reference one: images 8 MB / 16 MP, videos 32 MB / 8.29 MP per frame / 300 s
+at 2 fps, ≤ 16,384 video tokens per request, every refusal a 422 with the
+reference's `detail` string. `--max-tokens` is the same per-question cap as
+`--max-state-tokens` (default 32768); the body limit is 96 MiB. Placement:
+`--device npu` packs the text projections as resident fp16 (96 weights, ~1.0 GiB
+of BO); the tower, the backbone attention and the readout stay on the CPU in
+both configurations. `--defer-towers` is rejected (nothing to defer), and so are
+the attention/vision/decode stage flags.
+
+Board (d3-lite, cores 4-7, 600 MHz NPU module, embedding service stopped): text
+5 questions / 6,546 tokens 197 s (CPU f32) -> **113 s** (NPU fp16, 1.7x, ~3x
+less user CPU); image 56.7 -> 46.3 s; video 62.1 -> 40.8 s. Parity against each
+checkpoint's **f32** reference (dev host, gate 2e-3): d3-lite text 67/67
+(2.36e-06), image 8/8 (7.70e-06), video 9/9 (3.97e-06); d3-nano 10/10
+(1.74e-06). Recipes, caps and the full table:
+[`docs/recipes/decision.md`](docs/recipes/decision.md).
 
 ## Cross-compiling for the board (aarch64)
 

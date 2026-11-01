@@ -4,16 +4,19 @@
 `rocket-npu` driver (`crates/rocket-npu`) plus the `RocketOps` Burn backend extension
 (projections and attention on the mainline `rocket` driver). No C toolchain, CMake,
 kernel headers, or vendor archive are involved. The inference app is
-`examples/rocket-inference/` (one binary, four model families: `qwen3`
-Qwen3-Embedding-0.6B, `intent` Qwen3.5-0.8B, `gemma` EmbeddingGemma 2 and Gemma 4
-E2B-it). Read `README.md` (library) and `examples/rocket-inference/README.md` (app)
+`examples/rocket-inference/` (one binary, five model families: `qwen3`
+Qwen3-Embedding-0.6B, `intent` Qwen3.5-0.8B, `gemma` EmbeddingGemma 2, Gemma 4
+E2B-it and `decision` vllm-sr d3). Read `README.md` (library) and
+`examples/rocket-inference/README.md` (app)
 first; measurements live in `examples/rocket-inference/docs/experiment-log.md`
 (Qwen3 + intent) and `examples/rocket-inference/docs/experiment-log-gemma.md`
-(Gemma). The root README opens with
-`## AI Disclosure` and `## Inference server` (the four servers with their OpenAI/Ollama
-APIs and commands, plus the production embedding deployment and its board speeds)
-before "What it provides"; the speeds there mirror the experiment logs — keep both in
-sync when measurements change.
+(Gemma); d3's are in `examples/rocket-inference/docs/recipes/decision.md`
+(dev host + board) and `examples/rocket-inference/tools/decision.md` (parity).
+The root README opens with
+`## AI Disclosure` and `## Inference server` (the five servers with their API
+endpoints and commands, plus the production embedding deployment and its board
+speeds) before "What it provides"; the speeds there mirror the experiment logs —
+keep both in sync when measurements change.
 
 The repo was inverted on 2026-10-06 with no functional changes (commits `8c7eabb`
 structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
@@ -52,9 +55,10 @@ Ollama API for chat models; `/health` + `/v1/models` always). The old commands
 `qwen3 serve`, `intent serve-ollama`, `gemma serve` and `gemma serve-chat` are gone;
 the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API.
 **CLI refactor (2026-10-31)**: the family command tree is gone. Commands are
-`serve`, `embed`, `bench`, `gen`, `tokenize`, `gemm`; the family is detected from
-the checkpoint (`config.json` / GGUF arch) and `--family auto|qwen3|embeddinggemma|
-intent|gemma4` overrides it. `--model-dir` is required (or `-hf`). The commands
+`serve`, `embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`; the family is
+detected from the checkpoint (`config.json` / GGUF arch, a d3 package's
+`decision_config.json`) and `--family auto|qwen3|embeddinggemma|intent|gemma4|
+decision` overrides it. `--model-dir` is required (or `-hf`). The commands
 are documented in `examples/rocket-inference/README.md`, with per-model
 balanced/full-offload/speed command lines in `examples/rocket-inference/docs/recipes/`
 (which also maps the old flag names used by the dated bullets below).
@@ -1345,10 +1349,11 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
 ## rocket-inference CLI (2026-10-31 refactor)
 
 The example's CLI is family-agnostic. Commands are `serve`, `embed`, `bench`,
-`gen`, `tokenize`, `gemm`, `help`; there is no family command tree. The family is
-detected from `--model-dir` (`config.json` `model_type`, or a local GGUF's
-`general.architecture`) and `--family auto|qwen3|embeddinggemma|intent|gemma4`
-overrides it. `--model-dir` is required (or `-hf`, which injects it).
+`gen`, `decide`, `tokenize`, `gemm`, `help`; there is no family command tree. The
+family is detected from `--model-dir` (`config.json` `model_type`, a local GGUF's
+`general.architecture`, or a d3 package's `decision_config.json`) and `--family
+auto|qwen3|embeddinggemma|intent|gemma4|decision` overrides it. `--model-dir` is
+required (or `-hf`, which injects it).
 `src/family.rs` owns detection and the per-family stage-support predicates;
 `src/commands/` owns the commands; `src/cli.rs` owns `FlagArgs`, `LoadArgs`, the
 device enums and the usage texts. The old family CLI modules are deleted, so any
@@ -1374,6 +1379,9 @@ Family stages:
   CPU-only.
 - gemma4: `text` (prefill projections + prefill attention), `decode`; the
   vision/audio towers are not NPU-packed, so `--vision-device` is rejected.
+- decision: `text` only. The vision tower, the backbone attention and the
+  readout head are CPU in every configuration, so `--text-attn-device`,
+  `--vision-device`, `--vision-attn-device` and `--decode-device` are rejected.
 
 `--keep-cpu-weights auto|yes|no` (intent/gemma4): `auto` keeps the f16 CPU
 copies exactly when decode is on the CPU; `no` requires `--decode-device npu`
@@ -1445,11 +1453,69 @@ redeploy needs `serve --cpu-backend flex --device npu --attn-chunk 1024 ...`
 
 ### Tests
 
-`cargo test -p rocket-inference --no-default-features` = 53 tests; the new ones
-cover flag parsing, the auto/CPU/NPU stage resolution including the NPU-build
-case, family-scoped flag rejection, int8 dependencies and `--keep-cpu-weights`
-rules. `cargo clippy -p rocket-inference --no-default-features` and the
-aarch64+`npu` clippy are clean; `cargo fmt --all -- --check` is clean.
+`cargo test -p rocket-inference --no-default-features` = **162** tests. The CLI
+refactor's 53 cover flag parsing, the auto/CPU/NPU stage resolution including
+the NPU-build case, family-scoped flag rejection, int8 dependencies and
+`--keep-cpu-weights` rules; the decision family adds its contract, readout,
+mRoPE, splice and media-guard tests (see below). `cargo clippy -p
+rocket-inference --no-default-features` and the aarch64+`npu` clippy are clean;
+`cargo fmt --all -- --check` is clean.
+
+## Decision family (2026-11-01, vllm-sr d3)
+
+`vllm-sr/d3-lite` / `vllm-sr/d3-nano` (`d3-code-readout-v1`) are the fifth
+family: a Qwen3.5 backbone (the intent model's text encoder, loaded through
+`IntentTextConfig`, with **bidirectional** full-attention layers while the Gated
+DeltaNet layers stay causal) plus a 255-code readout head over the final-normed
+hidden state of the last prompt token. A request is a `state` plus typed
+`questions` (`choice`, `noul`, `score`); the answer is one prefill per question
+and a softmax over the codes — nothing is generated (`usage.output_tokens` is
+always 0) and there is no KV cache or decode stage. `src/decision/` owns it:
+`request` (the d3 contract), `format` (the answer records), `load`
+(`decision_config.json` / `MODEL_MANIFEST.json` / `readout.safetensors`),
+`model` (`prepare`/`run`/`respond`, the media guards), `mrope` (the multimodal
+rotary tables), `vision` (the tower — depth 12 for lite, 24 for nano — and the
+image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
+
+- **Parity** (dev host, f32 body, gate 2e-3; reference =
+  `tools/decision_reference.py --backbone-dtype f32`): text **67/67** top-1, max
+  |Δp| **2.36e-06**; image **8/8**, **7.70e-06**; video **9/9**, **3.97e-06**;
+  d3-nano **10/10**, **1.74e-06** against its own f32 reference. Token counts
+  are exact in every arm. The reference must be f32 (nano bf16 vs f32 differs by
+  up to 6.6e-3, over the gate) and is thread-count sensitive at ~1e-6. The
+  tower's pooled features are gated separately by `tools/vision_parity.py`
+  (8/8 images, pixel max|Δ| 0, cosine ≥ 0.999999999).
+- **Board (d3-lite, cores 4-7, 600 MHz module, `home-llm-gateway-embed-1`
+  stopped for the runs and restored healthy; load 7.8-10.7)**: text 5 questions
+  / 6,546 tokens **113 s** on the NPU (96 resident weights, **1,006.7 MiB** of
+  weights BO) vs **197 s** CPU f32 (**1.7x**, ~3x less user CPU, peak anon
+  3,999 -> 2,505 MiB); receipt image (1,029 tokens) 56.7 -> **46.3 s**; video
+  (1,720 tokens / 2 questions) 62.1 -> **40.8 s**. A 128-token question computes
+  in **1.98 s** with the model resident. After a request the matmul scratch is
+  26.4 MiB BO + 6.3 MiB host and the attention BO/host is **0** (there is no NPU
+  attention stage); `RssAnon` 943.6 -> 1,034.3 MiB, the BOs not being charged to
+  the process. The three deployment profiles collapse to `--device npu` vs
+  `--device cpu`.
+- **Caveat — board video parity is decoder-version sensitive**: the video arms
+  miss the 2e-3 gate at 1.4-1.45e-2 although both top-1 answers are correct. The
+  board's `ffmpeg` 7.1.5 decodes the sampled frames up to 2/255 per channel
+  away from the dev-host n9.0.2 (which is bit-identical to the OpenCV decode the
+  reference used): 67 % of RGB bytes differ, mean 0.68/255, and the tower turns
+  that into ~1e-2 of probability. The same-board CPU-vs-NPU delta is 4.6e-4, so
+  the miss is the decoder, not the body. Gate cross-host video on top-1 only or
+  regenerate the reference with the same `ffmpeg`.
+- **Caps/limits**: `--max-state-tokens` (CLI) and `--max-tokens` (server) are the
+  same **per-question** prompt cap, default **32768** (the board recipes pass
+  8192). Media are the reference's ceilings: images 8,000,000 decoded bytes /
+  16,000,000 pixels, videos 32,000,000 bytes / 8,294,400 pixels per frame /
+  300 s at 2 fps, ≤ **16,384** video input tokens per request, `data:` URLs only
+  (`decide` takes local paths), every refusal a 422 with the reference's
+  `detail` string. `/v1/systemone` has a **96 MiB** transport limit
+  (`DECISION_BODY_LIMIT`: one 32 MB video plus three 8 MB images, base64); every
+  other route stays at 32 MiB.
+- **Telemetry**: the `inference` span gains a `decision` child carrying
+  `questions`/`images`/`videos` at span creation and `answers`/`tokens` when the
+  request is answered (`answers` = 0 on a refusal or a failure).
 
 ## Repo layout
 
@@ -1464,10 +1530,11 @@ aarch64+`npu` clippy are clean; `cargo fmt --all -- --check` is clean.
 | `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
 | `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
 | `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
-| `examples/rocket-inference/src/family.rs` | the four families, checkpoint detection (`config.json` `model_type` / GGUF arch) and the per-family stage-support predicates |
-| `examples/rocket-inference/src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `tokenize`, `gemm`) and the shared embedding input assembly (`embed_input`) |
-| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `ollama` (`/`, `/api/*`) |
+| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`decide`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
+| `examples/rocket-inference/src/family.rs` | the five families, checkpoint detection (`config.json` `model_type`, a d3 package's `decision_config.json`, a GGUF arch) and the per-family stage-support predicates |
+| `examples/rocket-inference/src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`) and the shared embedding input assembly (`embed_input`) |
+| `examples/rocket-inference/src/decision/` | vllm-sr d3 family: `request` (the `d3_server.py` contract), `format` (answer records), `load` (package + readout + model name), `model` (prepare/run/respond, media guards), `mrope`, `vision/` (the tower and the image/video splice) |
+| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `systemone` (`/v1/systemone`), `ollama` (`/`, `/api/*`) |
 | `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
 | `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loader (f32/f16/bf16, `--quant q8`, per-stage NPU pack-and-drop + `load_cpu_projections`) |
 | `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`) |
@@ -1481,8 +1548,8 @@ aarch64+`npu` clippy are clean; `cargo fmt --all -- --check` is clean.
 | `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
 | `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
 | `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
-| `examples/rocket-inference/docs/recipes/` | the deployment recipes: `README.md` (profile definitions, placement matrix, board protocol, old→new flag map) + `embeddinggemma2.md` (measured 2026-10-31), `qwen3.md`, `intent.md`, `gemma4.md` (derived from the logs) |
-| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`) and the OTLP capture receiver (`otel_capture.py`) |
+| `examples/rocket-inference/docs/recipes/` | the deployment recipes: `README.md` (profile definitions, placement matrix, board protocol, old→new flag map) + `embeddinggemma2.md` (measured 2026-10-31), `qwen3.md`, `intent.md`, `gemma4.md` (derived from the logs), `decision.md` (dev host + board measured) |
+| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`), the d3 harness (`decision_reference.py`, `decision_parity.py`, `vision_parity.py`, `decision_fixtures*.json`, `decision.md`) and the OTLP capture receiver (`otel_capture.py`) |
 | `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
@@ -1706,6 +1773,13 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - `serve` smoke footgun: the OpenAI chat content parts (`image_url`/`input_audio`)
   insert the `<|image|>`/`<|audio|>` placeholders themselves; putting the placeholder
   in the text part as well yields a 400 `placeholder mismatch`.
+- d3 checkpoints and references: dev host `/tmp/opencode/d3/models/d3-lite` and
+  `/tmp/opencode/d3/models/d3-nano` (the HF packages), references in
+  `/tmp/opencode/d3/ref_{text,images,videos}_lite_f32.json` and
+  `/tmp/opencode/d3/task4/{subset.json,ref_nano_f32.json}`, Python venv `/tmp/opencode/d3/venv`
+  (transformers 5.17, CPU torch). Board: `/root/models/d3-lite` (the package plus
+  its `assets/` example image/video) and `/root/rocket-inference-decision/`
+  (aarch64 binary, fixtures, run outputs) — not a service.
 
 ## Board deployment (2026-10-05)
 
@@ -2398,6 +2472,34 @@ curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"i
 # robustness: a panicking forward (invalid token id) must 500 and leave the server alive
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":[999999999]}'
 curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' -d '{"input":"still alive"}'
+# d3 decision family: one CLI run, then the parity gates (each runs the CLI once per
+# case; the reference must be the f32 one). Run from examples/rocket-inference so the
+# fixtures' relative `data/*.jpeg|mp4` resolve (--media-base overrides).
+$CARGO_TARGET_DIR/release/rocket-inference decide \
+    --model-dir /tmp/opencode/d3/models/d3-lite \
+    --requests tools/decision_fixtures.json --out /tmp/opencode/d3/our_text.json
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-lite --requests tools/decision_fixtures.json \
+    --ref /tmp/opencode/d3/ref_text_lite_f32.json            # 67/67, max |dp| 2.36e-06
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-lite --requests tools/decision_fixtures_images.json \
+    --ref /tmp/opencode/d3/ref_images_lite_f32.json          # 8/8, 7.70e-06
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-lite --requests tools/decision_fixtures_videos.json \
+    --ref /tmp/opencode/d3/ref_videos_lite_f32.json          # 9/9, 3.97e-06
+python3 tools/decision_parity.py --bin $CARGO_TARGET_DIR/release/rocket-inference \
+    --model-dir /tmp/opencode/d3/models/d3-nano --requests /tmp/opencode/d3/task4/subset.json \
+    --ref /tmp/opencode/d3/task4/ref_nano_f32.json           # 10/10, 1.74e-06
+# ... and the server: one text request answers, a local path in `images` is a 422
+./rocket-inference serve --model-dir /tmp/opencode/d3/models/d3-lite --port 8399 \
+    --max-tokens 8192 &
+curl -s localhost:8399/v1/systemone -H 'Content-Type: application/json' \
+    -d '{"state":"Customer asks for a refund of a duplicate card charge.","questions":
+        {"route":{"type":"choice","instructions":"Which team should handle this request?",
+                  "criteria":{"returns":"Refunds","billing":"Payments","technical":"Firmware"}}}}'
+curl -s localhost:8399/v1/systemone -H 'Content-Type: application/json' \
+    -d '{"state":"x","questions":{"q":{"type":"noul"}},"images":["/tmp/a.png"]}'  # 422
+./rocket-inference decide --help     # `decision` in the family list, the caps in decide's text
 # deferred tower halves: an image request must load the vision half only, a later
 # audio request the audio half only (log: one `towers: loaded vision/audio` line
 # each, 211/272 tensors); a text request never prints either

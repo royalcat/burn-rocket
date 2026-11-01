@@ -31,6 +31,7 @@ standard clients work unchanged:
 | Qwen3.5-0.8B intent/query planner | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/ov-intent-analysis-sft` |
 | EmbeddingGemma 2 (text/image/video/audio) | OpenAI/OpenRouter `/v1/embeddings` (text + `image_url`/`input_audio`/`input_video` blocks) + native multimodal `/embed` | `rocket-inference serve --model-dir /models/embeddinggemma-2` |
 | Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/gemma-4-E2B-it` |
+| Decision 3.0 (text/image/video typed decisions) | `POST /v1/systemone`, `/v1/models`, `/health` | `rocket-inference serve --model-dir /models/d3-lite --max-tokens 8192 --port 8384` |
 
 The container image ships `ffmpeg`/`ffprobe`, so EmbeddingGemma 2's
 `/v1/embeddings` accepts `input_video` blocks and non-WAV audio without extra
@@ -39,7 +40,9 @@ host packages.
 One `serve` command covers every model: it detects the checkpoint's family and
 registers exactly the endpoints that model supports (embedding models get
 `/v1/embeddings`/`/embed`, chat models get both the OpenAI chat and the Ollama
-APIs).
+APIs, and the decision model gets `POST /v1/systemone`). Request bodies are
+capped at 32 MiB on the media routes; `/v1/systemone` takes 96 MiB because one
+request may carry a 32 MB video plus up to three 8 MB images (base64).
 
 OpenViking's embedding backend in production on a Rock 5B+ is EmbeddingGemma 2
 (`rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --device npu
@@ -55,8 +58,13 @@ configuration (Qwen3-Embedding-0.6B on the NPU, `--device npu
 (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds than the CPU-only flex path
 (the default NPU attention is slightly faster: ~45 tok/s, -51% CPU). The intent
 model answers the 166-token v7 planner prompt in 11.7 s with `--device auto`
-(89.9 s CPU-only). Flags, endpoints, recipes and deployment:
-[examples/rocket-inference/README.md](examples/rocket-inference/README.md).
+(89.9 s CPU-only). The vllm-sr d3 decision model answers a 5-question / 6,546-token
+text fixture in 113 s on the NPU (197 s CPU-only) and a 128-token question in
+1.98 s with the model resident; a 1,029-token receipt image takes 46 s and a
+1,720-token two-question video 41 s, with the vision tower and the readout on
+the CPU. Flags, endpoints, recipes and
+deployment: [examples/rocket-inference/README.md](examples/rocket-inference/README.md),
+[docs/recipes/decision.md](examples/rocket-inference/docs/recipes/decision.md).
 
 Container images for both architectures are built and published to GHCR on every
 push to `main`: `ghcr.io/royalcat/rocket-inference:<sha>` / `:latest` is the aarch64
@@ -581,12 +589,13 @@ reverts on reboot. Everything works at the stock clock.
 
 [`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
 built on this library: one binary with family-agnostic commands
-(`serve`, `embed`, `bench`, `gen`, `tokenize`, `gemm`); the model family is detected
-from the checkpoint and `--family` overrides it. One `serve` command loads any of the
+(`serve`, `embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`); the model family is
+detected from the checkpoint and `--family` overrides it. One `serve` command loads any of the
 models and exposes its compatible endpoints; the Qwen3-Embedding-0.6B and multimodal
 EmbeddingGemma 2 embedding models (`embed`/`bench`/`tokenize`), the Qwen3.5-0.8B
-intent/query-planner model and Gemma 4 E2B-it generation (`gen`) are one-shot CLI
-paths. Per-stage NPU placement is selected with `--device` and the
+intent/query-planner model and Gemma 4 E2B-it generation (`gen`), and the vllm-sr d3
+typed decision model (`decide`, `POST /v1/systemone`) are one-shot CLI paths. Per-stage
+NPU placement is selected with `--device` and the
 `--text-device`/`--text-attn-device`/`--vision-device`/`--vision-attn-device`/
 `--decode-device` flags; balanced/full-offload/speed recipes and measurements from the
 Rock 5B+ are in `examples/rocket-inference/docs/recipes/`, `.../docs/experiment-log.md`

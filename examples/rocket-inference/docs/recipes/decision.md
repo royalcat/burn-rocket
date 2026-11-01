@@ -60,9 +60,78 @@ ROCKET_MEM_LOG=1 $B serve --model-dir $M --device npu --port 8399 --max-tokens 8
 and `/v1/models` are always available. `--max-tokens` is the per-question prompt
 cap. The server logs one line per request with `questions`, `tokens` and
 `compute_s`, and (with `ROCKET_MEM_LOG=1`) the `npu scratch` line after load and
-after every request. The CLI commands install no tracing subscriber, so
-`ROCKET_MEM_LOG` prints nothing in `decide` runs; use `serve` when the BO split
-matters.
+after every request. With OpenTelemetry enabled (`OTEL_SDK_ENABLED=true`) the
+`inference` span gains a `decision` child with `questions`, `images`, `videos`,
+`answers` and `tokens` (`answers` is 0 on a refused or failed request).
+The CLI commands install no tracing subscriber, so `ROCKET_MEM_LOG` prints
+nothing in `decide` runs; use `serve` when the BO split matters.
+
+## Profiles
+
+d3 has a single NPU stage (`text`), so the three deployment profiles collapse
+into two configurations:
+
+| profile | d3 command |
+|---|---|
+| balanced | `--device npu` (text projections packed as resident fp16) |
+| full offload | `--device npu` (same: there is nothing else to move) |
+| speed | `--device npu` (same: the compute is the same command) |
+| CPU fallback | `--device cpu` (f32 body) |
+
+The vision tower, the backbone attention and the readout head run on the CPU in
+both configurations: d3 has no `--text-attn-device`, `--vision-device`,
+`--vision-attn-device` or `--decode-device` stage, and no decode at all.
+
+## Caps
+
+- `decide --max-state-tokens <n>` and `serve --max-tokens <n>` are the same cap:
+  the **per-question** prompt length (default **32768**, each question starts
+  from the shared state). A case with three long questions therefore spends the
+  cap three times.
+- A question over the cap is not a request error: it keeps a
+  `{"type": ..., "error": "max_length_exceeded", "message": ...}` record in
+  `answers` of a 200 response and is excluded from `usage.input_tokens`; only a
+  malformed *question* refuses the whole request (422) before anything runs.
+- Media caps come from the reference runtime and are fixed: images 8,000,000
+  decoded bytes / 16,000,000 pixels, videos 32,000,000 bytes / 8,294,400 pixels
+  per frame / 300 s, and **all videos of one request together ≤ 16,384 input
+  tokens** (the server takes `data:` URLs only).
+- The board recipe passes 8192 (`--max-state-tokens 8192` /
+  `--max-tokens 8192`): the long policy case is three ~2,100-token prompts over
+  one 6,307-token state, so 8192 leaves headroom without sizing the RoPE table
+  for 32k on a busy board.
+
+## Dev host (d3-lite / d3-nano)
+
+Both checkpoints, f32 CPU body, on the 32-core dev host (2026-11-01). The subset
+is seven cases: four text (`choice-routing-short`, `noul-refund-window`,
+`score-urgency-billing` and the three-question `choice-policy-long`), one
+receipt image, one two-image request and one video clip — 10 questions and
+12,155 prompt tokens, identical for both models because the prompts come from
+the checkpoint-agnostic fixtures. `compute` is the CLI's own decided time (load
+excluded), `wall` adds the load, `user` is process CPU-seconds, peak RSS/anon is
+`/proc/<pid>/status` sampled over the run.
+
+| model | questions / tokens | top-1 (max \|Δp\|) | load | compute | wall | peak RSS | peak anon | user CPU |
+|---|---|---|---|---|---|---|---|---|
+| d3-nano f32 | 10 / 12,155 | 10/10 (1.741e-06) | 3.00 s | 152.2 s | 156.4 s | 12,061 MiB | 9,220 MiB | 1,722 s |
+| d3-lite f32 | 10 / 12,155 | 10/10 | 1.25 s | 89.4 s | 91.3 s | 4,631 MiB | 4,391 MiB | 788 s |
+| d3-nano f32 (torch reference) | 10 / 12,155 | — | — | 83.7 s | 88.9 s | 13,286 MiB | 9,767 MiB | 1,181 s |
+
+The parity reference for d3-nano is its **f32** reference
+(`tools/decision_reference.py --backbone-dtype f32`), the same body dtype the
+Rust side runs. The checkpoint's bf16 path is not interchangeable: nano bf16 and
+the f32 reference agree on all six text answers but differ by up to **6.6e-3**
+in probability (`noul-refund-window`; 3.1e-3 at `choice-policy-long/risk`),
+above the 2e-3 gate, so a bf16 reference would report false mismatches.
+
+nano is the larger geometry (24 layers, hidden 2048, intermediate 6144, a
+2048-wide tower output): 1.71x the wall and 2.10x the anon for the same answers, with the
+resident f32 body alone at 7,716 MiB against lite's 2,926 MiB. The two
+checkpoints answer 4 of these 10 questions differently, so parity is per
+checkpoint — each against its own reference. Full detail (per-case wall/memory,
+the field-by-field config read, the two-image splice) is in
+[`tools/decision.md`](../../tools/decision.md).
 
 ## Board (d3-lite)
 
