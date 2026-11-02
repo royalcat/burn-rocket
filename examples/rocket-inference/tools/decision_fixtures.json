@@ -1,0 +1,2577 @@
+[
+  {
+    "name": "choice-routing-short",
+    "state": "Customer asks for a refund of a duplicate card charge.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-routing-thread",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-routing-returns",
+    "state": "Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-routing-tech",
+    "state": "Ticket 2026-04-10 13:02 customer: after the firmware update to 4.2.1 the device does not join the wireless network any more; the setup screen spins and then reports error 41 without a message. Ticket 2026-04-10 13:30 agent: error 41 means the device could not complete the key exchange with the access point. Please confirm whether the network uses WPA3 only and whether the router was rebooted after the update. Ticket 2026-04-10 13:52 customer: the router is a FritzBox 7590 with WPA2 and WPA3 mixed mode, and I already rebooted it twice; a second device on the same network updated fine and still connects. Ticket 2026-04-11 09:15 engineering: the 4.2.1 image ships a new regulatory domain table that rejects the country code the device cached before the update; affected units loop in the key exchange until the cache is cleared. Ticket 2026-04-11 09:40 engineering: workaround is to hold the pairing button for twelve seconds while the device boots, which clears the cached regulatory domain; a fixed image 4.2.2 is scheduled for next week.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      },
+      "has_invoice": {
+        "type": "noul",
+        "instructions": "Does the state list a receipt or invoice number?"
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-routing-billing-long",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-routing-mega",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter. Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. Ticket 2026-04-06 09:02 warehouse: the returned unit was received and inspected; the tank is cracked along the seam and the dent matches the photo, so the damage is accepted as transit damage rather than customer misuse. Ticket 2026-04-06 09:30 agent: the replacement ships today with express delivery, and the original order will be refunded in full once the carrier confirms the damage claim. Ticket 2026-04-07 17:12 customer: the replacement arrived but the milk frother attachment from the first order is missing from the box, and the manual is for a different model. Ticket 2026-04-07 17:40 agent: the missing attachment is in stock and will be sent separately; the manual mismatch is a packaging error at the supplier and has been reported under quality case QA-881. Ticket 2026-04-08 10:05 customer: I would rather return the whole machine now and buy it locally, because two deliveries in one week went wrong and I have lost confidence in the packaging. Ticket 2026-04-08 10:33 agent: a full return is possible within the thirty day window; I have emailed a prepaid label and the refund will be issued to the original payment method after the unit is scanned at the depot. Ticket 2026-04-09 08:20 returns desk: unit received at the depot, accessories complete, retail packaging damaged; refund of 349.00 EUR approved and queued for the next payment run. Ticket 2026-04-10 13:02 customer: after the firmware update to 4.2.1 the device does not join the wireless network any more; the setup screen spins and then reports error 41 without a message. Ticket 2026-04-10 13:30 agent: error 41 means the device could not complete the key exchange with the access point. Please confirm whether the network uses WPA3 only and whether the router was rebooted after the update. Ticket 2026-04-10 13:52 customer: the router is a FritzBox 7590 with WPA2 and WPA3 mixed mode, and I already rebooted it twice; a second device on the same network updated fine and still connects. Ticket 2026-04-11 09:15 engineering: the 4.2.1 image ships a new regulatory domain table that rejects the country code the device cached before the update; affected units loop in the key exchange until the cache is cleared. Ticket 2026-04-11 09:40 engineering: workaround is to hold the pairing button for twelve seconds while the device boots, which clears the cached regulatory domain; a fixed image 4.2.2 is scheduled for next week. Ticket 2026-04-11 10:05 agent: I have sent the button sequence to the customer with a screenshot and offered a remote session if the workaround does not take effect on the first attempt. Ticket 2026-04-11 15:20 customer: the workaround worked and the device is online again, but the clock is now one hour behind and the schedule I had configured did not survive the reset. Ticket 2026-04-11 15:44 agent: the clock follows the time zone the device receives from the network; the one hour offset suggests the router advertises a UTC offset without daylight saving. Ticket 2026-04-12 08:10 customer: the schedule is still empty after I recreated it twice, and the app shows a sync error badge next to the device name since this morning. Ticket 2026-04-12 08:50 engineering: schedules were stored in the old cloud namespace and the migration job skipped devices that were offline during the change window; a re-run is queued for tonight. Ticket 2026-04-13 10:02 customer: the parcel tracking has not moved for five days and the carrier hotline says the shipment was never handed over to them. Ticket 2026-04-13 10:30 agent: the warehouse scan exists but the carrier pickup scan is missing, so the parcel is still in the outbound cage and will be re-tendered today. Ticket 2026-04-14 11:15 customer: the delivery address has the wrong house number because the checkout form dropped the suffix after the street name. Ticket 2026-04-14 11:40 agent: the parcel has not left the depot yet, so the address can still be corrected; I have updated the label to include the suffix and notified the carrier. Ticket 2026-04-15 09:05 customer: I ordered a gift card for 100 EUR and the recipient says the code is not recognised at checkout. Ticket 2026-04-15 09:33 agent: the code was issued but the activation job batched it with a cancelled order, so the balance is still zero; I have reissued the card with a new code. Ticket 2026-04-15 14:20 customer: the replacement arrived without the accessory pack that the product page lists as included. Ticket 2026-04-15 14:55 warehouse: the accessory pack is a separate SKU and the pick list template omits it for replacement orders; the missing part ships today. Ticket 2026-04-16 08:12 customer: I need a VAT invoice with my company name and the VAT number on it, not a consumer receipt. Ticket 2026-04-16 08:40 finance: company invoices can be issued within the same fiscal quarter; I have created a corrected invoice with the company details and sent it as a PDF. Ticket 2026-04-16 13:02 customer: the warranty card in the box says two years but the product page says three years for the motor. Ticket 2026-04-16 13:30 agent: the three year motor warranty is a commercial guarantee on top of the statutory two years; both apply, and the motor claim is handled by the service partner. Ticket 2026-04-17 09:22 customer: my order was flagged for fraud review and then cancelled without any message, although I called my bank and the card is fine. Ticket 2026-04-17 09:50 payments: the fraud screen flagged the order because the billing country and the delivery country differ; the case was cancelled by mistake and is being re-created with a manual review note. Ticket 2026-04-17 16:05 customer: I wrote three messages in Italian and every reply came back in English, so I still do not know whether the return was accepted. Ticket 2026-04-17 16:35 agent: the case belongs in the shared Italian queue and was answered by the English queue by mistake; I have routed it and added a translation of the last reply. Ticket 2026-04-18 10:10 customer: we are a business customer and the quote for 2,400 EUR expired before our purchase department could sign it. Ticket 2026-04-18 10:44 sales: business quotes are valid for 14 days and this one expired on 12 April; I have reissued it with the same prices because the price book has not changed. Ticket 2026-04-19 07:55 customer: I received a recall notice for the pressure cooker but I no longer have the original packaging. Ticket 2026-04-19 08:20 safety: a recalled product is refunded without the packaging and outside the refund window; I have created the return and the safety case number. Ticket 2026-04-19 12:30 customer: the smoking complaint about the charger was reported on Friday and nobody from safety has called me back. Ticket 2026-04-19 12:35 safety desk: the report was filed under the wrong queue over the weekend; it is escalated now, the charger model is quarantined and a recall review is open. Ticket 2026-04-20 08:15 customer: the newest unit still will not join the wireless network after firmware 4.2.1 and shows error 41 during setup, so I need technical help with the device itself.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle the newest ticket in the thread?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-receipt-total-tiny",
+    "state": "Line 1: 1 x Cable USB-C 2m (variant 1, SKU-1000-1), unit price 1.50, line total 1.50, warehouse A, return window 30 days. Printed subtotal: 8.50, which includes a 7.00 delivery charge that is not one of the line items; the 5 percent loyalty discount applies to the line items only, payment taken by card, cashier 14, store 218, receipt number R-2026-1187",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "What amount is payable after the 5 percent loyalty discount?",
+        "criteria": {
+          "1.43 EUR": null,
+          "1.50 EUR": null,
+          "8.50 EUR": null,
+          "1.35 EUR": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-receipt-total-short",
+    "state": "Line 1: 1 x Cable USB-C 2m (variant 1, SKU-1000-1), unit price 1.50, line total 1.50, warehouse A, return window 30 days Line 2: 4 x Stainless Steel Mixing Bowl (variant 1, SKU-1007-1), unit price 2.87, line total 11.48, warehouse B, return window 30 days Line 3: 2 x Cotton Tea Towel (variant 1, SKU-1014-1), unit price 4.24, line total 8.48, warehouse C, return window 30 days Line 4: 5 x Espresso Tamper (variant 1, SKU-1021-1), unit price 5.61, line total 28.05, warehouse A, return window 30 days. Printed subtotal: 56.51, which includes a 7.00 delivery charge that is not one of the line items; the 5 percent loyalty discount applies to the line items only, payment taken by card, cashier 14, store 218, receipt number R-2026-1187",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "What amount is payable after the 5 percent loyalty discount?",
+        "criteria": {
+          "47.03 EUR": null,
+          "49.51 EUR": null,
+          "56.51 EUR": null,
+          "44.55 EUR": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-receipt-total-lines",
+    "state": "Line 1: 1 x Cable USB-C 2m (variant 1, SKU-1000-1), unit price 1.50, line total 1.50, warehouse A, return window 30 days Line 2: 4 x Stainless Steel Mixing Bowl (variant 1, SKU-1007-1), unit price 2.87, line total 11.48, warehouse B, return window 30 days Line 3: 2 x Cotton Tea Towel (variant 1, SKU-1014-1), unit price 4.24, line total 8.48, warehouse C, return window 30 days Line 4: 5 x Espresso Tamper (variant 1, SKU-1021-1), unit price 5.61, line total 28.05, warehouse A, return window 30 days Line 5: 3 x Glass Storage Jar (variant 1, SKU-1028-1), unit price 6.98, line total 20.94, warehouse B, return window 30 days Line 6: 1 x Bamboo Cutting Board (variant 1, SKU-1035-1), unit price 8.35, line total 8.35, warehouse C, return window 30 days Line 7: 4 x Ceramic Mug (variant 1, SKU-1042-1), unit price 9.72, line total 38.88, warehouse A, return window 30 days Line 8: 2 x Silicone Spatula (variant 1, SKU-1049-1), unit price 11.09, line total 22.18, warehouse B, return window 30 days Line 9: 5 x Cast Iron Skillet (variant 1, SKU-1056-1), unit price 12.46, line total 62.30, warehouse C, return window 30 days Line 10: 3 x Digital Kitchen Scale (variant 1, SKU-1063-1), unit price 13.83, line total 41.49, warehouse A, return window 30 days Line 11: 1 x Pour Over Filter (variant 1, SKU-1070-1), unit price 15.20, line total 15.20, warehouse B, return window 30 days Line 12: 4 x Coffee Grinder (variant 1, SKU-1077-1), unit price 16.57, line total 66.28, warehouse C, return window 30 days Line 13: 2 x Linen Apron (variant 1, SKU-1084-1), unit price 17.94, line total 35.88, warehouse A, return window 30 days Line 14: 5 x Wooden Spoon Set (variant 1, SKU-1091-1), unit price 19.31, line total 96.55, warehouse B, return window 30 days Line 15: 3 x Vacuum Food Container (variant 1, SKU-1098-1), unit price 20.68, line total 62.04, warehouse C, return window 30 days Line 16: 1 x Measuring Cup Set (variant 1, SKU-1105-1), unit price 22.05, line total 22.05, warehouse A, return window 30 days Line 17: 4 x Reusable Produce Bag (variant 1, SKU-1112-1), unit price 23.42, line total 93.68, warehouse B, return window 30 days Line 18: 2 x Hand Grinder Stand (variant 1, SKU-1119-1), unit price 24.79, line total 49.58, warehouse C, return window 30 days Line 19: 5 x Cold Brew Bottle (variant 1, SKU-1126-1), unit price 26.16, line total 130.80, warehouse A, return window 30 days Line 20: 3 x Milk Frother (variant 1, SKU-1133-1), unit price 27.53, line total 82.59, warehouse B, return window 30 days Line 21: 1 x Dish Brush (variant 1, SKU-1140-1), unit price 28.90, line total 28.90, warehouse C, return window 30 days Line 22: 4 x Storage Basket (variant 1, SKU-1147-1), unit price 30.27, line total 121.08, warehouse A, return window 30 days Line 23: 2 x Herb Scissors (variant 1, SKU-1154-1), unit price 31.64, line total 63.28, warehouse B, return window 30 days Line 24: 5 x Pizza Cutter (variant 1, SKU-1161-1), unit price 33.01, line total 165.05, warehouse C, return window 30 days Line 25: 3 x Mortar and Pestle (variant 1, SKU-1168-1), unit price 34.38, line total 103.14, warehouse A, return window 30 days Line 26: 1 x Cable USB-C 2m (variant 2, SKU-1175-2), unit price 35.75, line total 35.75, warehouse B, return window 30 days Line 27: 4 x Stainless Steel Mixing Bowl (variant 2, SKU-1182-2), unit price 37.12, line total 148.48, warehouse C, return window 30 days Line 28: 2 x Cotton Tea Towel (variant 2, SKU-1189-2), unit price 38.49, line total 76.98, warehouse A, return window 30 days Line 29: 5 x Espresso Tamper (variant 2, SKU-1196-2), unit price 39.86, line total 199.30, warehouse B, return window 30 days Line 30: 3 x Glass Storage Jar (variant 2, SKU-1203-2), unit price 41.23, line total 123.69, warehouse C, return window 30 days Line 31: 1 x Bamboo Cutting Board (variant 2, SKU-1210-2), unit price 42.60, line total 42.60, warehouse A, return window 30 days Line 32: 4 x Ceramic Mug (variant 2, SKU-1217-2), unit price 43.97, line total 175.88, warehouse B, return window 30 days Line 33: 2 x Silicone Spatula (variant 2, SKU-1224-2), unit price 45.34, line total 90.68, warehouse C, return window 30 days Line 34: 5 x Cast Iron Skillet (variant 2, SKU-1231-2), unit price 46.71, line total 233.55, warehouse A, return window 30 days Line 35: 3 x Digital Kitchen Scale (variant 2, SKU-1238-2), unit price 48.08, line total 144.24, warehouse B, return window 30 days Line 36: 1 x Pour Over Filter (variant 2, SKU-1245-2), unit price 49.45, line total 49.45, warehouse C, return window 30 days Line 37: 4 x Coffee Grinder (variant 2, SKU-1252-2), unit price 2.82, line total 11.28, warehouse A, return window 30 days Line 38: 2 x Linen Apron (variant 2, SKU-1259-2), unit price 4.19, line total 8.38, warehouse B, return window 30 days Line 39: 5 x Wooden Spoon Set (variant 2, SKU-1266-2), unit price 5.56, line total 27.80, warehouse C, return window 30 days Line 40: 3 x Vacuum Food Container (variant 2, SKU-1273-2), unit price 6.93, line total 20.79, warehouse A, return window 30 days. Printed subtotal: 2775.60, which includes a 7.00 delivery charge that is not one of the line items; the 5 percent loyalty discount applies to the line items only, payment taken by card, cashier 14, store 218, receipt number R-2026-1187",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "What amount is payable after the 5 percent loyalty discount?",
+        "criteria": {
+          "2630.17 EUR": null,
+          "2768.60 EUR": null,
+          "2775.60 EUR": null,
+          "2491.74 EUR": null
+        }
+      },
+      "over_200": {
+        "type": "noul",
+        "instructions": "Is the payable amount above 200 EUR?"
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How much work is needed to verify this total from the line items?",
+        "criteria": [
+          "Quick check",
+          "Careful recount",
+          "Full audit"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-sentiment-short",
+    "state": "Fast delivery, perfect mug, would buy again.",
+    "questions": {
+      "sentiment": {
+        "type": "choice",
+        "instructions": "What is the sentiment of the text?",
+        "criteria": {
+          "positive": null,
+          "negative": null,
+          "neutral": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-sentiment-review",
+    "state": "The mug keeps coffee hot for an hour and the lid does not leak in a bag. Delivery was two days early and the packaging was fully recyclable. Good value for the price, though the handle is a little small for large hands.",
+    "questions": {
+      "sentiment": {
+        "type": "choice",
+        "instructions": "What is the overall sentiment of these reviews?",
+        "criteria": {
+          "positive": "Mostly satisfied customers",
+          "negative": "Mostly dissatisfied customers",
+          "mixed": "Both strong praise and strong complaints"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-sentiment-long",
+    "state": "The mug keeps coffee hot for an hour and the lid does not leak in a bag. Delivery was two days early and the packaging was fully recyclable. Good value for the price, though the handle is a little small for large hands. The grinder arrived with a bent axle and support has not replied in six days. The scale works but the app loses the connection every time the phone locks. Second purchase from this shop and both orders were perfect. The bottle cracked on the first dishwasher cycle although the listing says dishwasher safe. Average quality; the filter fits, but the seams are rough and catch on the cloth. The parcel was left in the rain and the box was soaked through. The spatula melted at low heat, far below the temperature in the description. Two of the four jars arrived broken and there was no padding in the box. The cutting board warped after the second wash and no longer sits flat on the counter. Customer service promised a replacement twice and nothing has arrived after three weeks. Sturdy board, slightly smaller than expected, but the finish is nice. The coffee tastes burnt since the grinder produces a very uneven grind. The tracking number never worked and the order is three weeks late. The lid does not seal, so the container is not usable for liquids as advertised. The apron shrank two sizes after one cold wash. Exactly as described and the spoon set feels solid. The herb scissors jam on every cut and leave most leaves crushed. Wrong colour delivered twice and the return label took a week to arrive. The frother stopped working after ten days and the battery cover does not close properly. The cold brew bottle leaks from the cap even when it is barely filled. The brush bristles fell out during the first use. The price on the invoice is higher than the price shown at checkout. Works as expected, delivery was slow, the packaging was excessive.",
+    "questions": {
+      "sentiment": {
+        "type": "choice",
+        "instructions": "What is the overall sentiment of the review set?",
+        "criteria": {
+          "positive": "Mostly satisfied customers",
+          "negative": "Mostly dissatisfied customers",
+          "mixed": "No clear majority either way"
+        }
+      },
+      "satisfaction": {
+        "type": "score",
+        "instructions": "How satisfied are these customers overall?",
+        "criteria": [
+          "Very dissatisfied",
+          "Dissatisfied",
+          "Neutral",
+          "Satisfied",
+          "Very satisfied"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-policy-short",
+    "state": "An agent refunded 640 EUR without a team lead signature, although the policy requires a team lead above 500 EUR.",
+    "questions": {
+      "verdict": {
+        "type": "choice",
+        "instructions": "Is this action allowed by the policy described?",
+        "criteria": {
+          "compliant": null,
+          "violation": null,
+          "needs review": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-policy-long",
+    "state": "1. Scope: this policy covers every refund, replacement and credit issued to retail customers in the European Economic Area. 2. Refund window: a refund may be issued within 30 calendar days of delivery, counted from the carrier's delivery scan rather than the order date. 3. Proof of purchase: a receipt, invoice number or bank statement is sufficient proof of purchase; a loyalty card number alone is not. 4. Damaged goods: goods damaged in transit are replaced at no cost when the customer reports the damage within 48 hours and provides a photo of the parcel and the item. 5. Opened goods: opened goods may be returned within 14 days when they are unused apart from a reasonable inspection. 6. Hygiene items: opened hygiene items, including milk frothers with a used food contact surface, cannot be returned unless they are faulty. 7. Faulty goods: a fault that appears within six months is presumed to have existed at delivery unless the merchant can show otherwise. 8. Repair first: for goods with a purchase price above 400 EUR the merchant may choose one repair attempt before a replacement is issued. 9. Replacement stock: a replacement is offered from the same warehouse when stock is available, otherwise from any warehouse within the same country. 10. Refund method: refunds go to the original payment method; a cash refund is allowed only when the original payment was cash on delivery. 11. Refund timing: the refund is released within five business days of the returned goods being scanned at the depot, and the payment provider may need another five days. 12. Shipping fees: standard shipping is refunded when the entire order is returned; express surcharges are refunded only when the return is caused by the merchant. 13. Partial returns: when part of an order is returned, a free-shipping threshold granted by the original order is recalculated and the difference may be deducted. 14. Discounts: a discount larger than 20 percent of the order value requires written approval from a finance team lead before it is applied. 15. Credits: a credit note must show the same VAT rate as the invoice it corrects, even when it is issued in a later fiscal quarter. 16. Chargebacks: once a card chargeback is filed, the case moves to the payments team and the customer receives no direct refund until the dispute is closed. 17. Duplicate charges: a duplicate authorization is cancelled immediately when it has not settled; a settled duplicate is refunded with a credit note. 18. Subscription changes: a plan change takes effect at the start of the next billing cycle unless a prorated credit is approved by billing. 19. Price errors: an invoice issued from a stale price book is corrected with a prorated credit within one billing cycle. 20. Reminders: no reminder may be sent for an invoice that is already matched to a payment in the accounting system. 21. Data retention: order records are kept for 24 months after the end of the fiscal year in which the order was fulfilled. 22. Customer records: a deletion request removes the contact record within 30 days but keeps anonymised order lines for the retention period. 23. Access control: only staff with the billing role may view full card numbers; the support role sees the last four digits. 24. Security incidents: a suspected data breach is reported to the security team within 24 hours of discovery, and to the regulator within 72 hours. 25. Passwords: shared support accounts are forbidden; every agent uses a personal account with multi-factor authentication. 26. Escalation: a case older than ten business days without customer contact is escalated to the team lead automatically. 27. Duplicate cases: when two tickets describe the same order and the same fault, the newer ticket is merged into the older one. 28. Language: a customer writing in a language the agent does not speak is routed to the shared language queue instead of being answered with machine translation. 29. Recording: calls are recorded only with an announcement at the start; records are deleted after six months. 30. Concessions: a goodwill gesture above 50 EUR needs a documented reason in the case notes. 31. Warranty: the statutory warranty period of two years applies to every product; the commercial guarantee does not replace it. 32. Return shipping: the merchant pays return shipping for faulty and transit-damaged goods; the customer pays for change-of-mind returns unless the order value exceeds 200 EUR. 33. Inspection: returned goods are inspected at the depot within two business days; the inspection result is recorded against the RMA number. 34. Missing parts: a missing accessory is shipped separately at no cost and does not require a full return. 35. Packaging errors: a repeated packaging error affecting more than five orders is reported as a supplier quality case. 36. Tax: tax corrections are issued by finance only; support agents do not change VAT lines on invoices. 37. Fraud: an order flagged by the fraud screen is held, never cancelled, until the payments team clears it. 38. Address changes: a shipping address may be changed until the order is handed to the carrier; afterwards the customer must wait for delivery and redirect the parcel. 39. Delivery windows: a missed delivery window caused by the carrier is compensated with a shipping credit, not with a product discount. 40. Held stock: reserved stock is released after 48 hours when the payment has not been captured. 41. B2B orders: business orders above 2,000 EUR require a signed quote and are excluded from the retail refund window. 42. Promotions: a promotional bundle that is partially returned keeps the bundle price for the retained items and refunds the remainder at bundle rate. 43. Gift cards: gift cards are refunded as a gift card, never as cash, and expire after 36 months. 44. Recalls: a recalled product is refunded in full regardless of the refund window and without requiring the original packaging. 45. Safety: any report of smoke, fire or electric shock is escalated to the safety desk within one hour and the product is quarantined. 46. Documentation: every refund over 100 EUR needs the invoice number in the case notes; every replacement needs the RMA number. 47. Approval matrix: refunds up to 100 EUR are approved by the agent, up to 500 EUR by the team lead, and above 500 EUR by the finance lead. 48. Audit: a random sample of 5 percent of refunds is audited monthly, and every audited case must keep its evidence for 24 months. 49. Complaints: a complaint about a policy decision is answered within three business days with the policy clause that applies. 50. Review: this policy is reviewed twice a year by support, finance and legal, and every change is announced one week before it takes effect. 51. Bundles: a bundle returned in parts keeps the bundle discount only while at least half of the bundle's items are kept. 52. Deposits: a deposit for a custom order is refundable until production starts and non-refundable afterwards unless the merchant cancels. 53. Pre-orders: a pre-order may be cancelled at any time before the release date and is refunded in full within five business days. 54. Shipping damage: a parcel with visible outer damage may be refused at the door, which counts as a transit damage report. 55. Lost parcels: a parcel that has not moved for seven days is treated as lost and replaced or refunded at the customer's choice. 56. Returns abroad: cross-border returns use the merchant's carrier account when the return is caused by the merchant and the customer's account otherwise. 57. Fees: no restocking fee is charged for faulty goods, transit damage or recalls; a restocking fee of up to 10 percent may apply to large appliances returned without cause. 58. Inspection delays: when the depot cannot inspect within two business days, the refund is released on the customer's photos alone. 59. Store credit: store credit is offered only when the customer asks for it and may never replace a refund the customer is entitled to. 60. Price matching: a lower price at another retailer is matched within 14 days of purchase when the competitor has the item in stock. 61. Coupons: an expired coupon is not applied retroactively, but a coupon that expired during a checkout error is honoured manually. 62. Invoices: an invoice is issued at the latest on the day the order ships, never before the payment is captured. 63. Payment capture: a payment is captured only when the order is ready to ship; authorizations older than seven days are released. 64. Three dimensional secure: a payment that fails the second factor twice is not retried automatically and the customer is asked to use another method. 65. Refunds after chargeback: a refund already issued before a chargeback is documented in the dispute file and never repeated. 66. Duplicate refunds: a second refund for the same invoice is blocked by the payment run and reviewed by finance. 67. Customer contact: every case needs at least one attempt to contact the customer within two business days of the first agent reply.",
+    "questions": {
+      "verdict": {
+        "type": "choice",
+        "instructions": "An agent refunded 640 EUR to a card without asking a team lead. Is this action allowed?",
+        "criteria": {
+          "compliant": null,
+          "violation": null,
+          "needs review": null
+        }
+      },
+      "approval": {
+        "type": "noul",
+        "instructions": "Does a refund of 640 EUR require approval above the agent level?"
+      },
+      "risk": {
+        "type": "score",
+        "instructions": "How serious is the policy risk in this case?",
+        "criteria": [
+          "Negligible",
+          "Low",
+          "Moderate",
+          "High"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-policy-full",
+    "state": "1. Scope: this policy covers every refund, replacement and credit issued to retail customers in the European Economic Area. 2. Refund window: a refund may be issued within 30 calendar days of delivery, counted from the carrier's delivery scan rather than the order date. 3. Proof of purchase: a receipt, invoice number or bank statement is sufficient proof of purchase; a loyalty card number alone is not. 4. Damaged goods: goods damaged in transit are replaced at no cost when the customer reports the damage within 48 hours and provides a photo of the parcel and the item. 5. Opened goods: opened goods may be returned within 14 days when they are unused apart from a reasonable inspection. 6. Hygiene items: opened hygiene items, including milk frothers with a used food contact surface, cannot be returned unless they are faulty. 7. Faulty goods: a fault that appears within six months is presumed to have existed at delivery unless the merchant can show otherwise. 8. Repair first: for goods with a purchase price above 400 EUR the merchant may choose one repair attempt before a replacement is issued. 9. Replacement stock: a replacement is offered from the same warehouse when stock is available, otherwise from any warehouse within the same country. 10. Refund method: refunds go to the original payment method; a cash refund is allowed only when the original payment was cash on delivery. 11. Refund timing: the refund is released within five business days of the returned goods being scanned at the depot, and the payment provider may need another five days. 12. Shipping fees: standard shipping is refunded when the entire order is returned; express surcharges are refunded only when the return is caused by the merchant. 13. Partial returns: when part of an order is returned, a free-shipping threshold granted by the original order is recalculated and the difference may be deducted. 14. Discounts: a discount larger than 20 percent of the order value requires written approval from a finance team lead before it is applied. 15. Credits: a credit note must show the same VAT rate as the invoice it corrects, even when it is issued in a later fiscal quarter. 16. Chargebacks: once a card chargeback is filed, the case moves to the payments team and the customer receives no direct refund until the dispute is closed. 17. Duplicate charges: a duplicate authorization is cancelled immediately when it has not settled; a settled duplicate is refunded with a credit note. 18. Subscription changes: a plan change takes effect at the start of the next billing cycle unless a prorated credit is approved by billing. 19. Price errors: an invoice issued from a stale price book is corrected with a prorated credit within one billing cycle. 20. Reminders: no reminder may be sent for an invoice that is already matched to a payment in the accounting system. 21. Data retention: order records are kept for 24 months after the end of the fiscal year in which the order was fulfilled. 22. Customer records: a deletion request removes the contact record within 30 days but keeps anonymised order lines for the retention period. 23. Access control: only staff with the billing role may view full card numbers; the support role sees the last four digits. 24. Security incidents: a suspected data breach is reported to the security team within 24 hours of discovery, and to the regulator within 72 hours. 25. Passwords: shared support accounts are forbidden; every agent uses a personal account with multi-factor authentication. 26. Escalation: a case older than ten business days without customer contact is escalated to the team lead automatically. 27. Duplicate cases: when two tickets describe the same order and the same fault, the newer ticket is merged into the older one. 28. Language: a customer writing in a language the agent does not speak is routed to the shared language queue instead of being answered with machine translation. 29. Recording: calls are recorded only with an announcement at the start; records are deleted after six months. 30. Concessions: a goodwill gesture above 50 EUR needs a documented reason in the case notes. 31. Warranty: the statutory warranty period of two years applies to every product; the commercial guarantee does not replace it. 32. Return shipping: the merchant pays return shipping for faulty and transit-damaged goods; the customer pays for change-of-mind returns unless the order value exceeds 200 EUR. 33. Inspection: returned goods are inspected at the depot within two business days; the inspection result is recorded against the RMA number. 34. Missing parts: a missing accessory is shipped separately at no cost and does not require a full return. 35. Packaging errors: a repeated packaging error affecting more than five orders is reported as a supplier quality case. 36. Tax: tax corrections are issued by finance only; support agents do not change VAT lines on invoices. 37. Fraud: an order flagged by the fraud screen is held, never cancelled, until the payments team clears it. 38. Address changes: a shipping address may be changed until the order is handed to the carrier; afterwards the customer must wait for delivery and redirect the parcel. 39. Delivery windows: a missed delivery window caused by the carrier is compensated with a shipping credit, not with a product discount. 40. Held stock: reserved stock is released after 48 hours when the payment has not been captured. 41. B2B orders: business orders above 2,000 EUR require a signed quote and are excluded from the retail refund window. 42. Promotions: a promotional bundle that is partially returned keeps the bundle price for the retained items and refunds the remainder at bundle rate. 43. Gift cards: gift cards are refunded as a gift card, never as cash, and expire after 36 months. 44. Recalls: a recalled product is refunded in full regardless of the refund window and without requiring the original packaging. 45. Safety: any report of smoke, fire or electric shock is escalated to the safety desk within one hour and the product is quarantined. 46. Documentation: every refund over 100 EUR needs the invoice number in the case notes; every replacement needs the RMA number. 47. Approval matrix: refunds up to 100 EUR are approved by the agent, up to 500 EUR by the team lead, and above 500 EUR by the finance lead. 48. Audit: a random sample of 5 percent of refunds is audited monthly, and every audited case must keep its evidence for 24 months. 49. Complaints: a complaint about a policy decision is answered within three business days with the policy clause that applies. 50. Review: this policy is reviewed twice a year by support, finance and legal, and every change is announced one week before it takes effect. 51. Bundles: a bundle returned in parts keeps the bundle discount only while at least half of the bundle's items are kept. 52. Deposits: a deposit for a custom order is refundable until production starts and non-refundable afterwards unless the merchant cancels. 53. Pre-orders: a pre-order may be cancelled at any time before the release date and is refunded in full within five business days. 54. Shipping damage: a parcel with visible outer damage may be refused at the door, which counts as a transit damage report. 55. Lost parcels: a parcel that has not moved for seven days is treated as lost and replaced or refunded at the customer's choice. 56. Returns abroad: cross-border returns use the merchant's carrier account when the return is caused by the merchant and the customer's account otherwise. 57. Fees: no restocking fee is charged for faulty goods, transit damage or recalls; a restocking fee of up to 10 percent may apply to large appliances returned without cause. 58. Inspection delays: when the depot cannot inspect within two business days, the refund is released on the customer's photos alone. 59. Store credit: store credit is offered only when the customer asks for it and may never replace a refund the customer is entitled to. 60. Price matching: a lower price at another retailer is matched within 14 days of purchase when the competitor has the item in stock. 61. Coupons: an expired coupon is not applied retroactively, but a coupon that expired during a checkout error is honoured manually. 62. Invoices: an invoice is issued at the latest on the day the order ships, never before the payment is captured. 63. Payment capture: a payment is captured only when the order is ready to ship; authorizations older than seven days are released. 64. Three dimensional secure: a payment that fails the second factor twice is not retried automatically and the customer is asked to use another method. 65. Refunds after chargeback: a refund already issued before a chargeback is documented in the dispute file and never repeated. 66. Duplicate refunds: a second refund for the same invoice is blocked by the payment run and reviewed by finance. 67. Customer contact: every case needs at least one attempt to contact the customer within two business days of the first agent reply. 68. Closure: a case may be closed without a customer reply after 14 days of silence, with a reminder sent on day 7. 69. Reopening: a closed case is reopened within 30 days when the customer replies; afterwards a new case is created and linked to the old one. 70. Notes: case notes are written for the next agent, in the customer's language for customer-facing text and in English for internal notes. 71. Attachments: photos and videos are attached to the case, never only linked from an email, so the evidence survives mailbox deletion. 72. Personal data in notes: card numbers, passwords and identity document numbers are never written into case notes; only the last four digits of a card are allowed. 73. Supplier claims: transit damage is claimed from the carrier within 14 days of the delivery scan; a late claim needs a written exception. 74. Quality cases: three complaints about the same defect within 30 days open a supplier quality case automatically. 75. Recalls: the safety desk owns the recall decision; support only executes the refund or replacement once a recall number exists. 76. Escalation to legal: a threat of legal action or a regulator inquiry is escalated to legal the same day and answered only by legal. 77. Media inquiries: journalists are routed to communications; support does not comment on individual cases. 78. Accessibility: a customer who cannot use the web form may dictating the request by phone, and the agent fills the form on their behalf. 79. Language of the contract: the contract language is the language of the country of delivery, even when the customer writes in another language. 80. Record keeping: every exception to this policy is recorded with the approving manager, the reason and the expiry date. 81. Hold periods: a refund is never placed on hold longer than five business days without a written reason in the case. 82. Chargeback evidence: the payments team answers a chargeback with the delivery scan, the invoice and the customer contact history within the card scheme deadline. 83. Duplicate accounts: two accounts with the same VAT number and the same address are merged after finance confirms the identity. 84. Gift wrapping: gift wrapping is a service fee and is refunded only when the whole order is returned unopened. 85. Disposal: a recalled or unsafe product is never resold and is disposed of with a certificate after the refund is issued. 86. Training: every support agent completes the policy training before handling refunds and repeats it every twelve months.",
+    "questions": {
+      "verdict": {
+        "type": "choice",
+        "instructions": "A duplicate order that was paid by card is refunded as store credit instead of to the card. Is this action allowed?",
+        "criteria": {
+          "compliant": null,
+          "violation": null,
+          "needs review": null
+        }
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-scheduling-short",
+    "state": "Monday 09:00-09:30 daily stand-up, room A, attendees: platform team Monday 09:30-11:00 roadmap review, room B, attendees: product and platform leads Monday 11:00-12:00 vendor sync with Acme, video call, attendees: procurement and platform Monday 13:00-14:00 customer escalation review, room A, attendees: support and engineering Monday 14:00-16:00 architecture review, room C, attendees: platform and security Tuesday 09:00-10:00 incident retrospective, room B, attendees: on-call and platform Tuesday 10:00-11:30 quarterly planning, room A, attendees: all leads Tuesday 13:00-14:30 design review, room D, attendees: design and product Tuesday 15:00-16:00 hiring panel, room D, attendees: engineering managers Procurement is available on Tuesday from 13:00 to 17:00. The vendor sync must move from Monday 11:00 to a slot where procurement and the platform team can both attend.",
+    "questions": {
+      "slot": {
+        "type": "choice",
+        "instructions": "Which listed slot works for the vendor sync?",
+        "criteria": {
+          "Tuesday 09:00-10:00": null,
+          "Tuesday 13:00-14:30": null,
+          "Tuesday 15:00-16:00": null,
+          "Tuesday 10:00-11:30": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-scheduling-week",
+    "state": "Monday 09:00-09:30 daily stand-up, room A, attendees: platform team Monday 09:30-11:00 roadmap review, room B, attendees: product and platform leads Monday 11:00-12:00 vendor sync with Acme, video call, attendees: procurement and platform Monday 13:00-14:00 customer escalation review, room A, attendees: support and engineering Monday 14:00-16:00 architecture review, room C, attendees: platform and security Tuesday 09:00-10:00 incident retrospective, room B, attendees: on-call and platform Tuesday 10:00-11:30 quarterly planning, room A, attendees: all leads Tuesday 13:00-14:30 design review, room D, attendees: design and product Tuesday 15:00-16:00 hiring panel, room D, attendees: engineering managers Wednesday 09:00-10:00 security review, room C, attendees: security and platform Wednesday 10:30-12:00 budget review, room B, attendees: finance and product Wednesday 14:00-15:00 design critique, room A, attendees: design and frontend Thursday 09:00-10:00 support handover, room A, attendees: support leads Thursday 11:00-12:30 customer workshop, room D, attendees: product and design Thursday 14:00-15:00 platform office hours, room C, attendees: platform team Friday 09:00-10:00 sprint review, room B, attendees: all teams Friday 10:00-11:00 sprint retrospective, room B, attendees: all teams",
+    "questions": {
+      "day": {
+        "type": "choice",
+        "instructions": "Which day has the fewest scheduled meetings?",
+        "criteria": {
+          "Monday": null,
+          "Tuesday": null,
+          "Wednesday": null,
+          "Thursday": null,
+          "Friday": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-json-account",
+    "state": {
+      "account": {
+        "id": "acct-77812",
+        "plan": "growth",
+        "status": "active",
+        "balance_eur": -412.6
+      },
+      "usage": {
+        "seats": 42,
+        "api_calls_30d": 1184220,
+        "included_calls": 1000000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 890.0,
+          "status": "paid"
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 890.0,
+          "status": "paid"
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 412.6,
+          "status": "overdue",
+          "days_late": 21
+        }
+      ],
+      "alerts": [
+        "api usage at 118 percent of the included volume",
+        "invoice inv-2026-05 is 21 days overdue"
+      ],
+      "owner": "marta.k",
+      "renewal": "2026-09-30"
+    },
+    "questions": {
+      "action": {
+        "type": "choice",
+        "instructions": "What should the account team do next?",
+        "criteria": {
+          "escalate to collections": "The overdue invoice is the priority",
+          "offer a plan upgrade": null,
+          "reduce the seat count": null,
+          "close the account": null
+        }
+      },
+      "overdue": {
+        "type": "noul",
+        "instructions": "Is the account overdue on any invoice?"
+      }
+    }
+  },
+  {
+    "name": "choice-json-usage",
+    "state": {
+      "account": {
+        "id": "acct-99120",
+        "plan": "enterprise",
+        "status": "active",
+        "balance_eur": -12480.0
+      },
+      "contract": {
+        "seats": 240,
+        "renewal": "2026-12-31",
+        "discount_percent": 18,
+        "payment_terms": "net 45"
+      },
+      "usage": {
+        "seats_active": 231,
+        "api_calls_30d": 98842210,
+        "included_calls": 90000000,
+        "storage_gb": 8210,
+        "storage_included_gb": 8000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-01",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-02",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 41200.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-06",
+          "amount_eur": 41200.0,
+          "status": "overdue",
+          "days_late": 42
+        },
+        {
+          "id": "inv-2026-07",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-08",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-09",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-10",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-11",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-12",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        }
+      ],
+      "events": [
+        {
+          "id": "evt-4200",
+          "day": 1,
+          "units": 0,
+          "amount_eur": 12.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4201",
+          "day": 2,
+          "units": 7,
+          "amount_eur": 25.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4202",
+          "day": 3,
+          "units": 14,
+          "amount_eur": 38.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4203",
+          "day": 4,
+          "units": 21,
+          "amount_eur": 51.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4204",
+          "day": 5,
+          "units": 28,
+          "amount_eur": 64.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4205",
+          "day": 6,
+          "units": 4,
+          "amount_eur": 77.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4206",
+          "day": 7,
+          "units": 11,
+          "amount_eur": 90.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4207",
+          "day": 8,
+          "units": 18,
+          "amount_eur": 103.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4208",
+          "day": 9,
+          "units": 25,
+          "amount_eur": 116.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4209",
+          "day": 10,
+          "units": 1,
+          "amount_eur": 129.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4210",
+          "day": 11,
+          "units": 8,
+          "amount_eur": 142.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4211",
+          "day": 12,
+          "units": 15,
+          "amount_eur": 155.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4212",
+          "day": 13,
+          "units": 22,
+          "amount_eur": 168.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4213",
+          "day": 14,
+          "units": 29,
+          "amount_eur": 181.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4214",
+          "day": 15,
+          "units": 5,
+          "amount_eur": 194.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4215",
+          "day": 16,
+          "units": 12,
+          "amount_eur": 207.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4216",
+          "day": 17,
+          "units": 19,
+          "amount_eur": 220.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4217",
+          "day": 18,
+          "units": 26,
+          "amount_eur": 233.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4218",
+          "day": 19,
+          "units": 2,
+          "amount_eur": 246.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4219",
+          "day": 20,
+          "units": 9,
+          "amount_eur": 19.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4220",
+          "day": 21,
+          "units": 16,
+          "amount_eur": 32.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4221",
+          "day": 22,
+          "units": 23,
+          "amount_eur": 45.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4222",
+          "day": 23,
+          "units": 30,
+          "amount_eur": 58.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4223",
+          "day": 24,
+          "units": 6,
+          "amount_eur": 71.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4224",
+          "day": 25,
+          "units": 13,
+          "amount_eur": 84.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4225",
+          "day": 26,
+          "units": 20,
+          "amount_eur": 97.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4226",
+          "day": 27,
+          "units": 27,
+          "amount_eur": 110.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4227",
+          "day": 28,
+          "units": 3,
+          "amount_eur": 123.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4228",
+          "day": 29,
+          "units": 10,
+          "amount_eur": 136.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4229",
+          "day": 30,
+          "units": 17,
+          "amount_eur": 149.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4230",
+          "day": 31,
+          "units": 24,
+          "amount_eur": 162.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4231",
+          "day": 32,
+          "units": 0,
+          "amount_eur": 175.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4232",
+          "day": 33,
+          "units": 7,
+          "amount_eur": 188.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4233",
+          "day": 34,
+          "units": 14,
+          "amount_eur": 201.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4234",
+          "day": 35,
+          "units": 21,
+          "amount_eur": 214.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4235",
+          "day": 36,
+          "units": 28,
+          "amount_eur": 227.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4236",
+          "day": 37,
+          "units": 4,
+          "amount_eur": 240.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4237",
+          "day": 38,
+          "units": 11,
+          "amount_eur": 13.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4238",
+          "day": 39,
+          "units": 18,
+          "amount_eur": 26.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4239",
+          "day": 40,
+          "units": 25,
+          "amount_eur": 39.5,
+          "channel": "api",
+          "status": "settled"
+        }
+      ],
+      "alerts": [
+        "storage at 103 percent of the included volume",
+        "invoice inv-2026-06 is 42 days overdue",
+        "231 of 240 seats active"
+      ],
+      "owner": "j.okafor-audit",
+      "region": "eu-central"
+    },
+    "questions": {
+      "action": {
+        "type": "choice",
+        "instructions": "Which action fits the account state best?",
+        "criteria": {
+          "suspend the account": null,
+          "sell a storage add-on": null,
+          "downgrade the plan": null,
+          "mark as healthy": null
+        }
+      },
+      "overdue": {
+        "type": "noul",
+        "instructions": "Is any invoice more than 30 days late?"
+      },
+      "risk": {
+        "type": "score",
+        "instructions": "How much revenue risk does this account carry?",
+        "criteria": [
+          "Low",
+          "Medium",
+          "High",
+          "Critical"
+        ]
+      }
+    }
+  },
+  {
+    "name": "choice-intent-short",
+    "state": "Please summarise this support thread in three bullet points for the weekly report.",
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the user want?",
+        "criteria": {
+          "summarise": null,
+          "translate": null,
+          "classify": null,
+          "refund": null
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-language-german",
+    "state": "Der Lieferant hat die Ersatzteile heute verschickt, aber die Sendungsnummer fehlt in der Bestätigung.",
+    "questions": {
+      "language": {
+        "type": "choice",
+        "instructions": "Which language is the state written in?",
+        "criteria": {
+          "German": null,
+          "English": null,
+          "Dutch": null
+        }
+      },
+      "is_english": {
+        "type": "noul",
+        "instructions": "Is the state written in English?"
+      }
+    }
+  },
+  {
+    "name": "choice-tier-ticket",
+    "state": "Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. The order value was 349 EUR and the customer has already waited six days.",
+    "questions": {
+      "tier": {
+        "type": "choice",
+        "instructions": "Which handling tier fits this case?",
+        "criteria": {
+          "standard": "No deadline pressure",
+          "priority": "Needs attention this week",
+          "executive": "Board level attention required"
+        }
+      }
+    }
+  },
+  {
+    "name": "choice-compliance-audit",
+    "state": "Finding F-101, severity high: the support role can view full card numbers in the order detail view, which contradicts clause 23 of the data policy. Finding F-102, severity low: two archived cases are missing the invoice number in the notes, which is required for refunds over 100 EUR under clause 46. Finding F-103, severity medium: a refund of 640 EUR was approved by an agent without a team lead signature, which the approval matrix in clause 47 does not allow. Finding F-104, severity low: three call recordings from March are older than six months and have not been deleted yet, against clause 29. Finding F-105, severity high: a suspected credential leak on 3 April was reported to the security team on 6 April, more than 24 hours after discovery, against clause 24. Finding F-106, severity medium: a duplicate ticket from 14 March was answered separately and never merged into the older ticket, against clause 27. Finding F-107, severity low: a goodwill credit of 80 EUR has a one-line reason that does not explain the gesture, against clause 30. Finding F-108, severity medium: a gift card was refunded as cash at a retail counter, which clause 43 forbids. Finding F-109, severity high: an order flagged by the fraud screen was cancelled by an agent instead of being held, against clause 37. Finding F-110, severity low: an audit sample of 5 percent was not completed for April, against clause 48. Finding F-111, severity medium: a customer deletion request was completed after 44 days, which is over the 30 day limit in clause 22. Finding F-112, severity low: a policy change took effect in April without the one week notice required by clause 50.",
+    "questions": {
+      "verdict": {
+        "type": "choice",
+        "instructions": "How many findings are rated high severity?",
+        "criteria": {
+          "one": null,
+          "two": null,
+          "three": null,
+          "four": null
+        }
+      },
+      "breach": {
+        "type": "noul",
+        "instructions": "Does any finding involve a breach of the 24 hour security reporting rule?"
+      }
+    }
+  },
+  {
+    "name": "noul-receipt-short",
+    "state": "I bought the kettle last week and I still have the invoice, but the box is gone.",
+    "questions": {
+      "proof": {
+        "type": "noul",
+        "instructions": "Does the customer provide proof of purchase?"
+      }
+    }
+  },
+  {
+    "name": "noul-refund-window",
+    "state": "The espresso machine was delivered on 14 March according to the carrier scan. The customer writes on 2 April asking to return it because the steam wand leaks. The order confirmation and the delivery photo are attached.",
+    "questions": {
+      "in_window": {
+        "type": "noul",
+        "instructions": "Is the request still inside the 30 day refund window?",
+        "criteria": {
+          "false": "Outside the window",
+          "true": "Inside the window"
+        }
+      }
+    }
+  },
+  {
+    "name": "noul-policy-security",
+    "state": "1. Scope: this policy covers every refund, replacement and credit issued to retail customers in the European Economic Area. 2. Refund window: a refund may be issued within 30 calendar days of delivery, counted from the carrier's delivery scan rather than the order date. 3. Proof of purchase: a receipt, invoice number or bank statement is sufficient proof of purchase; a loyalty card number alone is not. 4. Damaged goods: goods damaged in transit are replaced at no cost when the customer reports the damage within 48 hours and provides a photo of the parcel and the item. 5. Opened goods: opened goods may be returned within 14 days when they are unused apart from a reasonable inspection. 6. Hygiene items: opened hygiene items, including milk frothers with a used food contact surface, cannot be returned unless they are faulty. 7. Faulty goods: a fault that appears within six months is presumed to have existed at delivery unless the merchant can show otherwise. 8. Repair first: for goods with a purchase price above 400 EUR the merchant may choose one repair attempt before a replacement is issued. 9. Replacement stock: a replacement is offered from the same warehouse when stock is available, otherwise from any warehouse within the same country. 10. Refund method: refunds go to the original payment method; a cash refund is allowed only when the original payment was cash on delivery. 11. Refund timing: the refund is released within five business days of the returned goods being scanned at the depot, and the payment provider may need another five days. 12. Shipping fees: standard shipping is refunded when the entire order is returned; express surcharges are refunded only when the return is caused by the merchant. 13. Partial returns: when part of an order is returned, a free-shipping threshold granted by the original order is recalculated and the difference may be deducted. 14. Discounts: a discount larger than 20 percent of the order value requires written approval from a finance team lead before it is applied. 15. Credits: a credit note must show the same VAT rate as the invoice it corrects, even when it is issued in a later fiscal quarter. 16. Chargebacks: once a card chargeback is filed, the case moves to the payments team and the customer receives no direct refund until the dispute is closed. 17. Duplicate charges: a duplicate authorization is cancelled immediately when it has not settled; a settled duplicate is refunded with a credit note. 18. Subscription changes: a plan change takes effect at the start of the next billing cycle unless a prorated credit is approved by billing. 19. Price errors: an invoice issued from a stale price book is corrected with a prorated credit within one billing cycle. 20. Reminders: no reminder may be sent for an invoice that is already matched to a payment in the accounting system. 21. Data retention: order records are kept for 24 months after the end of the fiscal year in which the order was fulfilled. 22. Customer records: a deletion request removes the contact record within 30 days but keeps anonymised order lines for the retention period. 23. Access control: only staff with the billing role may view full card numbers; the support role sees the last four digits. 24. Security incidents: a suspected data breach is reported to the security team within 24 hours of discovery, and to the regulator within 72 hours. 25. Passwords: shared support accounts are forbidden; every agent uses a personal account with multi-factor authentication. 26. Escalation: a case older than ten business days without customer contact is escalated to the team lead automatically. 27. Duplicate cases: when two tickets describe the same order and the same fault, the newer ticket is merged into the older one. 28. Language: a customer writing in a language the agent does not speak is routed to the shared language queue instead of being answered with machine translation. 29. Recording: calls are recorded only with an announcement at the start; records are deleted after six months. 30. Concessions: a goodwill gesture above 50 EUR needs a documented reason in the case notes. 31. Warranty: the statutory warranty period of two years applies to every product; the commercial guarantee does not replace it. 32. Return shipping: the merchant pays return shipping for faulty and transit-damaged goods; the customer pays for change-of-mind returns unless the order value exceeds 200 EUR. 33. Inspection: returned goods are inspected at the depot within two business days; the inspection result is recorded against the RMA number. 34. Missing parts: a missing accessory is shipped separately at no cost and does not require a full return. 35. Packaging errors: a repeated packaging error affecting more than five orders is reported as a supplier quality case. 36. Tax: tax corrections are issued by finance only; support agents do not change VAT lines on invoices. 37. Fraud: an order flagged by the fraud screen is held, never cancelled, until the payments team clears it. 38. Address changes: a shipping address may be changed until the order is handed to the carrier; afterwards the customer must wait for delivery and redirect the parcel. 39. Delivery windows: a missed delivery window caused by the carrier is compensated with a shipping credit, not with a product discount. 40. Held stock: reserved stock is released after 48 hours when the payment has not been captured. 41. B2B orders: business orders above 2,000 EUR require a signed quote and are excluded from the retail refund window. 42. Promotions: a promotional bundle that is partially returned keeps the bundle price for the retained items and refunds the remainder at bundle rate. 43. Gift cards: gift cards are refunded as a gift card, never as cash, and expire after 36 months. 44. Recalls: a recalled product is refunded in full regardless of the refund window and without requiring the original packaging. 45. Safety: any report of smoke, fire or electric shock is escalated to the safety desk within one hour and the product is quarantined. 46. Documentation: every refund over 100 EUR needs the invoice number in the case notes; every replacement needs the RMA number. 47. Approval matrix: refunds up to 100 EUR are approved by the agent, up to 500 EUR by the team lead, and above 500 EUR by the finance lead. 48. Audit: a random sample of 5 percent of refunds is audited monthly, and every audited case must keep its evidence for 24 months. 49. Complaints: a complaint about a policy decision is answered within three business days with the policy clause that applies. 50. Review: this policy is reviewed twice a year by support, finance and legal, and every change is announced one week before it takes effect. 51. Bundles: a bundle returned in parts keeps the bundle discount only while at least half of the bundle's items are kept. 52. Deposits: a deposit for a custom order is refundable until production starts and non-refundable afterwards unless the merchant cancels. 53. Pre-orders: a pre-order may be cancelled at any time before the release date and is refunded in full within five business days. 54. Shipping damage: a parcel with visible outer damage may be refused at the door, which counts as a transit damage report. 55. Lost parcels: a parcel that has not moved for seven days is treated as lost and replaced or refunded at the customer's choice. 56. Returns abroad: cross-border returns use the merchant's carrier account when the return is caused by the merchant and the customer's account otherwise. 57. Fees: no restocking fee is charged for faulty goods, transit damage or recalls; a restocking fee of up to 10 percent may apply to large appliances returned without cause. 58. Inspection delays: when the depot cannot inspect within two business days, the refund is released on the customer's photos alone. 59. Store credit: store credit is offered only when the customer asks for it and may never replace a refund the customer is entitled to. 60. Price matching: a lower price at another retailer is matched within 14 days of purchase when the competitor has the item in stock. 61. Coupons: an expired coupon is not applied retroactively, but a coupon that expired during a checkout error is honoured manually. 62. Invoices: an invoice is issued at the latest on the day the order ships, never before the payment is captured. 63. Payment capture: a payment is captured only when the order is ready to ship; authorizations older than seven days are released. 64. Three dimensional secure: a payment that fails the second factor twice is not retried automatically and the customer is asked to use another method. 65. Refunds after chargeback: a refund already issued before a chargeback is documented in the dispute file and never repeated. 66. Duplicate refunds: a second refund for the same invoice is blocked by the payment run and reviewed by finance. 67. Customer contact: every case needs at least one attempt to contact the customer within two business days of the first agent reply.",
+    "questions": {
+      "requires_security": {
+        "type": "noul",
+        "instructions": "Would a suspected data breach discovered today have to reach the regulator within 72 hours?"
+      },
+      "needs_finance": {
+        "type": "noul",
+        "instructions": "Does a 25 percent discount need finance approval?"
+      }
+    }
+  },
+  {
+    "name": "noul-scheduling-conflict",
+    "state": "Monday 09:00-09:30 daily stand-up, room A, attendees: platform team Monday 09:30-11:00 roadmap review, room B, attendees: product and platform leads Monday 11:00-12:00 vendor sync with Acme, video call, attendees: procurement and platform Monday 13:00-14:00 customer escalation review, room A, attendees: support and engineering Monday 14:00-16:00 architecture review, room C, attendees: platform and security Tuesday 09:00-10:00 incident retrospective, room B, attendees: on-call and platform Tuesday 10:00-11:30 quarterly planning, room A, attendees: all leads Tuesday 13:00-14:30 design review, room D, attendees: design and product Tuesday 15:00-16:00 hiring panel, room D, attendees: engineering managers Wednesday 09:00-10:00 security review, room C, attendees: security and platform Wednesday 10:30-12:00 budget review, room B, attendees: finance and product Wednesday 14:00-15:00 design critique, room A, attendees: design and frontend Thursday 09:00-10:00 support handover, room A, attendees: support leads Thursday 11:00-12:30 customer workshop, room D, attendees: product and design Thursday 14:00-15:00 platform office hours, room C, attendees: platform team Friday 09:00-10:00 sprint review, room B, attendees: all teams Friday 10:00-11:00 sprint retrospective, room B, attendees: all teams The security lead is invited to the architecture review and to the budget review.",
+    "questions": {
+      "conflict": {
+        "type": "noul",
+        "instructions": "Is the security lead double booked on Wednesday morning?"
+      }
+    }
+  },
+  {
+    "name": "noul-json-overdue",
+    "state": {
+      "account": {
+        "id": "acct-99120",
+        "plan": "enterprise",
+        "status": "active",
+        "balance_eur": -12480.0
+      },
+      "contract": {
+        "seats": 240,
+        "renewal": "2026-12-31",
+        "discount_percent": 18,
+        "payment_terms": "net 45"
+      },
+      "usage": {
+        "seats_active": 231,
+        "api_calls_30d": 98842210,
+        "included_calls": 90000000,
+        "storage_gb": 8210,
+        "storage_included_gb": 8000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-01",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-02",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 41200.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-06",
+          "amount_eur": 41200.0,
+          "status": "overdue",
+          "days_late": 42
+        },
+        {
+          "id": "inv-2026-07",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-08",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-09",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-10",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-11",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-12",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        }
+      ],
+      "events": [
+        {
+          "id": "evt-4200",
+          "day": 1,
+          "units": 0,
+          "amount_eur": 12.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4201",
+          "day": 2,
+          "units": 7,
+          "amount_eur": 25.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4202",
+          "day": 3,
+          "units": 14,
+          "amount_eur": 38.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4203",
+          "day": 4,
+          "units": 21,
+          "amount_eur": 51.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4204",
+          "day": 5,
+          "units": 28,
+          "amount_eur": 64.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4205",
+          "day": 6,
+          "units": 4,
+          "amount_eur": 77.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4206",
+          "day": 7,
+          "units": 11,
+          "amount_eur": 90.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4207",
+          "day": 8,
+          "units": 18,
+          "amount_eur": 103.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4208",
+          "day": 9,
+          "units": 25,
+          "amount_eur": 116.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4209",
+          "day": 10,
+          "units": 1,
+          "amount_eur": 129.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4210",
+          "day": 11,
+          "units": 8,
+          "amount_eur": 142.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4211",
+          "day": 12,
+          "units": 15,
+          "amount_eur": 155.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4212",
+          "day": 13,
+          "units": 22,
+          "amount_eur": 168.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4213",
+          "day": 14,
+          "units": 29,
+          "amount_eur": 181.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4214",
+          "day": 15,
+          "units": 5,
+          "amount_eur": 194.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4215",
+          "day": 16,
+          "units": 12,
+          "amount_eur": 207.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4216",
+          "day": 17,
+          "units": 19,
+          "amount_eur": 220.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4217",
+          "day": 18,
+          "units": 26,
+          "amount_eur": 233.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4218",
+          "day": 19,
+          "units": 2,
+          "amount_eur": 246.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4219",
+          "day": 20,
+          "units": 9,
+          "amount_eur": 19.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4220",
+          "day": 21,
+          "units": 16,
+          "amount_eur": 32.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4221",
+          "day": 22,
+          "units": 23,
+          "amount_eur": 45.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4222",
+          "day": 23,
+          "units": 30,
+          "amount_eur": 58.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4223",
+          "day": 24,
+          "units": 6,
+          "amount_eur": 71.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4224",
+          "day": 25,
+          "units": 13,
+          "amount_eur": 84.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4225",
+          "day": 26,
+          "units": 20,
+          "amount_eur": 97.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4226",
+          "day": 27,
+          "units": 27,
+          "amount_eur": 110.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4227",
+          "day": 28,
+          "units": 3,
+          "amount_eur": 123.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4228",
+          "day": 29,
+          "units": 10,
+          "amount_eur": 136.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4229",
+          "day": 30,
+          "units": 17,
+          "amount_eur": 149.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4230",
+          "day": 31,
+          "units": 24,
+          "amount_eur": 162.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4231",
+          "day": 32,
+          "units": 0,
+          "amount_eur": 175.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4232",
+          "day": 33,
+          "units": 7,
+          "amount_eur": 188.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4233",
+          "day": 34,
+          "units": 14,
+          "amount_eur": 201.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4234",
+          "day": 35,
+          "units": 21,
+          "amount_eur": 214.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4235",
+          "day": 36,
+          "units": 28,
+          "amount_eur": 227.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4236",
+          "day": 37,
+          "units": 4,
+          "amount_eur": 240.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4237",
+          "day": 38,
+          "units": 11,
+          "amount_eur": 13.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4238",
+          "day": 39,
+          "units": 18,
+          "amount_eur": 26.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4239",
+          "day": 40,
+          "units": 25,
+          "amount_eur": 39.5,
+          "channel": "api",
+          "status": "settled"
+        }
+      ],
+      "alerts": [
+        "storage at 103 percent of the included volume",
+        "invoice inv-2026-06 is 42 days overdue",
+        "231 of 240 seats active"
+      ],
+      "owner": "j.okafor-audit",
+      "region": "eu-central"
+    },
+    "questions": {
+      "overdue": {
+        "type": "noul",
+        "instructions": "Is there an overdue invoice on the account?"
+      },
+      "over_included": {
+        "type": "noul",
+        "instructions": "Is storage usage above the included volume?"
+      }
+    }
+  },
+  {
+    "name": "noul-sentiment-negative",
+    "state": "The grinder arrived with a bent axle and support has not replied in six days. The scale works but the app loses the connection every time the phone locks. Second purchase from this shop and both orders were perfect. The bottle cracked on the first dishwasher cycle although the listing says dishwasher safe. Average quality; the filter fits, but the seams are rough and catch on the cloth. The parcel was left in the rain and the box was soaked through.",
+    "questions": {
+      "negative": {
+        "type": "noul",
+        "instructions": "Do the reviews contain more complaints than praise?"
+      }
+    }
+  },
+  {
+    "name": "noul-duplicate-ticket",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. Ticket 2026-04-06 09:02 warehouse: the returned unit was received and inspected; the tank is cracked along the seam and the dent matches the photo, so the damage is accepted as transit damage rather than customer misuse. Ticket 2026-04-06 09:30 agent: the replacement ships today with express delivery, and the original order will be refunded in full once the carrier confirms the damage claim. The customer has now written twice about the same order and the same cracked tank.",
+    "questions": {
+      "duplicate": {
+        "type": "noul",
+        "instructions": "Do the tickets describe the same order and the same fault?"
+      }
+    }
+  },
+  {
+    "name": "noul-receipt-budget",
+    "state": "The invoice total is 214.90 EUR and the approved budget is 200 EUR.",
+    "questions": {
+      "over_budget": {
+        "type": "noul",
+        "instructions": "Is the invoice over the approved budget?"
+      }
+    }
+  },
+  {
+    "name": "noul-language-english",
+    "state": "The parcel was delivered to the wrong address and nobody has contacted me about a replacement.",
+    "questions": {
+      "english": {
+        "type": "noul",
+        "instructions": "Is the state written in English?"
+      }
+    }
+  },
+  {
+    "name": "noul-sla-incidents",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter. Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. Ticket 2026-04-06 09:02 warehouse: the returned unit was received and inspected; the tank is cracked along the seam and the dent matches the photo, so the damage is accepted as transit damage rather than customer misuse. Ticket 2026-04-06 09:30 agent: the replacement ships today with express delivery, and the original order will be refunded in full once the carrier confirms the damage claim. Ticket 2026-04-07 17:12 customer: the replacement arrived but the milk frother attachment from the first order is missing from the box, and the manual is for a different model. Ticket 2026-04-07 17:40 agent: the missing attachment is in stock and will be sent separately; the manual mismatch is a packaging error at the supplier and has been reported under quality case QA-881. Ticket 2026-04-08 10:05 customer: I would rather return the whole machine now and buy it locally, because two deliveries in one week went wrong and I have lost confidence in the packaging. Ticket 2026-04-08 10:33 agent: a full return is possible within the thirty day window; I have emailed a prepaid label and the refund will be issued to the original payment method after the unit is scanned at the depot. Ticket 2026-04-09 08:20 returns desk: unit received at the depot, accessories complete, retail packaging damaged; refund of 349.00 EUR approved and queued for the next payment run. Ticket 2026-04-10 13:02 customer: after the firmware update to 4.2.1 the device does not join the wireless network any more; the setup screen spins and then reports error 41 without a message. Ticket 2026-04-10 13:30 agent: error 41 means the device could not complete the key exchange with the access point. Please confirm whether the network uses WPA3 only and whether the router was rebooted after the update. Ticket 2026-04-10 13:52 customer: the router is a FritzBox 7590 with WPA2 and WPA3 mixed mode, and I already rebooted it twice; a second device on the same network updated fine and still connects. Ticket 2026-04-11 09:15 engineering: the 4.2.1 image ships a new regulatory domain table that rejects the country code the device cached before the update; affected units loop in the key exchange until the cache is cleared. Ticket 2026-04-11 09:40 engineering: workaround is to hold the pairing button for twelve seconds while the device boots, which clears the cached regulatory domain; a fixed image 4.2.2 is scheduled for next week. Ticket 2026-04-11 10:05 agent: I have sent the button sequence to the customer with a screenshot and offered a remote session if the workaround does not take effect on the first attempt. Ticket 2026-04-11 15:20 customer: the workaround worked and the device is online again, but the clock is now one hour behind and the schedule I had configured did not survive the reset. Ticket 2026-04-11 15:44 agent: the clock follows the time zone the device receives from the network; the one hour offset suggests the router advertises a UTC offset without daylight saving. Ticket 2026-04-12 08:10 customer: the schedule is still empty after I recreated it twice, and the app shows a sync error badge next to the device name since this morning. Ticket 2026-04-12 08:50 engineering: schedules were stored in the old cloud namespace and the migration job skipped devices that were offline during the change window; a re-run is queued for tonight. Ticket 2026-04-13 10:02 customer: the parcel tracking has not moved for five days and the carrier hotline says the shipment was never handed over to them. Ticket 2026-04-13 10:30 agent: the warehouse scan exists but the carrier pickup scan is missing, so the parcel is still in the outbound cage and will be re-tendered today. Ticket 2026-04-14 11:15 customer: the delivery address has the wrong house number because the checkout form dropped the suffix after the street name. Ticket 2026-04-14 11:40 agent: the parcel has not left the depot yet, so the address can still be corrected; I have updated the label to include the suffix and notified the carrier. Ticket 2026-04-15 09:05 customer: I ordered a gift card for 100 EUR and the recipient says the code is not recognised at checkout. Ticket 2026-04-15 09:33 agent: the code was issued but the activation job batched it with a cancelled order, so the balance is still zero; I have reissued the card with a new code. Ticket 2026-04-15 14:20 customer: the replacement arrived without the accessory pack that the product page lists as included. Ticket 2026-04-15 14:55 warehouse: the accessory pack is a separate SKU and the pick list template omits it for replacement orders; the missing part ships today. Ticket 2026-04-16 08:12 customer: I need a VAT invoice with my company name and the VAT number on it, not a consumer receipt. Ticket 2026-04-16 08:40 finance: company invoices can be issued within the same fiscal quarter; I have created a corrected invoice with the company details and sent it as a PDF. Ticket 2026-04-16 13:02 customer: the warranty card in the box says two years but the product page says three years for the motor. Ticket 2026-04-16 13:30 agent: the three year motor warranty is a commercial guarantee on top of the statutory two years; both apply, and the motor claim is handled by the service partner. Ticket 2026-04-17 09:22 customer: my order was flagged for fraud review and then cancelled without any message, although I called my bank and the card is fine. Ticket 2026-04-17 09:50 payments: the fraud screen flagged the order because the billing country and the delivery country differ; the case was cancelled by mistake and is being re-created with a manual review note. Ticket 2026-04-17 16:05 customer: I wrote three messages in Italian and every reply came back in English, so I still do not know whether the return was accepted. Ticket 2026-04-17 16:35 agent: the case belongs in the shared Italian queue and was answered by the English queue by mistake; I have routed it and added a translation of the last reply. Ticket 2026-04-18 10:10 customer: we are a business customer and the quote for 2,400 EUR expired before our purchase department could sign it. Ticket 2026-04-18 10:44 sales: business quotes are valid for 14 days and this one expired on 12 April; I have reissued it with the same prices because the price book has not changed. Ticket 2026-04-19 07:55 customer: I received a recall notice for the pressure cooker but I no longer have the original packaging. Ticket 2026-04-19 08:20 safety: a recalled product is refunded without the packaging and outside the refund window; I have created the return and the safety case number. Ticket 2026-04-19 12:30 customer: the smoking complaint about the charger was reported on Friday and nobody from safety has called me back. Ticket 2026-04-19 12:35 safety desk: the report was filed under the wrong queue over the weekend; it is escalated now, the charger model is quarantined and a recall review is open. Ticket 2026-04-20 08:15 customer: the newest unit still will not join the wireless network after firmware 4.2.1 and shows error 41 during setup, so I need technical help with the device itself. The first ticket was opened on 10 April and the last update from an agent is dated 12 April.",
+    "questions": {
+      "breached": {
+        "type": "noul",
+        "instructions": "Did the main thread stay without an agent update for more than ten business days?"
+      }
+    }
+  },
+  {
+    "name": "score-urgency-critical",
+    "state": "The production database is down and checkout fails for every customer.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-urgency-billing",
+    "state": "Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How urgent is this billing request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-satisfaction-reviews",
+    "state": "The bottle cracked on the first dishwasher cycle although the listing says dishwasher safe. Average quality; the filter fits, but the seams are rough and catch on the cloth. The parcel was left in the rain and the box was soaked through. The spatula melted at low heat, far below the temperature in the description.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How satisfied is the customer?",
+        "criteria": [
+          "Very dissatisfied",
+          "Dissatisfied",
+          "Neutral",
+          "Satisfied",
+          "Very satisfied"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-confidence-json",
+    "state": {
+      "account": {
+        "id": "acct-77812",
+        "plan": "growth",
+        "status": "active",
+        "balance_eur": -412.6
+      },
+      "usage": {
+        "seats": 42,
+        "api_calls_30d": 1184220,
+        "included_calls": 1000000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 890.0,
+          "status": "paid"
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 890.0,
+          "status": "paid"
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 412.6,
+          "status": "overdue",
+          "days_late": 21
+        }
+      ],
+      "alerts": [
+        "api usage at 118 percent of the included volume",
+        "invoice inv-2026-05 is 21 days overdue"
+      ],
+      "owner": "marta.k",
+      "renewal": "2026-09-30"
+    },
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How confident are you that the account is in good standing?",
+        "criteria": [
+          "No confidence",
+          "Some doubt",
+          "Confident",
+          "Certain"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-risk-policy",
+    "state": "1. Scope: this policy covers every refund, replacement and credit issued to retail customers in the European Economic Area. 2. Refund window: a refund may be issued within 30 calendar days of delivery, counted from the carrier's delivery scan rather than the order date. 3. Proof of purchase: a receipt, invoice number or bank statement is sufficient proof of purchase; a loyalty card number alone is not. 4. Damaged goods: goods damaged in transit are replaced at no cost when the customer reports the damage within 48 hours and provides a photo of the parcel and the item. 5. Opened goods: opened goods may be returned within 14 days when they are unused apart from a reasonable inspection. 6. Hygiene items: opened hygiene items, including milk frothers with a used food contact surface, cannot be returned unless they are faulty. 7. Faulty goods: a fault that appears within six months is presumed to have existed at delivery unless the merchant can show otherwise. 8. Repair first: for goods with a purchase price above 400 EUR the merchant may choose one repair attempt before a replacement is issued. 9. Replacement stock: a replacement is offered from the same warehouse when stock is available, otherwise from any warehouse within the same country. 10. Refund method: refunds go to the original payment method; a cash refund is allowed only when the original payment was cash on delivery. 11. Refund timing: the refund is released within five business days of the returned goods being scanned at the depot, and the payment provider may need another five days. 12. Shipping fees: standard shipping is refunded when the entire order is returned; express surcharges are refunded only when the return is caused by the merchant. 13. Partial returns: when part of an order is returned, a free-shipping threshold granted by the original order is recalculated and the difference may be deducted. 14. Discounts: a discount larger than 20 percent of the order value requires written approval from a finance team lead before it is applied. 15. Credits: a credit note must show the same VAT rate as the invoice it corrects, even when it is issued in a later fiscal quarter. 16. Chargebacks: once a card chargeback is filed, the case moves to the payments team and the customer receives no direct refund until the dispute is closed. 17. Duplicate charges: a duplicate authorization is cancelled immediately when it has not settled; a settled duplicate is refunded with a credit note. 18. Subscription changes: a plan change takes effect at the start of the next billing cycle unless a prorated credit is approved by billing. 19. Price errors: an invoice issued from a stale price book is corrected with a prorated credit within one billing cycle. 20. Reminders: no reminder may be sent for an invoice that is already matched to a payment in the accounting system. 21. Data retention: order records are kept for 24 months after the end of the fiscal year in which the order was fulfilled. 22. Customer records: a deletion request removes the contact record within 30 days but keeps anonymised order lines for the retention period. 23. Access control: only staff with the billing role may view full card numbers; the support role sees the last four digits. 24. Security incidents: a suspected data breach is reported to the security team within 24 hours of discovery, and to the regulator within 72 hours. 25. Passwords: shared support accounts are forbidden; every agent uses a personal account with multi-factor authentication. 26. Escalation: a case older than ten business days without customer contact is escalated to the team lead automatically. 27. Duplicate cases: when two tickets describe the same order and the same fault, the newer ticket is merged into the older one. 28. Language: a customer writing in a language the agent does not speak is routed to the shared language queue instead of being answered with machine translation. 29. Recording: calls are recorded only with an announcement at the start; records are deleted after six months. 30. Concessions: a goodwill gesture above 50 EUR needs a documented reason in the case notes. 31. Warranty: the statutory warranty period of two years applies to every product; the commercial guarantee does not replace it. 32. Return shipping: the merchant pays return shipping for faulty and transit-damaged goods; the customer pays for change-of-mind returns unless the order value exceeds 200 EUR. 33. Inspection: returned goods are inspected at the depot within two business days; the inspection result is recorded against the RMA number. 34. Missing parts: a missing accessory is shipped separately at no cost and does not require a full return. 35. Packaging errors: a repeated packaging error affecting more than five orders is reported as a supplier quality case. 36. Tax: tax corrections are issued by finance only; support agents do not change VAT lines on invoices. 37. Fraud: an order flagged by the fraud screen is held, never cancelled, until the payments team clears it. 38. Address changes: a shipping address may be changed until the order is handed to the carrier; afterwards the customer must wait for delivery and redirect the parcel. 39. Delivery windows: a missed delivery window caused by the carrier is compensated with a shipping credit, not with a product discount. 40. Held stock: reserved stock is released after 48 hours when the payment has not been captured. 41. B2B orders: business orders above 2,000 EUR require a signed quote and are excluded from the retail refund window. 42. Promotions: a promotional bundle that is partially returned keeps the bundle price for the retained items and refunds the remainder at bundle rate. 43. Gift cards: gift cards are refunded as a gift card, never as cash, and expire after 36 months. 44. Recalls: a recalled product is refunded in full regardless of the refund window and without requiring the original packaging. 45. Safety: any report of smoke, fire or electric shock is escalated to the safety desk within one hour and the product is quarantined. 46. Documentation: every refund over 100 EUR needs the invoice number in the case notes; every replacement needs the RMA number. 47. Approval matrix: refunds up to 100 EUR are approved by the agent, up to 500 EUR by the team lead, and above 500 EUR by the finance lead. 48. Audit: a random sample of 5 percent of refunds is audited monthly, and every audited case must keep its evidence for 24 months. 49. Complaints: a complaint about a policy decision is answered within three business days with the policy clause that applies. 50. Review: this policy is reviewed twice a year by support, finance and legal, and every change is announced one week before it takes effect. 51. Bundles: a bundle returned in parts keeps the bundle discount only while at least half of the bundle's items are kept. 52. Deposits: a deposit for a custom order is refundable until production starts and non-refundable afterwards unless the merchant cancels. 53. Pre-orders: a pre-order may be cancelled at any time before the release date and is refunded in full within five business days. 54. Shipping damage: a parcel with visible outer damage may be refused at the door, which counts as a transit damage report. 55. Lost parcels: a parcel that has not moved for seven days is treated as lost and replaced or refunded at the customer's choice. 56. Returns abroad: cross-border returns use the merchant's carrier account when the return is caused by the merchant and the customer's account otherwise. 57. Fees: no restocking fee is charged for faulty goods, transit damage or recalls; a restocking fee of up to 10 percent may apply to large appliances returned without cause. 58. Inspection delays: when the depot cannot inspect within two business days, the refund is released on the customer's photos alone. 59. Store credit: store credit is offered only when the customer asks for it and may never replace a refund the customer is entitled to. 60. Price matching: a lower price at another retailer is matched within 14 days of purchase when the competitor has the item in stock. 61. Coupons: an expired coupon is not applied retroactively, but a coupon that expired during a checkout error is honoured manually. 62. Invoices: an invoice is issued at the latest on the day the order ships, never before the payment is captured. 63. Payment capture: a payment is captured only when the order is ready to ship; authorizations older than seven days are released. 64. Three dimensional secure: a payment that fails the second factor twice is not retried automatically and the customer is asked to use another method. 65. Refunds after chargeback: a refund already issued before a chargeback is documented in the dispute file and never repeated. 66. Duplicate refunds: a second refund for the same invoice is blocked by the payment run and reviewed by finance. 67. Customer contact: every case needs at least one attempt to contact the customer within two business days of the first agent reply.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How much compliance risk does a 640 EUR refund without team lead approval carry?",
+        "criteria": [
+          "Negligible",
+          "Low",
+          "Moderate",
+          "High",
+          "Severe"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-effort-scheduling",
+    "state": "Monday 09:00-09:30 daily stand-up, room A, attendees: platform team Monday 09:30-11:00 roadmap review, room B, attendees: product and platform leads Monday 11:00-12:00 vendor sync with Acme, video call, attendees: procurement and platform Monday 13:00-14:00 customer escalation review, room A, attendees: support and engineering Monday 14:00-16:00 architecture review, room C, attendees: platform and security Tuesday 09:00-10:00 incident retrospective, room B, attendees: on-call and platform Tuesday 10:00-11:30 quarterly planning, room A, attendees: all leads Tuesday 13:00-14:30 design review, room D, attendees: design and product Tuesday 15:00-16:00 hiring panel, room D, attendees: engineering managers Wednesday 09:00-10:00 security review, room C, attendees: security and platform Wednesday 10:30-12:00 budget review, room B, attendees: finance and product Wednesday 14:00-15:00 design critique, room A, attendees: design and frontend Thursday 09:00-10:00 support handover, room A, attendees: support leads Thursday 11:00-12:30 customer workshop, room D, attendees: product and design Thursday 14:00-15:00 platform office hours, room C, attendees: platform team Friday 09:00-10:00 sprint review, room B, attendees: all teams Friday 10:00-11:00 sprint retrospective, room B, attendees: all teams",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How much effort does rescheduling the vendor sync take?",
+        "criteria": [
+          "Minutes",
+          "An hour",
+          "Half a day",
+          "A full day"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-severity-incidents",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter. Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. Ticket 2026-04-06 09:02 warehouse: the returned unit was received and inspected; the tank is cracked along the seam and the dent matches the photo, so the damage is accepted as transit damage rather than customer misuse. Ticket 2026-04-06 09:30 agent: the replacement ships today with express delivery, and the original order will be refunded in full once the carrier confirms the damage claim. Ticket 2026-04-07 17:12 customer: the replacement arrived but the milk frother attachment from the first order is missing from the box, and the manual is for a different model. Ticket 2026-04-07 17:40 agent: the missing attachment is in stock and will be sent separately; the manual mismatch is a packaging error at the supplier and has been reported under quality case QA-881. Ticket 2026-04-08 10:05 customer: I would rather return the whole machine now and buy it locally, because two deliveries in one week went wrong and I have lost confidence in the packaging. Ticket 2026-04-08 10:33 agent: a full return is possible within the thirty day window; I have emailed a prepaid label and the refund will be issued to the original payment method after the unit is scanned at the depot. Ticket 2026-04-09 08:20 returns desk: unit received at the depot, accessories complete, retail packaging damaged; refund of 349.00 EUR approved and queued for the next payment run. Ticket 2026-04-10 13:02 customer: after the firmware update to 4.2.1 the device does not join the wireless network any more; the setup screen spins and then reports error 41 without a message. Ticket 2026-04-10 13:30 agent: error 41 means the device could not complete the key exchange with the access point. Please confirm whether the network uses WPA3 only and whether the router was rebooted after the update. Ticket 2026-04-10 13:52 customer: the router is a FritzBox 7590 with WPA2 and WPA3 mixed mode, and I already rebooted it twice; a second device on the same network updated fine and still connects. Ticket 2026-04-11 09:15 engineering: the 4.2.1 image ships a new regulatory domain table that rejects the country code the device cached before the update; affected units loop in the key exchange until the cache is cleared. Ticket 2026-04-11 09:40 engineering: workaround is to hold the pairing button for twelve seconds while the device boots, which clears the cached regulatory domain; a fixed image 4.2.2 is scheduled for next week. Ticket 2026-04-11 10:05 agent: I have sent the button sequence to the customer with a screenshot and offered a remote session if the workaround does not take effect on the first attempt. Ticket 2026-04-11 15:20 customer: the workaround worked and the device is online again, but the clock is now one hour behind and the schedule I had configured did not survive the reset. Ticket 2026-04-11 15:44 agent: the clock follows the time zone the device receives from the network; the one hour offset suggests the router advertises a UTC offset without daylight saving. Ticket 2026-04-12 08:10 customer: the schedule is still empty after I recreated it twice, and the app shows a sync error badge next to the device name since this morning. Ticket 2026-04-12 08:50 engineering: schedules were stored in the old cloud namespace and the migration job skipped devices that were offline during the change window; a re-run is queued for tonight. Ticket 2026-04-13 10:02 customer: the parcel tracking has not moved for five days and the carrier hotline says the shipment was never handed over to them. Ticket 2026-04-13 10:30 agent: the warehouse scan exists but the carrier pickup scan is missing, so the parcel is still in the outbound cage and will be re-tendered today. Ticket 2026-04-14 11:15 customer: the delivery address has the wrong house number because the checkout form dropped the suffix after the street name. Ticket 2026-04-14 11:40 agent: the parcel has not left the depot yet, so the address can still be corrected; I have updated the label to include the suffix and notified the carrier. Ticket 2026-04-15 09:05 customer: I ordered a gift card for 100 EUR and the recipient says the code is not recognised at checkout. Ticket 2026-04-15 09:33 agent: the code was issued but the activation job batched it with a cancelled order, so the balance is still zero; I have reissued the card with a new code. Ticket 2026-04-15 14:20 customer: the replacement arrived without the accessory pack that the product page lists as included. Ticket 2026-04-15 14:55 warehouse: the accessory pack is a separate SKU and the pick list template omits it for replacement orders; the missing part ships today. Ticket 2026-04-16 08:12 customer: I need a VAT invoice with my company name and the VAT number on it, not a consumer receipt. Ticket 2026-04-16 08:40 finance: company invoices can be issued within the same fiscal quarter; I have created a corrected invoice with the company details and sent it as a PDF. Ticket 2026-04-16 13:02 customer: the warranty card in the box says two years but the product page says three years for the motor. Ticket 2026-04-16 13:30 agent: the three year motor warranty is a commercial guarantee on top of the statutory two years; both apply, and the motor claim is handled by the service partner. Ticket 2026-04-17 09:22 customer: my order was flagged for fraud review and then cancelled without any message, although I called my bank and the card is fine. Ticket 2026-04-17 09:50 payments: the fraud screen flagged the order because the billing country and the delivery country differ; the case was cancelled by mistake and is being re-created with a manual review note. Ticket 2026-04-17 16:05 customer: I wrote three messages in Italian and every reply came back in English, so I still do not know whether the return was accepted. Ticket 2026-04-17 16:35 agent: the case belongs in the shared Italian queue and was answered by the English queue by mistake; I have routed it and added a translation of the last reply. Ticket 2026-04-18 10:10 customer: we are a business customer and the quote for 2,400 EUR expired before our purchase department could sign it. Ticket 2026-04-18 10:44 sales: business quotes are valid for 14 days and this one expired on 12 April; I have reissued it with the same prices because the price book has not changed. Ticket 2026-04-19 07:55 customer: I received a recall notice for the pressure cooker but I no longer have the original packaging. Ticket 2026-04-19 08:20 safety: a recalled product is refunded without the packaging and outside the refund window; I have created the return and the safety case number. Ticket 2026-04-19 12:30 customer: the smoking complaint about the charger was reported on Friday and nobody from safety has called me back. Ticket 2026-04-19 12:35 safety desk: the report was filed under the wrong queue over the weekend; it is escalated now, the charger model is quarantined and a recall review is open. Ticket 2026-04-20 08:15 customer: the newest unit still will not join the wireless network after firmware 4.2.1 and shows error 41 during setup, so I need technical help with the device itself.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How severe is the customer impact of this incident?",
+        "criteria": [
+          "Cosmetic",
+          "Minor",
+          "Major",
+          "Service down"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-tone-positive",
+    "state": "Thank you for the quick help, the replacement works perfectly and the courier was friendly.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How positive is the tone of the message?",
+        "criteria": [
+          "Negative",
+          "Neutral",
+          "Positive",
+          "Enthusiastic"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-completeness-return",
+    "state": "Ticket 2026-04-05 11:20 customer: the espresso machine arrived with a cracked water tank and a dent on the left panel, and the parcel had no protective foam inside, only a single layer of paper. Ticket 2026-04-05 11:44 customer: I have the delivery photo, the unboxing video and the original receipt, and I would like a replacement rather than a repair because the machine is two days old. Ticket 2026-04-05 12:10 agent: I have created return RMA-55291 for the damaged unit and reserved a replacement from warehouse A; the courier will collect the parcel tomorrow between 09:00 and 12:00. Ticket 2026-04-06 09:02 warehouse: the returned unit was received and inspected; the tank is cracked along the seam and the dent matches the photo, so the damage is accepted as transit damage rather than customer misuse.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How complete is the information needed to decide the return?",
+        "criteria": [
+          "Missing most facts",
+          "Partially complete",
+          "Mostly complete",
+          "Ready to decide"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-priority-ticket",
+    "state": "Ticket 2026-04-10 13:02 customer: after the firmware update to 4.2.1 the device does not join the wireless network any more; the setup screen spins and then reports error 41 without a message. Ticket 2026-04-10 13:30 agent: error 41 means the device could not complete the key exchange with the access point. Please confirm whether the network uses WPA3 only and whether the router was rebooted after the update.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How should this ticket be prioritised?",
+        "criteria": [
+          "P4 back log",
+          "P3 normal",
+          "P2 high",
+          "P1 critical"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-likelihood-refund",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter.",
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How likely is a full refund in this case?",
+        "criteria": [
+          "Very unlikely",
+          "Unlikely",
+          "Possible",
+          "Likely",
+          "Very likely"
+        ]
+      }
+    }
+  },
+  {
+    "name": "score-risk-json-long",
+    "state": {
+      "account": {
+        "id": "acct-99120",
+        "plan": "enterprise",
+        "status": "active",
+        "balance_eur": -12480.0
+      },
+      "contract": {
+        "seats": 240,
+        "renewal": "2026-12-31",
+        "discount_percent": 18,
+        "payment_terms": "net 45"
+      },
+      "usage": {
+        "seats_active": 231,
+        "api_calls_30d": 98842210,
+        "included_calls": 90000000,
+        "storage_gb": 8210,
+        "storage_included_gb": 8000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-01",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-02",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 41200.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-06",
+          "amount_eur": 41200.0,
+          "status": "overdue",
+          "days_late": 42
+        },
+        {
+          "id": "inv-2026-07",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-08",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-09",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-10",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-11",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-12",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        }
+      ],
+      "events": [
+        {
+          "id": "evt-4200",
+          "day": 1,
+          "units": 0,
+          "amount_eur": 12.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4201",
+          "day": 2,
+          "units": 7,
+          "amount_eur": 25.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4202",
+          "day": 3,
+          "units": 14,
+          "amount_eur": 38.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4203",
+          "day": 4,
+          "units": 21,
+          "amount_eur": 51.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4204",
+          "day": 5,
+          "units": 28,
+          "amount_eur": 64.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4205",
+          "day": 6,
+          "units": 4,
+          "amount_eur": 77.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4206",
+          "day": 7,
+          "units": 11,
+          "amount_eur": 90.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4207",
+          "day": 8,
+          "units": 18,
+          "amount_eur": 103.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4208",
+          "day": 9,
+          "units": 25,
+          "amount_eur": 116.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4209",
+          "day": 10,
+          "units": 1,
+          "amount_eur": 129.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4210",
+          "day": 11,
+          "units": 8,
+          "amount_eur": 142.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4211",
+          "day": 12,
+          "units": 15,
+          "amount_eur": 155.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4212",
+          "day": 13,
+          "units": 22,
+          "amount_eur": 168.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4213",
+          "day": 14,
+          "units": 29,
+          "amount_eur": 181.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4214",
+          "day": 15,
+          "units": 5,
+          "amount_eur": 194.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4215",
+          "day": 16,
+          "units": 12,
+          "amount_eur": 207.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4216",
+          "day": 17,
+          "units": 19,
+          "amount_eur": 220.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4217",
+          "day": 18,
+          "units": 26,
+          "amount_eur": 233.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4218",
+          "day": 19,
+          "units": 2,
+          "amount_eur": 246.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4219",
+          "day": 20,
+          "units": 9,
+          "amount_eur": 19.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4220",
+          "day": 21,
+          "units": 16,
+          "amount_eur": 32.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4221",
+          "day": 22,
+          "units": 23,
+          "amount_eur": 45.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4222",
+          "day": 23,
+          "units": 30,
+          "amount_eur": 58.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4223",
+          "day": 24,
+          "units": 6,
+          "amount_eur": 71.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4224",
+          "day": 25,
+          "units": 13,
+          "amount_eur": 84.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4225",
+          "day": 26,
+          "units": 20,
+          "amount_eur": 97.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4226",
+          "day": 27,
+          "units": 27,
+          "amount_eur": 110.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4227",
+          "day": 28,
+          "units": 3,
+          "amount_eur": 123.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4228",
+          "day": 29,
+          "units": 10,
+          "amount_eur": 136.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4229",
+          "day": 30,
+          "units": 17,
+          "amount_eur": 149.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4230",
+          "day": 31,
+          "units": 24,
+          "amount_eur": 162.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4231",
+          "day": 32,
+          "units": 0,
+          "amount_eur": 175.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4232",
+          "day": 33,
+          "units": 7,
+          "amount_eur": 188.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4233",
+          "day": 34,
+          "units": 14,
+          "amount_eur": 201.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4234",
+          "day": 35,
+          "units": 21,
+          "amount_eur": 214.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4235",
+          "day": 36,
+          "units": 28,
+          "amount_eur": 227.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4236",
+          "day": 37,
+          "units": 4,
+          "amount_eur": 240.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4237",
+          "day": 38,
+          "units": 11,
+          "amount_eur": 13.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4238",
+          "day": 39,
+          "units": 18,
+          "amount_eur": 26.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4239",
+          "day": 40,
+          "units": 25,
+          "amount_eur": 39.5,
+          "channel": "api",
+          "status": "settled"
+        }
+      ],
+      "alerts": [
+        "storage at 103 percent of the included volume",
+        "invoice inv-2026-06 is 42 days overdue",
+        "231 of 240 seats active"
+      ],
+      "owner": "j.okafor-audit",
+      "region": "eu-central"
+    },
+    "questions": {
+      "score": {
+        "type": "score",
+        "instructions": "How much churn risk does this account carry?",
+        "criteria": [
+          "Low",
+          "Medium",
+          "High",
+          "Critical"
+        ]
+      }
+    }
+  },
+  {
+    "name": "mixed-all-three-thread",
+    "state": "Ticket 2026-04-01 09:12 customer: my card was charged twice for order 88213, once at checkout and once three minutes later, while the order page shows a single payment. Please refund the duplicate charge. Ticket 2026-04-01 09:40 agent: I can see two authorizations for 79.00 EUR each on the account. The second one is still pending at the bank and has not settled, so it may drop off within three working days without any action from us. Ticket 2026-04-01 10:05 customer: the pending charge is still visible in my banking app and my rent is due tomorrow, so I cannot wait three days for it to disappear on its own. Ticket 2026-04-01 10:22 agent: I have cancelled authorization A-774120 and opened a refund request for 79.00 EUR; the credit note will reference invoice 2026-03-4471 and should reach the card in two to five business days. Ticket 2026-04-02 08:03 customer: invoice 2026-03-4471 still shows the annual plan although I downgraded to monthly in February and the confirmation email says the change took effect on 14 February. Ticket 2026-04-02 08:55 agent: the subscription record shows the downgrade, but the billing run on 28 February used a cached price book and charged the old annual rate. I will issue a prorated credit of 41.30 EUR. Ticket 2026-04-02 09:10 agent note: the cached price book was rebuilt at 06:00 today; three other accounts on the same billing run show the same proration error and are being handled under incident BILL-2291. Ticket 2026-04-03 14:47 customer: the credit of 41.30 EUR arrived but the VAT line on the credit note says 0.00 even though the original invoice charged 19 percent VAT. Ticket 2026-04-03 15:30 agent: the tax engine skipped the credit note because the original invoice was booked in the previous fiscal quarter. Finance has to reissue the document with the correct VAT line. Ticket 2026-04-03 16:02 finance: reissued credit note CN-2026-1187 with 6.59 EUR VAT and a corrected net amount of 34.71 EUR; no further customer action is required for the tax correction. Ticket 2026-04-04 07:41 customer: I also received a reminder for the same invoice even though the payment left my account on 27 March and the bank statement shows the debit. Ticket 2026-04-04 08:15 agent: the payment matching job did not run over the weekend, which produced the reminder; I have marked invoice 2026-03-4471 as paid and the dunning process will not send another letter.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices, charges and subscription price changes",
+          "technical": "Product setup, firmware and connectivity faults"
+        }
+      },
+      "receipt": {
+        "type": "noul",
+        "instructions": "Did the customer mention an invoice number?"
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  },
+  {
+    "name": "mixed-all-three-json",
+    "state": {
+      "account": {
+        "id": "acct-99120",
+        "plan": "enterprise",
+        "status": "active",
+        "balance_eur": -12480.0
+      },
+      "contract": {
+        "seats": 240,
+        "renewal": "2026-12-31",
+        "discount_percent": 18,
+        "payment_terms": "net 45"
+      },
+      "usage": {
+        "seats_active": 231,
+        "api_calls_30d": 98842210,
+        "included_calls": 90000000,
+        "storage_gb": 8210,
+        "storage_included_gb": 8000
+      },
+      "invoices": [
+        {
+          "id": "inv-2026-01",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-02",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-03",
+          "amount_eur": 41200.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-04",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-05",
+          "amount_eur": 39600.0,
+          "status": "paid",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-06",
+          "amount_eur": 41200.0,
+          "status": "overdue",
+          "days_late": 42
+        },
+        {
+          "id": "inv-2026-07",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-08",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-09",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-10",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-11",
+          "amount_eur": 39600.0,
+          "status": "open",
+          "days_late": 0
+        },
+        {
+          "id": "inv-2026-12",
+          "amount_eur": 41200.0,
+          "status": "open",
+          "days_late": 0
+        }
+      ],
+      "events": [
+        {
+          "id": "evt-4200",
+          "day": 1,
+          "units": 0,
+          "amount_eur": 12.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4201",
+          "day": 2,
+          "units": 7,
+          "amount_eur": 25.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4202",
+          "day": 3,
+          "units": 14,
+          "amount_eur": 38.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4203",
+          "day": 4,
+          "units": 21,
+          "amount_eur": 51.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4204",
+          "day": 5,
+          "units": 28,
+          "amount_eur": 64.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4205",
+          "day": 6,
+          "units": 4,
+          "amount_eur": 77.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4206",
+          "day": 7,
+          "units": 11,
+          "amount_eur": 90.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4207",
+          "day": 8,
+          "units": 18,
+          "amount_eur": 103.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4208",
+          "day": 9,
+          "units": 25,
+          "amount_eur": 116.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4209",
+          "day": 10,
+          "units": 1,
+          "amount_eur": 129.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4210",
+          "day": 11,
+          "units": 8,
+          "amount_eur": 142.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4211",
+          "day": 12,
+          "units": 15,
+          "amount_eur": 155.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4212",
+          "day": 13,
+          "units": 22,
+          "amount_eur": 168.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4213",
+          "day": 14,
+          "units": 29,
+          "amount_eur": 181.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4214",
+          "day": 15,
+          "units": 5,
+          "amount_eur": 194.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4215",
+          "day": 16,
+          "units": 12,
+          "amount_eur": 207.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4216",
+          "day": 17,
+          "units": 19,
+          "amount_eur": 220.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4217",
+          "day": 18,
+          "units": 26,
+          "amount_eur": 233.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4218",
+          "day": 19,
+          "units": 2,
+          "amount_eur": 246.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4219",
+          "day": 20,
+          "units": 9,
+          "amount_eur": 19.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4220",
+          "day": 21,
+          "units": 16,
+          "amount_eur": 32.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4221",
+          "day": 22,
+          "units": 23,
+          "amount_eur": 45.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4222",
+          "day": 23,
+          "units": 30,
+          "amount_eur": 58.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4223",
+          "day": 24,
+          "units": 6,
+          "amount_eur": 71.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4224",
+          "day": 25,
+          "units": 13,
+          "amount_eur": 84.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4225",
+          "day": 26,
+          "units": 20,
+          "amount_eur": 97.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4226",
+          "day": 27,
+          "units": 27,
+          "amount_eur": 110.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4227",
+          "day": 28,
+          "units": 3,
+          "amount_eur": 123.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4228",
+          "day": 29,
+          "units": 10,
+          "amount_eur": 136.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4229",
+          "day": 30,
+          "units": 17,
+          "amount_eur": 149.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4230",
+          "day": 31,
+          "units": 24,
+          "amount_eur": 162.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4231",
+          "day": 32,
+          "units": 0,
+          "amount_eur": 175.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4232",
+          "day": 33,
+          "units": 7,
+          "amount_eur": 188.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4233",
+          "day": 34,
+          "units": 14,
+          "amount_eur": 201.5,
+          "channel": "api",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4234",
+          "day": 35,
+          "units": 21,
+          "amount_eur": 214.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4235",
+          "day": 36,
+          "units": 28,
+          "amount_eur": 227.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4236",
+          "day": 37,
+          "units": 4,
+          "amount_eur": 240.5,
+          "channel": "api",
+          "status": "failed"
+        },
+        {
+          "id": "evt-4237",
+          "day": 38,
+          "units": 11,
+          "amount_eur": 13.5,
+          "channel": "web",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4238",
+          "day": 39,
+          "units": 18,
+          "amount_eur": 26.5,
+          "channel": "batch",
+          "status": "settled"
+        },
+        {
+          "id": "evt-4239",
+          "day": 40,
+          "units": 25,
+          "amount_eur": 39.5,
+          "channel": "api",
+          "status": "settled"
+        }
+      ],
+      "alerts": [
+        "storage at 103 percent of the included volume",
+        "invoice inv-2026-06 is 42 days overdue",
+        "231 of 240 seats active"
+      ],
+      "owner": "j.okafor-audit",
+      "region": "eu-central"
+    },
+    "questions": {
+      "action": {
+        "type": "choice",
+        "instructions": "Which action should the account team take?",
+        "criteria": {
+          "escalate": null,
+          "upsell": null,
+          "monitor": null
+        }
+      },
+      "overdue": {
+        "type": "noul",
+        "instructions": "Is the account overdue?"
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this request?",
+        "criteria": [
+          "Routine",
+          "Soon",
+          "Today"
+        ]
+      }
+    }
+  }
+]

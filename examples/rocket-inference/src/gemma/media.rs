@@ -12,9 +12,9 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use image::RgbImage;
+use image::{DynamicImage, RgbImage};
 use reqwest::header::CONTENT_TYPE;
 
 use crate::server::telemetry;
@@ -244,42 +244,277 @@ pub fn extract_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Resul
 
 /// Decode an image file to RGB8 (PIL `convert('RGB')` equivalent).
 ///
-/// JPEGs go through mozjpeg (libjpeg-turbo), matching PIL's decoder; the Rust
-/// `image` crate's zune-jpeg decoder differs by up to ±4 LSB, which is the only
-/// remaining gap versus the HF reference on JPEG inputs.
+/// The decoder is chosen by the file's **content** (magic number), like
+/// `PIL.Image.open`: JPEG goes through [`load_jpeg`] (mozjpeg/libjpeg-turbo), the
+/// rest through the `image` crate.  The extension is not consulted — a JPEG saved
+/// as `.png` still takes libjpeg, which is what PIL does.
 #[telemetry::instrument(name = "image.decode", skip_all)]
 pub fn load_image(path: &Path) -> Result<RgbImage> {
-    let is_jpeg = path
-        .extension()
-        .map(|e| {
-            matches!(
-                e.to_string_lossy().to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg"
-            )
-        })
-        .unwrap_or(false);
-    if is_jpeg {
-        match load_jpeg(path) {
-            Ok(img) => return Ok(img),
-            Err(e) => eprintln!("mozjpeg decode failed ({e}); falling back to the image crate"),
+    let bytes = std::fs::read(path).with_context(|| format!("read image {}", path.display()))?;
+    decode_image(&bytes).with_context(|| format!("decode image {}", path.display()))
+}
+
+/// Decode already-read image bytes to RGB8, choosing the decoder by content.
+///
+/// JPEGs go through mozjpeg (libjpeg-turbo), matching PIL's decoder; the Rust
+/// `image` crate's zune-jpeg decoder differs by up to ±4 LSB, which is the only
+/// remaining gap versus the HF reference on JPEG inputs.  A JPEG libjpeg cannot
+/// handle (the CMYK/YCCK Adobe ones: libjpeg has no CMYK -> RGB conversion) falls
+/// back to the `image` crate instead of aborting the process.
+///
+/// Every JPEG goes through [`load_jpeg`], which checks the container
+/// ([`check_jpeg`]) before decoding: a truncated file (missing EOI, a cut segment)
+/// or an unsupported sample precision is refused there instead of being silently
+/// accepted by the fallback decoder, which is what PIL does (`OSError: image file
+/// is truncated` / `Unsupported precision`).
+///
+/// 16-bit PNGs get PIL's own conversion rules rather than `to_rgb8`'s rounding,
+/// because the checkpoints' processors see PIL pixels (see [`pil_rgb8`]).
+pub fn decode_image(bytes: &[u8]) -> Result<RgbImage> {
+    if is_jpeg(bytes) {
+        // The container check comes first and never falls back: a truncated file
+        // must not reach the more permissive `image` decoder.
+        check_jpeg(bytes)?;
+        match load_jpeg(bytes) {
+            JpegOutcome::Rgb(img) => return Ok(img),
+            JpegOutcome::Unsupported(error) => eprintln!(
+                "mozjpeg cannot decode this JPEG ({error:#}); falling back to the image crate"
+            ),
         }
     }
-    let img = image::open(path).with_context(|| format!("decode image {}", path.display()))?;
-    Ok(img.to_rgb8())
+    let img = image::load_from_memory(bytes).context("decode the image bytes")?;
+    Ok(pil_rgb8(&img))
+}
+
+/// What a mozjpeg decode produced.
+enum JpegOutcome {
+    /// The decoded pixels.
+    Rgb(RgbImage),
+    /// A JPEG libjpeg cannot convert to RGB (CMYK/YCCK, which has no libjpeg
+    /// conversion); the `image` crate can decode it, so the caller falls back.
+    Unsupported(anyhow::Error),
+}
+
+/// Whether these bytes start like a JPEG (`FF D8 FF`).
+pub fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF
+}
+
+/// The RGB8 pixels of a decoded image with PIL's `convert("RGB")` semantics.
+///
+/// 8-bit, palette and float images go through `to_rgb8` (which already matches
+/// PIL: luma is replicated, alpha dropped).  16-bit PNGs need Pillow's rules
+/// instead, because `to_rgb8` scales them (`(v + 128) / 257`) while PIL does not:
+///
+/// * a 16-bit **grayscale** PNG opens as `I;16` and `convert("RGB")` **clips each
+///   sample to `[0, 255]`** (so a 16-bit image reads as near-white);
+/// * a 16-bit **colour** PNG (RGB or RGBA) opens as `RGB`/`RGBA` and keeps the
+///   **high byte** (`v >> 8`), alpha dropped by the conversion;
+/// * a 16-bit **gray+alpha** PNG is opened by Pillow as `RGBA`, i.e. the same
+///   high-byte rule (`v >> 8`) replicated to RGB.
+///
+/// These are byte-exact against `PIL.Image.convert("RGB")` (see the unit tests).
+fn pil_rgb8(img: &DynamicImage) -> RgbImage {
+    fn from_rgb(mut pixels: impl Iterator<Item = [u8; 3]>, (w, h): (u32, u32)) -> RgbImage {
+        let mut out = Vec::with_capacity((w as usize) * (h as usize) * 3);
+        for pixel in &mut pixels {
+            out.extend_from_slice(&pixel);
+        }
+        RgbImage::from_raw(w, h, out).expect("pil_rgb8: buffer sized from the image")
+    }
+    match img {
+        DynamicImage::ImageLuma16(luma) => {
+            let (w, h) = luma.dimensions();
+            let pixels = luma.pixels().map(|p| {
+                let v = p.0[0].min(255) as u8;
+                [v, v, v]
+            });
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageLumaA16(luma) => {
+            let (w, h) = luma.dimensions();
+            let pixels = luma.pixels().map(|p| {
+                let v = (p.0[0] >> 8) as u8;
+                [v, v, v]
+            });
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageRgb16(rgb) => {
+            let (w, h) = rgb.dimensions();
+            let pixels = rgb
+                .pixels()
+                .map(|p| [p.0[0] >> 8, p.0[1] >> 8, p.0[2] >> 8].map(|v| v as u8));
+            from_rgb(pixels, (w, h))
+        }
+        DynamicImage::ImageRgba16(rgba) => {
+            let (w, h) = rgba.dimensions();
+            let pixels = rgba
+                .pixels()
+                .map(|p| [p.0[0] >> 8, p.0[1] >> 8, p.0[2] >> 8].map(|v| v as u8));
+            from_rgb(pixels, (w, h))
+        }
+        other => other.to_rgb8(),
+    }
+}
+
+/// The SOF markers that describe a frame (`0xC4`/`0xC8`/`0xCC` are not SOFs).
+fn is_sof(marker: u8) -> bool {
+    (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC)
+}
+
+/// The big-endian segment length at `at`, which must cover at least its own two
+/// bytes and stay inside `limit`.
+fn segment_length(bytes: &[u8], at: usize, limit: usize) -> Result<usize> {
+    if at + 2 > limit {
+        bail!("truncated JPEG segment (no length)");
+    }
+    let length = usize::from(bytes[at]) << 8 | usize::from(bytes[at + 1]);
+    if length < 2 {
+        bail!("malformed JPEG segment length {length}");
+    }
+    if at + length > limit {
+        bail!(
+            "truncated JPEG segment ({length} bytes declared, {} available)",
+            limit - at
+        );
+    }
+    Ok(length)
+}
+
+/// Structural integrity checks on an encoded JPEG, the ones PIL's loader gets for
+/// free: an SOI, well-formed marker segments, an 8-bit frame, and an EOI after the
+/// first scan.
+///
+/// This is deliberately a *container* check, not a decoder: libjpeg tolerates a
+/// missing EOI (and the `image` crate decodes the visible rows), while PIL raises
+/// `image file is truncated`, so a cut-off upload must be refused before either
+/// decoder runs.  A 12-bit frame is refused here too (libjpeg and the standard PIL
+/// wheels are 8-bit only) rather than aborting inside libjpeg.
+pub fn check_jpeg(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        bail!("not a JPEG (no SOI marker)");
+    }
+    let limit = bytes.len();
+    let mut at = 2usize;
+    let mut frame = false;
+    loop {
+        // Every segment starts with 0xFF (fill bytes may repeat it).
+        if at >= limit {
+            bail!("truncated JPEG (no EOI marker)");
+        }
+        if bytes[at] != 0xFF {
+            bail!("malformed JPEG (expected a marker at offset {at})");
+        }
+        while at < limit && bytes[at] == 0xFF {
+            at += 1;
+        }
+        if at >= limit {
+            bail!("truncated JPEG (no EOI marker)");
+        }
+        let marker = bytes[at];
+        at += 1;
+        match marker {
+            // EOI.
+            0xD9 => {
+                if !frame {
+                    bail!("malformed JPEG (EOI before any frame header)");
+                }
+                return Ok(());
+            }
+            // A stuffed 0xFF inside entropy data, or a stand-alone marker.
+            0x00 | 0x01 | 0xD0..=0xD7 => continue,
+            0xD8 => bail!("malformed JPEG (a second SOI after the first)"),
+            0xDA => {
+                // SOS: skip its header, then walk the entropy-coded data to the
+                // next real marker (FF 00 is stuffing, FF D0-D7 a restart).
+                let length = segment_length(bytes, at, limit)?;
+                at += length;
+                loop {
+                    if at + 1 >= limit {
+                        bail!("truncated JPEG (the scan has no EOI marker)");
+                    }
+                    if bytes[at] != 0xFF {
+                        at += 1;
+                        continue;
+                    }
+                    let next = bytes[at + 1];
+                    if next == 0x00 || (0xD0..=0xD7).contains(&next) {
+                        at += 2;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            _ => {
+                let length = segment_length(bytes, at, limit)?;
+                if is_sof(marker) {
+                    if length < 8 {
+                        bail!("malformed JPEG frame header ({length} bytes)");
+                    }
+                    let precision = bytes[at + 2];
+                    if precision != 8 {
+                        bail!("unsupported JPEG sample precision {precision} (only 8-bit)");
+                    }
+                    frame = true;
+                }
+                at += length;
+            }
+        }
+    }
 }
 
 /// JPEG decode via mozjpeg (libjpeg-turbo), PIL-compatible.
-fn load_jpeg(path: &Path) -> Result<RgbImage> {
-    let decompress = mozjpeg::Decompress::new_path(path)
-        .with_context(|| format!("open jpeg {}", path.display()))?;
-    let mut image = decompress
-        .rgb()
-        .with_context(|| format!("decode jpeg {}", path.display()))?;
+///
+/// libjpeg reports a fatal problem by calling `error_exit`, which mozjpeg turns
+/// into a `resume_unwind` (an abort for an unguarded call) — and that fires from
+/// `jpeg_read_header` too, i.e. inside [`mozjpeg::Decompress::new_mem`] on a
+/// malformed header.  The whole decode, header included, therefore runs inside
+/// `catch_unwind`; a CMYK or YCCK source comes back as [`JpegOutcome::Unsupported`]
+/// before decompression starts (libjpeg has no CMYK -> RGB conversion), so
+/// [`decode_image`] can fall back to the `image` crate for exactly that case and
+/// no other.
+fn load_jpeg(bytes: &[u8]) -> JpegOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_jpeg(bytes))) {
+        Ok(Ok(image)) => JpegOutcome::Rgb(image),
+        Ok(Err(error)) => JpegOutcome::Unsupported(error),
+        // libjpeg's `unwind_error_exit` resumes with a `String` — the formatted
+        // error message — and deliberately skips the panic hook.  A `String`
+        // payload is therefore libjpeg's own fatal; any other payload is a real
+        // panic (an `expect` in mozjpeg, our own code) and is re-raised so it
+        // still reaches the caller's panic policy.
+        Err(payload) => match payload.downcast::<String>() {
+            Ok(message) => {
+                JpegOutcome::Unsupported(anyhow!("libjpeg aborted the decode: {message}"))
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// Open, vet and decode one JPEG.  Every libjpeg fatal in here is a panic.
+///
+/// `Err` is reserved for the CMYK/YCCK refusal; any other libjpeg fatal arrives as
+/// a panic payload and reaches [`load_jpeg`]'s guard, which also treats it as
+/// "mozjpeg cannot decode this": the container was already checked, so what is
+/// left is a decoder limitation (the CMYK-class files the `image` crate handles),
+/// not a broken upload.
+fn decode_jpeg(bytes: &[u8]) -> Result<RgbImage> {
+    let decompress = mozjpeg::Decompress::new_mem(bytes).context("open jpeg")?;
+    let space = decompress.color_space();
+    if matches!(
+        space,
+        mozjpeg::ColorSpace::JCS_CMYK | mozjpeg::ColorSpace::JCS_YCCK
+    ) {
+        bail!("the JPEG stores CMYK/YCCK (libjpeg cannot convert it to RGB)");
+    }
+    decode_rgb(decompress)
+}
+
+fn decode_rgb<R: std::io::Read>(decompress: mozjpeg::Decompress<R>) -> Result<RgbImage> {
+    let mut image = decompress.rgb().context("convert the jpeg to RGB")?;
     let width = image.width() as u32;
     let height = image.height() as u32;
-    let pixels: Vec<u8> = image
-        .read_scanlines()
-        .with_context(|| format!("read jpeg scanlines {}", path.display()))?;
+    let pixels: Vec<u8> = image.read_scanlines().context("read jpeg scanlines")?;
     let buf = RgbImage::from_raw(width, height, pixels)
         .context("jpeg scanline buffer has an unexpected size")?;
     Ok(buf)
@@ -661,6 +896,16 @@ fn write_temp(bytes: &[u8], ext: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Write `bytes` to a temporary file with this extension and return it as a
+/// [`ResolvedMedia`], so the file is removed when the guard drops.
+///
+/// The decoders (ffmpeg, hound) pick their backend by file extension, so a caller
+/// that only has encoded bytes needs a named file on disk; the d3 video path uses
+/// this for `data:video/...` uploads and removes the file after decoding.
+pub(crate) fn temporary_file(bytes: &[u8], ext: &str) -> Result<ResolvedMedia, String> {
+    Ok(ResolvedMedia::temp(write_temp(bytes, ext)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,5 +997,256 @@ mod tests {
         assert!((parse_rate("30000/1001").unwrap() - 29.970_029_970_03).abs() < 1e-9);
         assert!(parse_rate("0/0").is_err());
         assert!(parse_rate("25").is_err());
+    }
+
+    /// PIL's `convert("RGB")` rules for 16-bit PNGs, with the exact samples the
+    /// review probe used (`0, 255, 256, 1000, 65535`).
+    ///
+    /// The expectations are `PIL.Image.convert("RGB")` output, measured on
+    /// Pillow 11: a 16-bit grayscale (`I;16`) is **clipped** to `[0, 255]`, while
+    /// 16-bit colour keeps the **high byte** and Pillow's 16-bit gray+alpha is
+    /// opened as RGBA and follows the high-byte rule too (alpha dropped).
+    #[test]
+    fn sixteen_bit_pngs_follow_pils_convert_rules() {
+        use image::{ImageBuffer, Luma, LumaA, Rgb, Rgba};
+        // `Gray16Image`/`GrayAlpha16Image` are crate-private in `image`, so name
+        // the buffers by their pixel types.
+        type Luma16 = ImageBuffer<Luma<u16>, Vec<u16>>;
+        type LumaA16 = ImageBuffer<LumaA<u16>, Vec<u16>>;
+        type Rgb16 = ImageBuffer<Rgb<u16>, Vec<u16>>;
+        type Rgba16 = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+        let luma: Luma16 =
+            Luma16::from_raw(3, 2, vec![0, 255, 256, 1000, 32768, 65535]).expect("luma buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageLuma16(luma));
+        assert_eq!(
+            rgb.as_raw(),
+            &[
+                0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255
+            ],
+            "a 16-bit gray sample is clipped, not scaled"
+        );
+
+        let rgb16: Rgb16 = Rgb16::from_raw(
+            2,
+            2,
+            vec![
+                0, 255, 256, // -> (0, 0, 1)
+                1000, 65535, 32768, // -> (3, 255, 128)
+                257, 512, 1023, // -> (1, 2, 3)
+                65535, 256, 0, // -> (255, 1, 0)
+            ],
+        )
+        .expect("rgb16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageRgb16(rgb16));
+        assert_eq!(rgb.as_raw(), &[0, 0, 1, 3, 255, 128, 1, 2, 3, 255, 1, 0]);
+
+        let rgba16: Rgba16 =
+            Rgba16::from_raw(2, 1, vec![0, 255, 256, 7, 1000, 65535, 32768, 65535])
+                .expect("rgba16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageRgba16(rgba16));
+        assert_eq!(rgb.as_raw(), &[0, 0, 1, 3, 255, 128], "alpha is dropped");
+
+        let la16: LumaA16 = LumaA16::from_raw(2, 1, vec![0, 7, 1000, 65535]).expect("la16 buffer");
+        let rgb = pil_rgb8(&DynamicImage::ImageLumaA16(la16));
+        assert_eq!(
+            rgb.as_raw(),
+            &[0, 0, 0, 3, 3, 3],
+            "Pillow opens LA16 as RGBA"
+        );
+    }
+
+    /// 8-bit images keep the `to_rgb8` mapping (luma replicated, alpha dropped),
+    /// which is PIL's: the EmbeddingGemma tower's pixels must not move.
+    #[test]
+    fn eight_bit_images_keep_the_to_rgb8_mapping() {
+        use image::{GrayAlphaImage, GrayImage, RgbaImage};
+
+        let luma: GrayImage = GrayImage::from_raw(2, 1, vec![0, 200]).unwrap();
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageLuma8(luma)).as_raw(),
+            &[0, 0, 0, 200, 200, 200]
+        );
+
+        let la: GrayAlphaImage = GrayAlphaImage::from_raw(2, 1, vec![7, 0, 9, 255]).unwrap();
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageLumaA8(la)).as_raw(),
+            &[7, 7, 7, 9, 9, 9]
+        );
+
+        let rgba: RgbaImage = RgbaImage::from_raw(1, 1, vec![10, 20, 30, 40]).expect("rgba buffer");
+        assert_eq!(
+            pil_rgb8(&DynamicImage::ImageRgba8(rgba)).as_raw(),
+            &[10, 20, 30]
+        );
+
+        let rgb = RgbImage::from_raw(1, 1, vec![1, 2, 3]).unwrap();
+        assert_eq!(pil_rgb8(&DynamicImage::ImageRgb8(rgb)).as_raw(), &[1, 2, 3]);
+    }
+
+    /// A CMYK (Adobe) JPEG must not abort the process: libjpeg has no CMYK to RGB
+    /// conversion and mozjpeg raises it as a `resume_unwind`, so the loader has to
+    /// fall back to the `image` crate.  `data/cmyk-test-rgb.raw` is PIL's
+    /// `convert("RGB")` of `data/cmyk-test.jpg`; zune-jpeg agrees within one LSB.
+    #[test]
+    fn a_cmyk_jpeg_decodes_without_aborting() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let expected = std::fs::read(dir.join("cmyk-test-rgb.raw")).expect("cmyk-test-rgb.raw");
+        let image = load_image(&dir.join("cmyk-test.jpg")).expect("a CMYK JPEG decodes");
+        assert_eq!((image.width(), image.height()), (32, 24));
+        let ours = image.as_raw();
+        assert_eq!(ours.len(), expected.len());
+        let worst = ours
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst <= 2,
+            "CMYK fallback differs from PIL by up to {worst} LSB"
+        );
+    }
+
+    /// The marker offsets (the `0xFF` of each segment) of a JPEG, in file order.
+    fn jpeg_markers(data: &[u8]) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        let mut i = 2; // past SOI
+        while i + 4 <= data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = data[i + 1];
+            offsets.push(i);
+            if marker == 0xD9 {
+                break;
+            }
+            if marker == 0xD8 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let length = usize::from(data[i + 2]) << 8 | usize::from(data[i + 3]);
+            if length < 2 {
+                break;
+            }
+            i += 2 + length;
+        }
+        offsets
+    }
+
+    /// A malformed JPEG must never abort the process, and must not be accepted by
+    /// the fallback decoder either.
+    ///
+    /// `jpeg_read_header` — called inside `Decompress::new_mem`, before any pixel
+    /// is read — fires libjpeg's `error_exit` for an unsupported SOF precision or a
+    /// bogus segment length, and mozjpeg raises that as a resumed unwind (a silent
+    /// exit 101 before the guard covered the header).  `check_jpeg` now refuses
+    /// both structurally, so the file is a clean error: the `image` crate would
+    /// otherwise accept a 12-bit frame or read past a nonsense segment length.
+    #[test]
+    fn a_malformed_jpeg_header_does_not_abort() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let source = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
+        let markers = jpeg_markers(&source);
+        let sof = markers
+            .iter()
+            .copied()
+            .find(|&i| {
+                matches!(
+                    source[i + 1],
+                    0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB
+                )
+            })
+            .expect("cat.jpeg has an SOF segment");
+        assert_eq!(source[sof + 4], 8, "cat.jpeg is an 8-bit JPEG");
+        let app0 = markers
+            .iter()
+            .copied()
+            .find(|&i| source[i + 1] == 0xE0)
+            .expect("cat.jpeg has an APP0 segment");
+
+        let mut sof12 = source.clone();
+        sof12[sof + 4] = 12;
+        let mut long_app0 = source.clone();
+        long_app0[app0 + 2..app0 + 4].copy_from_slice(&[0xFF, 0xFF]);
+
+        check_jpeg(&source).expect("cat.jpeg is structurally sound");
+
+        for (label, bytes, expected) in [
+            (
+                "SOF-precision-12",
+                sof12,
+                "unsupported JPEG sample precision 12",
+            ),
+            ("APP0-length-ffff", long_app0, "truncated JPEG segment"),
+        ] {
+            let message = format!("{:#}", check_jpeg(&bytes).expect_err(label));
+            assert!(message.contains(expected), "{label}: {message}");
+            // Every entry point reports the same clean error, no decode attempt.
+            let path = std::env::temp_dir().join(format!(
+                "rocket-malformed-{}-{label}.jpg",
+                std::process::id()
+            ));
+            std::fs::write(&path, &bytes).expect("write the malformed jpeg");
+            assert!(decode_image(&bytes).is_err(), "{label}");
+            let err = load_image(&path).expect_err(label);
+            assert!(
+                format!("{err:#}").contains("decode image"),
+                "{label}: {err:#}"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A truncated JPEG (the scan cut off, no EOI) is refused even though libjpeg
+    /// and the `image` crate both decode the visible rows; PIL raises
+    /// `image file is truncated`.  A missing EOI and a cut entropy scan are the two
+    /// shapes an interrupted upload takes.
+    #[test]
+    fn a_truncated_jpeg_is_refused() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let source = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
+        assert!(source.ends_with(&[0xFF, 0xD9]), "cat.jpeg ends with EOI");
+        // The control's cut: the last 36 bytes (EOI + trailing scan) are gone.
+        let no_eoi = &source[..source.len() - 36];
+        let message = format!("{:#}", check_jpeg(no_eoi).expect_err("no EOI"));
+        assert!(message.contains("truncated JPEG"), "{message}");
+        // A hard cut in the middle of the entropy-coded data.
+        let half = &source[..source.len() / 2];
+        assert!(check_jpeg(half).is_err());
+        // Both must fail every entry point, and neither may fall back.
+        assert!(decode_image(no_eoi).is_err());
+        assert!(decode_image(half).is_err());
+        // The intact file still decodes to the same pixels as before the check.
+        let intact = decode_image(&source).expect("cat.jpeg decodes");
+        assert_eq!((intact.width(), intact.height()), (960, 686));
+    }
+
+    /// `decode_image` picks the decoder by content, not by what a caller claims.
+    #[test]
+    fn the_decoder_is_chosen_by_magic() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let jpeg = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
+        assert!(is_jpeg(&jpeg));
+        // The same bytes under a `.png` name and with no extension at all.
+        for name in ["magic-lie.png", "magic-other.bin"] {
+            let path = std::env::temp_dir().join(format!("rocket-{}-{name}", std::process::id()));
+            std::fs::write(&path, &jpeg).expect("write the jpeg");
+            let image = load_image(&path).expect("a JPEG decodes whatever its name says");
+            assert_eq!((image.width(), image.height()), (960, 686), "{name}");
+            std::fs::remove_file(&path).ok();
+        }
+        // A PNG is not a JPEG and keeps the `image` decoder (and PIL's RGB
+        // mapping): encode one in memory so the test needs no fixture.
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        let rgb = RgbImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6]).expect("2x1 rgb");
+        DynamicImage::ImageRgb8(rgb)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode a png");
+        let png = encoded.into_inner();
+        assert!(!is_jpeg(&png));
+        let decoded = decode_image(&png).expect("a PNG decodes");
+        assert_eq!(decoded.as_raw(), &[1, 2, 3, 4, 5, 6]);
     }
 }

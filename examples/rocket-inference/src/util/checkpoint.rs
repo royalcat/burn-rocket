@@ -182,12 +182,33 @@ fn looks_like_gguf(path: &Path) -> Result<bool> {
     Ok(&magic == b"GGUF")
 }
 
-/// Locate the weight file in a model directory: `model.safetensors`, else the
-/// sole `*.gguf` (mmproj files excluded).
+/// Locate the weight file in a model directory: `model.safetensors`, else a
+/// single sharded `model-*.safetensors`, else the sole `*.gguf` (mmproj files
+/// excluded).
 pub fn find_in_dir(dir: &Path) -> Result<PathBuf> {
     let st = dir.join("model.safetensors");
     if st.exists() {
         return Ok(st);
+    }
+    // A Hugging Face sharded export (`model-00001-of-0000N.safetensors`). One
+    // shard is readable as-is; a multi-shard set would need a merged store.
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read_dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+            name.is_some_and(|n| n.starts_with("model-") && n.ends_with(".safetensors"))
+        })
+        .collect();
+    shards.sort();
+    match shards.len() {
+        0 => {}
+        1 => return Ok(shards.remove(0)),
+        n => bail!(
+            "{} holds {n} safetensors shards; merge them into a single \
+             model.safetensors first",
+            dir.display()
+        ),
     }
     let mut cands: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("read_dir {}", dir.display()))?
@@ -259,6 +280,15 @@ impl SafetensorsCheckpoint {
             .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(dtype)));
         Ok(model.load_from(&mut store)?)
     }
+
+    /// One tensor in the dtype the file stores it in (**no** conversion), in the
+    /// HF/PyTorch convention. The d3 vision tower keeps a bf16 weight bf16.
+    pub fn get_stored(&mut self, hf_key: &str) -> Result<Option<TensorData>> {
+        let Some(tensor) = self.store.get_tensor(hf_key)? else {
+            return Ok(None);
+        };
+        Ok(Some(bridge::to_data(tensor)?))
+    }
 }
 
 impl Checkpoint for SafetensorsCheckpoint {
@@ -297,11 +327,9 @@ impl Checkpoint for SafetensorsCheckpoint {
     }
 
     fn get(&mut self, hf_key: &str, dtype: DType) -> Result<Option<TensorData>> {
-        let Some(tensor) = self.store.get_tensor(hf_key)? else {
-            return Ok(None);
-        };
-        let data = bridge::to_data(tensor)?;
-        Ok(Some(data.convert_dtype(dtype)))
+        Ok(self
+            .get_stored(hf_key)?
+            .map(|data| data.convert_dtype(dtype)))
     }
 
     fn load_into<M: ModuleSnapshot>(&mut self, model: &mut M, dtype: DType) -> Result<ApplyResult> {
@@ -884,4 +912,33 @@ fn config_from_gguf(c: &GgufCheckpoint) -> Result<serde_json::Value> {
         "max_position_embeddings": c.meta_u64(&p("context_length")).unwrap_or(0),
     });
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example parses JSON with `serde_json`'s `arbitrary_precision` (a d3
+    /// state must keep big integers and Python-exact float text). Numbers that
+    /// other families read back with `as_u64`/`as_f64` must keep converting.
+    #[test]
+    fn parsed_json_numbers_still_convert() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"eos": 248044, "eos_list": [1, 2], "eps": 1e-06, "big": 123456789012345678901234567890}"#,
+        )
+        .unwrap();
+        assert_eq!(eos_from_value(json.get("eos")), vec![248044]);
+        assert_eq!(eos_from_value(json.get("eos_list")), vec![1, 2]);
+        assert_eq!(json["eps"].as_f64(), Some(1e-06));
+        assert_eq!(json["big"].as_u64(), None, "past u64::MAX");
+        assert!(
+            json["big"]
+                .to_string()
+                .contains("123456789012345678901234567890")
+        );
+        // Values the code builds itself (GGUF metadata, synthesized configs).
+        let built = serde_json::json!({"n": 7u64, "x": 1.5});
+        assert_eq!(built["n"].as_u64(), Some(7));
+        assert_eq!(built["x"].as_f64(), Some(1.5));
+    }
 }

@@ -29,6 +29,10 @@ use crate::util::rope::RopeCache;
 /// Model hyper-parameters, deserialized from the HF `config.json` `text_config`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IntentTextConfig {
+    /// The checkpoint's table rows. The loader sizes the table from the tensor
+    /// itself (it streams the stored dtype), so only [`IntentModel::new_stub`]
+    /// and the tests consume this.
+    #[allow(dead_code)]
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -141,6 +145,90 @@ impl PartialRope {
     }
 }
 
+/// Explicit rotary tables for one request: `cos`/`sin` of shape `[seq, rotary]`.
+///
+/// The d3 image prompt needs positions that are not a plain `0..seq` ramp (the
+/// multimodal RoPE mixes a temporal/height/width index per token), so the caller
+/// builds the tables for the whole prompt and hands them to the forward instead
+/// of the [`PartialRope`] cache. `rotary` is the model's partial-rotation width
+/// (`head_dim * partial_rotary_factor`, 64 for d3): the table covers the first
+/// `rotary` dims of the head and the tail passes through untouched, exactly like
+/// the reference's `apply_rotary_pos_emb` with a partial cos/sin.
+#[derive(Debug)]
+pub struct RopeTables {
+    cos: Tensor<2>,
+    sin: Tensor<2>,
+}
+
+impl RopeTables {
+    /// Wrap a `cos`/`sin` pair of the same `[seq, rotary]` shape (f32).
+    pub fn new(cos: Tensor<2>, sin: Tensor<2>) -> Self {
+        assert_eq!(
+            cos.dims(),
+            sin.dims(),
+            "the rope cos/sin tables must share one shape"
+        );
+        let [seq, rotary] = cos.dims();
+        assert!(
+            seq > 0 && rotary > 0 && rotary.is_multiple_of(2),
+            "bad rope table shape {seq}x{rotary}"
+        );
+        Self { cos, sin }
+    }
+
+    /// Table rows (prompt length it was built for).
+    pub fn len(&self) -> usize {
+        self.cos.dims()[0]
+    }
+
+    /// Rotated head dims (`head_dim * partial_rotary_factor`).
+    pub fn rotary(&self) -> usize {
+        self.cos.dims()[1]
+    }
+
+    /// Whether the table covers no tokens (an empty prompt can never be run).
+    #[allow(dead_code)] // the `len`/`is_empty` pair clippy wants; nothing builds an empty table
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `x * cos + rotate_half(x) * sin` over the first `rotary` dims of a
+    /// `[batch, seq, heads, head_dim]` tensor; the rest of the head passes
+    /// through.
+    pub fn apply(&self, x: Tensor<4>) -> Tensor<4> {
+        let [_, s, _, d] = x.dims();
+        let rotary = self.rotary();
+        assert_eq!(
+            s,
+            self.len(),
+            "the rope table has {} rows for {s} tokens",
+            self.len()
+        );
+        assert!(
+            rotary <= d,
+            "the rope table covers {rotary} of {d} head dims"
+        );
+        if rotary == d {
+            return self.rotate(x);
+        }
+        let head = self.rotate(x.clone().slice(s![.., .., .., 0..rotary]));
+        let tail = x.slice(s![.., .., .., rotary..d]);
+        Tensor::cat(vec![head, tail], 3)
+    }
+
+    /// The rotation on a tensor whose last dim is exactly `rotary`.
+    fn rotate(&self, x: Tensor<4>) -> Tensor<4> {
+        let [_, s, _, rotary] = x.dims();
+        let half = rotary / 2;
+        let cos = self.cos.clone().reshape([1, s, 1, rotary]).cast(x.dtype());
+        let sin = self.sin.clone().reshape([1, s, 1, rotary]).cast(x.dtype());
+        let x1 = x.clone().slice(s![.., .., .., 0..half]);
+        let x2 = x.clone().slice(s![.., .., .., half..rotary]);
+        let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
+        x * cos + rotated * sin
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Caches
 // ---------------------------------------------------------------------------
@@ -233,9 +321,24 @@ fn proj_sel(cpu: &Proj, id: &NpuId, x: Tensor<3>, npu: bool) -> Tensor<3> {
     proj3(cpu, x, false)
 }
 
-/// Run one projection: a resident NPU weight (prefill) or a CPU copy (f16 or
-/// f32). The CPU copy exists so single-token decode never pays the NPU's
+/// Run one projection: a resident NPU weight (prefill) or a CPU copy (f16, bf16
+/// or f32). The CPU copy exists so single-token decode never pays the NPU's
 /// `M >= 256` padding.
+///
+/// Three storage dtypes meet here. An f16 weight casts the *activations* down (the
+/// intent family's decode copy). A bf16 weight is the decision family's text-body
+/// storage: the checkpoint's own bf16, widened per call — exact, and half the
+/// resident bytes. The widen goes through the stored `[out, in]` orientation, so
+/// the matmul receives the same `[in, out]` operand layout an f32 load produced
+/// (see the long note on the vision tower's `weight_f32`).
+///
+/// The widen costs one pass over the body per prefill (0.95 GiB read, 1.9 GiB
+/// written for d3-lite), which measured **+6.0 %** wall over the f32 body on the
+/// 6-case text gate (90.9 -> 96.3 s) — the price of the −949 MiB resident. A
+/// rayon widen (the same conversion, in one parallel pass) was tried and is 1.5 %
+/// *slower*: flex's loop is already vectorized and the cost is the fresh f32
+/// allocation (page faults), not the elementwise conversion, so it stays a plain
+/// `cast`.
 fn proj3(p: &Proj, x: Tensor<3>, npu: bool) -> Tensor<3> {
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if npu && let Proj::Npu(id) = p {
@@ -246,10 +349,18 @@ fn proj3(p: &Proj, x: Tensor<3>, npu: bool) -> Tensor<3> {
     match p {
         Proj::Cpu(lin) => {
             let w = lin.weight.val();
-            if w.dtype() == DType::F16 {
-                burn::tensor::module::linear(x.cast(DType::F16), w, None).cast(DType::F32)
-            } else {
-                burn::tensor::module::linear(x, w, lin.bias.as_ref().map(|b| b.val()))
+            let bias = lin.bias.as_ref().map(|b| b.val());
+            match w.dtype() {
+                DType::F16 => {
+                    burn::tensor::module::linear(x.cast(DType::F16), w, None).cast(DType::F32)
+                }
+                DType::BF16 => {
+                    // Widen through the stored `[out, in]` orientation so the matmul
+                    // receives the f32 load's operand layout.
+                    let w = w.swap_dims(0, 1).cast(DType::F32).swap_dims(0, 1);
+                    burn::tensor::module::linear(x, w, bias)
+                }
+                _ => burn::tensor::module::linear(x, w, bias),
             }
         }
         #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -326,18 +437,31 @@ pub fn chunk_gated_delta_rule(
     let beta_u = beta.clone().unsqueeze_dim::<5>(4); // [., c, 1]
     let v_beta = v * beta_u.clone();
     let k_beta = k.clone() * beta_u;
+    drop(beta);
 
     let cum = g.cumsum(3); // [b,h,nc,c]
-    let up = cum.clone().unsqueeze_dim::<5>(4);
-    let lo = cum.clone().unsqueeze_dim::<5>(3);
-    let upper = Tensor::<2, Bool>::tril_mask([c, c], 0, device)
-        .reshape([1, 1, 1, c, c])
-        .expand([b, h, nc, c, c]);
-    let pair = (up - lo).mask_fill(upper, f32::NEG_INFINITY).exp(); // [b,h,nc,c,c]
 
-    let kt = k.clone().swap_dims(3, 4); // [b,h,nc,dk,c]
-    let ut = k_beta.clone().matmul(kt.clone()) * pair.clone();
-    let intra = q.clone().matmul(kt) * pair;
+    // The chunk-local matrices below are the prefill's working set: each is
+    // `[b, h, nc, c, .]`, i.e. 34-69 MiB per layer at 8k, so every one of them
+    // is released at its last use instead of at the end of the function (Burn
+    // frees a tensor when its last handle drops). `pair`/`kt` only feed `ut` and
+    // `intra` and die with this block; `ut` is consumed by the substitution and
+    // `inv` by `new_values`/`k_cumdecay`. What must stay alive across the chunk
+    // loop is exactly `intra`, `new_values`, `k_cumdecay`, `q_scaled`,
+    // `key_scaled` and `chunk_decay`.
+    let (ut, intra) = {
+        let up = cum.clone().unsqueeze_dim::<5>(4);
+        let lo = cum.clone().unsqueeze_dim::<5>(3);
+        let upper = Tensor::<2, Bool>::tril_mask([c, c], 0, device)
+            .reshape([1, 1, 1, c, c])
+            .expand([b, h, nc, c, c]);
+        let pair = (up - lo).mask_fill(upper, f32::NEG_INFINITY).exp(); // [b,h,nc,c,c]
+        let kt = k.clone().swap_dims(3, 4); // [b,h,nc,dk,c]
+        let ut = k_beta.clone().matmul(kt.clone()) * pair.clone();
+        let intra = q.clone().matmul(kt) * pair;
+        (ut, intra)
+    };
+    // `k_beta`/`decayed_k_beta` feed only `ut` and `k_cumdecay`.
     let decayed_k_beta = k_beta * cum.clone().exp().unsqueeze_dim::<5>(4);
 
     // Forward substitution for (I + L)^-1, the reference's export path: with
@@ -518,7 +642,11 @@ impl DeltaNet {
             let last = padded.clone().slice(s![.., .., s..s + k - 1]);
             (padded, last)
         };
-        cache.conv[idx] = Some(new_state);
+        // Burn's `slice` is a *view*: storing it as-is would keep the whole
+        // `[b, conv_dim, s + k - 1]` padding buffer alive for the rest of the
+        // request (0.19 GiB per linear layer at 8k, 18 of them). The state is
+        // only `k-1` tokens wide (75 KiB for d3-lite), so materialize it.
+        cache.conv[idx] = Some(Tensor::from_data(new_state.into_data(), &device));
 
         let mut out = Tensor::<3>::zeros([b, c, s], (&device, DType::F32));
         for j in 0..k {
@@ -661,14 +789,18 @@ impl GatedAttention {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         x: Tensor<3>,
         cache: &mut IntentCache,
         idx: usize,
         rope: &PartialRope,
+        tables: Option<&RopeTables>,
         start: usize,
         npu: bool,
+        causal_full: bool,
+        keep_kv: bool,
     ) -> Tensor<3> {
         let [b, s, _] = x.dims();
         let (nh, kv, d) = (self.n_heads, self.n_kv_heads, self.head_dim);
@@ -713,8 +845,12 @@ impl GatedAttention {
 
         let q = zc_norm4(q, &self.q_norm_w, self.eps);
         let k = zc_norm4(k, &self.k_norm_w, self.eps);
-        let q = rope.apply(q, start);
-        let k = rope.apply(k, start);
+        // An explicit per-request table replaces the position ramp; every other
+        // caller passes `None` and keeps the shared cache (bit-identical).
+        let (q, k) = match tables {
+            Some(tables) => (tables.apply(q), tables.apply(k)),
+            None => (rope.apply(q, start), rope.apply(k, start)),
+        };
 
         // Append to the KV cache ([b, kv, S, d] layout).
         let k = k.swap_dims(1, 2);
@@ -726,10 +862,18 @@ impl GatedAttention {
             ),
             None => (k, v),
         };
-        cache.kv[idx] = Some((k_all.clone(), v_all.clone()));
+        // A decoder keeps the prompt's K/V for its single-token steps; a
+        // one-prefill model (the d3 decision family) never does, and the store
+        // would retain `layers x 2 x kv_heads x head_dim x 4 B` per token
+        // (24.5 KiB/token for d3-lite) with no reader. The prefill's attention
+        // reads `k_all`/`v_all` below either way.
+        if keep_kv {
+            cache.kv[idx] = Some((k_all.clone(), v_all.clone()));
+        }
 
         let o = if s > 1 {
-            // Prefill: backend fused causal attention (GQA native).
+            // Prefill: backend fused attention (GQA native). Causal for generation,
+            // bidirectional for a d3 decision prompt (`noncausal_full_attention`).
             attention(
                 q.swap_dims(1, 2),
                 k_all,
@@ -739,7 +883,7 @@ impl GatedAttention {
                 AttentionModuleOptions {
                     scale: Some(1.0 / (d as f64).sqrt()),
                     softcap: None,
-                    is_causal: true,
+                    is_causal: causal_full,
                 },
             )
         } else {
@@ -837,15 +981,28 @@ impl Layer {
         cache: &mut IntentCache,
         idx: usize,
         rope: &PartialRope,
+        tables: Option<&RopeTables>,
         start: usize,
         chunk: usize,
         npu: bool,
+        causal_full: bool,
+        keep_kv: bool,
     ) -> Tensor<3> {
         let residual = x.clone();
         let h = zc_norm3(x, &self.input_norm_w, self.eps);
         let h = match &self.mixer {
             Mixer::Linear(dn) => dn.forward(h, cache, idx, chunk, npu),
-            Mixer::Full(fa) => fa.forward(h, cache, idx, rope, start, npu),
+            Mixer::Full(fa) => fa.forward(
+                h,
+                cache,
+                idx,
+                rope,
+                tables,
+                start,
+                npu,
+                causal_full,
+                keep_kv,
+            ),
         } + residual;
 
         let residual = h.clone();
@@ -855,13 +1012,230 @@ impl Layer {
 }
 
 // ---------------------------------------------------------------------------
+// Token table
+// ---------------------------------------------------------------------------
+
+/// Hidden values per int8 scale (the block width of [`Embed::Int8`]): one f32
+/// scale per 32 values, i.e. `vocab * hidden / 32` scales for the table.
+pub const EMBED_BLOCK: usize = 32;
+
+/// The tied token-embedding table (`[vocab, hidden]`, also the LM head).
+///
+/// It is CPU resident in every deployment (the NPU never holds it), and a forward
+/// only reads the rows of the current prompt, so the decision family stores it as
+/// block-wise symmetric int8: half of f16 plus one scale per [`EMBED_BLOCK`]
+/// values, and one rayon dequant pass per prompt.
+// The dense tensor is larger than the two int8 vectors; boxing it would only add
+// indirection to the row gather for the dense path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum Embed {
+    /// f32 or f16 `[vocab, hidden]` (the intent family's path).
+    Dense(Tensor<2>),
+    /// Block-wise symmetric int8, [`EMBED_BLOCK`] values per scale:
+    /// `codes[row * hidden + i] = round(v / scales[row * blocks + i / 32])`
+    /// clamped to `[-127, 127]`, `scales[row * blocks + j] = max|block j| / 127`
+    /// and `blocks = hidden / 32` (the hidden state must be divisible by it). A
+    /// value is at most half a step (`max|block| / 254`) off; an all-zero block
+    /// has scale 0.
+    Int8 {
+        codes: Vec<i8>,
+        scales: Vec<f32>,
+        blocks: usize,
+    },
+}
+
+impl Embed {
+    /// The ready line's label: `F32`, `F16` or `I8`.
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Embed::Dense(t) if t.dtype() == DType::F16 => "F16",
+            Embed::Dense(_) => "F32",
+            Embed::Int8 { .. } => "I8",
+        }
+    }
+
+    /// The table as a dense tensor: a clone for [`Embed::Dense`], the dequantized
+    /// whole table for [`Embed::Int8`]. Only the tied LM head needs it (the
+    /// intent/gemma generation paths, which never enable int8); the forwards use
+    /// [`Embed::rows`].
+    pub fn dense(&self, device: &Device) -> Tensor<2> {
+        match self {
+            Embed::Dense(t) => t.clone(),
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => {
+                let rows = scales.len() / *blocks;
+                let cols = codes.len().checked_div(rows).unwrap_or(0);
+                let ids: Vec<u32> = (0..rows as u32).collect();
+                let data = dequant_rows(codes, scales, *blocks, &ids, cols);
+                Tensor::<2>::from_data(TensorData::new(data, [rows, cols]), device)
+            }
+        }
+    }
+
+    /// The `[1, s, hidden]` f32 rows of `ids`, in the given order. A dense f16
+    /// table yields f16 rows, cast back because the body is f32.
+    pub fn rows(&self, ids: &[u32], hidden: usize, device: &Device) -> Tensor<3> {
+        let s = ids.len();
+        match self {
+            Embed::Dense(t) => {
+                let idx: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
+                let idx = Tensor::<1, Int>::from_data(TensorData::new(idx, [s]), device);
+                let rows = t.clone().select(0, idx).reshape([1, s, hidden]);
+                if t.dtype() == DType::F16 {
+                    rows.cast(DType::F32)
+                } else {
+                    rows
+                }
+            }
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => {
+                let data = dequant_rows(codes, scales, *blocks, ids, hidden);
+                Tensor::<3>::from_data(TensorData::new(data, [1, s, hidden]), device)
+            }
+        }
+    }
+
+    /// Quantize a `[rows, cols]` f32 table block-wise (`cols % 32 == 0`). Values
+    /// are rounded half away from zero (`f32::round`), then clamped to
+    /// `[-127, 127]` (a no-op by construction: `|v| <= max|block| = 127 * scale`).
+    ///
+    /// The whole table has to be in one f32 buffer, which is exactly what the
+    /// loader avoids for a d3 package: it streams the stored bf16 table through
+    /// [`quantize_rows_into`] instead. This form stays for the tests and any
+    /// caller that already holds the f32 table.
+    #[allow(dead_code)]
+    pub fn quantize(table: &[f32], rows: usize, cols: usize) -> Self {
+        assert_eq!(table.len(), rows * cols, "table shape mismatch");
+        let blocks = blocks_of(cols);
+        let mut codes = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows * blocks];
+        quantize_rows_into(table, rows, cols, &mut codes, &mut scales);
+        Embed::Int8 {
+            codes,
+            scales,
+            blocks,
+        }
+    }
+}
+
+/// The scale count of a `cols`-wide row: `cols / EMBED_BLOCK`.
+pub fn blocks_of(cols: usize) -> usize {
+    assert!(
+        cols > 0 && cols.is_multiple_of(EMBED_BLOCK),
+        "the int8 token table needs a hidden state divisible by {EMBED_BLOCK} (got {cols})"
+    );
+    cols / EMBED_BLOCK
+}
+
+/// One row's block-wise symmetric int8 quantization into `out` (the row's codes)
+/// and `scales` (one per [`EMBED_BLOCK`] values): per block,
+/// `scale = max|block| / 127`, `codes = round(v / scale)` clamped to
+/// `[-127, 127]` (rounded half away from zero). An all-zero block keeps scale 0
+/// and quantizes to all zeros.
+pub fn quantize_row(row: &[f32], out: &mut [i8], scales: &mut [f32]) {
+    assert_eq!(row.len(), out.len(), "quantize row length mismatch");
+    assert_eq!(
+        blocks_of(row.len()),
+        scales.len(),
+        "quantize row needs one scale per {EMBED_BLOCK} values"
+    );
+    for (j, (src, dst)) in row
+        .chunks(EMBED_BLOCK)
+        .zip(out.chunks_mut(EMBED_BLOCK))
+        .enumerate()
+    {
+        let max = src.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let scale = if max > 0.0 { max / 127.0 } else { 0.0 };
+        scales[j] = scale;
+        if scale == 0.0 {
+            dst.fill(0);
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (o, &v) in dst.iter_mut().zip(src) {
+            *o = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+}
+
+/// Block-wise symmetric int8 quantization of a `[rows, cols]` f32 table into
+/// caller-owned `codes` (`rows * cols`) and `scales` (`rows * cols / 32`)
+/// (rayon over the rows), one [`quantize_row`] per row. Every row is quantized on
+/// its own, so a caller may feed any block of rows at a time and still get the
+/// whole-table codes bit for bit (the loader's streaming table quantizer does).
+pub fn quantize_rows_into(
+    table: &[f32],
+    rows: usize,
+    cols: usize,
+    codes: &mut [i8],
+    scales: &mut [f32],
+) {
+    use rayon::prelude::*;
+    assert_eq!(table.len(), rows * cols, "table shape mismatch");
+    assert_eq!(codes.len(), rows * cols, "codes length mismatch");
+    let blocks = blocks_of(cols);
+    assert_eq!(scales.len(), rows * blocks, "scales length mismatch");
+    codes
+        .par_chunks_mut(cols)
+        .zip(scales.par_chunks_mut(blocks))
+        .enumerate()
+        .for_each(|(r, (out, scale))| {
+            quantize_row(&table[r * cols..(r + 1) * cols], out, scale);
+        });
+}
+
+/// Dequantize the rows `ids` of a block-wise int8 table into `ids.len() * cols`
+/// f32 values, in `ids` order (rayon over the rows).
+pub fn dequant_rows(
+    codes: &[i8],
+    scales: &[f32],
+    blocks: usize,
+    ids: &[u32],
+    cols: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    assert!(
+        blocks > 0 && blocks * EMBED_BLOCK == cols,
+        "dequant needs {blocks} scales for a {cols}-wide row"
+    );
+    let rows = scales.len() / blocks;
+    let mut out = vec![0f32; ids.len() * cols];
+    out.par_chunks_mut(cols)
+        .zip(ids.par_iter())
+        .for_each(|(dst, &id)| {
+            let row = id as usize;
+            assert!(row < rows, "token id {id} is outside the {rows}-row table");
+            let src = &codes[row * cols..(row + 1) * cols];
+            let row_scales = &scales[row * blocks..(row + 1) * blocks];
+            for (j, (d, c)) in dst
+                .chunks_mut(EMBED_BLOCK)
+                .zip(src.chunks(EMBED_BLOCK))
+                .enumerate()
+            {
+                let scale = row_scales[j];
+                for (d, &c) in d.iter_mut().zip(c) {
+                    *d = c as f32 * scale;
+                }
+            }
+        });
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct IntentModel {
     pub cfg: IntentTextConfig,
-    pub embed: Tensor<2>, // [vocab, hidden]
+    pub embed: Embed,
     pub layers: Vec<Layer>,
     pub norm_w: Tensor<1>,
     pub rope: PartialRope,
@@ -872,6 +1246,19 @@ pub struct IntentModel {
     pub npu_decode: bool,
     /// No CPU projection copies exist: every projection must go through the NPU.
     pub npu_only: bool,
+    /// The full-attention layers are causal (a decoder, the default) or
+    /// bidirectional (`noncausal_full_attention`, the d3 decision prompt). The
+    /// Gated DeltaNet layers are always causal.
+    pub full_attn_causal: bool,
+    /// Whether the full-attention layers store the prompt's K/V after a prefill.
+    ///
+    /// A decoder needs it for its single-token steps; the d3 decision family
+    /// runs exactly one prefill per question and never reads it again, and the
+    /// store pins `n_full_layers * 2 * kv_heads * head_dim * 4 B` per prompt
+    /// token (24.5 KiB/token for d3-lite: ~190 MiB at 8k, ~800 MiB at the 32k
+    /// cap). The decision loader turns it off ([`IntentModel::keep_kv`] stays
+    /// `true` everywhere else).
+    pub keep_kv: bool,
     pub stage: StageStats,
 }
 
@@ -887,8 +1274,30 @@ pub struct StageStats {
 
 impl IntentModel {
     /// Build the module skeleton with lazily-initialized projection weights; the
-    /// loader fills every tensor in place.
+    /// loader fills every tensor in place. The placeholder token table has the
+    /// config's `vocab_size` rows.
+    ///
+    /// The loader builds the same skeleton with a one-row placeholder
+    /// ([`IntentModel::new_stub_with_rows`]) because it always replaces the
+    /// table, so this full-size form is the tests' (and keeps the historical
+    /// shape for anything that builds a stub and runs it as-is).
+    #[allow(dead_code)]
     pub fn new_stub(cfg: &IntentTextConfig, max_seq: usize, device: &Device) -> Self {
+        Self::new_stub_with_rows(cfg, max_seq, cfg.vocab_size, device)
+    }
+
+    /// The same skeleton with a placeholder token table of `embed_rows` rows.
+    ///
+    /// A loader that always replaces the table ([`Embed::Dense`] or
+    /// [`Embed::Int8`]) passes `1`: the zero table would otherwise be a
+    /// vocab-sized f32 allocation (970 MiB for d3-lite, 1,940 MiB for d3-nano)
+    /// that sets the whole load's peak right before it is dropped.
+    pub fn new_stub_with_rows(
+        cfg: &IntentTextConfig,
+        max_seq: usize,
+        embed_rows: usize,
+        device: &Device,
+    ) -> Self {
         let layers = cfg
             .layer_types
             .iter()
@@ -906,7 +1315,7 @@ impl IntentModel {
             .collect();
         Self {
             cfg: cfg.clone(),
-            embed: Tensor::zeros([cfg.vocab_size, cfg.hidden_size], device),
+            embed: Embed::Dense(Tensor::zeros([embed_rows.max(1), cfg.hidden_size], device)),
             layers,
             norm_w: Tensor::zeros([cfg.hidden_size], device),
             rope: PartialRope::new(
@@ -921,42 +1330,56 @@ impl IntentModel {
             chunk: 64,
             npu_decode: false,
             npu_only: false,
+            full_attn_causal: true,
+            keep_kv: true,
             stage: StageStats::default(),
         }
     }
 
-    /// Gather `[1, s, hidden]` embeddings for `ids` (no EOS/BOS handling). An f16
-    /// table yields f16 rows; the model body is f32, so cast them back.
+    /// Gather `[1, s, hidden]` embeddings for `ids` (no EOS/BOS handling) as f32,
+    /// in the given order. A dense f16 table yields f16 rows; the model body is
+    /// f32, so they are cast back. An int8 table dequantizes only these rows.
     pub fn embed_ids(&self, ids: &[u32]) -> Tensor<3> {
-        let s = ids.len();
-        let ids_i64: Vec<i64> = ids.iter().map(|&t| t as i64).collect();
-        let idx = Tensor::<1, Int>::from_data(TensorData::new(ids_i64, [s]), &self.device);
-        let rows = self
-            .embed
-            .clone()
-            .select(0, idx)
-            .reshape([1, s, self.cfg.hidden_size]);
-        if self.embed.dtype() == DType::F16 {
-            rows.cast(DType::F32)
-        } else {
-            rows
-        }
+        self.embed.rows(ids, self.cfg.hidden_size, &self.device)
     }
 
-    /// Forward `ids`; appends to the cache. Returns logits for the last position
-    /// `[1, vocab]`. Multi-token input is only allowed for a fresh cache (prefill).
-    pub fn forward_logits(&mut self, ids: &[u32]) -> Tensor<2> {
-        let s = ids.len();
+    /// Forward `ids`; appends to the cache. Returns the final-normed hidden state
+    /// at the last position `[1, hidden]`. Multi-token input is only allowed for a
+    /// fresh cache (prefill).
+    pub fn forward_last_normed(&mut self, ids: &[u32]) -> Tensor<2> {
+        let embeds = self.embed_ids(ids);
+        self.forward_last_normed_embeds(embeds, None)
+    }
+
+    /// The same forward from caller-supplied embeddings `[1, seq, hidden]`
+    /// (a d3 image prompt splices the vision features into the text rows) with an
+    /// optional explicit RoPE table; `None` uses the shared position ramp exactly
+    /// like [`IntentModel::forward_last_normed`].
+    pub fn forward_last_normed_embeds(
+        &mut self,
+        embeds: Tensor<3>,
+        tables: Option<&RopeTables>,
+    ) -> Tensor<2> {
+        let s = embeds.dims()[1];
         assert!(
             self.cache.len == 0 || s == 1,
             "only single-token steps are supported after a prefill (cache len {})",
+            self.cache.len
+        );
+        let keep_kv = self.keep_kv;
+        // Without the K/V store a later step would attend to its own token only,
+        // so this model is a one-prefill model: refuse to reuse its cache.
+        debug_assert!(
+            keep_kv || self.cache.len == 0,
+            "a model with keep_kv = false can only run a fresh prefill (cache len {})",
             self.cache.len
         );
         let start = self.cache.len;
         let chunk = self.chunk;
         let eps = self.cfg.rms_norm_eps;
         let npu = self.npu_only || self.npu_decode || s > 1;
-        let mut h = self.embed_ids(ids);
+        let causal_full = self.full_attn_causal;
+        let mut h = embeds;
         let IntentModel {
             layers,
             cache,
@@ -964,13 +1387,30 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, start, chunk, npu);
+            h = layer.forward(
+                h,
+                cache,
+                i,
+                rope,
+                tables,
+                start,
+                chunk,
+                npu,
+                causal_full,
+                keep_kv,
+            );
         }
         let h = zc_norm3(h, &self.norm_w, eps);
         self.cache.len += s;
         let hidden = self.cfg.hidden_size;
-        let last = h.slice(s![.., s - 1..s, ..]).reshape([1, hidden]);
-        let table = self.embed.clone();
+        h.slice(s![.., s - 1..s, ..]).reshape([1, hidden])
+    }
+
+    /// Forward `ids`; appends to the cache. Returns logits for the last position
+    /// `[1, vocab]`. Multi-token input is only allowed for a fresh cache (prefill).
+    pub fn forward_logits(&mut self, ids: &[u32]) -> Tensor<2> {
+        let last = self.forward_last_normed(ids);
+        let table = self.dense_embed();
         if table.dtype() == DType::F16 {
             last.cast(DType::F16)
                 .matmul(table.transpose())
@@ -980,6 +1420,12 @@ impl IntentModel {
         }
     }
 
+    /// The tied table as a dense tensor (the LM head). Generation only: a d3
+    /// decision prompt never reads the head, so it never pays the dequantization.
+    fn dense_embed(&self) -> Tensor<2> {
+        self.embed.dense(&self.device)
+    }
+
     /// Debug helper: run a fresh forward and return the hidden state after the
     /// embedding and after every layer (25 entries for this model), each
     /// `[1, s, hidden]`. Does not touch generation state beyond resetting it.
@@ -987,6 +1433,8 @@ impl IntentModel {
         self.cache.reset();
         let chunk = self.chunk;
         let npu = self.npu_only || self.npu_decode || ids.len() > 1;
+        let causal_full = self.full_attn_causal;
+        let keep_kv = self.keep_kv;
         let mut h = self.embed_ids(ids);
         let mut out = vec![h.clone()];
         let IntentModel {
@@ -996,7 +1444,7 @@ impl IntentModel {
             ..
         } = self;
         for (i, layer) in layers.iter().enumerate() {
-            h = layer.forward(h, cache, i, rope, 0, chunk, npu);
+            h = layer.forward(h, cache, i, rope, None, 0, chunk, npu, causal_full, keep_kv);
             out.push(h.clone());
         }
         out
@@ -1112,4 +1560,497 @@ fn pick_token(logits: &[f32], temperature: f32, rng: &mut u64) -> u32 {
         }
     }
     (probs.len() - 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::proj::Proj;
+    use burn::module::Param;
+    use burn::nn::Linear;
+
+    /// A tiny two-layer hybrid (a full-attention layer feeding a delta-rule one)
+    /// that exercises every weight without loading a checkpoint. The full layer
+    /// goes first so a bidirectional mask reaches the last position through the
+    /// (causal) delta layer
+    fn tiny_cfg() -> IntentTextConfig {
+        IntentTextConfig::from_value(serde_json::json!({
+            "text_config": {
+                "vocab_size": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 64,
+                "layer_types": ["full_attention", "linear_attention"],
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8,
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "partial_rotary_factor": 0.5,
+                "rope_parameters": {"rope_theta": 10000.0},
+            }
+        }))
+        .unwrap()
+    }
+
+    /// Small deterministic pseudo-random values (a fixed LCG, `u` in `[-0.1, 0.1)`).
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = (state >> 40) as f32 / (1u64 << 24) as f32;
+                (u - 0.5) * 0.2
+            })
+            .collect()
+    }
+
+    fn tensor2(rows: usize, cols: usize, seed: u64, device: &Device) -> Tensor<2> {
+        Tensor::<2>::from_data(
+            TensorData::new(values(rows * cols, seed), [rows, cols]),
+            device,
+        )
+    }
+
+    fn tensor1(n: usize, seed: u64, device: &Device) -> Tensor<1> {
+        Tensor::<1>::from_data(TensorData::new(values(n, seed), [n]), device)
+    }
+
+    fn proj(input: usize, output: usize, seed: u64, device: &Device) -> Proj {
+        // `Linear.weight` is `[in, out]`; the values themselves are arbitrary.
+        Proj::Cpu(Linear {
+            weight: Param::from_tensor(tensor2(input, output, seed, device)),
+            bias: None,
+        })
+    }
+
+    fn filled_model(cfg: &IntentTextConfig, device: &Device) -> IntentModel {
+        let mut model = IntentModel::new_stub(cfg, 64, device);
+        model.embed = Embed::Dense(tensor2(cfg.vocab_size, cfg.hidden_size, 1, device));
+        model.norm_w = tensor1(cfg.hidden_size, 2, device);
+        for (i, layer) in model.layers.iter_mut().enumerate() {
+            let seed = 10 + i as u64 * 10;
+            layer.input_norm_w = tensor1(cfg.hidden_size, seed, device);
+            layer.post_norm_w = tensor1(cfg.hidden_size, seed + 1, device);
+            layer.mlp.gate_proj = proj(cfg.hidden_size, cfg.intermediate_size, seed + 2, device);
+            layer.mlp.up_proj = proj(cfg.hidden_size, cfg.intermediate_size, seed + 3, device);
+            layer.mlp.down_proj = proj(cfg.intermediate_size, cfg.hidden_size, seed + 4, device);
+            match &mut layer.mixer {
+                Mixer::Linear(dn) => {
+                    dn.in_proj_qkv = proj(cfg.hidden_size, cfg.conv_dim(), seed + 5, device);
+                    dn.in_proj_z = proj(cfg.hidden_size, cfg.value_dim(), seed + 6, device);
+                    dn.in_proj_b = proj(
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        seed + 7,
+                        device,
+                    );
+                    dn.in_proj_a = proj(
+                        cfg.hidden_size,
+                        cfg.linear_num_value_heads,
+                        seed + 8,
+                        device,
+                    );
+                    dn.out_proj = proj(cfg.value_dim(), cfg.hidden_size, seed + 9, device);
+                    dn.conv_w = tensor2(
+                        cfg.conv_dim(),
+                        cfg.linear_conv_kernel_dim,
+                        seed + 10,
+                        device,
+                    );
+                    dn.dt_bias = tensor1(cfg.linear_num_value_heads, seed + 11, device);
+                    dn.a_log = tensor1(cfg.linear_num_value_heads, seed + 12, device);
+                    dn.norm_w = tensor1(cfg.linear_value_head_dim, seed + 13, device);
+                }
+                Mixer::Full(fa) => {
+                    let d = cfg.head_dim;
+                    fa.q_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_attention_heads * d * 2,
+                        seed + 5,
+                        device,
+                    );
+                    fa.k_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_key_value_heads * d,
+                        seed + 6,
+                        device,
+                    );
+                    fa.v_proj = proj(
+                        cfg.hidden_size,
+                        cfg.num_key_value_heads * d,
+                        seed + 7,
+                        device,
+                    );
+                    fa.o_proj = proj(
+                        cfg.num_attention_heads * d,
+                        cfg.hidden_size,
+                        seed + 8,
+                        device,
+                    );
+                    fa.q_norm_w = tensor1(d, seed + 9, device);
+                    fa.k_norm_w = tensor1(d, seed + 10, device);
+                }
+            }
+        }
+        model
+    }
+
+    fn rows(tensor: Tensor<2>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
+    }
+
+    #[test]
+    fn keep_kv_off_skips_the_prefill_kv_store() {
+        // The d3 decision family runs one prefill per question and never decodes:
+        // storing the prompt's K/V there would pin 24.5 KiB/token for nothing.
+        // The store is never read by the prefill itself, so turning it off must
+        // not change the last hidden state.
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut keeping = filled_model(&cfg, &device);
+        assert!(
+            keeping.keep_kv,
+            "the default keeps the cache (intent/decode)"
+        );
+        let kept = rows(keeping.forward_last_normed(&ids));
+        let stored = keeping.cache.kv.iter().filter(|k| k.is_some()).count();
+        assert!(stored > 0, "a keeping model stores the full layers' K/V");
+        assert_eq!(keeping.cache.len, ids.len());
+
+        let mut skipping = filled_model(&cfg, &device);
+        skipping.keep_kv = false;
+        let skipped = rows(skipping.forward_last_normed(&ids));
+        assert_eq!(kept, skipped, "the prefill never reads the KV store");
+        assert!(skipping.cache.kv.iter().all(Option::is_none));
+        assert_eq!(skipping.cache.len, ids.len());
+    }
+
+    #[test]
+    fn a_decode_step_reuses_the_prefill_conv_history() {
+        // The conv history is an owned `[1, conv_dim, k-1]` copy of the last
+        // convolution inputs (storing the `slice` would pin the whole padded
+        // prefill buffer). A single-token step prepends it, so the shapes and
+        // the forward have to line up across the two paths.
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let mut model = filled_model(&cfg, &device);
+        let ids = [1u32, 4, 7, 9, 3];
+        let prefill = rows(model.forward_last_normed(&ids));
+        let linear = model
+            .layers
+            .iter()
+            .position(|layer| matches!(layer.mixer, Mixer::Linear(_)))
+            .expect("tiny_cfg has a delta-rule layer");
+        let state = model.cache.conv[linear].as_ref().expect("conv history");
+        assert_eq!(
+            state.dims(),
+            [1, cfg.conv_dim(), cfg.linear_conv_kernel_dim - 1]
+        );
+
+        let step = rows(model.forward_last_normed(&[7u32]));
+        assert!(step.iter().all(|v| v.is_finite()));
+        assert_eq!(model.cache.len, ids.len() + 1);
+        assert_ne!(prefill, step, "the decode step must see the whole prompt");
+    }
+
+    #[test]
+    fn forward_logits_is_the_normed_last_hidden_through_the_tied_table() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut logits_model = filled_model(&cfg, &device);
+        let logits = rows(logits_model.forward_logits(&ids));
+        let mut hidden_model = filled_model(&cfg, &device);
+        let hidden = hidden_model.forward_last_normed(&ids);
+        let expected = rows(hidden.matmul(hidden_model.dense_embed().transpose()));
+        assert_eq!(logits.len(), cfg.vocab_size);
+        assert_eq!(
+            logits, expected,
+            "forward_logits must be the readout of the hidden"
+        );
+    }
+
+    // ---- int8 token table ----
+
+    /// A `[rows, cols]` table whose rows differ in magnitude (row 0 is all zeros,
+    /// the last row is the widest) and whose 32-value blocks within a row differ
+    /// too (every other block is 64x smaller), so neither the row scales nor the
+    /// block scales repeat.
+    fn table_with_block_scales(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+        let mut out = values(rows * cols, seed);
+        for (r, row) in out.chunks_mut(cols).enumerate() {
+            let gain = if r == 0 { 0.0 } else { r as f32 * 0.5 };
+            for (i, v) in row.iter_mut().enumerate() {
+                let block_gain = if (i / EMBED_BLOCK) % 2 == 0 {
+                    1.0
+                } else {
+                    1.0 / 64.0
+                };
+                *v = (*v * gain
+                    + if i % 3 == 0 {
+                        gain * 0.001
+                    } else {
+                        -gain * 0.002
+                    })
+                    * block_gain;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_int8_table_is_within_half_a_step_of_every_block() {
+        let (rows, cols) = (24usize, 64);
+        let blocks = blocks_of(cols);
+        let table = table_with_block_scales(rows, cols, 7);
+        let mut codes = vec![0i8; rows * cols];
+        let mut scales = vec![0f32; rows * blocks];
+        quantize_rows_into(&table, rows, cols, &mut codes, &mut scales);
+        for r in 0..rows {
+            for j in 0..blocks {
+                let lo = r * cols + j * EMBED_BLOCK;
+                let block = &table[lo..lo + EMBED_BLOCK];
+                let max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let scale = scales[r * blocks + j];
+                if max == 0.0 {
+                    assert_eq!(scale, 0.0, "an all-zero block keeps scale 0");
+                    assert!(
+                        codes[lo..lo + EMBED_BLOCK].iter().all(|&c| c == 0),
+                        "an all-zero block quantizes to zeros"
+                    );
+                    continue;
+                }
+                assert!(scale > 0.0);
+                let step = max / 127.0;
+                assert!(
+                    (scale - step).abs() <= step * 1e-5,
+                    "scale = max|block|/127"
+                );
+                for (i, &v) in block.iter().enumerate() {
+                    let q = codes[lo + i] as f32 * scale;
+                    assert!(
+                        (q - v).abs() <= step / 2.0 * 1.0001,
+                        "row {r} block {j} col {i}: {v} quantized to {q}, step {step}"
+                    );
+                    assert!(
+                        (-127..=127).contains(&(codes[lo + i] as i16)),
+                        "codes stay in the symmetric range"
+                    );
+                }
+            }
+        }
+        // The dequantized gather reproduces the rows in id order.
+        let ids = [23u32, 0, 5];
+        let gathered = dequant_rows(&codes, &scales, blocks, &ids, cols);
+        assert_eq!(gathered.len(), ids.len() * cols);
+        for (k, &id) in ids.iter().enumerate() {
+            let r = id as usize;
+            for i in 0..cols {
+                let want = table[r * cols + i];
+                let got = gathered[k * cols + i];
+                let step = scales[r * blocks + i / EMBED_BLOCK];
+                assert!(
+                    (got - want).abs() <= step / 2.0 * 1.0001,
+                    "gather order: id {id} slot {k} col {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "divisible by 32")]
+    fn a_hidden_state_that_is_not_a_multiple_of_32_is_refused() {
+        // The loader turns this into a load error that points at --embed-f16.
+        let _ = blocks_of(48);
+    }
+
+    #[test]
+    fn a_block_scale_keeps_a_small_block_beside_a_large_one() {
+        // One row, two blocks: 32 values at 100 and 32 at 1e-3. A per-row scale
+        // (100 / 127 ≈ 0.79) would quantize the small block to all zeros; the
+        // block scale keeps its full range, at half a step of 1e-3 / 254.
+        let mut row = vec![100f32; EMBED_BLOCK];
+        row.extend(vec![1e-3f32; EMBED_BLOCK]);
+        let mut codes = vec![0i8; row.len()];
+        let mut scales = vec![0f32; 2];
+        quantize_row(&row, &mut codes, &mut scales);
+        assert_eq!(scales[0], 100.0 / 127.0);
+        assert_eq!(scales[1], 1e-3 / 127.0);
+        // The small block uses the whole int8 range, and the dequantized values
+        // are exact to the fp32 rounding of the scale.
+        assert!(
+            codes[EMBED_BLOCK..].iter().all(|&c| c == 127),
+            "the small block quantizes to its own full range"
+        );
+        let back = dequant_rows(&codes, &scales, 2, &[0], row.len());
+        for j in 0..row.len() {
+            assert!(
+                (back[j] - row[j]).abs() <= scales[j / EMBED_BLOCK] / 2.0 * 1.0001,
+                "col {j}: {} -> {}",
+                row[j],
+                back[j]
+            );
+        }
+        // The per-row formula this replaced would have zeroed the small block.
+        let row_scale = 100.0 / 127.0;
+        let lossy: Vec<i8> = row
+            .iter()
+            .map(|v| (v / row_scale).round().clamp(-127.0, 127.0) as i8)
+            .collect();
+        assert!(
+            lossy[EMBED_BLOCK..].iter().all(|&c| c == 0),
+            "the per-row arm loses the small block (that is the M2 finding)"
+        );
+    }
+
+    #[test]
+    fn an_int8_table_gathers_the_prompt_rows_in_id_order() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
+        let table = table_with_block_scales(vocab, hidden, 11);
+        let quantized = Embed::quantize(&table, vocab, hidden);
+        let mut dense = filled_model(&cfg, &device);
+        dense.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(table.clone(), [vocab, hidden]),
+            &device,
+        ));
+        let mut int8 = filled_model(&cfg, &device);
+        int8.embed = quantized;
+
+        // Out of order and repeated: the rows must follow `ids` exactly.
+        let ids = [7u32, 2, 5, 2];
+        let want = rows2(dense.embed_ids(&ids));
+        let got = rows2(int8.embed_ids(&ids));
+        assert_eq!(got.len(), ids.len() * hidden);
+        let mut max_abs = 0f32;
+        for (k, &id) in ids.iter().enumerate() {
+            let row = &table[id as usize * hidden..(id as usize + 1) * hidden];
+            for i in 0..hidden {
+                let d = (got[k * hidden + i] - want[k * hidden + i]).abs();
+                max_abs = max_abs.max(d);
+                // The tolerance is the value's own 32-block's half step.
+                let lo = i - i % EMBED_BLOCK;
+                let block = &row[lo..lo + EMBED_BLOCK];
+                let block_max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    d <= block_max / 254.0 * 1.0001,
+                    "id {id} slot {k} col {i}: dense {} vs int8 {}",
+                    want[k * hidden + i],
+                    got[k * hidden + i]
+                );
+            }
+        }
+        // Relative to the row's own magnitude the error is tiny (<= half a step).
+        assert!(max_abs > 0.0, "the fixture must exercise the quantizer");
+        println!("int8 table vs dense rows: max |delta| {max_abs:.3e}");
+
+        // The whole model still runs from the int8 table, to the same tolerance.
+        let h_dense = rows2_row(dense.forward_last_normed(&ids));
+        let h_int8 = rows2_row(int8.forward_last_normed(&ids));
+        let scale = h_dense.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = h_dense
+            .iter()
+            .zip(&h_int8)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst <= scale * 2e-2,
+            "hidden state moved by {worst} (magnitude {scale})"
+        );
+    }
+
+    #[test]
+    fn the_tied_head_dequantizes_an_int8_table() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
+        let table = table_with_block_scales(vocab, hidden, 13);
+        let quantized = Embed::quantize(&table, vocab, hidden);
+        let (codes, scales, blocks) = match &quantized {
+            Embed::Int8 {
+                codes,
+                scales,
+                blocks,
+            } => (codes.clone(), scales.clone(), *blocks),
+            Embed::Dense(_) => panic!("Embed::quantize builds an int8 table"),
+        };
+        assert_eq!(blocks, blocks_of(hidden));
+        let ids = [1u32, 4, 7];
+        let mut int8 = filled_model(&cfg, &device);
+        int8.embed = Embed::Int8 {
+            codes: codes.clone(),
+            scales: scales.clone(),
+            blocks,
+        };
+        // The dense table the int8 one stands for.
+        let dequant: Vec<f32> = dequant_rows(
+            &codes,
+            &scales,
+            blocks,
+            &(0..vocab as u32).collect::<Vec<_>>(),
+            hidden,
+        );
+        let mut dense = filled_model(&cfg, &device);
+        dense.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(dequant, [vocab, hidden]),
+            &device,
+        ));
+        assert_eq!(
+            rows2_row(int8.forward_logits(&ids)),
+            rows2_row(dense.forward_logits(&ids)),
+            "forward_logits over an int8 table is the readout of its dequantized form"
+        );
+        // And it still tracks the unquantized table closely (`forward_logits`
+        // appends to the cache, so reset before the second prefill).
+        int8.cache.reset();
+        let mut original = filled_model(&cfg, &device);
+        original.embed = Embed::Dense(Tensor::<2>::from_data(
+            TensorData::new(table, [vocab, hidden]),
+            &device,
+        ));
+        let a = rows2_row(original.forward_logits(&ids));
+        let b = rows2_row(int8.forward_logits(&ids));
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = a
+            .iter()
+            .zip(&b)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(worst <= scale * 2e-2, "logits moved by {worst} of {scale}");
+    }
+
+    /// `[1, s, hidden]` -> a flat vector.
+    fn rows2(tensor: Tensor<3>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
+    }
+
+    /// A `[1, hidden]` tensor -> a flat vector.
+    fn rows2_row(tensor: Tensor<2>) -> Vec<f32> {
+        tensor.to_data().try_to_vec().unwrap()
+    }
+
+    #[test]
+    fn the_full_attention_mask_defaults_to_causal_and_is_wired() {
+        let device = Device::default();
+        let cfg = tiny_cfg();
+        let ids = [1u32, 4, 7, 9, 3];
+        let mut causal = filled_model(&cfg, &device);
+        assert!(causal.full_attn_causal, "decoders stay causal by default");
+        let causal = rows(causal.forward_last_normed(&ids));
+        let mut noncausal = filled_model(&cfg, &device);
+        noncausal.full_attn_causal = false;
+        let noncausal = rows(noncausal.forward_last_normed(&ids));
+        assert!(
+            causal.iter().zip(&noncausal).any(|(a, b)| a != b),
+            "noncausal_full_attention must change the full-attention layer's mask"
+        );
+    }
 }

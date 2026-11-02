@@ -1,0 +1,121 @@
+[
+  {
+    "name": "image-receipt-total",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/example-receipt.png"],
+    "state": "Customer sent a photo of a receipt.",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "Which range holds the receipt total?",
+        "criteria": {
+          "under_100": "The total is under 100.00",
+          "100_to_150": "The total is between 100.00 and 150.00",
+          "over_150": "The total is over 150.00"
+        }
+      }
+    }
+  },
+  {
+    "name": "image-chart-pareto",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/index-pareto.png"],
+    "state": "A chart from the model's announcement.",
+    "questions": {
+      "higher": {
+        "type": "choice",
+        "instructions": "Which series reaches the higher full score in this chart?",
+        "criteria": {
+          "decision_3": "Decision 3.0",
+          "decision_2": "Decision 2.0",
+          "equal": "Both reach the same score"
+        }
+      }
+    }
+  },
+  {
+    "name": "image-cat",
+    "images": ["data/cat.jpeg"],
+    "state": "A photo attached to a support ticket.",
+    "questions": {
+      "animal": {
+        "type": "choice",
+        "instructions": "Which animal is in the photo?",
+        "criteria": {
+          "cat": "A cat",
+          "dog": "A dog",
+          "bird": "A bird"
+        }
+      }
+    }
+  },
+  {
+    "name": "image-banner",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/banner.png"],
+    "state": "Promotional artwork.",
+    "questions": {
+      "model": {
+        "type": "choice",
+        "instructions": "Which model does the banner advertise?",
+        "criteria": {
+          "lite": "d3-lite 0.8B",
+          "nano": "d3-nano",
+          "none": "No model is named"
+        }
+      }
+    }
+  },
+  {
+    "name": "image-two-images",
+    "images": [
+      "/tmp/opencode/d3/models/d3-lite/assets/example-receipt.png",
+      "/tmp/opencode/d3/models/d3-lite/assets/serving-throughput.png"
+    ],
+    "state": "Two documents in one request.",
+    "questions": {
+      "which": {
+        "type": "choice",
+        "instructions": "Which of the two images is a receipt?",
+        "criteria": {
+          "first": "The first image",
+          "second": "The second image",
+          "neither": "Neither image"
+        }
+      }
+    }
+  },
+  {
+    "name": "image-receipt-with-text",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/example-receipt.png"],
+    "state": "Ticket: the customer says order A-20481 was charged twice.",
+    "questions": {
+      "matches": {
+        "type": "noul",
+        "instructions": "Does the order number in the ticket match the receipt?"
+      }
+    }
+  },
+  {
+    "name": "image-receipt-multi",
+    "images": ["/tmp/opencode/d3/models/d3-lite/assets/example-receipt.png"],
+    "state": "Customer sent a photo of a receipt.",
+    "questions": {
+      "total": {
+        "type": "choice",
+        "instructions": "Which range holds the receipt total?",
+        "criteria": {
+          "under_100": "The total is under 100.00",
+          "100_to_150": "The total is between 100.00 and 150.00",
+          "over_150": "The total is over 150.00"
+        }
+      },
+      "payment": {
+        "type": "choice",
+        "instructions": "How was the purchase paid?",
+        "criteria": {
+          "visa": "By card, VISA ending 4421",
+          "cash": "In cash",
+          "transfer": "By bank transfer"
+        }
+      }
+    }
+  }
+]

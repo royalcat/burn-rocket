@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 
 use crate::cli::{FlagArgs, LoadArgs, ResolvedLoad};
 use crate::commands::{gemma4_load_dtype, resolve};
+use crate::decision::load::load_decision_model;
 use crate::gemma::embeddinggemma::load as emb2_load;
 use crate::gemma::gemma4::loader as gen_loader;
 use crate::gemma::inputs;
@@ -19,7 +20,8 @@ use crate::util::device;
 
 use super::Settings;
 use super::engine::{
-    Capabilities, Emb2Engine, Engine, Family, Gemma4Engine, IntentEngine, Qwen3Engine,
+    Capabilities, DecisionEngine, Emb2Engine, Engine, Family, Gemma4Engine, IntentEngine,
+    Qwen3Engine,
 };
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
@@ -53,6 +55,10 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         Family::Emb2 => (8192, 64),
         Family::Intent => (30000, 256),
         Family::Gemma4 => (30000, 64),
+        // One prompt per question; the readout generates nothing. The decision
+        // cap is the family's own default (images spend ~900 tokens each; see
+        // `commands::decide::MAX_STATE_TOKENS`).
+        Family::Decision => (crate::commands::decide::MAX_STATE_TOKENS, 64),
     };
     let max_tokens = max_tokens.unwrap_or(default_max_tokens);
     let max_new_tokens = max_new_tokens.unwrap_or(default_max_new);
@@ -85,6 +91,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     embeddings: true,
                     multimodal: false,
                     chat: false,
+                    decisions: false,
                 },
             )
         }
@@ -130,6 +137,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     embeddings: true,
                     multimodal: true,
                     chat: false,
+                    decisions: false,
                 },
             )
         }
@@ -141,6 +149,8 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 keep_cpu_weights: load.keep_cpu_weights,
                 npu_threads: load.npu_threads,
                 embed_f16: load.embed_f16,
+                embed_int8: load.embed_int8,
+                ..IntentLoadOptions::default()
             };
             let loaded = intent_loader::load_for_serving(
                 &model_dir,
@@ -159,6 +169,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     embeddings: false,
                     multimodal: false,
                     chat: true,
+                    decisions: false,
                 },
             )
         }
@@ -201,12 +212,44 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                     embeddings: false,
                     multimodal: false,
                     chat: true,
+                    decisions: false,
+                },
+            )
+        }
+        Family::Decision => {
+            let opts = IntentLoadOptions {
+                npu: load.placement.text,
+                text: load.placement.text,
+                decode: false,
+                // A d3 prompt is always a prefill: no decode stage needs CPU copies.
+                keep_cpu_weights: false,
+                npu_threads: load.npu_threads,
+                embed_f16: load.embed_f16,
+                embed_int8: load.embed_int8,
+                npu_int8: load.npu_int8(),
+                ..IntentLoadOptions::default()
+            };
+            let model =
+                load_decision_model(&model_dir, &device, &opts, max_tokens, load.defer_towers)?;
+            (
+                Engine::Decision(Box::new(DecisionEngine { model, max_tokens })),
+                Capabilities {
+                    decisions: true,
+                    ..Default::default()
                 },
             )
         }
     };
 
-    let model_name = model_name.unwrap_or_else(|| dir_name(&model_dir));
+    let model_name = match model_name {
+        Some(name) => name,
+        // A d3 package declares its served name in MODEL_MANIFEST.json.
+        None if family == Family::Decision => {
+            crate::decision::load::manifest_model_name(&model_dir)
+                .unwrap_or_else(|| dir_name(&model_dir))
+        }
+        None => dir_name(&model_dir),
+    };
     let settings = Settings {
         model_name,
         family,

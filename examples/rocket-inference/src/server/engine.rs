@@ -4,12 +4,15 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use axum::http::StatusCode;
 use burn::prelude::*;
 use burn::tensor::{DType, Int, TensorData};
 use tokenizers::Tokenizer;
 
 pub use crate::family::Family;
 
+use crate::decision::model::{DecisionModel, PrepareError};
+use crate::decision::request::{DecisionRequest, MediaMode};
 use crate::gemma::embeddinggemma::model::Emb2Model;
 use crate::gemma::gemma4::chat::{self, GenOptions};
 use crate::gemma::gemma4::loader::load_towers;
@@ -19,6 +22,7 @@ use crate::gemma::media::{self, ResolvedMedia};
 use crate::gemma::vision::VisionAttn;
 use crate::qwen3_embedding::model::{Qwen3Config, Qwen3Embedding};
 use crate::qwen35_intent::model::IntentModel;
+use crate::server::telemetry;
 use crate::util::rope::RopeCache;
 
 use super::error::ApiError;
@@ -32,6 +36,8 @@ pub struct Capabilities {
     pub embeddings: bool,
     pub multimodal: bool,
     pub chat: bool,
+    /// `/v1/systemone` (the d3 decision family).
+    pub decisions: bool,
 }
 
 impl Capabilities {
@@ -45,6 +51,9 @@ impl Capabilities {
         }
         if self.chat {
             names.push("chat");
+        }
+        if self.decisions {
+            names.push("decisions");
         }
         names
     }
@@ -148,6 +157,7 @@ pub enum Engine {
     Emb2(Box<Emb2Engine>),
     Intent(Box<IntentEngine>),
     Gemma4(Box<Gemma4Engine>),
+    Decision(Box<DecisionEngine>),
 }
 
 #[derive(Debug)]
@@ -210,6 +220,31 @@ pub struct Gemma4Engine {
     pub attn_chunk: usize,
     pub image_soft_tokens: usize,
     pub video_soft_tokens: usize,
+}
+
+/// A loaded d3 decision model (`/v1/systemone`).
+#[derive(Debug)]
+pub struct DecisionEngine {
+    pub model: DecisionModel,
+    /// Per-question prompt-token cap (the server's `--max-tokens`).
+    pub max_tokens: usize,
+}
+
+/// What one decision request produced, in the terms the log line reports.
+pub struct DecisionOutcome {
+    pub response: serde_json::Value,
+    /// Questions that were actually answered.
+    pub questions: usize,
+    /// Prompt tokens of those questions (`usage.input_tokens`).
+    pub tokens: usize,
+}
+
+/// The answer to one `/v1/systemone` request.
+pub enum DecisionReply {
+    /// Questions that failed validation: the reference server refuses the whole
+    /// request (422 `{"detail": {"invalid_questions": ...}}`) and runs nothing.
+    Refused(serde_json::Map<String, serde_json::Value>),
+    Answered(DecisionOutcome),
 }
 
 /// A multimodal block after resolution: text with one placeholder per media
@@ -317,7 +352,7 @@ impl Engine {
         match self {
             Self::Qwen3(engine) => engine.embed_texts(req),
             Self::Emb2(engine) => engine.embed_texts(req),
-            Self::Intent(_) | Self::Gemma4(_) => Err(ApiError::bad_request(
+            Self::Intent(_) | Self::Gemma4(_) | Self::Decision(_) => Err(ApiError::bad_request(
                 "this model does not produce embeddings",
             )),
         }
@@ -336,9 +371,23 @@ impl Engine {
         match self {
             Self::Intent(engine) => engine.chat(turn),
             Self::Gemma4(engine) => engine.chat(turn),
-            Self::Qwen3(_) | Self::Emb2(_) => {
+            Self::Qwen3(_) | Self::Emb2(_) | Self::Decision(_) => {
                 Err(ApiError::bad_request("this model does not generate text"))
             }
+        }
+    }
+
+    /// `/v1/systemone`: one typed decision per question.
+    pub fn decisions(
+        &mut self,
+        model: &str,
+        req: DecisionRequest,
+    ) -> Result<DecisionReply, ApiError> {
+        match self {
+            Self::Decision(engine) => engine.decide(model, req),
+            _ => Err(ApiError::bad_request(
+                "this model does not answer decision requests",
+            )),
         }
     }
 }
@@ -680,6 +729,94 @@ impl IntentEngine {
             eval_ms: stats.decode_s * 1000.0,
             done_reason,
         })
+    }
+}
+
+impl DecisionEngine {
+    /// `/v1/systemone`'s compute: validate and prepare the request, run one
+    /// forward per question, and record the outcome on the `decision` span.
+    ///
+    /// The span is the child of `inference` (the blocking closure enters it);
+    /// `answers` and `tokens` are only known after the run, so they are
+    /// declared empty and recorded here. A refused or failed request answers
+    /// nothing.
+    #[telemetry::instrument(
+        name = "decision",
+        skip_all,
+        fields(
+            questions = req.questions.len(),
+            images = req.images.len(),
+            videos = req.videos.len(),
+            tokens = tracing::field::Empty,
+            answers = tracing::field::Empty,
+        )
+    )]
+    fn decide(&mut self, model: &str, req: DecisionRequest) -> Result<DecisionReply, ApiError> {
+        let result = self.decide_request(model, req);
+        let span = tracing::Span::current();
+        match &result {
+            Ok(DecisionReply::Answered(outcome)) => {
+                span.record("answers", outcome.questions as u64);
+                span.record("tokens", outcome.tokens as u64);
+            }
+            // A refused request runs nothing, and a failed one stopped early.
+            _ => {
+                span.record("answers", 0u64);
+            }
+        }
+        result
+    }
+
+    fn decide_request(
+        &mut self,
+        model: &str,
+        req: DecisionRequest,
+    ) -> Result<DecisionReply, ApiError> {
+        // The server's media contract is the reference `d3_server.py` one: data
+        // URLs only, never local paths or remote URLs. A media problem is the
+        // reference's 422 `{"detail": "<reason>"}`; nothing runs.
+        // The reference loads `images` before `videos`, so a package without a
+        // tower reports an image request's reason even when the request also has
+        // videos, and an undecodable image is reported before an undecodable video.
+        if (!req.images.is_empty() || !req.videos.is_empty()) && !self.model.has_vision() {
+            let reason =
+                crate::decision::model::unavailable_media(req.images.len(), req.videos.len())
+                    .expect("the request carries media");
+            return Err(ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, reason));
+        }
+        let images = req
+            .decode_images(MediaMode::DataUrls)
+            .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
+        let videos = req
+            .decode_videos(MediaMode::DataUrls)
+            .map_err(|message| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message))?;
+        // A refused image or video is the client's fault and keeps the
+        // reference's 422 detail string; everything else (tokenizer, tower,
+        // device) is a 500.
+        let prepared = self
+            .model
+            .prepare(&req, &images, &videos, self.max_tokens)
+            .map_err(|error| match error {
+                PrepareError::InvalidMedia(message) => {
+                    ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+                }
+                PrepareError::Internal(error) => ApiError::internal(format!("{error:#}")),
+            })?;
+        let invalid = prepared.invalid_questions();
+        if !invalid.is_empty() {
+            return Ok(DecisionReply::Refused(invalid));
+        }
+        let (probabilities, tokens) = self
+            .model
+            .run(&prepared)
+            .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+        let questions = prepared.sequences.len();
+        let response = self.model.respond(model, &prepared, &probabilities, tokens);
+        Ok(DecisionReply::Answered(DecisionOutcome {
+            response,
+            questions,
+            tokens,
+        }))
     }
 }
 

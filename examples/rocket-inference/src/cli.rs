@@ -19,16 +19,18 @@ rocket-inference - Burn inference on the RK3588 (flex CPU backend, per-stage NPU
 usage: rocket-inference <command> [flags]
 
 commands:
-  serve      HTTP server for the detected checkpoint (embedding and/or chat routes)
+  serve      HTTP server for the detected checkpoint (embedding, chat or decision routes)
   embed      one embedding for text and/or media (embedding models)
   bench      embedding throughput over repeated forwards (embedding models)
   gen        one chat completion (chat models)
+  decide     typed System One decisions (decision models)
   tokenize   tokenize text with the checkpoint's tokenizer
   gemm       flex matmul microbenchmark (no model)
   help       this text; `rocket-inference help <command>` for one command
 
-The model family is detected from --model-dir (config.json `model_type`, or the
-GGUF architecture of a local *.gguf); --family overrides the detection.
+The model family is detected from --model-dir (config.json `model_type`, a
+decision_config.json readout head, or the GGUF architecture of a local *.gguf);
+--family overrides the detection.
 --model-dir <dir> is required (or `-hf <owner>/<name>:<quant>`).
 
 Every stage runs on the CPU unless it is placed on the NPU:
@@ -54,6 +56,7 @@ pub fn command_usage(cmd: &str) -> Option<&'static str> {
         "embed" => EMBED_USAGE,
         "bench" => BENCH_USAGE,
         "gen" => GEN_USAGE,
+        "decide" => DECIDE_USAGE,
         "tokenize" => TOKENIZE_USAGE,
         "gemm" => GEMM_USAGE,
         _ => return None,
@@ -66,13 +69,15 @@ rocket-inference serve - one HTTP server for the detected checkpoint
 usage: rocket-inference serve --model-dir <dir> [flags]
 
 Routes follow the model: /v1/embeddings (+ /embed for multimodal embedding
-models), /v1/chat/completions and the Ollama API for chat models; /health and
-/v1/models always. `--family auto` detects the loader from the checkpoint.
+models), /v1/chat/completions and the Ollama API for chat models,
+/v1/systemone for a decision model (d3); /health and /v1/models always.
+`--family auto` detects the loader from the checkpoint.
 
 server:
   --port <n>                   listen port (default 8383)
   --model-name <name>          served model name (default: the model dir name)
-  --max-tokens <n>             prompt/context cap (family default)
+  --max-tokens <n>             prompt/context cap (family default; per question
+                               on decision, default 32768)
   --max-new-tokens <n>         default generation cap (family default)
   --temperature <f>            default sampling temperature (default 0 = greedy)
   --delta-chunk <n>            delta-rule chunk width (intent, default 64)
@@ -85,8 +90,9 @@ placement:
   --npu-threads / --npu-dtype / --int8-group / --keep-cpu-weights
 
 model and memory:
-  --model-dir / -hf / --family / --cpu-backend / --dtype / --quant /
-  --defer-towers / --embed-f16 / --attn-chunk / --chunk / --key-block
+  --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision /
+  --cpu-backend / --dtype / --quant / --defer-towers /
+  --embed-f16 / --embed-int8 / --attn-chunk / --chunk / --key-block
 
 See `rocket-inference help` for the shared placement flags and README.md for
 the endpoints.";
@@ -188,6 +194,51 @@ placement / model / memory:
 
 See `rocket-inference help` for the shared placement flags and docs/recipes/
 for balanced, full-offload and speed command lines.";
+
+const DECIDE_USAGE: &str = "\
+rocket-inference decide - typed System One decisions
+
+usage: rocket-inference decide --model-dir <dir> (--requests <file> | --request <json>)
+
+Valid for decision models (vllm-sr d3, `d3-code-readout-v1`: a Qwen3.5 text
+backbone plus a 255-code readout head). One noncausal forward per question; the
+answer is a probability for every option. Text, image and video requests are
+served (`images`/`videos` entries are local paths here; the HTTP server takes
+data URLs only). The checkpoint must be a local safetensors package
+(`--model-dir`); `-hf` (a GGUF Hub repo) is not accepted.
+
+input:
+  --requests <path>            a JSON array of cases
+                               [{\"name\", \"state\", \"questions\", \"images\", \"videos\"}, ...]
+  --request <json>             one case as a JSON object
+  --max-state-tokens <n>       per-question prompt cap (default 32768; an image
+                               spends one token per merged image token, a video
+                               one per merged token of each temporal pair)
+
+output:
+  --out <path>                 write the JSON result (default: stdout)
+  --model-name <name>          reported model name (default: MODEL_MANIFEST.json
+                               `model_name`, else the model dir name)
+  --dump-prompts <dir>         write each rendered prompt as <case>__<qid>.prompt.txt
+
+  --requests writes {\"schema\": \"d3-decision-v1\", \"model\", \"cases\":
+  [{\"name\", \"response\"}]}; --request writes the bare response
+  {\"model\", \"answers\", \"usage\"}. A question that cannot be answered keeps its
+  error record in `answers` (the `/v1/systemone` server refuses an invalid
+  question with a 422 instead).
+
+placement / model:
+  --device / --text-device auto|cpu|npu
+  --model-dir / --family / --cpu-backend / --npu-threads / --npu-dtype /
+  --int8-group / --embed-int8 (default) / --embed-f16 / --defer-towers
+    --npu-dtype int8 packs the text projections as resident int8 (opt-in,
+    `--int8-group` default 32); --embed-int8 keeps the tied token table as
+    block-wise int8 (one scale per 32 values; the default); --embed-f16 keeps
+    the exact table;
+    --defer-towers loads the vision tower on the first media request.
+
+See `rocket-inference help` for the shared placement flags and
+examples/rocket-inference/tools/decision.md for the format contract.";
 
 const TOKENIZE_USAGE: &str = "\
 rocket-inference tokenize - tokenize text with the checkpoint's tokenizer
@@ -383,6 +434,7 @@ pub struct LoadArgs {
     pub vision_attn_kernel: Option<AttnKernel>,
     pub attn_chunk: Option<usize>,
     pub embed_f16: Option<bool>,
+    pub embed_int8: Option<bool>,
 }
 
 impl LoadArgs {
@@ -469,6 +521,7 @@ impl LoadArgs {
             a.attn_chunk = Some(v);
         }
         a.embed_f16 = f.take_flag("--embed-f16");
+        a.embed_int8 = f.take_flag("--embed-int8");
         Ok(a)
     }
 
@@ -527,8 +580,12 @@ impl LoadArgs {
             bail!("--quant does not apply to the {} model", family.name());
         }
         if self.defer_towers.is_some() && !family.supports_defer_towers() {
+            // The embedding and intent models have no tower to defer; a d3 package
+            // has one and accepts the flag (the loader leaves `visual.*` to the
+            // first media request).
             bail!(
-                "--defer-towers does not apply to the {} model (no multimodal towers)",
+                "--defer-towers does not apply to the {} model (it has no tower halves to \
+                 load on first use)",
                 family.name()
             );
         }
@@ -564,15 +621,29 @@ impl LoadArgs {
         if self.embed_f16.is_some() && !family.supports_embed_f16() {
             bail!("--embed-f16 does not apply to the {} model", family.name());
         }
+        if self.embed_int8.is_some() && !family.supports_embed_int8() {
+            bail!(
+                "--embed-int8 does not apply to the {} model (it has no int8 \
+                 token table; only the decision family does)",
+                family.name()
+            );
+        }
+        if self.embed_f16 == Some(true) && self.embed_int8 == Some(true) {
+            bail!("--embed-f16 and --embed-int8 select different token tables; pick one");
+        }
         if self.npu_dtype.is_some() && !family.supports_int8() {
             bail!(
-                "--npu-dtype only applies to the embeddinggemma text backbone, \
-                 not the {} model",
+                "--npu-dtype only applies to the embeddinggemma and decision text \
+                 backbones, not the {} model",
                 family.name()
             );
         }
         if self.int8_group.is_some() && !family.supports_int8() {
-            bail!("--int8-group only applies to the embeddinggemma text backbone");
+            bail!(
+                "--int8-group only applies to the embeddinggemma and decision text \
+                 backbones, not the {} model",
+                family.name()
+            );
         }
 
         // ---- placement ----
@@ -610,21 +681,8 @@ impl LoadArgs {
         };
 
         // ---- NPU precision ----
-        let npu_dtype = self.npu_dtype.unwrap_or(NpuDtype::Fp16);
-        if npu_dtype == NpuDtype::Int8 {
-            if !placement.text {
-                bail!(
-                    "--npu-dtype int8 requires the text projections on the NPU \
-                     (`--text-device npu`)"
-                );
-            }
-            if self.int8_group.is_some() && !avail {
-                bail!("{}", npu_build_error("--int8-group"));
-            }
-        } else if self.int8_group.is_some() {
-            bail!("--int8-group requires `--npu-dtype int8`");
-        }
-        let int8_group = self.int8_group.unwrap_or(32);
+        let (npu_dtype, int8_group) =
+            resolve_npu_dtype(self.npu_dtype, self.int8_group, placement.text, avail)?;
 
         // ---- CPU copies of NPU-packed projections ----
         let keep_cpu_weights = if family.supports_keep_cpu_weights() {
@@ -662,6 +720,7 @@ impl LoadArgs {
         let cpu_backend = self.cpu_backend.clone().unwrap_or_else(default_backend);
         let attn_kernel = self.attn_kernel.unwrap_or(AttnKernel::Fused);
         let vision_attn_kernel = self.vision_attn_kernel.unwrap_or(AttnKernel::Fused);
+        let (embed_f16, embed_int8) = resolve_embed_table(family, self.embed_f16, self.embed_int8)?;
 
         Ok(ResolvedLoad {
             model_dir,
@@ -681,9 +740,60 @@ impl LoadArgs {
             key_block: self.key_block.unwrap_or(256),
             vision_attn_kernel,
             attn_chunk: self.attn_chunk.unwrap_or(1024),
-            embed_f16: self.embed_f16.unwrap_or(false),
+            embed_f16,
+            embed_int8,
         })
     }
+}
+
+/// Resolve the token-table flags into `(f16, int8)`.
+///
+/// One choice per run, so no pair is ambiguous: an explicit `--embed-int8` wins,
+/// then an explicit `--embed-f16`; `--embed-int8 false` on the decision family
+/// keeps its historical f16 table, and with neither flag the decision family
+/// defaults to int8 while every other family stays f32. The caller has already
+/// rejected `--embed-f16`/`--embed-int8` on a family without them.
+fn resolve_embed_table(
+    family: Family,
+    embed_f16: Option<bool>,
+    embed_int8: Option<bool>,
+) -> Result<(bool, bool)> {
+    match (embed_int8, embed_f16) {
+        (Some(true), Some(true)) => {
+            bail!("--embed-f16 and --embed-int8 select different token tables; pick one")
+        }
+        (Some(true), _) => Ok((false, true)),
+        (_, Some(true)) => Ok((true, false)),
+        (Some(false), _) => Ok((family == Family::Decision, false)),
+        (None, _) => Ok((false, family == Family::Decision)),
+    }
+}
+
+/// Resolve `--npu-dtype`/`--int8-group` into the resident-precision pair.
+///
+/// int8 needs the text projections on the NPU: the loader packs them there in one
+/// pass and drops the host copies, so a CPU text stage can never use int8 weights.
+fn resolve_npu_dtype(
+    requested: Option<NpuDtype>,
+    int8_group: Option<usize>,
+    text_on_npu: bool,
+    available: bool,
+) -> Result<(NpuDtype, usize)> {
+    let npu_dtype = requested.unwrap_or(NpuDtype::Fp16);
+    if npu_dtype == NpuDtype::Int8 {
+        if !text_on_npu {
+            bail!(
+                "--npu-dtype int8 requires the text projections on the NPU \
+                 (`--text-device npu`)"
+            );
+        }
+        if int8_group.is_some() && !available {
+            bail!("{}", npu_build_error("--int8-group"));
+        }
+    } else if int8_group.is_some() {
+        bail!("--int8-group requires `--npu-dtype int8`");
+    }
+    Ok((npu_dtype, int8_group.unwrap_or(32)))
 }
 
 /// Resolve one stage: the explicit flag, else the base device, else the build
@@ -774,9 +884,18 @@ pub struct ResolvedLoad {
     pub vision_attn_kernel: AttnKernel,
     pub attn_chunk: usize,
     pub embed_f16: bool,
+    /// Store the tied table as block-wise int8 (`--embed-int8`, the decision default).
+    pub embed_int8: bool,
 }
 
 impl ResolvedLoad {
+    /// The int8 K-group for the resident NPU text weights (`--npu-dtype int8`),
+    /// else `None` (fp16). The decision loader takes it as
+    /// `IntentLoadOptions::npu_int8`; the intent family has no int8 flag.
+    pub fn npu_int8(&self) -> Option<usize> {
+        (self.npu_dtype == NpuDtype::Int8).then_some(self.int8_group)
+    }
+
     /// The one-line placement report printed before loading.
     pub fn placement_line(&self) -> String {
         let text_npu = self.placement.text;
@@ -820,6 +939,17 @@ impl ResolvedLoad {
                     "CPU".to_string()
                 }
             ),
+            // One noncausal forward per question; the 255-code readout is tiny and
+            // always runs on the CPU. The CPU body is always f32 (the loader reads
+            // the backbone in f32), so the checkpoint's native dtype does not apply.
+            Family::Decision => {
+                let text = if text_npu {
+                    format!("NPU({})", self.npu_dtype.name())
+                } else {
+                    "CPU(f32)".to_string()
+                };
+                format!("placement: text={text} readout=CPU(f32)")
+            }
         }
     }
 }
@@ -984,6 +1114,70 @@ mod tests {
         assert!(format!("{err:#}").contains("--npu-dtype int8"));
     }
 
+    /// `--npu-dtype int8` needs the packed text stage; the group flag is only
+    /// meaningful with int8, and the default group is 32.
+    #[test]
+    fn int8_resolves_only_with_the_text_stage_on_the_npu() {
+        // An NPU build with the text stage packed resolves both flags.
+        assert_eq!(
+            resolve_npu_dtype(Some(NpuDtype::Int8), Some(128), true, true).unwrap(),
+            (NpuDtype::Int8, 128)
+        );
+        assert_eq!(
+            resolve_npu_dtype(Some(NpuDtype::Int8), None, true, true).unwrap(),
+            (NpuDtype::Int8, 32),
+            "the default group is 32"
+        );
+        assert_eq!(
+            resolve_npu_dtype(None, None, true, true).unwrap(),
+            (NpuDtype::Fp16, 32),
+            "fp16 is the default everywhere"
+        );
+        // A CPU text stage does not pack the weights, so int8 cannot apply.
+        for available in [true, false] {
+            let err = resolve_npu_dtype(Some(NpuDtype::Int8), None, false, available).unwrap_err();
+            assert!(format!("{err:#}").contains("--text-device npu"));
+        }
+        // `--int8-group` without `--npu-dtype int8` is a mistake, not a no-op.
+        let err = resolve_npu_dtype(None, Some(64), true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `--npu-dtype int8`"));
+        let err = resolve_npu_dtype(Some(NpuDtype::Fp16), Some(64), true, true).unwrap_err();
+        assert!(format!("{err:#}").contains("requires `--npu-dtype int8`"));
+    }
+
+    /// Only the two families whose text backbone packs resident int8 weights take
+    /// `--npu-dtype`/`--int8-group`; for the decision family the flag is accepted
+    /// and the host build refuses only the placement.
+    #[test]
+    fn int8_is_family_scoped() {
+        assert!(Family::Decision.supports_int8());
+        assert!(Family::Emb2.supports_int8());
+        for family in [Family::Intent, Family::Gemma4, Family::Qwen3Embed] {
+            assert!(!family.supports_int8());
+            let err = resolve(&["--npu-dtype", "int8"], family).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("--npu-dtype only applies"), "{message}");
+            assert!(message.contains("embeddinggemma and decision"), "{message}");
+            let err = resolve(&["--int8-group", "64"], family).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("--int8-group only applies"), "{message}");
+        }
+        // The decision family passes the family check: on a CPU-only host build
+        // the only refusal is the missing NPU, i.e. the flag itself is valid.
+        let err = resolve(
+            &["--npu-dtype", "int8", "--device", "npu"],
+            Family::Decision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("aarch64 build"));
+        let err = resolve(
+            &["--npu-dtype", "int8", "--text-device", "npu"],
+            Family::Decision,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("--text-device npu requires"));
+    }
+
     #[test]
     fn keep_cpu_weights_tracks_the_decode_stage() {
         // The host build has no NPU, so decode cannot be placed there; keeping
@@ -992,5 +1186,41 @@ mod tests {
         assert!(r.keep_cpu_weights);
         let err = resolve(&["--keep-cpu-weights", "no"], Family::Intent).unwrap_err();
         assert!(format!("{err:#}").contains("decode stage runs on the CPU"));
+    }
+
+    // ---- token table ----
+
+    #[test]
+    fn the_token_table_flags_resolve_to_one_choice() {
+        // A decision checkpoint defaults to the block-wise int8 table (half of f16
+        // plus one scale per 32 values, and it is CPU resident in every deployment).
+        let r = resolve(&[], Family::Decision).unwrap();
+        assert!(r.embed_int8 && !r.embed_f16);
+        // Every other family keeps its f32 table unless asked.
+        let r = resolve(&[], Family::Intent).unwrap();
+        assert!(!r.embed_f16 && !r.embed_int8);
+        // Explicit flags win.
+        let r = resolve(&["--embed-f16"], Family::Decision).unwrap();
+        assert!(r.embed_f16 && !r.embed_int8);
+        let r = resolve(&["--embed-int8"], Family::Decision).unwrap();
+        assert!(r.embed_int8 && !r.embed_f16);
+        // `--embed-int8 false` (the model-level `Some(false)`, not a CLI form)
+        // keeps the decision family's historical f16 table and leaves the other
+        // families at f32.
+        assert_eq!(
+            resolve_embed_table(Family::Decision, None, Some(false)).unwrap(),
+            (true, false)
+        );
+        assert_eq!(
+            resolve_embed_table(Family::Intent, None, Some(false)).unwrap(),
+            (false, false)
+        );
+        // Ambiguous and unsupported combinations are rejected.
+        let err = resolve(&["--embed-f16", "--embed-int8"], Family::Decision).unwrap_err();
+        assert!(format!("{err:#}").contains("pick one"));
+        let err = resolve(&["--embed-int8"], Family::Intent).unwrap_err();
+        assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
+        let err = resolve(&["--embed-int8"], Family::Gemma4).unwrap_err();
+        assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
     }
 }

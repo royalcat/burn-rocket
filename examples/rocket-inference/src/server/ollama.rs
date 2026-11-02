@@ -122,7 +122,7 @@ async fn version() -> Json<serde_json::Value> {
 
 fn parameter_size(family: Family) -> &'static str {
     match family {
-        Family::Intent => "0.8B",
+        Family::Intent | Family::Decision => "0.8B",
         Family::Gemma4 => "5.1B",
         Family::Qwen3Embed => "0.6B",
         Family::Emb2 => "0.4B",

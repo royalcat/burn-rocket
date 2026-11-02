@@ -15,6 +15,9 @@ pub enum Family {
     Emb2,
     Intent,
     Gemma4,
+    /// vllm-sr Decision 3.0 (`d3-code-readout-v1`): a Qwen3.5 text backbone plus a
+    /// 255-code readout head; text-only, no generation.
+    Decision,
 }
 
 impl Family {
@@ -25,6 +28,7 @@ impl Family {
             Self::Emb2 => "embeddinggemma",
             Self::Intent => "intent",
             Self::Gemma4 => "gemma4",
+            Self::Decision => "decision",
         }
     }
 
@@ -34,9 +38,11 @@ impl Family {
             "embeddinggemma" => Ok(Self::Emb2),
             "intent" => Ok(Self::Intent),
             "gemma4" => Ok(Self::Gemma4),
-            other => {
-                bail!("unknown family '{other}' (expected auto|qwen3|embeddinggemma|intent|gemma4)")
-            }
+            "decision" => Ok(Self::Decision),
+            other => bail!(
+                "unknown family '{other}' \
+                 (expected auto|qwen3|embeddinggemma|intent|gemma4|decision)"
+            ),
         }
     }
 
@@ -47,6 +53,8 @@ impl Family {
             Self::Emb2 => "embedding_gemma2",
             Self::Intent => "qwen3_5",
             Self::Gemma4 => "gemma4",
+            // d3 is a Qwen3.5 backbone; it has no chat surface of its own.
+            Self::Decision => "qwen3_5",
         }
     }
 
@@ -82,16 +90,16 @@ impl Family {
     // ---- Precision / memory flags ----
 
     pub fn supports_dtype(self) -> bool {
-        !self.is_chat() || self == Self::Gemma4
+        matches!(self, Self::Qwen3Embed | Self::Emb2 | Self::Gemma4)
     }
 
     pub fn supports_quant(self) -> bool {
         matches!(self, Self::Qwen3Embed | Self::Emb2 | Self::Gemma4)
     }
 
-    /// Resident group-wise int8 NPU weights (emb2 text backbone).
+    /// Resident group-wise int8 NPU weights (the emb2 and d3 text backbones).
     pub fn supports_int8(self) -> bool {
-        matches!(self, Self::Emb2)
+        matches!(self, Self::Emb2 | Self::Decision)
     }
 
     /// Keeping CPU copies of NPU-packed projections is meaningful for the two
@@ -100,8 +108,11 @@ impl Family {
         self.is_chat()
     }
 
+    /// Whether the model has vision (and/or audio) towers that can load on first
+    /// use: the EmbeddingGemma 2 / Gemma 4 tower halves, and a d3 package's vision
+    /// tower (a CPU stage loaded with the backbone unless the flag defers it).
     pub fn supports_defer_towers(self) -> bool {
-        matches!(self, Self::Emb2 | Self::Gemma4)
+        matches!(self, Self::Emb2 | Self::Gemma4 | Self::Decision)
     }
 
     pub fn supports_attn_kernel(self) -> bool {
@@ -122,15 +133,30 @@ impl Family {
         matches!(self, Self::Emb2 | Self::Gemma4)
     }
 
-    /// The f16 embedding/LM-head table (intent keeps a large tied table).
+    /// The f16 embedding/LM-head table (intent and decision keep a large tied table).
     pub fn supports_embed_f16(self) -> bool {
-        matches!(self, Self::Intent)
+        matches!(self, Self::Intent | Self::Decision)
+    }
+
+    /// The block-wise int8 table: a d3 decision checkpoint's tied table is CPU
+    /// resident in every deployment, so its default is int8.
+    pub fn supports_embed_int8(self) -> bool {
+        matches!(self, Self::Decision)
     }
 }
 
 /// Detect the model family from a checkpoint's `config.json` (`model_type`), or
 /// from a GGUF file's `general.architecture`.
+///
+/// A `decision_config.json` wins over `config.json`: d3 checkpoints report the
+/// backbone's `model_type` (`qwen3_5`), and the readout head is what makes them a
+/// decision model.
 pub fn detect_family(model_dir: &Path) -> Result<Family> {
+    if model_dir.join("decision_config.json").exists() {
+        return crate::decision::config::DecisionConfig::load(model_dir)
+            .map(|_| Family::Decision)
+            .with_context(|| format!("detect the model family in {}", model_dir.display()));
+    }
     let path = model_dir.join("config.json");
     if path.exists() {
         let text =
@@ -158,7 +184,7 @@ fn detect_from_arch(arch: Option<&str>) -> Result<Family> {
         Some("gemma4") => Ok(Family::Gemma4),
         Some(other) => bail!(
             "unsupported GGUF architecture '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4)"
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
         ),
         None => bail!("checkpoint is neither config.json nor GGUF"),
     }
@@ -172,10 +198,126 @@ pub(crate) fn detect_from_value(json: &serde_json::Value) -> Result<Family> {
         Some("gemma4") => Ok(Family::Gemma4),
         Some(other) => bail!(
             "unsupported model_type '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4)"
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
         ),
         None => bail!(
-            "config.json has no model_type (pass --family qwen3|embeddinggemma|intent|gemma4)"
+            "config.json has no model_type \
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn family_names_round_trip() {
+        for family in [
+            Family::Qwen3Embed,
+            Family::Emb2,
+            Family::Intent,
+            Family::Gemma4,
+            Family::Decision,
+        ] {
+            assert_eq!(Family::parse(family.name()).unwrap(), family);
+        }
+        assert!(Family::parse("d3").is_err());
+    }
+
+    #[test]
+    fn decision_is_text_only_with_no_optional_stages() {
+        let d = Family::Decision;
+        assert!(!d.is_embedding());
+        assert!(!d.is_chat());
+        assert!(d.supports_embed_f16());
+        assert!(d.supports_embed_int8());
+        assert!(!Family::Intent.supports_embed_int8());
+        assert!(!Family::Emb2.supports_embed_f16());
+        assert!(!d.supports_text_attn());
+        assert!(!d.supports_vision());
+        assert!(!d.supports_decode());
+        assert!(!d.supports_dtype());
+        assert!(!d.supports_quant());
+        // The d3 text backbone packs the same resident int8 weights as emb2.
+        assert!(d.supports_int8());
+        assert!(Family::Emb2.supports_int8());
+        assert!(!Family::Intent.supports_int8());
+        assert!(!Family::Qwen3Embed.supports_int8());
+        assert!(!Family::Gemma4.supports_int8());
+        assert!(!d.supports_keep_cpu_weights());
+        // The vision tower is a CPU stage that loads with the backbone; the flag
+        // moves that load to the first media request.
+        assert!(d.supports_defer_towers());
+        assert!(!d.supports_attn_kernel());
+        assert!(!d.supports_attn_tiles());
+        assert!(!d.supports_vision_attn_kernel());
+        assert!(!d.supports_attn_chunk());
+        assert_eq!(d.ollama_architecture(), "qwen3_5");
+    }
+
+    /// A throwaway model directory (no `tempfile` dependency in this crate).
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rocket-decision-family-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn decision_config(format_id: &str) -> String {
+        serde_json::json!({
+            "format_version": 1,
+            "format_id": format_id,
+            "prompt": "d3",
+            "codes": (0..255).map(|i| format!("C{i}")).collect::<Vec<_>>(),
+            "token_ids": (0..255).collect::<Vec<_>>(),
+            "temperature": 1.0,
+            "attention_mode": "noncausal_full_attention",
+            "pooling": "last",
+            "max_length": null,
+            "readout_dtype": "float32",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn decision_config_wins_over_the_backbone_model_type() {
+        let dir = temp_dir("detect");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "qwen3_5", "text_config": {}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("decision_config.json"),
+            decision_config("d3-code-readout-v1"),
+        )
+        .unwrap();
+        assert_eq!(detect_family(&dir).unwrap(), Family::Decision);
+        // Without the decision config the same directory is a plain qwen3.5.
+        std::fs::remove_file(dir.join("decision_config.json")).unwrap();
+        assert_eq!(detect_family(&dir).unwrap(), Family::Intent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_decision_config_with_the_wrong_format_is_refused() {
+        let dir = temp_dir("bad-format");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "qwen3_5", "text_config": {}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("decision_config.json"),
+            decision_config("other-format"),
+        )
+        .unwrap();
+        let err = format!("{:#}", detect_family(&dir).unwrap_err());
+        assert!(err.contains("d3-code-readout-v1"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
