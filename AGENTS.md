@@ -1563,7 +1563,8 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   exact table, both is an error, `Family::supports_embed_int8` is Decision-only, and
   the ready line prints `embed I8`/`F16`/`F32`. Memory (dev host, text-only
   `--defer-towers`, lite): f16 table 1,513 resident / 1,607 load peak / 1,877 request
-  peak -> block-32 int8 **1,302 / 1,382 / 1,666** MiB; the scale table is
+  peak -> block-32 int8 **1,302 / 1,382 / 1,666** MiB (d3-nano resident
+  **3,244**, measured 2026-11-02); the scale table is
   `vocab * blocks * 4 B` (30.3 MiB lite, 60.6 nano), i.e. **+29 MiB** over the per-row
   scheme M2b replaced, which turns M2's -242/-485 into **-211 / -424** against f16.
   Numerics, bounded M2b subset (the 6-case text subset, `image-receipt-total`,

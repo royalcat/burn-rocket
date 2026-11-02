@@ -40,8 +40,8 @@ The recommended board line — every memory default is implicit in it:
 
 - **Dev host**, text-only `--defer-towers`: d3-lite resident **1,302 MiB**, load
   peak **1,382 MiB**, request peak at 2.1k tokens **1,666 MiB** (M2b + M5b);
-  d3-nano resident **3,186 MiB** (M5 — its 60.6 MiB block-32 scale table was not
-  re-measured). The f16 table is 1,513 MiB on lite; the per-row table 1,273.
+  d3-nano resident **3,244 MiB** (M2b block-32; 3,186 with the per-row table).
+  The f16 table is 1,513 MiB on lite; the per-row table 1,273.
 - **Board**, beside the live service (never stopped, load 15-21): text-only
   resident **347 MiB** anon and **966.0 MiB** of weights BO, so about **1.28 GiB**
   of NPU-side total (1,313 MiB). The per-row-table arm is 317 MiB / 1.25 GiB; the

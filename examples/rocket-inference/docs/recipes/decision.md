@@ -123,9 +123,9 @@ The text backbone's projections are stored in the checkpoint's own **bf16** and
 widened per matmul (exact: bf16 is a truncated f32), which halves the body:
 resident `RssAnon` d3-lite **2,222 -> 1,273 MiB**, d3-nano **5,804 -> 3,186**
 (text-only `--defer-towers`, one 2,113-token case). The block-32 scale table
-(M2b) adds 30.3 / 60.6 MiB on top; lite's measured current figure is **1,302
-MiB**, nano's block-32 resident was not re-measured (3,186 is the M5 number with
-the per-row table). Output is byte-identical; the
+(M2b) adds 30.3 / 60.6 MiB on top, so the measured current figures are **1,302
+MiB** lite and **3,244 MiB** nano (nano re-measured 2026-11-02 on a 101-token
+text case: 3,186 + 58 MiB of scales). Output is byte-identical; the
 `placement:` line keeps saying `text=CPU(f32)` because the *compute* dtype is
 still f32 (the ready line adds `, text body bf16`). It costs one pass over the
 body per prefill: the 6-case text gate 90.9 -> 96.3 s (**+6.0 %**), image
@@ -139,7 +139,9 @@ quantized from the stored dtype in row blocks (no f32 zeros table, no f32 read):
 lite 2,473 -> **1,330** MiB against a 1,273 MiB resident and nano 4,796 ->
 **3,349** MiB against 3,186 (text-only `--defer-towers`, one 2,113-token case,
 `RssAnon` sampled at 20 ms; the M2b block scales add ~30 / 61 MiB of f32 scale
-table on top, so d3-lite is **1,302 resident / 1,382 startup**). `--embed-f16` lite
+table on top, so d3-lite is **1,302 resident / 1,382 startup**). d3-nano's
+measured resident is **3,244 MiB** (the 3,349 startup figure is the per-row arm
+plus the 61 MiB of scales, not separately sampled). `--embed-f16` lite
 loads at 1,607 MiB for its
 1,513 MiB resident. A board deployment should budget nano's *startup* against
 ~3.4 GiB, and roughly the resident figure afterwards.
@@ -243,7 +245,7 @@ the field-by-field config read, the two-image splice) is in
 This table is the f32-resident baseline, not the current memory profile: the
 body is now stored bf16 (M5) and the table block-32 int8 (M2b), so a text-only
 d3-lite process is **1,302 MiB** resident (2,926 here; 1,273 with the per-row
-table) and d3-nano **3,186** (7,716 here). The body change is byte-identical on
+table) and d3-nano **3,244** (7,716 here; 3,186 with the per-row table). The body change is byte-identical on
 the fixtures; the table's own deltas (1.465e-3 / 1.480e-3 / 9.788e-4) are in
 `### Token table`. Compute is still f32, so the wall/compute columns describe
 the same arithmetic.
