@@ -7,9 +7,10 @@ the answer is one non-causal forward pass per question and a softmax over the
 codes. Nothing is generated (`usage.output_tokens` is always 0), so both the CLI
 and the server prefill only.
 
-Checkpoint: `/root/models/d3-lite` (1.7 GB safetensors; backbone bf16, read as
-f32, plus `readout.safetensors`). d3-nano runs through the same code but is
-validated on the dev host only; the numbers here are d3-lite.
+Checkpoint: `/root/models/d3-lite` (1.7 GB safetensors; the backbone is stored
+bf16 and widened to f32 per matmul, plus `readout.safetensors`). d3-nano runs
+through the same code but is validated on the dev host only; the numbers here
+are d3-lite, except where nano is named.
 
 ## Decide
 
@@ -19,7 +20,7 @@ B=./rocket-inference
 CASES=cases.json          # JSON array of {"name", "state", "questions"[, "images"[,
                           # "videos"]]}; local paths for media
 
-# CPU f32 body
+# CPU compute (f32; the body is stored bf16 and widened per matmul)
 $B decide --model-dir $M --requests $CASES --out out-cpu.json \
     --max-state-tokens 8192 --device cpu
 
@@ -103,8 +104,8 @@ and are gone (exact: the `decide` JSON is byte-identical before/after at 2.1k an
   32k cap). `IntentModel.keep_kv = false` in the decision loader skips it.
 
 Dev host (M4 round: `d3-lite`, text-only `--defer-towers`, resident 2,222 MiB at
-the time — the body and table storage below bring it to 1,273 MiB — `RssAnon`
-sampled at 20 ms):
+the time — the body and table storage below bring it to 1,273 MiB per-row /
+1,302 MiB with the block-32 scales — `RssAnon` sampled at 20 ms):
 
 | prompt tokens | peak anon before | peak anon after | transient after | wall |
 |---|---|---|---|---|
@@ -121,7 +122,10 @@ the conv term) and is not implemented.
 The text backbone's projections are stored in the checkpoint's own **bf16** and
 widened per matmul (exact: bf16 is a truncated f32), which halves the body:
 resident `RssAnon` d3-lite **2,222 -> 1,273 MiB**, d3-nano **5,804 -> 3,186**
-(text-only `--defer-towers`, one 2,113-token case). Output is byte-identical; the
+(text-only `--defer-towers`, one 2,113-token case). The block-32 scale table
+(M2b) adds 30.3 / 60.6 MiB on top; lite's measured current figure is **1,302
+MiB**, nano's block-32 resident was not re-measured (3,186 is the M5 number with
+the per-row table). Output is byte-identical; the
 `placement:` line keeps saying `text=CPU(f32)` because the *compute* dtype is
 still f32 (the ready line adds `, text body bf16`). It costs one pass over the
 body per prefill: the 6-case text gate 90.9 -> 96.3 s (**+6.0 %**), image
@@ -144,7 +148,13 @@ loads at 1,607 MiB for its
 ## Serve
 
 ```sh
-ROCKET_MEM_LOG=1 $B serve --model-dir $M --device npu --port 8399 --max-tokens 8192
+# the recommended board line (see `## Deployment (current)`); this is the only
+# command a d3 deployment needs
+$B serve --model-dir $M --device npu --defer-towers --max-tokens 8192 --port 8384
+
+# the same, with the NPU scratch line per request (dev host / debugging)
+ROCKET_MEM_LOG=1 $B serve --model-dir $M --device npu --defer-towers \
+    --max-tokens 8192 --port 8399
 ```
 
 `/v1/systemone` takes the same request object (media as `data:` URLs), `/health`
@@ -164,17 +174,19 @@ into two configurations:
 
 | profile | d3 command |
 |---|---|
-| balanced | `--device npu` (text projections packed as resident fp16) |
-| full offload | `--device npu` (same: there is nothing else to move) |
-| speed | `--device npu` (same: the compute is the same command) |
+| balanced | `--device npu --defer-towers` (text projections packed as resident fp16; the block-32 int8 table is automatic) |
+| full offload | `--device npu --defer-towers` (same: there is nothing else to move) |
+| speed | `--device npu --defer-towers` (same: the compute is the same command) |
 | CPU fallback | `--device cpu` (f32 compute, bf16-stored body widened per projection) |
 
 The vision tower, the backbone attention and the readout head run on the CPU in
 both configurations: d3 has no `--text-attn-device`, `--vision-device`,
 `--vision-attn-device` or `--decode-device` stage, and no decode at all.
-`--npu-dtype int8` (resident int8 projections, half the weights BO) is measured
-and **rejected** for this family: it costs ~7 % wall and misses the 1e-2
-probability bar by 3-4.5x — see the int8 table in the Board section.
+`--npu-dtype int8` (resident int8 projections, **474.0 MiB** of weights BO
+against 966.0) is available but **not recommended** for this family: it costs
++6.5 % wall and +18 % user CPU at `--int8-group 512` and misses the 1e-2
+probability bar by 3-4.5x (text 3.4e-2, image 4.4e-2) — see the int8 table in
+the Board section.
 
 ## Caps
 
@@ -197,7 +209,8 @@ probability bar by 3-4.5x — see the int8 table in the Board section.
 
 ## Dev host (d3-lite / d3-nano)
 
-Both checkpoints, f32 CPU body, on the 32-core dev host (2026-11-01). The subset
+Both checkpoints, f32 compute with an f32-resident body and token table (the
+2026-11-01 baseline), on the 32-core dev host. The subset
 is seven cases: four text (`choice-routing-short`, `noul-refund-window`,
 `score-urgency-billing` and the three-question `choice-policy-long`), one
 receipt image, one two-image request and one video clip — 10 questions and
@@ -227,6 +240,72 @@ checkpoint — each against its own reference. Full detail (per-case wall/memory
 the field-by-field config read, the two-image splice) is in
 [`tools/decision.md`](../../tools/decision.md).
 
+This table is the f32-resident baseline, not the current memory profile: the
+body is now stored bf16 (M5) and the table block-32 int8 (M2b), so a text-only
+d3-lite process is **1,302 MiB** resident (2,926 here; 1,273 with the per-row
+table) and d3-nano **3,186** (7,716 here). The body change is byte-identical on
+the fixtures; the table's own deltas (1.465e-3 / 1.480e-3 / 9.788e-4) are in
+`### Token table`. Compute is still f32, so the wall/compute columns describe
+the same arithmetic.
+
+## Deployment (current)
+
+The recommended board configuration is this one line — every memory default
+below is already in it, and nothing else needs a flag:
+
+```sh
+/root/rocket-inference-decision/rocket-inference serve \
+    --model-dir /root/models/d3-lite --device npu --defer-towers \
+    --max-tokens 8192 --port 8384
+```
+
+| part | current setting | measured cost |
+|---|---|---|
+| text projections | fp16 resident NPU pack, 96 weights | **966.0 MiB** of weights BO (948.0 MiB in the ready line) |
+| token table | block-32 symmetric int8 (`--embed-int8`, the default) | **347 MiB** anon resident for the text-only service, 30.3 MiB of it the scale table |
+| text body | the checkpoint's bf16, widened to f32 per matmul | half the CPU-resident body; output is bit-identical |
+| vision tower | deferred (`--defer-towers`) | +195.6 MiB, only after the first media request |
+
+Text-only service, measured with that line on the board (2026-11-02, beside the
+live embedding service, load 15-21, `RssAnon` sampled every 50 ms):
+
+- **347 MiB** anon resident and **966.0 MiB** of weights BO, i.e. about
+  **1.28 GiB** of NPU-side total (347 + 966.0 = 1,313 MiB) against the pre-round
+  **1.90 GiB** (943.6 anon + 1,006.7 BO). The per-row table arm is 317 MiB /
+  **1.25 GiB**; the f16 table (`--embed-f16`) is 559 MiB.
+- **Image** (1,029 tokens): **1.664e-3** max |Δp| against the f32 reference with
+  top-1 unchanged; peak anon 1,027.4 MiB. The f16 table reads 5.238e-4 there,
+  the per-row table 1.03e-2 (over the bar).
+- **Video**: 1.55e-2, the board's `ffmpeg` 7.1.5 decode (the CPU arm reads
+  1.51e-2 on the same clip); top-1 is correct. Gate cross-host video on top-1 or
+  decode the reference with the same `ffmpeg`.
+- **Wall**, all contended: text 5 questions / 6,546 tokens **147.3 s** compute /
+  **160.2 s** wall (CPU f32 265.6 / 270.1 s); image 1,029 tokens **62.9 s**
+  compute; video 1,720 tokens / 2 questions **61.7 s** wall, 54.0 s compute.
+  The text and video walls are the M6 window's **per-row-table** arms; block-32
+  was re-measured on the image case only (no wall change outside the board's
+  noise: a table is dequantized per prompt row, and the scale table is 30.3 MiB
+  of resident bytes). The 2026-11-01 idle-service window measured the same text
+  case at 113 s NPU vs 197 s CPU f32; every 2026-11-02 wall is 25-35 % higher
+  because the service stayed up, so compare only within a window.
+
+The approved deployment bar is **max |Δp| ≤ 1e-2 with 100 % top-1**; the block-32
+table is inside it on every shipped arm. `--embed-f16` restores the exact table
+(f16-vs-f32 2.4e-6) for +211 MiB (lite) / +424 MiB (nano) where the
+probabilities themselves must match the f32 reference.
+
+`--npu-dtype int8` exists for this family but is **not recommended**: it halves
+the weights BO (**474.0 MiB** vs 966.0) at **+6.5 %** wall and **+18 %** user CPU
+at `--int8-group 512`, does not move the resident or peak anon, and moves text by
+**3.4e-2** and image by **4.4e-2** — 3-4.5x over the bar. `--int8-group 128` is
+both slower and less accurate (216.3 s wall, 4.5e-2). The per-arm tables are the
+memory-round subsection at the end of the Board section.
+
+The CPU fallback is the same binary with `--device cpu`: f32 compute on the
+bf16-stored body — 1,265 MiB resident for a text-only service in the M6 window
+(that arm ran the per-row table; the block-32 scales add their 30.3 MiB on top,
+and the CPU arm was not re-measured with them).
+
 ## Board (d3-lite)
 
 Board: Rock 5B+, 8 cores (A76 CPUs 4-7 via `taskset -c 4-7`), kernel
@@ -238,9 +317,11 @@ the live embedding service `home-llm-gateway-embed-1` was stopped for the runs
 service was restored); outputs are bit-identical between repeats. The deployed
 copy is `/root/rocket-inference-decision/` (binary, fixtures and run outputs).
 The video CPU `user` column has one valid sample (see the note below the table).
-This table is the **2026-11-01** window; the memory/int8 round of **2026-11-02**
-ran beside the live service on a busier board and is the subsection at the end
-of this section.
+This table is the **2026-11-01 window and a pre-memory-round baseline** (f32-loaded
+CPU-side body, per-row int8 table, eager vision tower); read the current
+configuration from `## Deployment (current)` above. The memory/int8 round of
+**2026-11-02** ran beside the live service on a busier board and is the
+subsection at the end of this section.
 
 Fixtures (board paths):
 
@@ -274,14 +355,16 @@ second, which is impossible); its compute/wall/anon are inside the ranges above
 and are kept, the CPU reading is discarded. The other configs have two readings
 each; the text CPU user range (384-522 s) is the widest.
 
-NPU memory (the same binary's `serve`, after load and after a 128-token
-`/v1/systemone` request, `ROCKET_MEM_LOG=1`): 96 resident NPU weights,
-**1,006.7 MiB** of weights BO; matmul BO **93.7 MiB** after load, trimmed to
-**26.4 MiB** BO + 6.3 MiB host after the request (`ROCKET_KEEP_MB=64`); attention
-BO/host **0** (there is no NPU attention stage). `RssAnon` is 943.6 MiB after
-load and 1,034.3 MiB after the request. The BOs are not charged to the process,
-so the anon peaks above exclude the ~1 GiB of NPU weights. The 128-token server
-request computed in 1.98 s (64.7 tok/s) with the model already resident.
+NPU memory in the 2026-11-01 window (the same binary's `serve`, after load and
+after a 128-token `/v1/systemone` request, `ROCKET_MEM_LOG=1`): 96 resident NPU
+weights, **1,006.7 MiB** of weights BO; matmul BO **93.7 MiB** after load, trimmed
+to **26.4 MiB** BO + 6.3 MiB host after the request (`ROCKET_KEEP_MB=64`);
+attention BO/host **0** (there is no NPU attention stage). `RssAnon` is 943.6 MiB
+after load and 1,034.3 MiB after the request — that is the f32-loaded body and
+the per-row table; the current 347 MiB and 966.0 MiB BO are in
+`## Deployment (current)`. The BOs are not charged to the process, so the anon
+peaks above exclude the ~1 GiB of NPU weights. The 128-token server request
+computed in 1.98 s (64.7 tok/s) with the model already resident.
 
 Parity against the f32 reference (`/tmp/opencode/d3/ref_*_lite_f32.json`, the
 same case names; gate 2e-3). Prompt-token counts match exactly in every arm.
@@ -319,8 +402,9 @@ Reading the table:
   arm's resident figure is now about 1.0 GiB lower (dev-host −949 MiB for lite),
   and its wall carries the per-prefill widen (+2-4 % on a 1k-token question whose
   prefill is ~40 s on the board). The NPU arm's anon side drops the same way
-  (**943.6 -> 317 MiB**, the bf16 body plus the streamed int8 table) while its
-  weights BO stays ~1 GiB — the 2026-11-02 round below has the current numbers.
+  (**943.6 -> 317 MiB** on the per-row table, **347 MiB** with the default
+  block-32 scales; the bf16 body plus the streamed int8 table) while its weights
+  BO stays ~1 GiB — the 2026-11-02 round below has the current numbers.
 - **Board noise**: the other services keep the load at ~8-10, so wall/CPU spread
   by ±20-30 % between samples. The runs in the table were taken with the
   embedding service stopped; the two samples of each config are the pre-restore
@@ -381,11 +465,15 @@ Text, 5 questions / 6,546 prompt tokens (`--defer-towers`, so text-only):
 
 | NPU weights / token table | compute | wall | user CPU | peak anon | anon after | resident after load | weights BO |
 |---|---|---|---|---|---|---|---|
-| fp16 / int8 table (default) | 147.3 s (144.8, 149.8) | 160.2 s (159.9, 160.5) | 153.8 s | 1,014-1,025 MiB | 564 / 618 MiB | **317 MiB** | **966.0 MiB** |
-| int8 g512 / int8 table | 157.2 s (156.1, 158.3) | 169.9 s (167.1, 172.7) | 182.2 s | 1,012-1,046 MiB | 760 MiB | 321 MiB | ~474 MiB |
-| int8 g128 / int8 table | 201.9 s | 216.3 s | 266.7 s | 1,054.5 MiB | 446 MiB | 332 MiB | ~474 MiB |
+| fp16 / per-row int8 table (M2's default) | 147.3 s (144.8, 149.8) | 160.2 s (159.9, 160.5) | 153.8 s | 1,014-1,025 MiB | 564 / 618 MiB | **317 MiB** | **966.0 MiB** |
+| int8 g512 / per-row int8 table | 157.2 s (156.1, 158.3) | 169.9 s (167.1, 172.7) | 182.2 s | 1,012-1,046 MiB | 760 MiB | 321 MiB | ~474 MiB |
+| int8 g128 / per-row int8 table | 201.9 s | 216.3 s | 266.7 s | 1,054.5 MiB | 446 MiB | 332 MiB | ~474 MiB |
 | fp16 / f16 table (`--embed-f16`) | 147.4 s | 164.8 s | 160.2 s | 1,523.6 MiB | 783 MiB | 559 MiB | 966.0 MiB |
-| CPU f32 / int8 table (`--device cpu`) | 265.6 s | 270.1 s | 426.0 s | 1,548.6 MiB | 1,300 MiB | 1,265 MiB | — |
+| CPU f32 / per-row int8 table (`--device cpu`) | 265.6 s | 270.1 s | 426.0 s | 1,548.6 MiB | 1,300 MiB | 1,265 MiB | — |
+
+The `int8 table` rows are M2's **per-row** scheme, the default when this window
+ran; block-32 scales (M2b) are the current default and their row is in the M2b
+subsection below.
 
 The fp16 and int8-g512 rows are medians with both samples in parentheses; the
 g128, `--embed-f16` and CPU rows are one sample each. `weights BO` is the
@@ -397,7 +485,9 @@ ready-line number only (fp16's own ratio suggests ~483 MiB of actual BO).
 Memory headline: text-only resident `RssAnon` **943.6 -> 317 MiB** (−66 %) while
 the weights BO only moved 1,006.7 -> 966.0 MiB (f16 table -> int8 table and
 bf16 body do not touch the f16 pack). The NPU-side total is therefore
-**1.25 GiB against 1.90 GiB**, and the peak (prefill transient, not weights)
+**1.25 GiB against 1.90 GiB** on the per-row table, and **1.28 GiB** with the
+block-32 scales that M2b made the default (the M2b row: 347 MiB anon, same
+966.0 MiB BO, 1,313 MiB together); the peak (prefill transient, not weights)
 drops 2,505 -> 1,014-1,025 MiB. Image (1,029 tokens) and video (1,720 tokens,
 2 questions) at the same config:
 
@@ -496,7 +586,7 @@ as `rocket-inference.2026-11-01`); run outputs and metrics are in
 `/root/rocket-inference-decision/runs6/` (`*.json` = wall/RSS samples,
 `*-out.json` = answers, `serve-*.log` = the scratch lines).
 
-#### Token table block scales (phase M2b)
+#### Token table block scales (phase M2b, the current default)
 
 The block-32 table was measured with the same protocol (one image case beside the
 live service, `taskset -c 4-7`, `--device npu --defer-towers`, load ~15). Board:

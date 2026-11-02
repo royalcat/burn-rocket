@@ -1482,7 +1482,7 @@ always 0) and there is no KV cache or decode stage. `src/decision/` owns it:
 rotary tables), `vision` (the tower — depth 12 for lite, 24 for nano — and the
 image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
 
-- **Parity** (dev host, f32 body, gate 2e-3; reference =
+- **Parity** (dev host, f32 compute, gate 2e-3; reference =
   `tools/decision_reference.py --backbone-dtype f32`): text **67/67** top-1, max
   |Δp| **2.36e-06**; image **8/8**, **7.70e-06**; video **9/9**, **3.97e-06**;
   d3-nano **10/10**, **1.74e-06** against its own f32 reference. Token counts
@@ -1491,7 +1491,9 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   tower's pooled features are gated separately by `tools/vision_parity.py`
   (8/8 images, pixel max|Δ| 0, cosine ≥ 0.999999999).
 - **Board (d3-lite, cores 4-7, 600 MHz module, `home-llm-gateway-embed-1`
-  stopped for the runs and restored healthy; load 7.8-10.7)**: text 5 questions
+  stopped for the runs and restored healthy; load 7.8-10.7)** — the
+  **pre-memory-round baseline** (2026-11-01: f32-loaded body, per-row int8 table,
+  eager tower; the current numbers are the next bullet): text 5 questions
   / 6,546 tokens **113 s** on the NPU (96 resident weights, **1,006.7 MiB** of
   weights BO) vs **197 s** CPU f32 (**1.7x**, ~3x less user CPU, peak anon
   3,999 -> 2,505 MiB); receipt image (1,029 tokens) 56.7 -> **46.3 s**; video
@@ -1501,15 +1503,21 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   attention stage); `RssAnon` 943.6 -> 1,034.3 MiB, the BOs not being charged to
   the process. The three deployment profiles collapse to `--device npu` vs
   `--device cpu`.
-- **Later board windows (2026-11-02, beside the live service, load 15-21)**:
-  the M1/M2/M5b rounds keep the text-only service at **317 MiB** anon resident
-  (bf16 body + streamed int8 table; weights BO 966.0 MiB), the vision tower at
-  +195.6 MiB when deferred, and reject `--npu-dtype int8` for d3 (+6.5 % wall, text
-  max |Δp| 3.4e-2). The M2b block-32 table then puts the default image arm at
-  **1.664e-3** against the f32 reference (was 1.03e-2 per-row, top-1 unchanged;
-  the f16 table reads 5.24e-4) with 347 MiB resident (+30 for the scales). All
-  walls there are contended; the per-window tables are in
-  `examples/rocket-inference/docs/recipes/decision.md`.
+- **After the memory round (2026-11-02, beside the live service, load 15-21)**:
+  the M1/M2/M5/M5b/M2b rounds keep the text-only service at **347 MiB** anon
+  resident (block-32 table; 317 on the per-row table, 559 with `--embed-f16`)
+  with **966.0 MiB** of weights BO, i.e. ~**1.28 GiB** (1,313 MiB) of NPU-side
+  total against the 1.90 GiB baseline above (1.25 GiB on the per-row table); all
+  walls there are contended, text reads 147.3 s compute / 160.2 s wall (CPU f32
+  265.6 / 270.1 s). The vision tower is deferred (+195.6 MiB on the first media
+  request), and `--npu-dtype int8` is rejected for d3 (+6.5 % wall, +18 % CPU,
+  text max |Δp| 3.4e-2). The M2b block-32 table then puts the default image arm
+  at **1.664e-3** against the f32 reference (was 1.03e-2 per-row, top-1
+  unchanged; the f16 table reads 5.24e-4) with 347 MiB resident (+30 for the
+  scales). **Recommended serve line** (every default implicit):
+  `serve --model-dir /root/models/d3-lite --device npu --defer-towers
+  --max-tokens 8192 --port 8384`. The per-window tables are in
+  `examples/rocket-inference/docs/recipes/decision.md` (`## Deployment (current)`).
 - **Deferred tower + bf16 tower storage** (phase M1): the `visual.*` matmul
   weights are read in the checkpoint's own dtype (bf16 for every shipped package)
   and widened per linear — exact, and the widening goes through the stored

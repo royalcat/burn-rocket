@@ -178,7 +178,8 @@ curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
 
 # decision server (POST /v1/systemone): one typed answer per question
-$B serve --model-dir /root/models/d3-lite --device npu --port 8384 --max-tokens 8192
+$B serve --model-dir /root/models/d3-lite --device npu --defer-towers --port 8384 \
+    --max-tokens 8192
 curl -s localhost:8384/v1/systemone -H 'Content-Type: application/json' -d '{
   "state": "Customer asks for a refund of a duplicate card charge.",
   "questions": {"route": {"type": "choice",
@@ -838,7 +839,7 @@ $B decide --model-dir $M --request '{"state": "Refund request", "questions":
   {"route": {"type": "choice", "instructions": "Which team?", "criteria":
   {"returns": "refunds", "billing": "payments"}}}}'
 
-# CPU f32 body vs the packed text projections
+# CPU compute vs the packed text projections
 $B decide --model-dir $M --requests cases.json --device cpu --out cpu.json
 $B decide --model-dir $M --requests cases.json --device npu --out npu.json
 ```
@@ -857,25 +858,47 @@ the reference one: images 8 MB / 16 MP, videos 32 MB / 8.29 MP per frame / 300 s
 at 2 fps, ≤ 16,384 video tokens per request, every refusal a 422 with the
 reference's `detail` string. `--max-tokens` is the same per-question cap as
 `--max-state-tokens` (default 32768); the body limit is 96 MiB. Placement:
-`--device npu` packs the text projections as resident fp16 (96 weights, ~1.0 GiB
-of BO); the tower, the backbone attention and the readout stay on the CPU in
-both configurations. The tied token table is **block-wise int8** by default
-(`--embed-int8`; `--embed-f16` keeps the exact table): one f32 scale per 32 hidden
-values, so the table is half of f16 plus 30 MiB of scales on d3-lite (61 MiB on
-d3-nano) — 1,302 vs 1,513 MiB resident on d3-lite today, with top-1 unchanged and
-the largest option probability moving by up to 1.5e-3 on the bounded text subset
-and 1.66e-3 on the board's image case.
-`--defer-towers` leaves the tower to the first media
-request (a package that declares `vision_config` but lacks `visual.*` therefore
-starts healthy and fails each media request with a 500 instead of failing at
-startup); the attention/vision/decode stage flags are rejected.
+`--device npu` packs the text projections as resident fp16 (96 weights, 966.0
+MiB of BO); the tower, the backbone attention and the readout stay on the CPU in
+both configurations.
 
-Board (d3-lite, cores 4-7, 600 MHz NPU module, embedding service stopped): text
-5 questions / 6,546 tokens 197 s (CPU f32) -> **113 s** (NPU fp16, 1.7x, ~3x
-less user CPU); image 56.7 -> 46.3 s; video 62.1 -> 40.8 s. Parity against each
-checkpoint's **f32** reference (dev host, gate 2e-3): d3-lite text 67/67
+The recommended board line, with every memory default implicit in it:
+
+```sh
+$B serve --model-dir /root/models/d3-lite --device npu --defer-towers \
+    --max-tokens 8192 --port 8384
+```
+
+The text body is stored in the checkpoint's **bf16** and widened per matmul
+(exact, half the resident bytes). The tied token table is **block-wise int8** by
+default (`--embed-int8`; `--embed-f16` keeps the exact table): one f32 scale per
+32 hidden value, so the table is half of f16 plus 30 MiB of scales on d3-lite
+(61 MiB on d3-nano) — 1,302 MiB resident against 1,273 for the per-row scheme
+and 1,513 for the f16 table, with top-1 unchanged and the largest option
+probability moving by up to 1.5e-3 on the bounded text subset and 1.66e-3 on the
+board's image case. `--defer-towers` leaves the tower to the first media request
+(it then costs +195.6 MiB; a package that declares `vision_config` but lacks
+`visual.*` therefore starts healthy and fails each media request with a 500
+instead of failing at startup); the attention/vision/decode stage flags are
+rejected. The approved bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, and the
+block-32 table is inside it everywhere shipped. `--npu-dtype int8` (group-wise
+int8 text projections, 474.0 MiB of BO) exists but is **not recommended**:
++6.5 % wall and +18 % user CPU for text 3.4e-2 / image 4.4e-2 against that bar.
+
+Board (d3-lite, cores 4-7, 600 MHz NPU module). The 2026-11-01 window ran with
+the embedding service stopped: text 5 questions / 6,546 tokens 197 s (CPU f32) ->
+**113 s** (NPU fp16, 1.7x, ~3x less user CPU); image 56.7 -> 46.3 s; video 62.1
+-> 40.8 s. The 2026-11-02 memory window ran beside the live service on a busier
+board (load 15-21), so its walls are 25-35 % higher and only comparable within
+that window: text **147.3 s** compute / 160.2 s wall (CPU 265.6 / 270.1), image
+62.9 s, video 61.7 s. Memory in that window: a text-only service is **347 MiB**
+anon resident (317 on the per-row table, 559 with the f16 table) plus **966.0
+MiB** of weights BO — about 1.28 GiB together (1,313 MiB), against 1.90 GiB
+before the round (943.6 anon + 1,006.7 BO); the image arm's parity is
+**1.664e-3**. Parity against
+each checkpoint's **f32** reference (dev host, gate 2e-3): d3-lite text 67/67
 (2.36e-06), image 8/8 (7.70e-06), video 9/9 (3.97e-06); d3-nano 10/10
-(1.74e-06). Recipes, caps and the full table:
+(1.74e-06). Recipes, caps and the full tables:
 [`docs/recipes/decision.md`](docs/recipes/decision.md).
 
 ## Cross-compiling for the board (aarch64)

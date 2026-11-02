@@ -15,6 +15,48 @@ Reply with only the code of the best option.`  Full-attention layers are bidirec
 (`attention_mode: noncausal_full_attention`); the Gated DeltaNet layers stay causal.
 Codes are `A..Z, AA..JT` (255, the ones that are single tokens).
 
+## Current state (after the memory round, 2026-11-02)
+
+Phases M1-M6 changed what a d3 deployment costs, not what it answers: the
+request/answer contract, the caps and the refusals below are unchanged. This
+block is the summary; `docs/recipes/decision.md` (`## Deployment (current)`)
+carries the same figures as a recipe, and the per-phase evidence is at the end
+of this file.
+
+The recommended board line — every memory default is implicit in it:
+
+```sh
+/root/rocket-inference-decision/rocket-inference serve \
+    --model-dir /root/models/d3-lite --device npu --defer-towers \
+    --max-tokens 8192 --port 8384
+```
+
+| default | setting | measured |
+|---|---|---|
+| text projections | fp16 resident NPU pack, 96 weights | **966.0 MiB** of weights BO (948.0 MiB in the ready line) |
+| token table | block-32 symmetric int8 (`--embed-int8`) | text-only service **347 MiB** anon, 30.3 MiB of it scales |
+| text body | the checkpoint's bf16, widened to f32 per matmul | byte-identical output; half the resident body |
+| vision tower | deferred (`--defer-towers`) | **+195.6 MiB**, only after the first media request |
+
+- **Dev host**, text-only `--defer-towers`: d3-lite resident **1,302 MiB**, load
+  peak **1,382 MiB**, request peak at 2.1k tokens **1,666 MiB** (M2b + M5b);
+  d3-nano resident **3,186 MiB** (M5 — its 60.6 MiB block-32 scale table was not
+  re-measured). The f16 table is 1,513 MiB on lite; the per-row table 1,273.
+- **Board**, beside the live service (never stopped, load 15-21): text-only
+  resident **347 MiB** anon and **966.0 MiB** of weights BO, so about **1.28 GiB**
+  of NPU-side total (1,313 MiB). The per-row-table arm is 317 MiB / 1.25 GiB; the
+  pre-memory-round arm was 943.6 MiB anon + 1,006.7 MiB BO = 1.90 GiB. Image
+  (1,029 tokens) parity **1.664e-3** against the f32 reference (per-row 1.03e-2,
+  f16 table 5.238e-4), top-1 unchanged; video 1.55e-2 through the board's
+  `ffmpeg` 7.1.5 decode (1.51e-2 on the CPU arm too, top-1 correct).
+- **`--npu-dtype int8` is rejected** for this family (phase M3/M6): it halves the
+  weights BO (474.0 vs 966.0 MiB) but costs +6.5 % wall / +18 % user CPU at
+  g512 and moves text by 3.4e-2 / image by 4.4e-2. It is opt-in code, not a
+  recommendation.
+- **Bar**: max |Δp| ≤ 1e-2 with 100 % top-1. The block-32 table is inside it on
+  every shipped arm; `--embed-f16` is the exact-table escape hatch (+211 MiB
+  lite, +424 MiB nano).
+
 ## Environment
 
 ```sh
@@ -388,9 +430,11 @@ tower (visual.* weights)"}` (verified with d3-lite's `config.json` minus
 `vision_config`/`image_token_id`:
 text answers unchanged at 107 tokens, 0.9293 for the routing case).
 
-The tower is 100.5M f32 parameters (~0.40 GB for d3-lite) and loads eagerly with the
-backbone: a d3-lite process is 2926 MiB anon with it, the same package without the tower
-2488 MiB.
+The tower is 100.5M parameters. At phase 2b it loaded eagerly with the backbone
+as f32 (~0.40 GB for d3-lite): a d3-lite process was 2926 MiB anon with it, 2488
+MiB without. M1 now stores it in the checkpoint's own bf16 and the deferred load
+is the recommended setting; the tower then costs **+195.6 MiB** resident, on the
+first media request (`## Current state`).
 
 `--defer-towers` is accepted for the decision family: the tower stays out of the process
 until the first media request (`decision: vision tower deferred to the first media
@@ -696,9 +740,10 @@ committed as a fixture):
 | image-receipt-total, image-two-images | 2 | 3,579 | one and two `<\|image_pad\|>` spans |
 | video-example | 2 | 1,720 | a 4-pair clip (868 + 852) |
 
-The reference is **f32**, not the official bf16 (the f32 body is what the Rust side
-runs); `--dump-vision` is batch-size 1 and writes the nano pooled tensors (`[tokens,
-2048]`) for a later probe:
+The reference is **f32**, not the official bf16 (the f32 path is what the parity arms
+compute; the body is stored bf16 and widened per matmul since M5, which is
+byte-identical); `--dump-vision` is batch-size 1 and writes the nano pooled tensors
+(`[tokens, 2048]`) for a later probe:
 
 ```sh
 python3 tools/decision_reference.py --model /tmp/opencode/d3/models/d3-nano \
@@ -764,7 +809,9 @@ process, whose "compute" is the CLI's own number (load excluded):
 
 So nano costs **1.71x** the wall and **2.10x** the anon (2.60x the RSS, which also holds
 the checkpoint's file-backed pages) for the same answers; the resident f32 body alone is
-7,716 MiB anon against lite's 2,926 MiB. Two things to read out of the per-case column:
+7,716 MiB anon against lite's 2,926 MiB (phase 4 loaded the body as f32; M5's bf16
+storage halves both, to 3,186 / 1,273 MiB with the per-row table). Two things to read
+out of the per-case column:
 a short prompt is *weight-bandwidth*-bound, not attention-bound (a 128-token forward
 streams the whole resident body — ~7.7 GiB anon on nano, ~2.9 GiB on lite — in ~3.9 s
 against ~2.1 s), so the flat ~7 s for the three short cases is the load plus one
@@ -801,9 +848,11 @@ by up to **6.6e-3** in probability (`noul-refund-window`, 3.1e-3 at
 `choice-policy-long/risk`), i.e. above the 2e-3 gate — the same body-dtype rule the
 phase-1 text section gives for lite.
 
-Not measured here: **the board NPU run is still pending**. This round is the dev host
-only (f32 CPU body, no device); the NPU offload needs the aarch64 build plus the
-RK3588's 600 MHz module, and the numbers above say nothing about it. Also noted for a
+Not measured in phase 4: **the board NPU run** (it came later; the d3 board window and
+the memory round are `docs/recipes/decision.md`'s Board section and this file's
+`## Current state`). This round is the dev host only (f32 compute, no device); the NPU
+offload needs the aarch64 build plus the RK3588's 600 MHz module, and the numbers above
+say nothing about it. Also noted for a
 future re-run: `image-two-images` names the *d3-lite* `serving-throughput.png` (the
 fixtures' absolute asset paths), and d3-nano ships a **different** file under that name
 (`4603c2c3…` vs `c6536167…`); both sides consumed the same file here, so the parity
@@ -830,7 +879,7 @@ table — bit-exact for these bf16 checkpoints, so it stands in for the f32 refe
 and against the same named cases of the stored per-row arm:
 
 | set | questions | top-1 | block-32 max \|Δp\| | per-row max \|Δp\| |
-|---|---|---|---|
+|---|---|---|---|---|
 | text (6-case subset) | 10 | 10/10 | 1.465e-3 | 3.769e-3 |
 | images (`image-receipt-total`) | 1 | 1/1 | 1.480e-3 | 8.362e-3 |
 | videos (`video-example`) | 2 | 2/2 | 9.788e-4 | 3.334e-3 |
@@ -894,12 +943,18 @@ for s in ("decision_fixtures", "decision_fixtures_images", "decision_fixtures_vi
 PY
 ```
 
-Memory, text-only `--defer-towers`, one 128-token case (`RssAnon` sampled every 50 ms;
-`--embed-f16` in parentheses): d3-lite resident **2,222** (2,462) MiB, peak **2,397**
-(2,583); d3-nano resident **5,804** (6,287), peak **5,969** (6,457). The loader consumes
-the checkpoint's f32 table in place, so the int8 load also peaks lower than the f16 cast.
+Memory at M2 (f32-loaded body, text-only `--defer-towers`, one 128-token case,
+`RssAnon` sampled every 50 ms; `--embed-f16` in parentheses): d3-lite resident
+**2,222** (2,462) MiB, peak **2,397** (2,583); d3-nano resident **5,804**
+(6,287), peak **5,969** (6,457). That is the pre-M4/M5 profile: the bf16 body
+(M5) and the streamed table load (M5b) bring lite's resident to **1,273** MiB,
+and M2b's block scales then add 30.3 / 60.6 MiB (lite **1,302** resident /
+**1,382** load peak, request peak **1,666** MiB at 2.1k). The M2 loader did
+consume the checkpoint's f32 table in place; M5b replaced that read, so the f32
+table no longer exists at all and the load peak is now the resident body plus one
+stored 16-bit table (`src/qwen35_intent/loader.rs`, `quantize_stored_table`).
 
-## NPU int8 text weights (phase M3)
+## NPU int8 text weights (phase M3, rejected in M6)
 
 `decide` and `serve` accept `--npu-dtype int8` for d3: the text backbone's resident
 weights are then packed as group-wise int8 (W8A8, `--int8-group <g>`, a multiple of 32
@@ -908,5 +963,49 @@ against `2·n·k` fp16; the ready line reports the packed sum — 948 MiB for d3
 weights, while the d3 board round measured 1,006.7 MiB of fp16 weight BO). It is
 opt-in (fp16 stays the default), requires `--device npu` / `--text-device npu` (the
 pack-and-drop load needs the packed stage), and is independent of the token table's
-`--embed-int8`. The group is chosen by the board sweep in phase M6 — **quality, wall
-time and the exact int8 BO bytes are not measured yet**; the CLI default is 32.
+`--embed-int8`. **Phase M6 measured it and rejected it for this family** (quality,
+wall time and the BO bytes are in `docs/recipes/decision.md`, `### Memory, int8 and
+tower round`): `--int8-group 512` halves the weights BO (474.0 vs 966.0 MiB) but
+costs +6.5 % wall and +18 % user CPU and moves text by 3.4e-2 / image by 4.4e-2
+against the max |Δp| ≤ 1e-2 bar; `--int8-group 128` is both slower and less accurate
+(4.5e-2). The code stays as an opt-in; the CLI default group is 32, the recipe uses
+fp16.
+
+## Memory round (phases M4-M6, 2026-11-02)
+
+The evidence behind `## Current state`; the per-arm tables are in
+`docs/recipes/decision.md` (`### Prefill memory`, `### Text body storage`,
+`### Memory, int8 and tower round` and `#### Token table block scales`), which is
+the recipe view of the same runs. Summarised here so this file's per-phase
+history stays readable in order.
+
+- **M4, prefill retentions** (exact: the `decide` JSON is byte-identical at 2.1k
+  and 7,893 tokens): the delta-rule conv history stopped being a `slice` view of
+  the padded conv input (3.5 GiB pinned at 8k) and the prefill stopped storing a
+  KV cache for a decode that never comes (194 MiB at 8k, ~800 MiB at the 32k
+  cap). With the body still f32-loaded and the per-row table, lite's peak anon at
+  2.1k tokens went 3,380 -> **2,477** MiB and at 7,893 tokens 6,385 -> **3,048**
+  MiB (resident 2,222 at the time).
+- **M5, bf16 text body**: the backbone is stored in the checkpoint's bf16 and
+  widened per matmul; byte-identical JSON on the 6-case text subset,
+  `image-receipt-total` and `video-example`. Resident lite 2,222 -> **1,273** MiB,
+  nano 5,804 -> **3,186**; the cost is the per-prefill widen (6-case text gate
+  90.9 -> 96.3 s, +6.0 %).
+- **M5b, streamed int8 table load**: the table is quantized from the stored dtype
+  in 1024-row blocks, so a vocab-sized f32 table never exists (codes
+  bit-identical by construction). Load peak lite 2,473 -> **1,330** MiB, nano
+  4,796 -> **3,349**; `--embed-f16` lite 2,506 -> **1,607**.
+- **M6, board window** (beside the live service, load 15-21, every wall
+  contended): text-only resident 943.6 -> **317** MiB anon (per-row table),
+  weights BO 1,006.7 -> **966.0** MiB, NPU-side total 1.90 -> **1.25** GiB
+  (**1.28** with M2b's block-32 scales, below); text
+  147.3 s compute / 160.2 s wall against CPU f32 265.6 / 270.1 s; image 58.2 s
+  compute, video 54.0 s; tower deferral +195.6 MiB (eager load 512.8 MiB).
+  `--npu-dtype int8` rejected (phase M3 above). The 2026-11-01 idle-service table
+  (113 s vs 197 s, 2,505 MiB peak anon, 1,006.7 MiB BO) stays the historical
+  reference.
+- **M2b, block-32 table scales** (the current default): 30.3 MiB (lite) /
+  60.6 MiB (nano) of scales; the board image case moved 1.030e-2 ->
+  **1.664e-3** (inside the bar), resident 317 -> **347** MiB, no wall change
+  outside the board's noise. Dev-host lite resident 1,273 -> **1,302**, load peak
+  1,330 -> **1,382**.

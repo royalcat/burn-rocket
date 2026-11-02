@@ -31,7 +31,7 @@ standard clients work unchanged:
 | Qwen3.5-0.8B intent/query planner | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/ov-intent-analysis-sft` |
 | EmbeddingGemma 2 (text/image/video/audio) | OpenAI/OpenRouter `/v1/embeddings` (text + `image_url`/`input_audio`/`input_video` blocks) + native multimodal `/embed` | `rocket-inference serve --model-dir /models/embeddinggemma-2` |
 | Gemma 4 E2B-it chat (text/image/audio) | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` | `rocket-inference serve --model-dir /models/gemma-4-E2B-it` |
-| Decision 3.0 (text/image/video typed decisions) | `POST /v1/systemone`, `/v1/models`, `/health` | `rocket-inference serve --model-dir /models/d3-lite --max-tokens 8192 --port 8384` |
+| Decision 3.0 (text/image/video typed decisions) | `POST /v1/systemone`, `/v1/models`, `/health` | `rocket-inference serve --model-dir /models/d3-lite --device npu --defer-towers --max-tokens 8192 --port 8384` |
 
 The container image ships `ffmpeg`/`ffprobe`, so EmbeddingGemma 2's
 `/v1/embeddings` accepts `input_video` blocks and non-WAV audio without extra
@@ -58,11 +58,21 @@ configuration (Qwen3-Embedding-0.6B on the NPU, `--device npu
 (~42 tok/s on 4 A76 cores) at ~34% fewer CPU-seconds than the CPU-only flex path
 (the default NPU attention is slightly faster: ~45 tok/s, -51% CPU). The intent
 model answers the 166-token v7 planner prompt in 11.7 s with `--device auto`
-(89.9 s CPU-only). The vllm-sr d3 decision model answers a 5-question / 6,546-token
-text fixture in 113 s on the NPU (197 s CPU-only) and a 128-token question in
-1.98 s with the model resident; a 1,029-token receipt image takes 46 s and a
-1,720-token two-question video 41 s, with the vision tower and the readout on
-the CPU. Flags, endpoints, recipes and
+(89.9 s CPU-only). The vllm-sr d3 decision model is the memory-tightest board
+server: a text-only process is **347 MiB** anon resident plus 966.0 MiB of NPU
+weights BO (~1.28 GiB together, 1,313 MiB, against 1.90 GiB before the
+2026-11-02 memory round), because the body is stored bf16, the tied token table
+is block-32 int8 by default (`--embed-f16` keeps the exact table for +211 MiB)
+and the vision tower loads only on the first media request (+195.6 MiB). The
+approved bar is max |Δp| ≤ 1e-2 with 100 % top-1, met on every shipped arm
+(board image 1.664e-3). In the 2026-11-01 window a 5-question / 6,546-token text
+fixture took 113 s on the NPU against 197 s CPU-only, a 1,029-token receipt
+image 46 s, a 1,720-token two-question video 41 s, and a 128-token question
+1.98 s with the model resident; the 2026-11-02 window ran beside the live
+service and reads 147.3 s compute / 160.2 s wall for the same text case (CPU
+265.6 / 270.1 s). `--npu-dtype int8` exists for d3 but is not recommended
+(+6.5 % wall, text 3.4e-2). The vision tower, the backbone attention and the
+readout stay on the CPU. Flags, endpoints, recipes and
 deployment: [examples/rocket-inference/README.md](examples/rocket-inference/README.md),
 [docs/recipes/decision.md](examples/rocket-inference/docs/recipes/decision.md).
 
