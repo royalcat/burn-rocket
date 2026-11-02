@@ -18,7 +18,9 @@
 # architectures: `serve` picks the NPU on aarch64 builds that have it (pass
 # `--no-npu` for the flex CPU path) and stays on flex elsewhere.
 
-FROM rust:1.98-trixie AS build
+FROM --platform=$BUILDPLATFORM rust:1.98-trixie AS build
+RUN apt-get update && apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
 WORKDIR /src
 
 COPY . .
@@ -34,15 +36,20 @@ RUN set -eux; \
     arch="${TARGETARCH:-$(uname -m)}"; \
     case "$arch" in \
         arm64|aarch64) \
+            rustup target add aarch64-unknown-linux-gnu; \
+            RUSTFLAGS="-C target-cpu=cortex-a76" \
             cargo build --release --locked \
                 -p rocket-inference \
+                --target aarch64-unknown-linux-gnu \
                 --no-default-features --features npu \
                 --jobs "${CARGO_BUILD_JOBS}" \
             ;; \
         amd64|x86_64) \
+            rustup target add x86_64-unknown-linux-gnu; \
             RUSTFLAGS="-C target-cpu=x86-64-v3" \
             cargo build --release --locked \
                 -p rocket-inference \
+                --target x86_64-unknown-linux-gnu \
                 --no-default-features \
                 --jobs "${CARGO_BUILD_JOBS}" \
             ;; \
@@ -53,14 +60,17 @@ RUN set -eux; \
     install -Dm755 "$bin" /src/out/rocket-inference
 
 FROM debian:trixie-slim
+
 # ffmpeg/ffprobe decode video (and non-WAV audio) inputs at request time; the
 # model itself never links libav*. Debian's package ships both binaries, so the
 # two version calls fail the build if a future split moves one of them.
+COPY --from=mwader/static-ffmpeg:9.0.2-1 /ffmpeg /usr/local/bin/
+COPY --from=mwader/static-ffmpeg:9.0.2-1 /ffprobe /usr/local/bin/
+RUN ffmpeg -version >/dev/null && ffprobe -version >/dev/null
+
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates ffmpeg \
- && ffmpeg -version >/dev/null \
- && ffprobe -version >/dev/null \
- && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /src/out/rocket-inference /usr/local/bin/rocket-inference
 

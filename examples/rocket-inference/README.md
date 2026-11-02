@@ -66,6 +66,9 @@ Every family also loads **GGUF** checkpoints, locally or straight from the Hub:
 ./rocket-inference gen   -hf unsloth/gemma-4-E2B-it-GGUF:Q8_0 --text "Hi"
 ./rocket-inference gen   -hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0 --text "Hello!"
 
+# serve fro
+./rocket-inference serve-hf unsloth/embeddinggemma-2-GGUF:Q8_0 --port 8383
+
 # a local directory with a *.gguf (and optionally mmproj-*.gguf) works the same
 ./rocket-inference serve --model-dir /path/to/gguf-dir --port 8383
 ```
@@ -118,7 +121,7 @@ CLI f32 vector at cosine 1.000000000000 (log §21.3).
 One command serves every model:
 
 ```sh
-rocket-inference serve --model-dir <dir> [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
+rocket-inference serve --hf <model> [--family auto|qwen3|embeddinggemma|intent|gemma4] [flags]
 ```
 
 `--family auto` (the default) reads `config.json` `model_type` and picks the
