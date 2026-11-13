@@ -274,6 +274,22 @@ pub fn register_npu_weight_id(param: burn::module::ParamId, id: burn_rocket::Wei
         .insert(param.val(), id);
 }
 
+/// The tied LM head packed as a resident per-channel int8 NPU weight (QAT
+/// checkpoints under `--npu-dtype int8`); `logits` uses it instead of the dense
+/// head tensor.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static NPU_HEAD: std::sync::OnceLock<burn_rocket::WeightId> = std::sync::OnceLock::new();
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn set_npu_head(id: burn_rocket::WeightId) {
+    let _ = NPU_HEAD.set(id);
+}
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn npu_head() -> Option<burn_rocket::WeightId> {
+    NPU_HEAD.get().copied()
+}
+
 /// QAT weights packed by the checkpoint adapter, by module path, until
 /// `take_qat_packed` hands them to the loader to bind to their `ParamId`s.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -390,8 +406,9 @@ pub fn weight_nk(lin: &Linear, device: &Device) -> Tensor<2> {
 /// keeps the parameter id, so `lin` still resolves the registry entry.
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 pub fn drop_linear_weight(lin: &mut Linear, device: &Device) {
-    let dev = device.clone();
-    lin.weight = lin.weight.clone().map(|_| Tensor::zeros([1, 1], &dev));
+    // Same id, no evaluation: `Param::map` would run the lazy random initializer
+    // over the full f32 weight first (71 s of an E4B load).
+    lin.weight = Param::initialized(lin.weight.id, Tensor::zeros([1, 1], device));
 }
 
 /// Pack one `Linear` into NPU memory in its native dtype and register it: f32

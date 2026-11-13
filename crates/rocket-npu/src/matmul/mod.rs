@@ -27,7 +27,7 @@ pub use context::{Context, MemStats, SlotMem, Weight};
 pub use f32out::one_shot as one_shot_f32out;
 pub use int4::{one_shot_int4, one_shot_int4_ex, one_shot_int4_groupwise, plan_int4};
 pub use int4_context::{I4Context, I4Weight};
-pub use int8::{I8Context, I8Weight};
+pub use int8::{I8Context, I8Weight, PhaseStats, phase_reset, phase_stats};
 pub use int8_dense::{one_shot_int8, one_shot_int8_groupwise, plan_int8};
 pub use int16::one_shot_int16_exact;
 pub use plan::{Plan, plan_geom};

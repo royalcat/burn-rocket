@@ -745,7 +745,15 @@ impl LoadArgs {
             defer_towers: self.defer_towers.unwrap_or(false),
             keep_cpu_weights,
             placement,
-            npu_threads: self.npu_threads.unwrap_or(5),
+            // Gemma 4 QAT int8 keeps one worker per NPU core: more workers only
+            // contend (E4B decode/prefill measured faster with 3 than 4-5).
+            npu_threads: self.npu_threads.unwrap_or(
+                if family == Family::Gemma4 && npu_dtype == NpuDtype::Int8 {
+                    3
+                } else {
+                    5
+                },
+            ),
             npu_dtype,
             int8_group,
             attn_kernel,

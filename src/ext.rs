@@ -1258,15 +1258,21 @@ fn matmul_qat(
             .unwrap_or_else(|| panic!("NPU QAT weight id {id} is not packed"))
             .in_scale
     });
-    // The input grid is the model's SRQ grid: a zero scale would mean an
-    // uncalibrated linear, which the packer refuses.
-    let inv = 1.0 / in_scale;
+    // Static scale: the model's SRQ grid. A zero scale means the checkpoint left
+    // this linear uncalibrated: each row then gets its own max|x|/127.
     let m4 = m.div_ceil(4) * 4;
     let t_conv = Instant::now();
     let mut q = vec![0i8; m4 * k];
+    let mut row_scale = vec![in_scale; m4];
     q.par_chunks_mut(k)
+        .zip(row_scale.par_iter_mut())
         .zip(values.par_chunks(k))
-        .for_each(|(qrow, xrow)| {
+        .for_each(|((qrow, rs), xrow)| {
+            if in_scale == 0.0 {
+                let amax = xrow.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                *rs = (amax / 127.0).max(1e-12);
+            }
+            let inv = 1.0 / *rs;
             for (d, &v) in qrow.iter_mut().zip(xrow) {
                 *d = static_code(v, inv);
             }
@@ -1340,12 +1346,14 @@ fn matmul_qat(
             } else {
                 0.0
             };
+            let rs = &row_scale[off..off + rows];
             c32[off * n..(off + rows) * n]
                 .par_chunks_mut(n)
                 .zip(ci[..rows * n].par_chunks(n))
-                .for_each(|(orow, crow)| {
+                .zip(rs.par_iter())
+                .for_each(|((orow, crow), &row_in)| {
                     for ((o, &acc), &s) in orow.iter_mut().zip(crow).zip(ws) {
-                        let y = acc as f32 * (in_scale * s);
+                        let y = acc as f32 * (row_in * s);
                         *o = if out_scale != 0.0 {
                             static_code(y, out_inv) as f32 * out_scale
                         } else {
@@ -1367,7 +1375,8 @@ fn matmul_qat(
 /// Pack one pre-quantized `[N, K]` per-channel int8 weight of a QAT checkpoint
 /// (int4/int8 codes widened to `i8`, symmetric, no zero point). `w_scale` is the
 /// per-output-channel dequant scale `[N]`; `in_scale` is the calibrated static
-/// activation scale (must be non-zero), `out_scale` the calibrated output scale
+/// activation scale (0 = dynamic: each row is scaled by its own `max|x|/127`,
+/// for linears the checkpoint left uncalibrated, like `lm_head`), `out_scale` the calibrated output scale
 /// (0 = leave the output unrounded). The codes are scattered into NPU BOs once;
 /// the caller keeps no copy.
 pub fn pack_qat(
@@ -1380,14 +1389,18 @@ pub fn pack_qat(
 ) -> WeightId {
     assert_eq!(codes.len(), n * k, "QAT codes must be [N, K]");
     assert_eq!(w_scale.len(), n, "one weight scale per output channel");
-    assert!(in_scale > 0.0, "QAT linears need a calibrated input scale");
+    assert!(in_scale >= 0.0, "QAT input scale must not be negative");
     assert_eq!(k % 32, 0, "the int8 path needs K % 32 == 0 (K={k})");
     assert_eq!(n % 32, 0, "the int8 path needs N % 32 == 0 (N={n})");
     with_engine(|e| {
         let threads = e.threads;
         let ctx = e.i8_ctx.get_or_insert_with(|| {
-            RocketI8Ctx::new(threads)
-                .unwrap_or_else(|err| op_failure("rocket_i8_ctx_create", err.rc, 0, k, n))
+            let ctx = RocketI8Ctx::new(threads)
+                .unwrap_or_else(|err| op_failure("rocket_i8_ctx_create", err.rc, 0, k, n));
+            // `ROCKET_I8_MT` (read by the context) picks a decode-shaped layout:
+            // 32 gives 1280-deep K-tiles, 25-30% faster in the microbenchmark but
+            // ~1% end to end on E4B and 10-20% slower prefill, so it is opt-in.
+            ctx
         });
         let weight = ctx
             .pack_weight(PACK_M, k, n, codes)

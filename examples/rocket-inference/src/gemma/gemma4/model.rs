@@ -22,7 +22,7 @@ use std::time::Instant;
 use burn::module::Param;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, RmsNorm, RmsNormConfig};
 use burn::prelude::*;
-use burn::tensor::activation::{gelu_approximate, softmax};
+use burn::tensor::activation::softmax;
 use burn::tensor::{DType, Int, s};
 
 use std::collections::HashMap;
@@ -31,10 +31,10 @@ use crate::gemma::audio::AudioTower;
 use crate::gemma::audio_frontend::{AudioFeatures, subsample_mask};
 use crate::gemma::config::{AudioConfig, TextConfig, VisionConfig};
 use crate::gemma::layers::ClipBounds;
-use crate::gemma::layers::lin;
+use crate::gemma::layers::{self, lin};
 use crate::gemma::media::PreparedImage;
 use crate::gemma::vision::{MultimodalEmbedder, VisionAttn, VisionSpec, VisionTower};
-use crate::gemma::{linear_cfg, repeat_kv, rms_norm_noscale};
+use crate::gemma::{linear_cfg, repeat_kv};
 use crate::server::telemetry;
 
 // Stage wall-time instrumentation (microseconds) for the generation path.
@@ -219,6 +219,12 @@ impl GenRopeTable {
     pub fn apply(&self, x: Tensor<4>, seq_start: usize) -> Tensor<4> {
         let [_, s, _, d] = x.dims();
         let half = self.half;
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if layers::npu_glue() && x.dtype() == DType::F32 {
+            let cos = self.cos.clone().slice(s![seq_start..seq_start + s, ..]);
+            let sin = self.sin.clone().slice(s![seq_start..seq_start + s, ..]);
+            return layers::rope_apply(x, cos, sin);
+        }
         let cos = self
             .cos
             .clone()
@@ -281,6 +287,25 @@ impl GenKv {
             shared: [None, None],
             len: 0,
         }
+    }
+
+    /// Drops every cached position at or after `len` (speculative decoding rolls
+    /// back the rejected draft tokens). The slices are views until the next append
+    /// concatenates over them.
+    pub fn truncate(&mut self, len: usize) {
+        fn cut(t: &mut Tensor<4>, len: usize) {
+            if t.dims()[2] > len {
+                *t = t.clone().slice(s![.., .., 0..len, ..]);
+            }
+        }
+        for t in self.k.iter_mut().chain(self.v.iter_mut()).flatten() {
+            cut(t, len);
+        }
+        for (k, v) in self.shared.iter_mut().flatten() {
+            cut(k, len);
+            cut(v, len);
+        }
+        self.len = len.min(self.len);
     }
 
     /// Appends the new K/V of `layer` and returns the full cached tensors.
@@ -399,7 +424,7 @@ impl GenAttention {
         let [b, s, _] = x.dims();
         let (h, kvh, d) = (spec.n_heads, spec.n_kv_heads, spec.head_dim);
         let q = lin(&self.q_proj, x.clone()).reshape([b, s, h, d]);
-        let q = rope.apply(self.q_norm.forward(q), seq_start);
+        let q = rope.apply(layers::rms_norm(&self.q_norm, q), seq_start);
 
         let (k, v) = if spec.is_kv_shared {
             // The K/V of the last non-shared layer of the same type (full
@@ -415,8 +440,8 @@ impl GenAttention {
             } else {
                 lin(&self.v_proj, x).reshape([b, s, kvh, d])
             };
-            let kk = rope.apply(self.k_norm.forward(kk), seq_start);
-            let vv = rms_norm_noscale(raw_v, gspec.eps);
+            let kk = rope.apply(layers::rms_norm(&self.k_norm, kk), seq_start);
+            let vv = layers::rms_norm_noscale(raw_v, gspec.eps);
             let (kk, vv) = kv.append(layer, kk.swap_dims(1, 2), vv.swap_dims(1, 2));
             if spec.stores_shared_kv {
                 kv.shared[spec.type_idx] = Some((kk.clone(), vv.clone()));
@@ -477,9 +502,9 @@ impl GenMlp {
     }
 
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let gate = gelu_approximate(lin(&self.gate_proj, x.clone()));
+        let gate = lin(&self.gate_proj, x.clone());
         let up = lin(&self.up_proj, x);
-        lin(&self.down_proj, gate * up)
+        lin(&self.down_proj, layers::gelu_mul(gate, up))
     }
 }
 
@@ -541,7 +566,7 @@ impl GenLayer {
     ) -> Tensor<3> {
         let residual = x.clone();
         let t = Instant::now();
-        let h = self.input_layernorm.forward(x);
+        let h = layers::rms_norm(&self.input_layernorm, x);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -551,13 +576,13 @@ impl GenLayer {
         T_ATTN_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
-        let h = self.post_attention_layernorm.forward(h);
+        let h = layers::rms_norm(&self.post_attention_layernorm, h);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let x = residual + h;
 
         let residual = x.clone();
         let t = Instant::now();
-        let h = self.pre_feedforward_layernorm.forward(x);
+        let h = layers::rms_norm(&self.pre_feedforward_layernorm, x);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
@@ -565,16 +590,15 @@ impl GenLayer {
         T_MLP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         let t = Instant::now();
-        let h = self.post_feedforward_layernorm.forward(h);
+        let h = layers::rms_norm(&self.post_feedforward_layernorm, h);
         T_NORM_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let x = residual + h;
 
         let t = Instant::now();
         let residual = x.clone();
-        let h = gelu_approximate(lin(&self.per_layer_input_gate, x));
-        let h = h * ple_i;
+        let h = layers::gelu_mul(lin(&self.per_layer_input_gate, x), ple_i);
         let h = lin(&self.per_layer_projection, h);
-        let h = self.post_per_layer_input_norm.forward(h);
+        let h = layers::rms_norm(&self.post_per_layer_input_norm, h);
         T_PLE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         let x = residual + h;
         x * self.layer_scalar.val().reshape([1, 1, 1])
@@ -665,17 +689,17 @@ impl GenTextModel {
     /// materialized (4.7 GiB in f16, 9.4 GiB in f32). The stub is a fresh
     /// parameter: `Param::map` would force the lazy initializer first (a
     /// 8.75 GiB f32 table written and dropped — the load-time peak).
-    pub fn shrink_ple_table(&mut self) {
-        let dev = self.embed_tokens.weight.val().device();
-        self.embed_tokens_per_layer.weight = Param::from_tensor(Tensor::zeros([1, 1], &dev));
+    pub fn shrink_ple_table(&mut self, dev: &Device) {
+        // Never touch the old param: reading it would run its lazy initializer
+        // over the whole (multi-GiB) table.
+        self.embed_tokens_per_layer.weight = Param::from_tensor(Tensor::zeros([1, 1], dev));
     }
 
     /// Replace the token table parameter with a 1-element stub *before* loading
     /// (the packed copy is read separately; the head is materialized from it).
     /// Fresh parameter, like [`Self::shrink_ple_table`].
-    pub fn shrink_embed_table(&mut self) {
-        let dev = self.embed_tokens.weight.val().device();
-        self.embed_tokens.weight = Param::from_tensor(Tensor::zeros([1, 1], &dev));
+    pub fn shrink_embed_table(&mut self, dev: &Device) {
+        self.embed_tokens.weight = Param::from_tensor(Tensor::zeros([1, 1], dev));
     }
 
     pub fn spec(&self) -> &GenSpec {
@@ -861,6 +885,25 @@ impl GenTextModel {
     pub fn logits(&self, h: Tensor<3>, lm_head: &Tensor<2>) -> Tensor<2> {
         let [b, s, _] = h.dims();
         let last = h.slice(s![.., s - 1..s, ..]).reshape([b, self.spec.hidden]);
+        self.head(last, lm_head)
+    }
+
+    /// Soft-capped logits `[s, vocab]` for every position of a batch-1 `h`
+    /// (the speculative verify pass reads one row per drafted token).
+    pub fn logits_rows(&self, h: Tensor<3>, lm_head: &Tensor<2>) -> Tensor<2> {
+        let [b, s, _] = h.dims();
+        self.head(h.reshape([b * s, self.spec.hidden]), lm_head)
+    }
+
+    fn head(&self, last: Tensor<2>, lm_head: &Tensor<2>) -> Tensor<2> {
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if let Some(id) = crate::gemma::layers::npu_head() {
+            let mut logits = burn_rocket::matmul(last.cast(DType::F32), &id);
+            if let Some(c) = self.spec.logit_softcap {
+                logits = (logits / c).tanh() * c;
+            }
+            return logits;
+        }
         // The tied head may be f16 (q8 mode): compute the logits in its dtype and
         // apply the soft cap in f32.
         let last = if last.dtype() != lm_head.dtype() {

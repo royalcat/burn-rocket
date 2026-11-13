@@ -16,7 +16,9 @@
 //!   accumulated in f32. The natively-quantized-weight path.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::Instant;
 
 use crate::Device;
 use crate::device::uapi::DrmRocketTask;
@@ -35,6 +37,62 @@ use super::run::wait_ns;
 
 const MAX_WORKERS: usize = 8;
 
+/// Wall-clock phase counters of the resident int8 matmul, summed over workers
+/// (nanoseconds). `fanout` is the scope wall minus the slowest worker's own wall,
+/// i.e. the thread spawn/join cost of one call.
+static PH_PACK: AtomicU64 = AtomicU64::new(0);
+static PH_EMIT: AtomicU64 = AtomicU64::new(0);
+static PH_SUBMIT: AtomicU64 = AtomicU64::new(0);
+static PH_WAIT: AtomicU64 = AtomicU64::new(0);
+static PH_DETILE: AtomicU64 = AtomicU64::new(0);
+static PH_FANOUT: AtomicU64 = AtomicU64::new(0);
+static PH_CALLS: AtomicU64 = AtomicU64::new(0);
+static PH_JOBS: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds spent per phase since the last [`phase_reset`] (worker-summed except
+/// `fanout`, which is per call), plus the call and job counts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PhaseStats {
+    pub pack_s: f64,
+    pub emit_s: f64,
+    pub submit_s: f64,
+    pub wait_s: f64,
+    pub detile_s: f64,
+    pub fanout_s: f64,
+    pub calls: u64,
+    pub jobs: u64,
+}
+
+pub fn phase_stats() -> PhaseStats {
+    let s = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 * 1e-9;
+    PhaseStats {
+        pack_s: s(&PH_PACK),
+        emit_s: s(&PH_EMIT),
+        submit_s: s(&PH_SUBMIT),
+        wait_s: s(&PH_WAIT),
+        detile_s: s(&PH_DETILE),
+        fanout_s: s(&PH_FANOUT),
+        calls: PH_CALLS.load(Ordering::Relaxed),
+        jobs: PH_JOBS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn phase_reset() {
+    for c in [
+        &PH_PACK, &PH_EMIT, &PH_SUBMIT, &PH_WAIT, &PH_DETILE, &PH_FANOUT, &PH_CALLS, &PH_JOBS,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn add_ns(c: &AtomicU64, t: Instant) {
+    c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// `(m0, n0, mtile, ntile, group)` of one queued tile.
+type TileMeta = (usize, usize, usize, usize, usize);
+
 struct Worker {
     dev: Device,
     n0: usize,
@@ -42,9 +100,10 @@ struct Worker {
     plan: Plan,
     kt_per_group: usize,
     _guard: Bo,
-    regcmd: Bo,
+    /// Double-buffered: batch b+1 is submitted before batch b is de-tiled.
+    regcmd: [Bo; 2],
     in_all: Bo,
-    out_all: Bo,
+    out_all: [Bo; 2],
     facc: Vec<f32>,
     iacc: Vec<i64>,
     in_zeroed: bool,
@@ -87,10 +146,100 @@ struct Sig {
     wt_bytes: usize,
 }
 
+/// A unit of work for a pool thread; `Quit` ends the thread.
+enum Task {
+    Run(Box<dyn FnOnce() + Send + 'static>),
+    Quit,
+}
+
+/// Persistent, pinned worker threads for one [`I8Context`]. A call used to spawn
+/// (and join) one scoped thread per worker; at decode-size `M` that fan-out alone
+/// cost ~0.6 ms of a ~4 ms call. The threads here live as long as the context,
+/// each pinned once to its worker's core, and a call just wakes them.
+struct Pool {
+    txs: Vec<std::sync::mpsc::Sender<Task>>,
+    done: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl Pool {
+    fn new(n: usize) -> Pool {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let mut txs = Vec::with_capacity(n);
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let (tx, rx) = std::sync::mpsc::channel::<Task>();
+            let done_tx = done_tx.clone();
+            handles.push(thread::spawn(move || {
+                let mut pinned_base = None;
+                while let Ok(Task::Run(f)) = rx.recv() {
+                    let base = crate::device::affinity::base();
+                    // The caller's core base can differ between contexts; re-pin
+                    // only when it changes (a syscall otherwise saved per call).
+                    if pinned_base != Some(base) {
+                        crate::device::affinity::pin_current(i, base);
+                        pinned_base = Some(base);
+                    }
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+                    let _ = done_tx.send(());
+                }
+            }));
+            txs.push(tx);
+        }
+        Pool {
+            txs,
+            done: std::sync::Mutex::new(done),
+            handles,
+        }
+    }
+
+    /// Run `tasks[i]` on pool thread `i` and block until every task has finished
+    /// (also when one panics: the pool thread still reports completion).
+    ///
+    /// The tasks may borrow from the caller's stack: they are lifetime-erased to
+    /// `'static` for the channel, which is sound because this function does not
+    /// return before all of them have run to completion and been dropped.
+    fn run<'a>(&self, tasks: Vec<Box<dyn FnOnce() + Send + 'a>>) {
+        assert!(
+            tasks.len() <= self.txs.len(),
+            "more tasks than pool threads"
+        );
+        let n = tasks.len();
+        for (tx, task) in self.txs.iter().zip(tasks) {
+            // SAFETY: see the function doc; the borrow outlives the wait below.
+            let task: Box<dyn FnOnce() + Send + 'static> = unsafe { std::mem::transmute(task) };
+            tx.send(Task::Run(task)).expect("int8 pool thread is gone");
+        }
+        // One `run` at a time (the context is used through `&mut self`, so the
+        // lock is uncontended; it only makes the pool `Sync`).
+        let done = self
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for _ in 0..n {
+            done.recv().expect("int8 pool thread is gone");
+        }
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        for tx in &self.txs {
+            let _ = tx.send(Task::Quit);
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 /// A persistent int8 context (per-channel and group-wise resident weights).
 pub struct I8Context {
     devs: Vec<Device>,
     threads: usize,
+    pool: std::sync::Arc<Pool>,
+    /// Canonical tile height of the per-channel layout (see [`plan_for`]).
+    canon_mt: usize,
     scratches: HashMap<(usize, usize, usize, usize), Vec<Worker>>,
     order: VecDeque<(usize, usize, usize, usize)>,
 }
@@ -105,9 +254,25 @@ impl I8Context {
         Ok(I8Context {
             devs,
             threads,
+            pool: std::sync::Arc::new(Pool::new(threads)),
+            canon_mt: std::env::var("ROCKET_I8_MT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v >= 4 && v % 4 == 0)
+                .unwrap_or(hw::current().max_tile as usize),
             scratches: HashMap::new(),
             order: VecDeque::new(),
         })
+    }
+
+    /// Set the canonical tile height of the per-channel layout. Must be called
+    /// before the first weight is packed: a packed weight keeps the layout it was
+    /// scattered with and is refused by a context that plans a different one.
+    pub fn set_canonical_mt(&mut self, mt: usize) {
+        assert!(self.scratches.is_empty(), "set_canonical_mt after use");
+        if mt >= 4 && mt.is_multiple_of(4) {
+            self.canon_mt = mt;
+        }
     }
 
     fn build(&self, m: usize, k: usize, n: usize, group: usize) -> Result<Vec<Worker>> {
@@ -128,16 +293,22 @@ impl I8Context {
                 break;
             }
             let nsub = (n - n0).min(nstep);
-            let plan = plan_for(m, k, nsub, group)?;
+            let plan = plan_for(self.canon_mt, m, k, nsub, group)?;
             let kt_per_group = if group == 0 { 0 } else { group / plan.kt };
             debug_assert!(group == 0 || kt_per_group * plan.kt == group);
             let tiles = plan.nmt * plan.nnt * plan.nkt;
             let slots = tiles.clamp(1, BATCH);
             let guard = self.devs[t].alloc_bo(4096)?;
-            let regcmd = self.devs[t].alloc_bo(slots * RC_STRIDE * 8)?;
+            let regcmd = [
+                self.devs[t].alloc_bo(slots * RC_STRIDE * 8)?,
+                self.devs[t].alloc_bo(slots * RC_STRIDE * 8)?,
+            ];
             let in_all =
                 self.devs[t].alloc_bo(plan.nmt * plan.nkt * plan.in_slot + CBUF_BANK_SIZE)?;
-            let out_all = self.devs[t].alloc_bo(slots * plan.out_slot * 4 + CBUF_BANK_SIZE)?;
+            let out_all = [
+                self.devs[t].alloc_bo(slots * plan.out_slot * 4 + CBUF_BANK_SIZE)?,
+                self.devs[t].alloc_bo(slots * plan.out_slot * 4 + CBUF_BANK_SIZE)?,
+            ];
             workers.push(Worker {
                 dev: self.devs[t].clone(),
                 n0,
@@ -193,46 +364,67 @@ impl I8Context {
             return Err(Error::shape("int8/pack"));
         }
         let workers = self.scratch(m, k, n, group)?;
-        let mut bos = Vec::with_capacity(workers.len());
-        let mut sig = Vec::with_capacity(workers.len());
-        for w in workers.iter_mut() {
-            let wt_sz = w.plan.nnt * w.plan.nkt * w.plan.wt_slot + CBUF_BANK_SIZE;
-            let mut bo = w.dev.alloc_bo(wt_sz)?;
-            bo.prep(0)?;
-            {
-                let words = i8_words(&mut bo);
-                words.fill(0);
-                for ni in 0..w.plan.nnt {
-                    let n0 = ni * w.plan.nt;
-                    let ntile = w.plan.n_tile(ni);
-                    for ki in 0..w.plan.nkt {
-                        let k0 = ki * w.plan.kt;
-                        let ktile = w.plan.k_tile(ki);
-                        let off = (ni * w.plan.nkt + ki) * w.plan.wt_slot;
-                        layout::wt_scatter_tile_i8(
-                            &mut words[off..off + w.plan.wt_slot],
-                            &b[w.n0 * k..],
-                            k,
-                            n0,
-                            k0,
-                            ntile,
-                            ktile,
-                        );
-                    }
-                }
-            }
-            bo.fini()?;
-            sig.push(Sig {
-                n0: w.n0,
-                nsub: w.nsub,
-                kt: w.plan.kt,
-                nt: w.plan.nt,
-                nkt: w.plan.nkt,
-                nnt: w.plan.nnt,
-                wt_slot: w.plan.wt_slot,
-                wt_bytes: bo.len(),
-            });
+        // Each worker scatters its own N-slice into its own BO, so the slices are
+        // independent: pack them on one thread per worker (load time).
+        let packed: Vec<Result<(Bo, Sig)>> = thread::scope(|scope| {
+            let handles: Vec<_> = workers
+                .iter_mut()
+                .map(|w| {
+                    scope.spawn(move || -> Result<(Bo, Sig)> {
+                        let wt_sz = w.plan.nnt * w.plan.nkt * w.plan.wt_slot + CBUF_BANK_SIZE;
+                        let mut bo = w.dev.alloc_bo(wt_sz)?;
+                        bo.prep(0)?;
+                        {
+                            let words = i8_words(&mut bo);
+                            words.fill(0);
+                            for ni in 0..w.plan.nnt {
+                                let n0 = ni * w.plan.nt;
+                                let ntile = w.plan.n_tile(ni);
+                                for ki in 0..w.plan.nkt {
+                                    let k0 = ki * w.plan.kt;
+                                    let ktile = w.plan.k_tile(ki);
+                                    let off = (ni * w.plan.nkt + ki) * w.plan.wt_slot;
+                                    layout::wt_scatter_tile_i8(
+                                        &mut words[off..off + w.plan.wt_slot],
+                                        &b[w.n0 * k..],
+                                        k,
+                                        n0,
+                                        k0,
+                                        ntile,
+                                        ktile,
+                                    );
+                                }
+                            }
+                        }
+                        bo.fini()?;
+                        let sig = Sig {
+                            n0: w.n0,
+                            nsub: w.nsub,
+                            kt: w.plan.kt,
+                            nt: w.plan.nt,
+                            nkt: w.plan.nkt,
+                            nnt: w.plan.nnt,
+                            wt_slot: w.plan.wt_slot,
+                            wt_bytes: bo.len(),
+                        };
+                        Ok((bo, sig))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::device("int8/pack", 0)))
+                })
+                .collect()
+        });
+        let mut bos = Vec::with_capacity(packed.len());
+        let mut sig = Vec::with_capacity(packed.len());
+        for r in packed {
+            let (bo, sg) = r?;
             bos.push(bo);
+            sig.push(sg);
         }
         Ok(I8Weight {
             m,
@@ -281,6 +473,7 @@ impl I8Context {
         b_scale: &[f32],
         w: &I8Weight,
     ) -> Result<()> {
+        let pool = self.pool.clone();
         let workers = self.scratch(m, k, n, group)?;
         if workers.len() != w.bos.len() {
             return Err(Error::tiling("int8/weight-workers"));
@@ -301,25 +494,42 @@ impl I8Context {
             }
         }
 
-        let base = crate::device::affinity::base();
-        let results: Vec<Result<()>> = thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers.len());
-            for (i, worker) in workers.iter_mut().enumerate() {
-                let wt = &w.bos[i];
-                handles.push(scope.spawn(move || -> Result<()> {
-                    crate::device::affinity::pin_current(i, base);
-                    worker.pack_input(k, a)?;
-                    worker.compute(m, k, n, ng, a_scale, b_scale, wt)
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(Error::device("int8/worker", 0)))
+        let t_scope = Instant::now();
+        let slowest = AtomicU64::new(0);
+        let slowest_ref = &slowest;
+        let mut results: Vec<Option<Result<()>>> = (0..workers.len()).map(|_| None).collect();
+        {
+            let tasks: Vec<Box<dyn FnOnce() + Send + '_>> = workers
+                .iter_mut()
+                .zip(results.iter_mut())
+                .enumerate()
+                .map(|(i, (worker, slot))| {
+                    let wt = &w.bos[i];
+                    Box::new(move || {
+                        let t_w = Instant::now();
+                        let r = (|| -> Result<()> {
+                            let t_pack = Instant::now();
+                            worker.pack_input(k, a)?;
+                            add_ns(&PH_PACK, t_pack);
+                            worker.compute(m, k, n, ng, a_scale, b_scale, wt)
+                        })();
+                        slowest_ref.fetch_max(t_w.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        *slot = Some(r);
+                    }) as Box<dyn FnOnce() + Send + '_>
                 })
-                .collect()
-        });
+                .collect();
+            pool.run(tasks);
+        }
+        let results: Vec<Result<()>> = results
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|| Err(Error::device("int8/worker", 0))))
+            .collect();
+        let scope_ns = t_scope.elapsed().as_nanos() as u64;
+        PH_FANOUT.fetch_add(
+            scope_ns.saturating_sub(slowest.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        PH_CALLS.fetch_add(1, Ordering::Relaxed);
         if let Some(e) = results.into_iter().find_map(|r| r.err()) {
             return Err(e);
         }
@@ -427,6 +637,46 @@ impl Worker {
         self.in_all.fini()
     }
 
+    /// Wait for the batch queued in buffer `buf`, then de-tile and accumulate it.
+    fn drain(
+        &mut self,
+        buf: usize,
+        meta: &[TileMeta],
+        plan: &Plan,
+        ng: usize,
+        a_scale: &[f32],
+        b_scale: &[f32],
+    ) -> Result<()> {
+        let dense = ng == 0;
+        let t_wait = Instant::now();
+        self.out_all[buf].prep(wait_ns())?;
+        add_ns(&PH_WAIT, t_wait);
+        let t_det = Instant::now();
+        {
+            let words = super::bos::i32_words_ref(&self.out_all[buf]);
+            let n0_base = self.n0;
+            for (j, &(m0, n0, mtile, ntile, g)) in meta.iter().enumerate() {
+                let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
+                if dense {
+                    layout::detile_accum_i32(&mut self.iacc, self.nsub, slot, m0, n0, mtile, ntile);
+                } else {
+                    layout::detile_accum_i8_scaled(
+                        &mut self.facc,
+                        self.nsub,
+                        slot,
+                        m0,
+                        n0,
+                        mtile,
+                        ntile,
+                        |row, col| a_scale[row * ng + g] * b_scale[(n0_base + col) * ng + g],
+                    );
+                }
+            }
+        }
+        add_ns(&PH_DETILE, t_det);
+        self.out_all[buf].fini()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn compute(
         &mut self,
@@ -438,7 +688,7 @@ impl Worker {
         b_scale: &[f32],
         wt: &Bo,
     ) -> Result<()> {
-        let plan = &self.plan;
+        let plan = self.plan;
         let dense = ng == 0;
         if dense {
             self.iacc.clear();
@@ -448,11 +698,13 @@ impl Worker {
             self.facc.resize(m * self.nsub, 0.0);
         }
         let mut tasks: Vec<DrmRocketTask> = Vec::with_capacity(BATCH);
-        let mut meta: Vec<(usize, usize, usize, usize, usize)> = Vec::with_capacity(BATCH);
+        let mut meta: Vec<TileMeta> = Vec::with_capacity(BATCH);
         let mut ops = Vec::with_capacity(160);
         let mut done = 0usize;
         let total = plan.jobs();
         let mut nb = 0usize;
+        let mut cur = 0usize;
+        let mut pending: Option<(usize, Vec<TileMeta>)> = None;
 
         for mi in 0..plan.nmt {
             let m0 = mi * plan.mt;
@@ -462,14 +714,14 @@ impl Worker {
                 let ntile = plan.n_tile(ni);
                 for ki in 0..plan.nkt {
                     if nb == 0 {
-                        self.regcmd.prep(0)?;
+                        self.regcmd[cur].prep(0)?;
                     }
                     let ktile = plan.k_tile(ki);
                     let out_off = nb * plan.out_slot;
                     let input =
                         self.in_all.dma_address() + ((mi * plan.nkt + ki) * plan.in_slot) as u64;
                     let weights = wt.dma_address() + ((ni * plan.nkt + ki) * plan.wt_slot) as u64;
-                    let output = self.out_all.dma_address() + (out_off * 4) as u64;
+                    let output = self.out_all[cur].dma_address() + (out_off * 4) as u64;
                     let mut p = MatmulParams::new(
                         mtile as u32,
                         ktile as u32,
@@ -479,20 +731,24 @@ impl Worker {
                         output as u32,
                     );
                     p.fp32_to_fp16 = false;
+                    let t_emit = Instant::now();
                     ops.clear();
                     let count = emit(&p, &mut ops)?;
                     if ops.len() > RC_STRIDE {
                         return Err(Error::tiling("int8/regcmd"));
                     }
                     {
-                        let bytes = self.regcmd.as_mut_slice();
+                        let bytes = self.regcmd[cur].as_mut_slice();
                         let base = nb * RC_STRIDE * 8;
                         for (j, op) in ops.iter().enumerate() {
                             bytes[base + j * 8..base + j * 8 + 8]
                                 .copy_from_slice(&op.0.to_ne_bytes());
                         }
                     }
-                    let regcmd = (self.regcmd.dma_address() + (nb * RC_STRIDE * 8) as u64) as u32;
+                    add_ns(&PH_EMIT, t_emit);
+                    PH_JOBS.fetch_add(1, Ordering::Relaxed);
+                    let regcmd =
+                        (self.regcmd[cur].dma_address() + (nb * RC_STRIDE * 8) as u64) as u32;
                     tasks.push(DrmRocketTask {
                         regcmd,
                         regcmd_count: count as u32,
@@ -503,55 +759,31 @@ impl Worker {
                     done += 1;
 
                     if nb == BATCH || done == total {
-                        self.regcmd.fini()?;
-                        self.out_all.prep(0)?;
-                        self.out_all.fini()?;
+                        self.regcmd[cur].fini()?;
+                        self.out_all[cur].prep(0)?;
+                        self.out_all[cur].fini()?;
                         let in_h: [Handle; 3] =
-                            [self.in_all.handle(), wt.handle(), self.regcmd.handle()];
-                        let out_h = [self.out_all.handle()];
-                        // `self` also owns the BOs; submit through the BO's device.
+                            [self.in_all.handle(), wt.handle(), self.regcmd[cur].handle()];
+                        let out_h = [self.out_all[cur].handle()];
+                        let t_sub = Instant::now();
                         self.dev.submit(&tasks, &in_h, &out_h, 0)?;
-                        self.out_all.prep(wait_ns())?;
-                        {
-                            let words = super::bos::i32_words_ref(&self.out_all);
-                            let n0_base = self.n0;
-                            for (j, &(m0, n0, mtile, ntile, g)) in meta.iter().enumerate() {
-                                let slot = &words[j * plan.out_slot..(j + 1) * plan.out_slot];
-                                if dense {
-                                    layout::detile_accum_i32(
-                                        &mut self.iacc,
-                                        self.nsub,
-                                        slot,
-                                        m0,
-                                        n0,
-                                        mtile,
-                                        ntile,
-                                    );
-                                } else {
-                                    let facc = &mut self.facc;
-                                    layout::detile_accum_i8_scaled(
-                                        facc,
-                                        self.nsub,
-                                        slot,
-                                        m0,
-                                        n0,
-                                        mtile,
-                                        ntile,
-                                        |row, col| {
-                                            a_scale[row * ng + g]
-                                                * b_scale[(n0_base + col) * ng + g]
-                                        },
-                                    );
-                                }
-                            }
+                        add_ns(&PH_SUBMIT, t_sub);
+                        // The batch just queued runs while the previous one is
+                        // read back and de-tiled.
+                        if let Some((buf, m_prev)) = pending.take() {
+                            self.drain(buf, &m_prev, &plan, ng, a_scale, b_scale)?;
                         }
-                        self.out_all.fini()?;
+                        pending = Some((cur, std::mem::take(&mut meta)));
+                        meta = Vec::with_capacity(BATCH);
+                        cur ^= 1;
                         nb = 0;
                         tasks.clear();
-                        meta.clear();
                     }
                 }
             }
+        }
+        if let Some((buf, m_prev)) = pending.take() {
+            self.drain(buf, &m_prev, &plan, ng, a_scale, b_scale)?;
         }
         let _ = k;
         Ok(())
@@ -562,10 +794,14 @@ impl Worker {
 /// height (`max_tile`), not the call's `M`, so a resident weight's scatter layout is
 /// M-independent and one pack serves every `M` — the C `rki_worker_alloc`. Only the
 /// live `Mt` and `nMt` follow the call.
-fn plan_for(m: usize, k: usize, n: usize, group: usize) -> Result<Plan> {
+fn plan_for(canon_mt: usize, m: usize, k: usize, n: usize, group: usize) -> Result<Plan> {
     let max_tile = hw::current().max_tile as usize;
     let geom = if group == 0 { &INT8 } else { &INT8_GW };
-    let (cmt, kt, nt) = plan_geom(geom, max_tile.max(4), k, n, group)?;
+    // Only the per-channel layout follows the context's canonical tile height: a
+    // smaller one trades prefill weight reuse for fewer, deeper K-tiles at decode
+    // (`Kt` is derived from the CBUF budget at that height).
+    let plan_mt = if group == 0 { canon_mt } else { max_tile };
+    let (cmt, kt, nt) = plan_geom(geom, plan_mt.max(4), k, n, group)?;
     if group > 0 && !group.is_multiple_of(kt) {
         return Err(Error::shape("int8/group-kt"));
     }

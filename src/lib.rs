@@ -371,6 +371,11 @@ impl RocketI8Ctx {
         Ok(self.inner.pack_weight_gw(m, k, n, b, group)?)
     }
 
+    /// Canonical tile height of the per-channel layout (before the first pack).
+    pub fn set_canonical_mt(&mut self, mt: usize) {
+        self.inner.set_canonical_mt(mt);
+    }
+
     /// Pack a pre-quantized `[N, K]` int8 weight for the per-channel (dense) path.
     pub fn pack_weight(
         &mut self,
@@ -410,6 +415,18 @@ impl RocketI8Ctx {
     ) -> Result<(), Error> {
         Ok(self.inner.matmul_gw(m, k, n, a, a_scale, b_scale, cf, w)?)
     }
+}
+
+/// Phase counters of the resident int8 matmul since the last [`i8_phase_reset`].
+#[cfg(feature = "npu")]
+pub fn i8_phase_stats() -> rocket_npu::matmul::PhaseStats {
+    rocket_npu::matmul::phase_stats()
+}
+
+/// Zero the int8 phase counters.
+#[cfg(feature = "npu")]
+pub fn i8_phase_reset() {
+    rocket_npu::matmul::phase_reset();
 }
 
 /// A group-wise int8 weight resident in NPU buffers.

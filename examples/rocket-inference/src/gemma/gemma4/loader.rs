@@ -330,8 +330,14 @@ pub fn load_gen_model(
     if qat.is_some() {
         // The packed token tables are read separately; stub the parameters
         // first so the dequantized tables are never allocated.
-        model.text_mut().shrink_ple_table();
-        model.text_mut().shrink_embed_table();
+        model.text_mut().shrink_ple_table(device);
+        model.text_mut().shrink_embed_table(device);
+    }
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "load stage [model built+shrunk]: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     let mut store =
         SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
@@ -343,6 +349,12 @@ pub fn load_gen_model(
         }
         None => None,
     };
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "load stage [read_scales]: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     // Per-channel int8 NPU path: the adapter packs the text linears while they
     // load, so their params are stubbed first (no float copy of the text body).
     let first_shared = cfg
@@ -357,10 +369,22 @@ pub fn load_gen_model(
             model.text_mut().for_each_layer_projection_mut(|lin| {
                 crate::gemma::layers::drop_linear_weight(lin, device);
             });
+            if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+                eprintln!(
+                    "load stage [npu init + drop weights]: {:.1}s",
+                    t0.elapsed().as_secs_f64()
+                );
+            }
             Some(first_shared)
         }
         _ => None,
     };
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "load stage [scales read + npu init]: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     let mut store = with_load_adapters(
         store,
         qat.as_ref(),
@@ -372,6 +396,12 @@ pub fn load_gen_model(
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "load stage [load_from done]: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     // KV-shared layers never compute K/V, so checkpoints may omit their
     // weights (the QAT export does; the bf16 one ships them anyway).
     crate::util::store::check_load_report(&result, |name| is_shared_kv_param(name, first_shared))?;
@@ -430,6 +460,12 @@ pub fn load_gen_model(
         };
         model.text_mut().set_packed_embed(table, round);
     }
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "load stage [tables set]: {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+    }
     if !defer_towers {
         load_towers_with(
             &mut model,
@@ -446,6 +482,18 @@ pub fn load_gen_model(
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
     if npu_pack.is_some() {
         let n = register_qat_npu(&model);
+        pack_npu_head(&model);
+        if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+            let g = |c: &std::sync::atomic::AtomicU64| {
+                c.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9
+            };
+            eprintln!(
+                "load phases (s, inside the adapter): bytes {:.1} unpack {:.1} pack {:.1}",
+                g(&LOAD_BYTES_NS),
+                g(&LOAD_UNPACK_NS),
+                g(&LOAD_PACK_NS)
+            );
+        }
         crate::gemma::layers::set_npu_prefill_only(false);
         let (mut bytes, mut count) = (0usize, 0usize);
         if let Some(st) = burn_rocket::mem_stats() {
@@ -962,6 +1010,12 @@ pub fn quantize_gen(model: GenRoot) -> Result<GenRoot> {
 /// full-size table copy (the `[vocab, hidden]` table stays packed).
 pub fn build_lm_head(text: &GenTextModel, dtype: DType, device: &Device) -> Tensor<2> {
     use burn::tensor::{bf16, f16};
+    // The head already lives on the NPU (`pack_npu_head`): `logits` never reads
+    // this tensor, so do not materialize the 1.3 GiB dense table.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if crate::gemma::layers::npu_head().is_some() {
+        return Tensor::<2>::zeros([1, 1], (device, dtype));
+    }
     if let Some(table) = text.packed_embed() {
         let shape = [table.k, table.rows];
         let data = match dtype {
@@ -1009,6 +1063,15 @@ pub struct QatAdapter {
     /// weights instead of dequantizing them (see [`set_qat_npu`]).
     npu_pack: Option<usize>,
 }
+
+/// Load-phase counters of the QAT NPU pack (nanoseconds): tensor bytes, code
+/// unpack, `pack_qat` (BO scatter). Printed with `ROCKET_PHASE_LOG=1`.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static LOAD_BYTES_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static LOAD_UNPACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static LOAD_PACK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ModuleAdapter for QatAdapter {
     fn adapt(&self, tensor: PackTensor, _ctx: ModuleContext<'_>) -> PackTensor {
@@ -1070,6 +1133,7 @@ impl ModuleAdapter for QatAdapter {
                 Shape::new([1, 1]),
                 move |data| {
                     if !skip {
+                        let t_a = std::time::Instant::now();
                         let bytes: Vec<u8> = if data.dtype() == DType::U8 {
                             data.try_to_vec().expect("packed u8")
                         } else {
@@ -1079,7 +1143,9 @@ impl ModuleAdapter for QatAdapter {
                                 .map(|v| v as u8)
                                 .collect()
                         };
+                        let t_b = std::time::Instant::now();
                         let codes = crate::gemma::qat::unpack_codes(&bytes, bits, rows, k);
+                        let t_c = std::time::Instant::now();
                         let id = burn_rocket::pack_qat(
                             &codes,
                             scales.weight_scale.clone(),
@@ -1088,6 +1154,14 @@ impl ModuleAdapter for QatAdapter {
                             scales.in_scale,
                             scales.out_scale,
                         );
+                        let t_d = std::time::Instant::now();
+                        for (c, d) in [
+                            (&LOAD_BYTES_NS, t_b - t_a),
+                            (&LOAD_UNPACK_NS, t_c - t_b),
+                            (&LOAD_PACK_NS, t_d - t_c),
+                        ] {
+                            c.fetch_add(d.as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
                         crate::gemma::layers::stash_qat_packed(path.clone(), id);
                     }
                     TensorData::new(vec![0.0f32], [1, 1])
@@ -1185,6 +1259,35 @@ fn register_srq_scales<M: burn::module::Module>(
         }
     }
     n
+}
+
+/// Pack the tied LM head (the 2-bit `embed_tokens` table, per-row scales) as a
+/// resident per-channel int8 NPU weight. The checkpoint's `lm_head` activation
+/// scales are 0 (uncalibrated, like the reference), so the NPU matmul scales the
+/// single final hidden row dynamically.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn pack_npu_head(model: &GenRoot) {
+    let Some(table) = model.text().packed_embed() else {
+        return;
+    };
+    if table.blocks != 1 {
+        println!(
+            "NPU: lm_head not packed (table has {} scale blocks)",
+            table.blocks
+        );
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let codes =
+        crate::gemma::qat::unpack_codes(table.data.as_slice(), table.bits, table.rows, table.k);
+    let id = burn_rocket::pack_qat(&codes, table.scales.clone(), table.rows, table.k, 0.0, 0.0);
+    crate::gemma::layers::set_npu_head(id);
+    println!(
+        "NPU: tied lm_head [{} x {}] resident as per-channel int8 in {:.2}s",
+        table.rows,
+        table.k,
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 /// Bind the weights the adapter packed (by module path) to their `ParamId`s so

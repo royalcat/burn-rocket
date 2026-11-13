@@ -471,20 +471,30 @@ pub fn detile_accum_i32(
     ntile: usize,
 ) {
     let h = mtile;
-    for row in 0..mtile {
-        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
-        let mut col = 0;
-        while col + 4 <= ntile {
-            let g = col / 4;
-            let src = &slot[g * h * 4 + 4 * row..][..4];
-            for (dv, sv) in d[col..col + 4].iter_mut().zip(src) {
-                *dv += *sv as i64;
+    // Row blocks: each 4-column group of a block is a contiguous `RB * 16` B read of
+    // the cube and each destination row is walked left to right, so both sides stay
+    // cache-resident (a plain row-major walk strides the cube by `h * 16` B).
+    const RB: usize = 16;
+    let full = ntile / 4;
+    let mut r0 = 0;
+    while r0 < mtile {
+        let rb = RB.min(mtile - r0);
+        for g in 0..full {
+            let base = g * h * 4 + 4 * r0;
+            let src = &slot[base..base + 4 * rb];
+            for (r, sv) in src.as_chunks::<4>().0.iter().enumerate() {
+                let d = &mut acc[(m0 + r0 + r) * n + n0 + g * 4..][..4];
+                d[0] += sv[0] as i64;
+                d[1] += sv[1] as i64;
+                d[2] += sv[2] as i64;
+                d[3] += sv[3] as i64;
             }
-            col += 4;
         }
-        while col < ntile {
-            d[col] += slot[out_idx_i8(h, col + 1, row + 1)] as i64;
-            col += 1;
+        r0 += rb;
+    }
+    for row in 0..mtile {
+        for col in full * 4..ntile {
+            acc[(m0 + row) * n + n0 + col] += slot[out_idx_i8(h, col + 1, row + 1)] as i64;
         }
     }
 }
@@ -502,20 +512,29 @@ pub fn detile_accum_i8_scaled(
     scale: impl Fn(usize, usize) -> f32,
 ) {
     let h = mtile;
-    for row in 0..mtile {
-        let d = &mut acc[(m0 + row) * n + n0..][..ntile];
-        let mut col = 0;
-        while col + 4 <= ntile {
-            let g = col / 4;
-            let src = &slot[g * h * 4 + 4 * row..][..4];
-            for (j, v) in src.iter().enumerate() {
-                d[col + j] += scale(m0 + row, n0 + col + j) * (*v as f32);
+    const RB: usize = 16;
+    let full = ntile / 4;
+    let mut r0 = 0;
+    while r0 < mtile {
+        let rb = RB.min(mtile - r0);
+        for g in 0..full {
+            let base = g * h * 4 + 4 * r0;
+            let src = &slot[base..base + 4 * rb];
+            for (r, sv) in src.as_chunks::<4>().0.iter().enumerate() {
+                let row = m0 + r0 + r;
+                let c = n0 + g * 4;
+                let d = &mut acc[row * n + c..][..4];
+                for j in 0..4 {
+                    d[j] += scale(row, c + j) * (sv[j] as f32);
+                }
             }
-            col += 4;
         }
-        while col < ntile {
-            d[col] += scale(m0 + row, n0 + col) * slot[out_idx_i8(h, col + 1, row + 1)] as f32;
-            col += 1;
+        r0 += rb;
+    }
+    for row in 0..mtile {
+        for col in full * 4..ntile {
+            acc[(m0 + row) * n + n0 + col] +=
+                scale(m0 + row, n0 + col) * slot[out_idx_i8(h, col + 1, row + 1)] as f32;
         }
     }
 }

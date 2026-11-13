@@ -250,6 +250,11 @@ pub fn generate_with_media(
     };
     let mut rng = SplitMix64(0x5EED_1234_ABCD_0001);
 
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    {
+        burn_rocket::i8_phase_reset();
+        burn_rocket::stats_reset();
+    }
     let t0 = std::time::Instant::now();
     // NPU prefill: the packed weights are used only inside this call.
     crate::gemma::layers::set_prefill_mode(true);
@@ -260,6 +265,25 @@ pub fn generate_with_media(
     }
     let next = sample(&logits, opts, &mut rng)?;
     stats.prefill_s = t0.elapsed().as_secs_f64();
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        let st = burn_rocket::stats();
+        let p = burn_rocket::i8_phase_stats();
+        eprintln!(
+            "prefill {:.1}s: in-driver matmul {:.1}s, host convert {:.1}s, calls {}; int8 (worker-summed s): pack {:.1} emit {:.1} submit {:.1} wait {:.1} detile {:.1} fanout {:.1}, jobs {}",
+            stats.prefill_s,
+            st.npu_s,
+            st.convert_s,
+            st.calls,
+            p.pack_s,
+            p.emit_s,
+            p.submit_s,
+            p.wait_s,
+            p.detile_s,
+            p.fanout_s,
+            p.jobs
+        );
+    }
 
     let t1 = std::time::Instant::now();
     let (out, stopped) = decode_loop(
@@ -269,6 +293,7 @@ pub fn generate_with_media(
         &mut kv,
         opts,
         next,
+        ids,
         chunk,
         device,
         &mut rng,
@@ -278,6 +303,42 @@ pub fn generate_with_media(
     stats.generated = out.len();
     stats.stopped = stopped;
     Ok((out, stats))
+}
+
+/// Draft length of the prompt-lookup speculation (`ROCKET_SPEC`, 0 = off). Only
+/// greedy runs speculate: a sampled run would need rejection sampling, and the
+/// per-step top-8 dump wants one logits row per forward.
+fn spec_draft_len(opts: &GenOptions) -> usize {
+    if !opts.greedy || opts.collect_top8 {
+        return 0;
+    }
+    std::env::var("ROCKET_SPEC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(7)
+}
+
+/// The tokens that followed the most recent earlier occurrence of the history's
+/// trailing 3- (then 2-) gram, at most `k` of them; empty when there is none.
+fn draft_lookup(hist: &[u32], k: usize) -> Vec<u32> {
+    let len = hist.len();
+    for n in [3usize, 2] {
+        if len <= n {
+            continue;
+        }
+        let pat = &hist[len - n..];
+        for i in (0..len - n).rev() {
+            if &hist[i..i + n] == pat {
+                let from = i + n;
+                let to = (from + k).min(len);
+                if to > from {
+                    return hist[from..to].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// The token-by-token decode loop: one cached forward, logits and a sample per
@@ -302,32 +363,153 @@ fn decode_loop(
     kv: &mut GenKv,
     opts: &GenOptions,
     first: u32,
+    context: &[u32],
     chunk: usize,
     device: &Device,
     rng: &mut SplitMix64,
     top8: &mut Vec<Vec<(u32, f32)>>,
 ) -> Result<(Vec<u32>, bool)> {
     let stages_before = gen_stage_stats();
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    {
+        burn_rocket::i8_phase_reset();
+        burn_rocket::stats_reset();
+    }
+    let (mut t_forward, mut t_logits, mut t_sample) = (0.0f64, 0.0f64, 0.0f64);
     let started = std::time::Instant::now();
     let mut out: Vec<u32> = Vec::new();
     let mut stopped = false;
     let mut next = first;
-    for _ in 0..opts.max_new_tokens {
+    // Greedy prompt-lookup speculation: draft the continuation of the latest
+    // repeated n-gram and verify it in one forward (the NPU pads M to 4 anyway).
+    let spec_k = spec_draft_len(opts);
+    let mut hist: Vec<u32> = context.to_vec();
+    let (mut drafted, mut accepted_n, mut verifies) = (0usize, 0usize, 0usize);
+    while out.len() < opts.max_new_tokens {
         out.push(next);
+        hist.push(next);
         if opts.eos.contains(&next) {
             stopped = true;
             break;
         }
-        let input = crate::gemma::inputs::make_input(&[next], device);
+        if out.len() >= opts.max_new_tokens {
+            break;
+        }
         let seq_start = kv.len;
+        let draft = if spec_k > 0 {
+            draft_lookup(&hist, spec_k)
+        } else {
+            Vec::new()
+        };
+        if !draft.is_empty() {
+            let mut toks = vec![next];
+            toks.extend_from_slice(&draft);
+            let input = crate::gemma::inputs::make_input(&toks, device);
+            let t = std::time::Instant::now();
+            let h = model.text().forward(input, ropes, kv, seq_start, chunk);
+            t_forward += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let logits = model.text().logits_rows(h, lm_head);
+            let vocab = logits.dims()[1];
+            let all: Vec<f32> = logits.cast(DType::F32).into_data().try_to_vec()?;
+            t_logits += t.elapsed().as_secs_f64();
+            let pred = |r: usize| -> u32 {
+                let row = &all[r * vocab..(r + 1) * vocab];
+                let mut best = 0usize;
+                let mut best_v = f32::NEG_INFINITY;
+                for (i, &x) in row.iter().enumerate() {
+                    if x > best_v {
+                        best_v = x;
+                        best = i;
+                    }
+                }
+                best as u32
+            };
+            let mut a = 0;
+            while a < draft.len() && pred(a) == draft[a] {
+                a += 1;
+            }
+            drafted += draft.len();
+            accepted_n += a;
+            verifies += 1;
+            kv.truncate(seq_start + 1 + a);
+            // The accepted drafts are real output; the row after them is the next token.
+            let mut done = false;
+            for &d in &draft[..a] {
+                out.push(d);
+                hist.push(d);
+                if opts.eos.contains(&d) {
+                    stopped = true;
+                    done = true;
+                    break;
+                }
+                if out.len() >= opts.max_new_tokens {
+                    done = true;
+                    break;
+                }
+            }
+            if done {
+                break;
+            }
+            next = pred(a);
+            continue;
+        }
+        let input = crate::gemma::inputs::make_input(&[next], device);
+        let t = std::time::Instant::now();
         let h = model.text().forward(input, ropes, kv, seq_start, chunk);
+        let _ = h.clone().slice(s![.., 0..1, 0..1]).into_data(); // sync the lazy graph
+        t_forward += t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
         let logits = model.text().logits(h, lm_head);
+        let _ = logits.clone().slice(s![0..1, 0..1]).into_data();
+        t_logits += t.elapsed().as_secs_f64();
         if opts.collect_top8 {
             top8.push(top_k(&logits, 8));
         }
+        let t = std::time::Instant::now();
         next = sample(&logits, opts, rng)?;
+        t_sample += t.elapsed().as_secs_f64();
+    }
+    if verifies > 0 && std::env::var_os("ROCKET_PHASE_LOG").is_some() {
+        eprintln!(
+            "speculation: {verifies} verify passes, {accepted_n}/{drafted} drafted tokens accepted"
+        );
     }
     let decode_s = started.elapsed().as_secs_f64();
+    if std::env::var_os("ROCKET_PHASE_LOG").is_some() && !out.is_empty() {
+        let n = out.len() as f64;
+        eprintln!(
+            "decode/token: forward {:.0} ms, logits {:.0} ms, sample {:.0} ms ({} tokens)",
+            t_forward / n * 1e3,
+            t_logits / n * 1e3,
+            t_sample / n * 1e3,
+            out.len()
+        );
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        {
+            let st = burn_rocket::stats();
+            eprintln!(
+                "ext per token: in-driver matmul {:.0} ms, host convert (quantize+epilogue) {:.0} ms, calls {:.0}",
+                st.npu_s / n * 1e3,
+                st.convert_s / n * 1e3,
+                st.calls as f64 / n
+            );
+            let p = burn_rocket::i8_phase_stats();
+            let c = p.calls.max(1) as f64;
+            eprintln!(
+                "int8 npu calls/token {:.0}, jobs/token {:.0}; per call (ms, worker-summed): \
+                 pack {:.3} emit {:.3} submit {:.3} wait {:.3} detile {:.3} | fanout {:.3}",
+                p.calls as f64 / n,
+                p.jobs as f64 / n,
+                p.pack_s / c * 1e3,
+                p.emit_s / c * 1e3,
+                p.submit_s / c * 1e3,
+                p.wait_s / c * 1e3,
+                p.detile_s / c * 1e3,
+                p.fanout_s / c * 1e3,
+            );
+        }
+    }
     let (attn_s, mlp_s, ple_s, norms_s) = gen_stage_stats();
     let span = tracing::Span::current();
     span.record("gen_tokens", out.len());
@@ -362,4 +544,23 @@ pub(crate) fn gen_eos(model_dir: &Path) -> Vec<u32> {
         }
     }
     eos
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::draft_lookup;
+
+    #[test]
+    fn lookup_drafts_the_continuation_of_the_latest_repeat() {
+        // ... 5 6 7 8 9 ... 5 6 7  -> draft 8 9 ...
+        let h = [1, 5, 6, 7, 8, 9, 2, 5, 6, 7];
+        assert_eq!(draft_lookup(&h, 3), vec![8, 9, 2]);
+        assert_eq!(draft_lookup(&h, 2), vec![8, 9]);
+    }
+
+    #[test]
+    fn lookup_is_empty_without_a_repeat() {
+        assert!(draft_lookup(&[1, 2, 3, 4, 5], 3).is_empty());
+        assert!(draft_lookup(&[1, 2], 3).is_empty());
+    }
 }

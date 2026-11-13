@@ -1594,7 +1594,7 @@ no CPU copies. Default (`--npu-dtype fp16`) is unchanged. `--int8-group` is reje
   decode 0.94 (NPU) vs 0.78 tok/s (CPU).
 - **E4B** (`gemma-4-E4B-it-qat-mobile-transformers`, 3.5 GiB, board
   `/root/models/gemma-4-E4B-it-qat-mobile`): 342 linears, **3.84 GiB BO**, load 129-137 s,
-  221 MiB anon after load, peak anon 3.5 GiB on a 1073-token request. Layer-0 hidden summary
+  221 MiB anon after load (134 after the decode round), peak anon 3.5 GiB on a 1073-token request (2.27 after it). Layer-0 hidden summary
   matches the f32 CPU reference to 4 digits; first 21 greedy ids equal the host f16 run (12/12
   vs f32), then the usual QAT near-tie. 19-token prompt prefill 2.4 s, decode 0.68 tok/s;
   1073 tokens prefill 83.9 s, decode 0.51 tok/s (board shared, load ~8). Decode is the weak
@@ -1607,10 +1607,105 @@ no CPU copies. Default (`--npu-dtype fp16`) is unchanged. `--int8-group` is reje
 - **Known issue (not mine)**: `--device cpu` on an aarch64 `npu` build panics in prefill
   (`burn_rocket::init() has not been called` from `causal_attention`): prefill mode routes
   attention to the NPU regardless of placement.
+- **Decode round (2026-11-13, same section)**: board cores 4-7, live containers stopped,
+  E4B, short prompt. Where a token goes (before): forward 1417-1520 ms (94% of it inside
+  the int8 matmul calls: 342 calls x ~4.2 ms, ~2.6 ms of each is hardware wait), `lm_head`
+  321-335 ms, sampling 1 ms, host quantize/epilogue 13-15 ms. Kept: (1) **persistent
+  pinned worker pool** in `I8Context` (`Pool`, replaces the per-call `thread::scope`;
+  fan-out 0.60 -> 0.24 ms per call, forward 1520 -> 1263 ms, also faster prefill: E4B
+  1073 tokens 83.9 -> 66.4 s); (2) **tied `lm_head` on the NPU**
+  (`gemma4/loader.rs::pack_npu_head`: the 2-bit `embed_tokens` table widened to int8,
+  per-row scales, 0.6 GiB BO; the checkpoint's `lm_head` activation scales are 0, so
+  `pack_qat(.., in_scale = 0)` means *dynamic per-row* scaling; `logits` 335 -> 155 ms
+  and the dense 1.3 GiB f16 head is no longer built); (3) **3 workers by default** for
+  this path (default elsewhere stays 5; the NPU has 3 cores). Results: E4B decode
+  0.54-0.58 -> 0.70 tok/s (short prompt) / 0.51 -> 0.58 (1073-token context), peak anon
+  3.5 -> 2.27 GiB, 134 MiB resident after load; E2B decode 0.94 -> 1.45 tok/s, ids still
+  32/32 equal to the host CPU f16 run. int8 selftests (dense, prepacked, gw, prepacked-gw)
+  stay exact/bit-identical and the `q8_bench` gates PASS (the pool serves every
+  `I8Context` user). Diagnostics: `ROCKET_PHASE_LOG=1` prints per-token forward/logits/
+  sample times and the int8 phase counters (pack/emit/submit/wait/detile/fan-out) at the
+  end of `gen`.
+  **Measured and rejected / not adopted**: NPU int4 mode with the activation split into
+  two nibble digits (exact w4a8 at half the weight bytes) - an int4 resident matmul at
+  M=8 takes the same time as int8 at M=4 (7.4 vs 6.9 ms), so decode is not weight-byte
+  bound; a decode-shaped layout (`ROCKET_I8_MT=32` -> Kt 1280) is 25-30% faster in the
+  M=4 microbenchmark but only ~1% end to end and costs 10-20% prefill wall (CPU -40%), so
+  it stays opt-in; `--npu-threads 3` alone showed no end-to-end gain before the pool
+  (0.67 vs 0.69 tok/s); running NPU and CPU decode concurrently: both share one DRAM
+  ceiling (~18-19 GB/s; 2 CPU readers take the NPU matmul from 6.2 to 9.7 ms for a ~12%
+  combined gain), so splitting each matmul across the devices does not pay. The
+  remaining overhead is ~63% hardware wait per call plus worker imbalance (slowest
+  worker ~25% above the mean) and the per-call fixed cost; **not done**: fused q|k|v and
+  gate|up (the adapter sees the three tensors one at a time, so it needs buffering; est.
+  -0.1 s/token), a single-fd multi-job submit to balance the 3 cores dynamically, caching
+  the emitted programs per weight (`emit` is ~0.1 ms per worker per call), and a CPU
+  `sdot` int4 decode kernel (est. 3+ tok/s: all 8 cores have `asimddp`, single-thread
+  streaming read is 12 GB/s; parked, it is the biggest remaining lever).
+- **Prefill profile + Gemma 4 glue (2026-11-13)**: `ROCKET_PHASE_LOG=1` now also prints a
+  `prefill` line (in-driver matmul, host convert, int8 phase counters). E4B 1073 tokens,
+  66 s: in-driver matmul 40.7 s, host quantize/epilogue 9.8 s, int8 de-tile 24.8 s
+  worker-summed (~8 s wall, the P2 double-buffer target), the rest attention/glue.
+  `gemma4/model.rs` now calls the `layers::{rms_norm, gelu_mul, rope_apply}` wrappers; the
+  glue is **off by default** for Gemma 4 (`ROCKET_GLUE=1` enables it): it cut E4B prefill
+  71.1 -> 66.0 s with identical ids, but flipped an E2B near-tie at token 5 (SRQ
+  rounding), so the 32/32 parity gate fails with it on.
+- **P2 double-buffered batches (2026-11-13)**: `Worker` in `matmul/int8.rs` now owns two
+  regcmd and two output BOs (`[Bo; 2]`); batch b+1 is submitted before batch b is waited
+  on and de-tiled (`Worker::drain`). Bit-identical (int8 selftests exact, E2B 32/32 vs the
+  host f16 reference). E4B 1073-token prefill 71.1 -> **63.8 s** (glue off), in-driver
+  matmul 40.7 -> 32.0 s; wait 56.6 -> 33.5 s worker-summed, so de-tile (28.5 s summed,
+  ~9.5 s wall) is now the largest exposed host cost, followed by host convert (6.5 s).
+  Cost: a second out/regcmd BO set per worker scratch shape. Next: P3 (i32 accumulation
+  when `K*127*128 < 2^31`, vectorized de-tile) and the load-time work.
+- **Load round (2026-11-13)**: E4B QAT int8 load 141 -> **41.6 s**, E2B parity still 32/32.
+  `ROCKET_PHASE_LOG=1` prints `load stage [...]` timestamps and the adapter split. The
+  141 s was mostly wasted work: `Param::map`/`.val()` on a *lazy* burn parameter runs its
+  random initializer over the full f32 tensor. `drop_linear_weight` now uses
+  `Param::initialized(id, stub)` (71 s) and `shrink_ple_table/shrink_embed_table(device)`
+  no longer read the old table's device (17 s). Rule: never `map`/`val()` a
+  parameter you are about to replace. Remaining (E4B): `read_scales` 12 s, the weight pass
+  ~30 s (file read ~19 s at 187 MB/s, code unpack 6 s, BO scatter 5.6 s, now one thread
+  per worker in `pack_codes`).
+- **P3 blocked de-tile + D4 speculative decoding (2026-11-13)**: `detile_accum_i32` /
+  `detile_accum_i8_scaled` walk 16-row blocks (contiguous cube reads, sequential
+  destination rows) instead of striding the cube per row: bit-identical (int8 selftests
+  exact, E2B 32/32), E4B 1073-token prefill 63.8 -> 61.5 s, de-tile 28.5 -> 25.4 s
+  worker-summed. **D4** (`gemma4/chat.rs::decode_loop`): greedy prompt-lookup speculation —
+  the trailing 3- (then 2-) gram's latest earlier occurrence in prompt+output drafts up to
+  `ROCKET_SPEC` (default 3, 0 = off) tokens, verified in ONE forward over `[next, drafts]`
+  (the NPU pads M to 4, so it costs about one token); `GenTextModel::logits_rows` gives
+  every row, `GenKv::truncate` rolls back the rejected ones. Only for `greedy` without
+  `collect_top8`; a step with no draft is the unchanged single-token path.
+  `ROCKET_PHASE_LOG=1` prints `speculation: N verify passes, a/d drafted accepted`.
+  Board E2B: repeat-the-text prompt 1.48 -> **3.66 tok/s** (23/24 drafts accepted), ids
+  identical to `ROCKET_SPEC=0`; the sky prompt never drafts and keeps the 32/32 host-f16
+  reference ids. Not done / evaluated as low-yield: D1 (cache emitted programs, ~3% of
+  decode), D2 (single-fd multi-job submit, needs a kernel-scheduling microbenchmark first),
+  D3 (fused q|k|v and gate|up, ~0.05-0.1 s/token).
+- **Handoff notes (end of the 2026-11-13 session)**: everything above is committed;
+  nothing is half-done. Open items for the next agent, in rough value order:
+  (1) **D4 caveat**: the sky prompt (no draft ever found) read 1.23 tok/s with
+  `ROCKET_SPEC=3` vs 1.59 with `ROCKET_SPEC=0`, same ids. Not isolated (board noise was
+  +-20%); re-run both on an idle board, and if a no-draft step really costs more, check
+  `draft_lookup` (O(history) per token) and the extra `hist` bookkeeping before blaming
+  the model path. D4 was only verified on E2B; run E4B and a chat-shaped prompt too.
+  (2) D1 (cache emitted programs per weight, ~3% of decode), D2 (single-fd multi-job submit:
+  microbenchmark must beat the pool by >=10% first; depends on how the `rocket` kernel
+  spreads one submit over the 3 cores), D3 (fused q|k|v and gate|up: needs the adapter to
+  buffer three tensors; ~0.05-0.1 s/token) were deliberately skipped as low-yield.
+  (3) Gemma 4 fused glue (`ROCKET_GLUE=1`) is off by default: it flipped an E2B near-tie.
+  (4) After the final clippy fix (`as_chunks` in `layout.rs`) the board was not re-run;
+  the change is mechanical and host tests (rocket-npu 268) pass, but re-verify the int8
+  selftests once on the board. Remaining load time (E4B 41.6 s): `read_scales` ~12 s and
+  the weight pass ~30 s (mostly the 187 MB/s file read). The parked CPU `sdot` int4 decode
+  kernel and the NPU clock experiment (needs the user's go-ahead) are the bigger levers.
+  Board protocol: stop `home-llm-gateway-embed-1` / `home-llm-gateway-decision-1`, run with
+  `taskset -c 4-7`, restart them afterwards (scripts were in `/tmp/opencode/e4b/`, ephemeral).
 - **Not done**: vision tower on the NPU int8 (weights are already int8 + act scales),
-  `lm_head`/`per_layer_model_projection` on the NPU, fused q|k|v and gate|up (each
-  projection re-quantizes its input; shared in_scale makes this a clean follow-up), fusing
-  the epilogue into a NEON kernel, decode tuning, KV-cache scales (`k/v_cache_scale` are
+  `per_layer_model_projection` on the NPU, fused q|k|v and gate|up (each projection
+  re-quantizes its input; shared in_scale makes this a clean follow-up), fusing the
+  epilogue into a NEON kernel, KV-cache scales (`k/v_cache_scale` are
   ignored; tokens match the reference without them).
 
 ## Decision family (2026-11-01, vllm-sr d3)
