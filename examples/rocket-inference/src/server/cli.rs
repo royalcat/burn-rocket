@@ -175,11 +175,24 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
         Family::Gemma4 => {
             let dtype = gemma4_load_dtype(&load);
+            // `--npu-dtype int8` on a QAT checkpoint packs per-channel int8 during the load.
+            let qat_int8 = load.npu_dtype == crate::cli::NpuDtype::Int8;
+            if qat_int8 {
+                #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+                {
+                    if !gen_loader::is_qat_checkpoint(&model_dir) {
+                        bail!(
+                            "--npu-dtype int8 on gemma4 needs a QAT checkpoint (quant_method gemma)"
+                        );
+                    }
+                    gen_loader::set_qat_npu(load.npu_threads);
+                }
+            }
             #[allow(unused_mut)]
             let (mut model, cfg) =
                 gen_loader::load_gen_model(&model_dir, dtype, &device, load.defer_towers)?;
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
-            if load.placement.text {
+            if load.placement.text && !qat_int8 {
                 gen_loader::pack_text_for_prefill(
                     &mut model,
                     load.npu_threads,

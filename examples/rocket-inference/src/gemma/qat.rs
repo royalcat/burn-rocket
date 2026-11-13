@@ -341,6 +341,25 @@ pub fn dequantize_weight(
     out
 }
 
+/// Unpack a `[rows, packed_k]` integer weight into signed int8 codes `[rows, k]`
+/// (the same codes [`dequantize_weight`] multiplies by the scale, widened to
+/// `i8`), for the NPU's per-channel int8 path.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn unpack_codes(packed: &[u8], bits: u8, rows: usize, k: usize) -> Vec<i8> {
+    use rayon::prelude::*;
+
+    let packed_k = k.div_ceil(values_per_byte(bits));
+    let mut out = vec![0i8; rows * k];
+    out.par_chunks_mut(k)
+        .zip(packed.par_chunks(packed_k))
+        .for_each(|(orow, prow)| {
+            for (c, o) in orow.iter_mut().enumerate() {
+                *o = packed_code(prow, bits, c);
+            }
+        });
+    out
+}
+
 /// Read all `*.weight_scale` / `*_activation_scale` tensors into per-module
 /// scale records.
 pub fn read_scales(
@@ -510,4 +529,45 @@ pub fn read_packed_table(
         data: TableBytes::Owned(data),
         scales,
     })
+}
+
+#[cfg(all(test, feature = "npu", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    /// The NPU path feeds `unpack_codes` straight to the int8 matmul, so its
+    /// codes times the scale must be exactly what `dequantize_weight` produces.
+    #[test]
+    fn unpacked_codes_times_scale_are_the_dequantized_weight() {
+        for bits in [2u8, 4, 8] {
+            let (rows, k) = (3usize, 64usize);
+            let packed_k = k / values_per_byte(bits);
+            let packed: Vec<u8> = (0..rows * packed_k)
+                .map(|i| (i as u32).wrapping_mul(2654435761).rotate_left(7) as u8)
+                .collect();
+            let scales = ModuleScales {
+                weight_scale: vec![0.5, 0.125, 2.0],
+                blocks: 1,
+                in_scale: 1.0,
+                out_scale: 1.0,
+            };
+            let dq = dequantize_weight(&packed, bits, rows, k, &scales);
+            let codes = unpack_codes(&packed, bits, rows, k);
+            for r in 0..rows {
+                for c in 0..k {
+                    assert_eq!(
+                        codes[r * k + c] as f32 * scales.weight_scale[r],
+                        dq[r * k + c],
+                        "bits {bits} row {r} col {c}"
+                    );
+                }
+            }
+            let (lo, hi) = match bits {
+                2 => (-2, 1),
+                4 => (-8, 7),
+                _ => (-128, 127),
+            };
+            assert!(codes.iter().all(|&c| (lo..=hi).contains(&(c as i32))));
+        }
+    }
 }

@@ -76,6 +76,15 @@ pub(crate) fn weight_dtype<const D: usize>(w: &Param<Tensor<D>>) -> DType {
 /// know which projections were packed: the loader packs a weight, registers its
 /// id and drops the CPU copy. The SRQ registry works the same way.
 pub(crate) fn lin<const D: usize>(l: &Linear, x: Tensor<D>) -> Tensor<D> {
+    // A QAT linear packed as a per-channel int8 NPU weight quantizes its input
+    // with the calibrated static scale and rounds its output to the calibrated
+    // grid inside the matmul, so the SRQ passes below must not run around it.
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if let Some(id) = npu_lookup(&l.weight)
+        && id.is_qat()
+    {
+        return burn_rocket::matmul(x, &id);
+    }
     let srq = srq_lookup(&l.weight);
     let x = match srq {
         Some((in_scale, _)) => apply_srq(x, in_scale),
@@ -251,6 +260,43 @@ pub fn register_npu_weight(param: &Param<Tensor<2>>, id: burn_rocket::WeightId) 
     guard
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(param.id.val(), id);
+}
+
+/// Register a packed weight by raw `ParamId` (the QAT per-channel int8 path
+/// packs inside the checkpoint adapter, before the params can be named).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn register_npu_weight_id(param: burn::module::ParamId, id: burn_rocket::WeightId) {
+    let mut guard = NPU_WEIGHTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(param.val(), id);
+}
+
+/// QAT weights packed by the checkpoint adapter, by module path, until
+/// `take_qat_packed` hands them to the loader to bind to their `ParamId`s.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+static QAT_PACKED: std::sync::Mutex<
+    Option<std::collections::HashMap<String, burn_rocket::WeightId>>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn stash_qat_packed(path: String, id: burn_rocket::WeightId) {
+    QAT_PACKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(path, id);
+}
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn take_qat_packed() -> std::collections::HashMap<String, burn_rocket::WeightId> {
+    QAT_PACKED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .unwrap_or_default()
 }
 
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]

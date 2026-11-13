@@ -1551,6 +1551,68 @@ M5b's block-wise table quantizer against the whole-table form (block sizes
 rocket-inference --no-default-features` and the aarch64+`npu` clippy are clean;
 `cargo fmt --all -- --check` is clean.
 
+## Gemma 4 QAT on the NPU: per-channel int8 (2026-11-13)
+
+`rocket-inference gen|serve --model-dir <gemma-4-*-qat-mobile-transformers> --device npu
+--npu-dtype int8 [--defer-towers]` packs the text linears of a Gemma 4 QAT-mobile
+checkpoint as **resident per-channel int8** NPU weights, prefill *and* decode on the NPU,
+no CPU copies. Default (`--npu-dtype fp16`) is unchanged. `--int8-group` is rejected here
+(per-channel), and `--decode-device npu` is required (there are no CPU weights).
+
+- **Why this works where Q8_0 group-32 did not** (log §20): the checkpoint stores int2/4/8
+  codes with ONE scale per output channel and calibrated static per-tensor int8 activation
+  scales (`input_activation_scale`/`output_activation_scale`, the "a8o8"). Codes widen to
+  int8 exactly; the NPU's int8 mode is exact int32 (host int64 K-sum), so the only
+  readback is `4*nKt` B/element (nKt = 4 for K=2560, 16 for the E4B down K=10240) instead of
+  `4*K/32`. The NPU int4 mode is int4 x int4 and cannot take int8 activations: not usable.
+- **Mixed precision of the file** (E4B; E2B is the same schema, its layers >= 15 MLPs are
+  2-bit): q/k/v/o + gate/up/down int4 (E2B: some int2), `per_layer_input_gate`/
+  `per_layer_projection` int8, `embed_tokens`/`lm_head` int2 per-row (the stored `lm_head`
+  is byte-identical to the embedding table, so the tied-head path covers it), PLE int2
+  block-256 (E4B) / int4 (E2B), vision int8, audio int2 (lconv `linear_start` int4),
+  norms/`layer_scalar`/`per_layer_model_projection` unquantized. Only the nine per-layer
+  text projections go to the NPU; tables, head, towers and norms stay as before.
+- **Code**: `qat::unpack_codes` (== `dequantize_weight / scale`, tested); the checkpoint
+  `QatAdapter` packs each projection while the store applies it (`npu_pack`,
+  `gen_loader::set_qat_npu`), params are pre-stubbed to `[1,1]`, so there is no float copy
+  and no 7-12 GiB load transient; `register_qat_npu` binds the packed ids to `ParamId`s.
+  `burn_rocket::pack_qat(codes, w_scale, n, k, in_scale, out_scale)` + `WeightId::is_qat`;
+  `matmul_qat` (src/ext.rs) quantizes with the static scale (ties-to-even, clamp
+  [-128,127] = the SRQ grid), runs `I8Context::matmul`, then `acc * in_scale * w_scale[n]`
+  and the output-grid rounding in one rayon pass; `layers::lin` skips its SRQ passes for
+  these weights. KV-shared layers' k/v are not packed. Debug hooks: `ROCKET_QAT_CHECK=1`
+  re-computes two rows of the first two calls per weight exactly on the host (prints
+  mismatch counts), `ROCKET_LAYER_LOG=1` prints per-layer hidden-state summaries.
+- **Bench** (`q8_bench --groups 0`, per-channel int4-range codes + static scale, activation
+  quantize + epilogue included, board cores 4-7, live containers stopped, cosine 0.999992
+  vs the f64 reference): int8/fp16 wall M=4 0.46-0.93x, M=82 1.01-1.26x, M=512 1.13-1.37x,
+  M=2048 0.94-1.17x at the E4B shapes (K=2560 N=2048/10240, K=10240 N=2560); resident
+  weights half the fp16 size; up to ~2x the CPU of fp16 at large M (host int64 sum).
+- **E2B parity/board** (`gemma-4-E2B-it-qat-mobile`): NPU int8 greedy ids equal the host
+  CPU f16 run, 32/32. 1073-token prompt: load 76 s / 170 MiB anon / 2.52 GiB BO vs the fp16
+  NPU path 119 s load + 81 s pack, 6.8 GiB anon transient, 3.50 GiB; prefill 41.5 vs 49.5 s,
+  decode 0.94 (NPU) vs 0.78 tok/s (CPU).
+- **E4B** (`gemma-4-E4B-it-qat-mobile-transformers`, 3.5 GiB, board
+  `/root/models/gemma-4-E4B-it-qat-mobile`): 342 linears, **3.84 GiB BO**, load 129-137 s,
+  221 MiB anon after load, peak anon 3.5 GiB on a 1073-token request. Layer-0 hidden summary
+  matches the f32 CPU reference to 4 digits; first 21 greedy ids equal the host f16 run (12/12
+  vs f32), then the usual QAT near-tie. 19-token prompt prefill 2.4 s, decode 0.68 tok/s;
+  1073 tokens prefill 83.9 s, decode 0.51 tok/s (board shared, load ~8). Decode is the weak
+  spot (~1.5-2 s/token: 342 matmuls/token + host epilogues); not tuned.
+- **Bug fixed on the way (pre-existing, E4B only)**: the NPU prefill attention in
+  `gemma4/model.rs` flattened K/V `[b, kvh, kn, d]` to `[b, kn, kvh*d]` without moving the
+  head axis; with one KV head (E2B) that is a no-op, E4B has two, so K/V were scrambled and
+  the first token was `<eos>`. It now does `swap_dims(1, 2)` first. The fp16 NPU path was
+  affected too.
+- **Known issue (not mine)**: `--device cpu` on an aarch64 `npu` build panics in prefill
+  (`burn_rocket::init() has not been called` from `causal_attention`): prefill mode routes
+  attention to the NPU regardless of placement.
+- **Not done**: vision tower on the NPU int8 (weights are already int8 + act scales),
+  `lm_head`/`per_layer_model_projection` on the NPU, fused q|k|v and gate|up (each
+  projection re-quantizes its input; shared in_scale makes this a clean follow-up), fusing
+  the epilogue into a NEON kernel, decode tuning, KV-cache scales (`k/v_cache_scale` are
+  ignored; tokens match the reference without them).
+
 ## Decision family (2026-11-01, vllm-sr d3)
 
 `vllm-sr/d3-lite` / `vllm-sr/d3-nano` (`d3-code-readout-v1`) are the fifth

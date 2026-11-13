@@ -102,6 +102,12 @@ impl Family {
         matches!(self, Self::Emb2 | Self::Decision)
     }
 
+    /// `--npu-dtype` is accepted by the int8 families plus Gemma 4, whose QAT
+    /// checkpoints pack per-channel int8 (no `--int8-group`).
+    pub fn supports_npu_dtype(self) -> bool {
+        self.supports_int8() || matches!(self, Self::Gemma4)
+    }
+
     /// Keeping CPU copies of NPU-packed projections is meaningful for the two
     /// chat families (their decode can stay on the CPU).
     pub fn supports_keep_cpu_weights(self) -> bool {

@@ -631,9 +631,9 @@ impl LoadArgs {
         if self.embed_f16 == Some(true) && self.embed_int8 == Some(true) {
             bail!("--embed-f16 and --embed-int8 select different token tables; pick one");
         }
-        if self.npu_dtype.is_some() && !family.supports_int8() {
+        if self.npu_dtype.is_some() && !family.supports_npu_dtype() {
             bail!(
-                "--npu-dtype only applies to the embeddinggemma and decision text \
+                "--npu-dtype only applies to the embeddinggemma, gemma4 (QAT) and decision text \
                  backbones, not the {} model",
                 family.name()
             );
@@ -683,6 +683,19 @@ impl LoadArgs {
         // ---- NPU precision ----
         let (npu_dtype, int8_group) =
             resolve_npu_dtype(self.npu_dtype, self.int8_group, placement.text, avail)?;
+        if family == Family::Gemma4 && npu_dtype == NpuDtype::Int8 {
+            // The QAT path packs per-channel int8 inside the checkpoint load and
+            // keeps no float copies, so decode must run on the NPU too.
+            if !placement.decode {
+                bail!(
+                    "--npu-dtype int8 on gemma4 keeps no CPU weights: add \
+                     `--decode-device npu` (or `--device npu`)"
+                );
+            }
+            if self.keep_cpu == Some(KeepCpu::Yes) {
+                bail!("--npu-dtype int8 on gemma4 keeps no CPU weights (--keep-cpu-weights yes)");
+            }
+        }
 
         // ---- CPU copies of NPU-packed projections ----
         let keep_cpu_weights = if family.supports_keep_cpu_weights() {
@@ -1154,10 +1167,12 @@ mod tests {
         assert!(Family::Emb2.supports_int8());
         for family in [Family::Intent, Family::Gemma4, Family::Qwen3Embed] {
             assert!(!family.supports_int8());
-            let err = resolve(&["--npu-dtype", "int8"], family).unwrap_err();
-            let message = format!("{err:#}");
-            assert!(message.contains("--npu-dtype only applies"), "{message}");
-            assert!(message.contains("embeddinggemma and decision"), "{message}");
+            if family != Family::Gemma4 {
+                let err = resolve(&["--npu-dtype", "int8"], family).unwrap_err();
+                let message = format!("{err:#}");
+                assert!(message.contains("--npu-dtype only applies"), "{message}");
+                assert!(message.contains("embeddinggemma, gemma4"), "{message}");
+            }
             let err = resolve(&["--int8-group", "64"], family).unwrap_err();
             let message = format!("{err:#}");
             assert!(message.contains("--int8-group only applies"), "{message}");

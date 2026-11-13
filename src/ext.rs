@@ -207,7 +207,15 @@ pub fn mem_stats() -> Option<MemStats> {
     let mut guard = engine();
     let e = guard.as_mut()?;
     let mut stats = MemStats {
-        weights_bytes: e.weights.values().map(|r| r.weight.bytes()).sum(),
+        weights_bytes: e.weights.values().map(|r| r.weight.bytes()).sum::<usize>()
+            + e.qat_weights
+                .values()
+                .map(|r| r.weight.bytes())
+                .sum::<usize>()
+            + e.i8_weights
+                .values()
+                .map(|r| r.weight.bytes())
+                .sum::<usize>(),
         ..MemStats::default()
     };
     let mm = e.ctx.mem_stats();
@@ -368,6 +376,21 @@ struct I8Resident {
     b_scale: Vec<f32>,
 }
 
+/// A resident per-channel int8 weight from a QAT checkpoint: the codes live in
+/// NPU BOs; the per-channel weight scales and the calibrated static activation
+/// scales (`input_activation_scale` / `output_activation_scale`, 0 = none) stay
+/// host-side for the epilogue.
+struct QatResident {
+    weight: RocketI8Weight,
+    k: usize,
+    n: usize,
+    w_scale: Vec<f32>,
+    in_scale: f32,
+    out_scale: f32,
+    /// Host copy of the codes, kept only under `ROCKET_QAT_CHECK=1` (debug).
+    check: Option<(Vec<i8>, std::sync::atomic::AtomicUsize)>,
+}
+
 struct FaState {
     fa: RocketFaCtx,
     n_head: usize,
@@ -506,6 +529,8 @@ struct Engine {
     /// pack; it owns its own worker fds).
     i8_ctx: Option<RocketI8Ctx>,
     i8_weights: HashMap<u64, I8Resident>,
+    /// Resident per-channel int8 weights of QAT checkpoints (share `i8_ctx`).
+    qat_weights: HashMap<u64, QatResident>,
     next_id: u64,
 }
 
@@ -548,6 +573,7 @@ pub fn init(threads: usize) -> Result<(), Error> {
         bf16: None,
         i8_ctx: None,
         i8_weights: HashMap::new(),
+        qat_weights: HashMap::new(),
         next_id: 1,
     });
     Ok(())
@@ -1131,6 +1157,7 @@ enum WeightKind {
     F16,
     Bf16,
     I8 { group: usize },
+    Qat,
 }
 
 fn weight_kind(id: u64, k: usize) -> WeightKind {
@@ -1144,6 +1171,9 @@ fn weight_kind(id: u64, k: usize) -> WeightKind {
         } else if let Some(r) = e.i8_weights.get(&id) {
             assert_eq!(k, r.k, "activation K mismatch for NPU weight id {id}");
             WeightKind::I8 { group: r.group }
+        } else if let Some(r) = e.qat_weights.get(&id) {
+            assert_eq!(k, r.k, "activation K mismatch for NPU QAT weight id {id}");
+            WeightKind::Qat
         } else {
             panic!("NPU weight id {id} is not packed");
         }
@@ -1197,6 +1227,197 @@ fn matmul_impl(x: FlexTensor, id: u64) -> FlexTensor {
             T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
             matmul_i8(dims, m, k, id, group, &q, &a_scale, out_dtype)
         }
+        WeightKind::Qat => matmul_qat(dims, m, k, id, &values, out_dtype),
+    }
+}
+
+/// `clamp(round_ties_even(v / scale), -128, 127)` as an int8 code.
+#[inline]
+fn static_code(v: f32, inv: f32) -> i8 {
+    (v * inv).round_ties_even().clamp(-128.0, 127.0) as i8
+}
+
+/// Per-channel int8 matmul of a QAT checkpoint linear. The activation is
+/// quantized with the calibrated static scale (ties-to-even, like the SRQ grid
+/// the model was trained on), the NPU produces exact int32 sums (host int64
+/// K-accumulation), and the epilogue applies `in_scale * w_scale[n]` and, when
+/// the checkpoint calibrated one, rounds the result to the output int8 grid.
+fn matmul_qat(
+    dims: Vec<usize>,
+    m: usize,
+    k: usize,
+    id: u64,
+    values: &[f32],
+    out_dtype: DType,
+) -> FlexTensor {
+    use rayon::prelude::*;
+
+    let in_scale = with_engine(|e| {
+        e.qat_weights
+            .get(&id)
+            .unwrap_or_else(|| panic!("NPU QAT weight id {id} is not packed"))
+            .in_scale
+    });
+    // The input grid is the model's SRQ grid: a zero scale would mean an
+    // uncalibrated linear, which the packer refuses.
+    let inv = 1.0 / in_scale;
+    let m4 = m.div_ceil(4) * 4;
+    let t_conv = Instant::now();
+    let mut q = vec![0i8; m4 * k];
+    q.par_chunks_mut(k)
+        .zip(values.par_chunks(k))
+        .for_each(|(qrow, xrow)| {
+            for (d, &v) in qrow.iter_mut().zip(xrow) {
+                *d = static_code(v, inv);
+            }
+        });
+    T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+    with_engine(|e| {
+        let r = e
+            .qat_weights
+            .get(&id)
+            .unwrap_or_else(|| panic!("NPU QAT weight id {id} is not packed"));
+        let n = r.n;
+        let chunk_m = matmul_chunk_m();
+        let chunk = if chunk_m == 0 { m } else { chunk_m.max(4) & !3 };
+        let mut c32: Vec<f32> = vec![0f32; m4 * n];
+        let mut ci: Vec<i32> = Vec::new();
+        let mut off = 0;
+        while off < m {
+            let rows = (m - off).min(chunk);
+            let padded_m = (rows + 3) & !3;
+            let a = &q[off * k..(off + padded_m) * k];
+            ci.clear();
+            ci.resize(padded_m * n, 0);
+
+            let t_npu = Instant::now();
+            e.i8_ctx
+                .as_mut()
+                .expect("the int8 context exists once an int8 weight is packed")
+                .matmul(padded_m, k, n, a, &mut ci, &r.weight)
+                .unwrap_or_else(|err| {
+                    op_failure("rocket_matmul_int8_prepacked", err.rc, rows, k, n)
+                });
+            T_NPU_US.fetch_add(t_npu.elapsed().as_micros() as u64, Ordering::Relaxed);
+            NPU_CALLS.fetch_add(1, Ordering::Relaxed);
+
+            if let Some((codes, seen)) = &r.check
+                && seen.fetch_add(1, Ordering::Relaxed) < 2
+            {
+                // Exact host recomputation of the first two rows.
+                let mut bad = 0usize;
+                let mut first = None;
+                for row in 0..rows.min(2) {
+                    for col in 0..n {
+                        let mut acc = 0i64;
+                        for p in 0..k {
+                            acc += a[row * k + p] as i64 * codes[col * k + p] as i64;
+                        }
+                        if acc != ci[row * n + col] as i64 {
+                            bad += 1;
+                            first.get_or_insert((row, col, acc, ci[row * n + col]));
+                        }
+                    }
+                }
+                eprintln!(
+                    "qat-check id {id} m={rows} k={k} n={n}: {bad} mismatches in {} values, first (row,col,want,got) {:?}, a_amax {}",
+                    rows.min(2) * n,
+                    first,
+                    a[..rows.min(2) * k]
+                        .iter()
+                        .map(|v| (*v as i32).abs())
+                        .max()
+                        .unwrap_or(0)
+                );
+            }
+
+            let t_conv = Instant::now();
+            let ws = &r.w_scale;
+            let out_scale = r.out_scale;
+            let out_inv = if out_scale != 0.0 {
+                1.0 / out_scale
+            } else {
+                0.0
+            };
+            c32[off * n..(off + rows) * n]
+                .par_chunks_mut(n)
+                .zip(ci[..rows * n].par_chunks(n))
+                .for_each(|(orow, crow)| {
+                    for ((o, &acc), &s) in orow.iter_mut().zip(crow).zip(ws) {
+                        let y = acc as f32 * (in_scale * s);
+                        *o = if out_scale != 0.0 {
+                            static_code(y, out_inv) as f32 * out_scale
+                        } else {
+                            y
+                        };
+                    }
+                });
+            T_CONVERT_US.fetch_add(t_conv.elapsed().as_micros() as u64, Ordering::Relaxed);
+            off += rows;
+        }
+        c32.truncate(m * n);
+
+        let mut out_dims = dims;
+        *out_dims.last_mut().unwrap() = n;
+        floats_tensor(c32, out_dims, out_dtype)
+    })
+}
+
+/// Pack one pre-quantized `[N, K]` per-channel int8 weight of a QAT checkpoint
+/// (int4/int8 codes widened to `i8`, symmetric, no zero point). `w_scale` is the
+/// per-output-channel dequant scale `[N]`; `in_scale` is the calibrated static
+/// activation scale (must be non-zero), `out_scale` the calibrated output scale
+/// (0 = leave the output unrounded). The codes are scattered into NPU BOs once;
+/// the caller keeps no copy.
+pub fn pack_qat(
+    codes: &[i8],
+    w_scale: Vec<f32>,
+    n: usize,
+    k: usize,
+    in_scale: f32,
+    out_scale: f32,
+) -> WeightId {
+    assert_eq!(codes.len(), n * k, "QAT codes must be [N, K]");
+    assert_eq!(w_scale.len(), n, "one weight scale per output channel");
+    assert!(in_scale > 0.0, "QAT linears need a calibrated input scale");
+    assert_eq!(k % 32, 0, "the int8 path needs K % 32 == 0 (K={k})");
+    assert_eq!(n % 32, 0, "the int8 path needs N % 32 == 0 (N={n})");
+    with_engine(|e| {
+        let threads = e.threads;
+        let ctx = e.i8_ctx.get_or_insert_with(|| {
+            RocketI8Ctx::new(threads)
+                .unwrap_or_else(|err| op_failure("rocket_i8_ctx_create", err.rc, 0, k, n))
+        });
+        let weight = ctx
+            .pack_weight(PACK_M, k, n, codes)
+            .unwrap_or_else(|err| op_failure("rocket_i8_weights_pack", err.rc, PACK_M, k, n));
+        let id = e.next_id;
+        e.next_id += 1;
+        e.qat_weights.insert(
+            id,
+            QatResident {
+                weight,
+                k,
+                n,
+                w_scale,
+                in_scale,
+                out_scale,
+                check: std::env::var_os("ROCKET_QAT_CHECK")
+                    .map(|_| (codes.to_vec(), std::sync::atomic::AtomicUsize::new(0))),
+            },
+        );
+        WeightId(id)
+    })
+}
+
+impl WeightId {
+    /// Whether this handle is a QAT per-channel int8 weight. Such a matmul
+    /// quantizes its input with the calibrated static scale and rounds its
+    /// output to the calibrated grid itself, so the caller must not apply the
+    /// checkpoint's SRQ rounding around it.
+    pub fn is_qat(self) -> bool {
+        with_engine(|e| e.qat_weights.contains_key(&self.0))
     }
 }
 
@@ -2011,5 +2232,29 @@ mod tests {
             vec![1., 2., 3., 4., 5., 6., 4., 5., 6., 4., 5., 6.]
         );
         assert_eq!(pad_rows_f32(&src, 2, 3, 2), src);
+    }
+}
+
+#[cfg(test)]
+mod qat_tests {
+    use super::static_code;
+
+    /// The int8 activation grid is the model's SRQ grid: ties-to-even (like
+    /// `torch.round`), clamped to [-128, 127].
+    #[test]
+    fn static_codes_round_half_to_even_and_saturate() {
+        let inv = 1.0;
+        assert_eq!(static_code(0.5, inv), 0);
+        assert_eq!(static_code(1.5, inv), 2);
+        assert_eq!(static_code(2.5, inv), 2);
+        assert_eq!(static_code(-0.5, inv), 0);
+        assert_eq!(static_code(-1.5, inv), -2);
+        assert_eq!(static_code(1000.0, inv), 127);
+        assert_eq!(static_code(-1000.0, inv), -128);
+        // A value already on the grid (`code * scale`) maps back to its code.
+        let scale = 0.0173f32;
+        for c in [-128i32, -77, -1, 0, 3, 64, 127] {
+            assert_eq!(static_code(c as f32 * scale, 1.0 / scale) as i32, c);
+        }
     }
 }

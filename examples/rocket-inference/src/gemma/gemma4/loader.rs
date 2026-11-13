@@ -70,6 +70,56 @@ pub fn pack_text_for_prefill(
     Ok(())
 }
 
+/// Worker-thread count for the QAT per-channel int8 NPU path (`--npu-dtype int8`
+/// on a Gemma 4 QAT checkpoint); 0 = off. Set before [`load_gen_model`]: the
+/// checkpoint adapter then packs each text linear straight into resident NPU
+/// memory while the store applies it, so no float copy is ever materialized.
+static QAT_NPU_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn set_qat_npu(threads: usize) {
+    QAT_NPU_THREADS.store(threads, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn qat_npu_threads() -> Option<usize> {
+    match QAT_NPU_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Whether `model_dir` holds a pre-quantized Gemma (QAT) safetensors checkpoint.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub fn is_qat_checkpoint(model_dir: &Path) -> bool {
+    std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|c| crate::gemma::qat::QatConfig::from_json(&c).ok().flatten())
+        .is_some()
+}
+
+/// The nine per-layer projections the QAT NPU path packs (module-path suffixes).
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+const QAT_NPU_PROJECTIONS: [&str; 9] = [
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+    "per_layer_input_gate",
+    "per_layer_projection",
+];
+
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn is_qat_npu_projection(module_path: &str) -> bool {
+    module_path.starts_with("model.language_model.layers.")
+        && QAT_NPU_PROJECTIONS
+            .iter()
+            .any(|p| module_path.ends_with(&format!(".{p}")))
+}
+
 /// Per-tensor dtype selection, applied during loading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadDtype {
@@ -293,16 +343,37 @@ pub fn load_gen_model(
         }
         None => None,
     };
-    let mut store = with_load_adapters(store, qat.as_ref(), scales.as_ref(), dtype, device);
+    // Per-channel int8 NPU path: the adapter packs the text linears while they
+    // load, so their params are stubbed first (no float copy of the text body).
+    let first_shared = cfg
+        .text_config
+        .num_hidden_layers
+        .saturating_sub(cfg.text_config.num_kv_shared_layers);
+    let npu_pack = match (qat.is_some(), qat_npu_threads()) {
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        (true, Some(threads)) => {
+            burn_rocket::init(threads)
+                .map_err(|e| anyhow::anyhow!("NPU context creation failed: {e}"))?;
+            model.text_mut().for_each_layer_projection_mut(|lin| {
+                crate::gemma::layers::drop_linear_weight(lin, device);
+            });
+            Some(first_shared)
+        }
+        _ => None,
+    };
+    let mut store = with_load_adapters(
+        store,
+        qat.as_ref(),
+        scales.as_ref(),
+        dtype,
+        device,
+        npu_pack,
+    );
     let result = model
         .load_from(&mut store)
         .with_context(|| format!("load {}", model_dir.display()))?;
     // KV-shared layers never compute K/V, so checkpoints may omit their
     // weights (the QAT export does; the bf16 one ships them anyway).
-    let first_shared = cfg
-        .text_config
-        .num_hidden_layers
-        .saturating_sub(cfg.text_config.num_kv_shared_layers);
     crate::util::store::check_load_report(&result, |name| is_shared_kv_param(name, first_shared))?;
     let tolerated = result.missing.len();
     if qat.is_some() {
@@ -371,6 +442,21 @@ pub fn load_gen_model(
     }
     if let Ok(want) = std::env::var("DUMP_PARAM") {
         dump_param(&model, &want)?;
+    }
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    if npu_pack.is_some() {
+        let n = register_qat_npu(&model);
+        crate::gemma::layers::set_npu_prefill_only(false);
+        let (mut bytes, mut count) = (0usize, 0usize);
+        if let Some(st) = burn_rocket::mem_stats() {
+            bytes = st.weights_bytes;
+        }
+        count += n;
+        println!(
+            "NPU: {count} QAT linears resident as per-channel int8 ({:.2} GiB BO); \
+             prefill and decode on the NPU, no CPU copies",
+            bytes as f64 / (1u64 << 30) as f64
+        );
     }
     if let Some(scales) = &scales {
         if std::env::var("NO_SRQ").is_ok() {
@@ -637,6 +723,7 @@ fn with_load_adapters(
     scales: Option<&std::sync::Arc<QatScales>>,
     dtype: LoadDtype,
     device: &Device,
+    npu_pack: Option<usize>,
 ) -> SafetensorsStore {
     match qat {
         Some(qat) => store.with_from_adapter(
@@ -644,6 +731,7 @@ fn with_load_adapters(
                 qat: std::sync::Arc::new(qat.clone()),
                 scales: scales.expect("QAT scales").clone(),
                 dtype,
+                npu_pack,
             }
             .chain(LoadDtypeAdapter::new(device, dtype).with_f32_tables(dtype == LoadDtype::F32))
             .chain(PyTorchToBurnAdapter),
@@ -814,7 +902,14 @@ fn load_tower_half<M: ModuleSnapshot>(
     let tower_dtype = LoadDtype::F32;
     let store =
         SafetensorsStore::from_file(model_dir.join("model.safetensors")).allow_partial(true);
-    let mut store = with_load_adapters(store, qat.as_ref(), scales.as_ref(), tower_dtype, device);
+    let mut store = with_load_adapters(
+        store,
+        qat.as_ref(),
+        scales.as_ref(),
+        tower_dtype,
+        device,
+        None,
+    );
     let result = root
         .load_from(&mut store)
         .with_context(|| format!("load {part} towers from {}", model_dir.display()))?;
@@ -910,6 +1005,9 @@ pub struct QatAdapter {
     qat: std::sync::Arc<crate::gemma::qat::QatConfig>,
     scales: std::sync::Arc<std::collections::HashMap<String, crate::gemma::qat::ModuleScales>>,
     dtype: LoadDtype,
+    /// `Some(first_shared_layer)` packs the text linears as per-channel int8 NPU
+    /// weights instead of dequantizing them (see [`set_qat_npu`]).
+    npu_pack: Option<usize>,
 }
 
 impl ModuleAdapter for QatAdapter {
@@ -948,6 +1046,54 @@ impl ModuleAdapter for QatAdapter {
             _ => return tensor,
         };
         let k = packed_k * values_per_byte(bits);
+        #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+        if let Some(first_shared) = self.npu_pack
+            && is_qat_npu_projection(&module_path)
+        {
+            assert!(
+                matches!(bits, 2 | 4 | 8)
+                    && scales.in_scale > 0.0
+                    && scales.weight_scale.len() == rows,
+                "{module_path}: not packable as a per-channel int8 NPU weight \
+                 ({bits}-bit, in_scale {}, {} scales for {rows} rows)",
+                scales.in_scale,
+                scales.weight_scale.len()
+            );
+            // KV-shared layers never use their k/v: stub them without packing.
+            let skip = is_shared_kv_param(&name, first_shared);
+            let scales = scales.clone();
+            let path = module_path.clone();
+            return bridge::map_data(
+                tensor,
+                target_name,
+                DType::F32,
+                Shape::new([1, 1]),
+                move |data| {
+                    if !skip {
+                        let bytes: Vec<u8> = if data.dtype() == DType::U8 {
+                            data.try_to_vec().expect("packed u8")
+                        } else {
+                            data.try_to_vec::<i8>()
+                                .expect("packed i8")
+                                .into_iter()
+                                .map(|v| v as u8)
+                                .collect()
+                        };
+                        let codes = crate::gemma::qat::unpack_codes(&bytes, bits, rows, k);
+                        let id = burn_rocket::pack_qat(
+                            &codes,
+                            scales.weight_scale.clone(),
+                            rows,
+                            k,
+                            scales.in_scale,
+                            scales.out_scale,
+                        );
+                        crate::gemma::layers::stash_qat_packed(path.clone(), id);
+                    }
+                    TensorData::new(vec![0.0f32], [1, 1])
+                },
+            );
+        }
         let target = match self.dtype {
             LoadDtype::F32 => DType::F32,
             LoadDtype::F16 | LoadDtype::Q8 => DType::F16,
@@ -983,6 +1129,7 @@ impl ModuleAdapter for QatAdapter {
             qat: self.qat.clone(),
             scales: self.scales.clone(),
             dtype: self.dtype,
+            npu_pack: self.npu_pack,
         })
     }
 }
@@ -1036,6 +1183,49 @@ fn register_srq_scales<M: burn::module::Module>(
             crate::gemma::layers::register_srq(id, s.in_scale, s.out_scale);
             n += 1;
         }
+    }
+    n
+}
+
+/// Bind the weights the adapter packed (by module path) to their `ParamId`s so
+/// `lin` routes them to the NPU. Returns the number bound.
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+fn register_qat_npu<M: burn::module::Module>(model: &M) -> usize {
+    use burn::module::{ModuleVisitor, Param};
+
+    #[derive(Default)]
+    struct Paths {
+        stack: Vec<String>,
+        out: Vec<(String, burn::module::ParamId)>,
+    }
+    impl ModuleVisitor for Paths {
+        fn enter_module(&mut self, name: &str, _container_type: &str) {
+            self.stack.push(name.to_string());
+        }
+        fn exit_module(&mut self, _name: &str, _container_type: &str) {
+            self.stack.pop();
+        }
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<D>>) {
+            self.out.push((self.stack.join("."), param.id));
+        }
+    }
+    let mut packed = crate::gemma::layers::take_qat_packed();
+    let mut paths = Paths::default();
+    model.visit(&mut paths);
+    let mut n = 0;
+    for (path, id) in paths.out {
+        let key = path.strip_suffix(".weight").unwrap_or(&path);
+        if let Some(wid) = packed.remove(key) {
+            crate::gemma::layers::register_npu_weight_id(id, wid);
+            n += 1;
+        }
+    }
+    if !packed.is_empty() {
+        println!(
+            "warning: {} packed QAT weights matched no parameter (e.g. {:?})",
+            packed.len(),
+            packed.keys().next()
+        );
     }
     n
 }

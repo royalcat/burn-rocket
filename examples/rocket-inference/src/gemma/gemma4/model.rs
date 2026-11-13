@@ -431,12 +431,13 @@ impl GenAttention {
             // prompts run in query chunks with a per-chunk causal mask (the dense
             // `[s, s]` mask is what OOMs at long context); short ones take the
             // dense op unchanged. The `[kvh, kn, d] -> [kn, kvh*d]` reshape is the
-            // pre-existing layout assumption here (Gemma 4 E2B has one KV head).
+            // head axis moves behind the sequence axis first (E4B has two KV heads;
+            // with one the swap is a no-op, which is why E2B never showed it).
             let kn = k.dims()[2];
             let o = crate::util::causal::causal_attention(
                 q.reshape([b, s, h * d]),
-                k.reshape([b, kn, kvh * d]),
-                v.reshape([b, kn, kvh * d]),
+                k.swap_dims(1, 2).reshape([b, kn, kvh * d]),
+                v.swap_dims(1, 2).reshape([b, kn, kvh * d]),
                 h,
                 kvh,
                 d,
@@ -681,6 +682,24 @@ impl GenTextModel {
         &self.spec
     }
 
+    /// Visit every per-layer projection, including the k/v of KV-shared layers
+    /// (their checkpoint weights exist but are never used) but not
+    /// `per_layer_model_projection` (unquantized, stays on the CPU).
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    pub fn for_each_layer_projection_mut(&mut self, mut f: impl FnMut(&mut Linear)) {
+        for layer in self.layers.iter_mut() {
+            f(&mut layer.self_attn.k_proj);
+            f(&mut layer.self_attn.v_proj);
+            f(&mut layer.self_attn.q_proj);
+            f(&mut layer.self_attn.o_proj);
+            f(&mut layer.mlp.gate_proj);
+            f(&mut layer.mlp.up_proj);
+            f(&mut layer.mlp.down_proj);
+            f(&mut layer.per_layer_input_gate);
+            f(&mut layer.per_layer_projection);
+        }
+    }
+
     /// Visit every *used* text projection (q/k/v/o, MLP, PLE); the k/v of
     /// KV-shared layers are never called and are skipped.
     #[cfg(all(feature = "npu", target_arch = "aarch64"))]
@@ -807,6 +826,31 @@ impl GenTextModel {
                 .slice(s![.., .., i..i + 1, ..])
                 .reshape([b, s, spec.ple_dim]);
             h = layer.forward(h, ple_i, ropes.of(ls), ls, spec, kv, i, seq_start, chunk);
+            if layer_log() {
+                let last = h
+                    .clone()
+                    .slice(s![.., s - 1..s, ..])
+                    .cast(DType::F32)
+                    .reshape([spec.hidden]);
+                let l2 = last
+                    .powf_scalar(2.0)
+                    .sum()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("f32")[0];
+                let amean = h
+                    .clone()
+                    .cast(DType::F32)
+                    .abs()
+                    .mean()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("f32")[0];
+                eprintln!(
+                    "layer {i:2}: mean|h| {amean:.5e} last-row l2 {:.5e}",
+                    l2.sqrt()
+                );
+            }
         }
         kv.len += s;
         self.norm.forward(h)
@@ -1103,4 +1147,10 @@ impl GenTextModel {
     pub fn embed_table(&self) -> &Param<Tensor<2>> {
         &self.embed_tokens.weight
     }
+}
+
+/// `ROCKET_LAYER_LOG=1`: print per-layer hidden-state summaries (debug).
+fn layer_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ROCKET_LAYER_LOG").is_some())
 }

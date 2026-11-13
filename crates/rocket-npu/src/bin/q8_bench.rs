@@ -161,6 +161,39 @@ fn quantize_rows_par(
     });
 }
 
+/// Static-scale activation quantize (QAT `input_activation_scale`): ties-to-even,
+/// clamped to int8, parallel over row blocks. Pad rows (beyond `m`) stay zero.
+fn quantize_static_par(x: &[f32], m: usize, k: usize, scale: f32, q: &mut [i8], threads: usize) {
+    let inv = 1.0 / scale;
+    let step = m.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        for (xs, qs) in x.chunks(step * k).zip(q.chunks_mut(step * k)) {
+            scope.spawn(move || {
+                for (d, &v) in qs.iter_mut().zip(xs) {
+                    *d = (v * inv).round_ties_even().clamp(-128.0, 127.0) as i8;
+                }
+            });
+        }
+    });
+}
+
+/// Per-channel epilogue: `out = int32 * in_scale * w_scale[n]`.
+fn epilogue_par(c: &[i32], ws: &[f32], in_scale: f32, n: usize, out: &mut [f32], threads: usize) {
+    let rows = c.len() / n;
+    let step = rows.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|scope| {
+        for (cs, os) in c.chunks(step * n).zip(out.chunks_mut(step * n)) {
+            scope.spawn(move || {
+                for (cr, or) in cs.chunks(n).zip(os.chunks_mut(n)) {
+                    for ((o, &v), &s) in or.iter_mut().zip(cr).zip(ws) {
+                        *o = v as f32 * (in_scale * s);
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// llama.cpp Q8_0 quantization: 32-value blocks of `{f16 scale, int8 codes}`,
 /// `scale = max|v| / 127` (the same rule the W8A8 group path uses at group 32).
 /// Returns `(codes [N,K], scales [N,K/32] widened to f32)`.
@@ -362,8 +395,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     for &g in &groups {
         assert!(
-            g >= 32 && g.is_multiple_of(32),
-            "group {g} must be a multiple of 32"
+            g == 0 || (g >= 32 && g.is_multiple_of(32)),
+            "group {g} must be 0 (per-channel) or a multiple of 32"
         );
     }
 
@@ -403,7 +436,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for &group in &groups {
             // The group's stored weight: group 32 is the Q8_0 file itself, wider
             // groups are a requant of the same dequantized values.
-            let (bq, bs, bf16) = if group == 32 {
+            let (bq, bs, bf16) = if group == 0 {
+                // Per-channel int4-range codes ([-8,7], the QAT-mobile linears
+                // widened to int8) with one scale per output channel.
+                let mut q = vec![0i8; n * k];
+                let mut s = vec![0f32; n];
+                let mut dq = vec![0f32; n * k];
+                for r in 0..n {
+                    let row = &w32[r * k..(r + 1) * k];
+                    let amax = row.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                    let sc = (amax / 8.0).max(1e-12);
+                    s[r] = sc;
+                    for (i, &v) in row.iter().enumerate() {
+                        let c = (v / sc).round_ties_even().clamp(-8.0, 7.0);
+                        q[r * k + i] = c as i8;
+                        dq[r * k + i] = c * sc;
+                    }
+                }
+                (q, s, dq)
+            } else if group == 32 {
                 (wq8.clone(), ws8.clone(), wdq8.clone())
             } else {
                 let (q, s) = requantize(&wdq8, n, k, group);
@@ -420,7 +471,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  -- group {group}: stored weight cosine {wcos:.8} | f64 reference over \
                  {sample}/{m} rows in {:.2}s (readback {:.1} MiB/row)",
                 t.elapsed().as_secs_f64(),
-                (k / group) as f64 * n as f64 * 4.0 / (1u64 << 20) as f64
+                k.checked_div(group).unwrap_or(1) as f64 * n as f64 * 4.0 / (1u64 << 20) as f64
             );
 
             // ---- f16 resident arm (the deployed `--npu` projection path) ----
@@ -460,10 +511,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ---- int8 group-wise arm ----
             if run_i8 {
                 let t = Instant::now();
-                let w = ictx.pack_weight_gw(PACK_M, k, n, &bq, group)?;
+                let w = if group == 0 {
+                    ictx.pack_weight(PACK_M, k, n, &bq)?
+                } else {
+                    ictx.pack_weight_gw(PACK_M, k, n, &bq, group)?
+                };
                 let i8_pack = t.elapsed().as_secs_f64() * 1e3;
                 let i8_bo = w.bytes();
-                let ng = k / group;
+                let ng = k.checked_div(group).unwrap_or(1);
+                // Static per-tensor activation scale (the QAT checkpoint's
+                // `input_activation_scale`): calibrated once, outside the timing.
+                let a_amax = a32.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let in_scale = (a_amax / 127.0).max(1e-12);
                 let mut walls = Vec::with_capacity(reps);
                 let mut cpus = Vec::with_capacity(reps);
                 let mut quants = Vec::with_capacity(reps);
@@ -474,12 +533,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let t = Instant::now();
                     let mut q = vec![0i8; pm * k];
                     let mut sa = vec![1f32; pm * ng];
-                    quantize_rows_par(&a32, m, k, group, &mut q, &mut sa, threads);
+                    if group == 0 {
+                        quantize_static_par(&a32, m, k, in_scale, &mut q, threads);
+                    } else {
+                        quantize_rows_par(&a32, m, k, group, &mut q, &mut sa, threads);
+                    }
                     let tq = t.elapsed().as_secs_f64() * 1e3;
 
                     let t = Instant::now();
                     let mut cf = vec![0f32; pm * n];
-                    ictx.matmul_gw(pm, k, n, &q, &sa, &bs, &mut cf, &w)?;
+                    if group == 0 {
+                        let mut ci = vec![0i32; pm * n];
+                        ictx.matmul(pm, k, n, &q, &mut ci, &w)?;
+                        epilogue_par(&ci, &bs, in_scale, n, &mut cf, threads);
+                    } else {
+                        ictx.matmul_gw(pm, k, n, &q, &sa, &bs, &mut cf, &w)?;
+                    }
                     let npu = t.elapsed().as_secs_f64() * 1e3;
                     quants.push(tq);
                     npus.push(npu);

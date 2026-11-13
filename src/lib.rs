@@ -35,8 +35,8 @@ pub mod ext;
 pub use ext::{
     Stats, WeightId, attention, attention_causal_block, attention_causal_block_window,
     attention_causal_window, attention_window, attention_window_block, bf16_stream_mode, gelu_mul,
-    init, matmul, pack, pack_i8, pack2, pack3, rms_norm, rms_norm_noscale, rope_apply, silu_mul,
-    stats, stats_reset,
+    init, matmul, pack, pack_i8, pack_qat, pack2, pack3, rms_norm, rms_norm_noscale, rope_apply,
+    silu_mul, stats, stats_reset,
 };
 #[cfg(feature = "npu")]
 pub use ext::{clear_scratch, mem_stats, trim_scratch, trim_scratch_to};
@@ -369,6 +369,30 @@ impl RocketI8Ctx {
         group: usize,
     ) -> Result<RocketI8Weight, Error> {
         Ok(self.inner.pack_weight_gw(m, k, n, b, group)?)
+    }
+
+    /// Pack a pre-quantized `[N, K]` int8 weight for the per-channel (dense) path.
+    pub fn pack_weight(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        b: &[i8],
+    ) -> Result<RocketI8Weight, Error> {
+        Ok(self.inner.pack_weight(m, k, n, b)?)
+    }
+
+    /// Per-channel `C[m,n] = A[m,k] * B[n,k]^T`, raw int32 (`m % 4 == 0`).
+    pub fn matmul(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        a: &[i8],
+        c: &mut [i32],
+        w: &RocketI8Weight,
+    ) -> Result<(), Error> {
+        Ok(self.inner.matmul(m, k, n, a, c, w)?)
     }
 
     /// `C[m,n] = sum_g a_scale[m,g] * b_scale[n,g] * (A_g B_g^T)`, f32 output.

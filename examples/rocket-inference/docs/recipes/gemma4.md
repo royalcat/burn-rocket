@@ -42,3 +42,18 @@ Notes:
   (`--dtype auto`) or `--dtype f32` for parity.
 - One-shot generation:
   `rocket-inference gen --model-dir $M --device auto --dtype f16 --defer-towers --text "What is the capital of France?" --max-new-tokens 16`.
+
+
+## QAT-mobile on the NPU, per-channel int8 (2026-11-13)
+
+Applies to `google/gemma-4-E2B-it-qat-mobile-transformers` and `...-E4B-...` (the
+`quant_method: gemma` safetensors checkpoints). Text projections become resident int8
+(E4B 3.84 GiB BO, E2B 2.52 GiB), no CPU weight copies, prefill and decode on the NPU:
+
+```sh
+rocket-inference serve --model-dir /root/models/gemma-4-E4B-it-qat-mobile \
+    --device npu --npu-dtype int8 --defer-towers --port 8391
+```
+
+Stop the live `rocket-inference` containers before benchmarking (they share the NPU and
+cores 4-7). Measurements and caveats: AGENTS.md "Gemma 4 QAT on the NPU".
