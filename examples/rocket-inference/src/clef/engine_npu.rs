@@ -8,12 +8,10 @@
 //! f32. `Int8Emu` (engine.rs) is the host twin of exactly this.
 
 use super::engine::{
-    AttnDevice, CpuDense, Dense, ExpertTimes, ExpertWorker, PackEngine, depth_from_env,
-    resident_linear,
+    AttnDevice, ClefStore, CpuDense, Dense, ExpertTimes, ExpertWorker, PackEngine, depth_from_env,
 };
 use super::int8::{f16_scales_to_f32, m_chunks, quantize_rows};
 use super::model::{TextConfig, silu};
-use super::pack::PackDir;
 use super::pack::format::{Dims, ExpertRecord};
 use anyhow::Result;
 use burn_rocket::npu::matmul::{I8Context, I8Weight};
@@ -233,10 +231,10 @@ pub struct NpuDense {
 }
 
 impl NpuDense {
-    pub fn new(pack: &PackDir, cfg: &TextConfig) -> Result<Self> {
+    pub fn new(pack: &dyn ClefStore, cfg: &TextConfig) -> Result<Self> {
         let t0 = Instant::now();
         let (h, d) = (cfg.hidden, cfg.head_dim);
-        let g = pack.dims.group;
+        let g = pack.dims().group;
         let (qn, kn) = (cfg.heads * d, cfg.kv_heads * d);
         let mut ctx = I8Context::new_at(3, 0).map_err(|e| fail(e, 0, h, qn))?;
         let mut layers = Vec::with_capacity(cfg.layers);
@@ -246,20 +244,20 @@ impl NpuDense {
             let mut codes: Vec<i8> = Vec::with_capacity((qn + 2 * kn) * h);
             let mut qkv_s: Vec<f32> = Vec::new();
             for (name, rows) in [("q_proj", qn), ("k_proj", kn), ("v_proj", kn)] {
-                let (c, s) = resident_linear(pack, &format!("{pre}{name}"), rows, h)?;
-                codes.extend_from_slice(c);
+                let (c, s) = pack.resident_linear(&format!("{pre}{name}"), rows, h)?;
+                codes.extend_from_slice(&c);
                 qkv_s.extend_from_slice(&s);
             }
             let qkv = ctx
                 .pack_weight_gw(PACK_M, h, qn + 2 * kn, &codes, g)
                 .map_err(|e| fail(e, PACK_M, h, qn + 2 * kn))?;
-            let (oc, o_s) = resident_linear(pack, &format!("{pre}o_proj"), h, qn)?;
+            let (oc, o_s) = pack.resident_linear(&format!("{pre}o_proj"), h, qn)?;
             let o = ctx
-                .pack_weight_gw(PACK_M, qn, h, oc, g)
+                .pack_weight_gw(PACK_M, qn, h, &oc, g)
                 .map_err(|e| fail(e, PACK_M, qn, h))?;
             bytes += qkv.bytes() + o.bytes();
             layers.push(LayerProj { qkv, qkv_s, o, o_s });
-            pack.release();
+            pack.release_resident();
         }
         eprintln!(
             "clef: packed the attention projections on the NPU: {} layers, {:.0} MiB of BOs in {:.1}s",
@@ -354,14 +352,14 @@ fn consumers_from_env() -> usize {
 
 /// The NPU engine: three one-worker expert contexts + resident attention projections.
 pub fn npu_engine(
-    pack: Arc<PackDir>,
+    pack: Arc<dyn ClefStore>,
     cfg: TextConfig,
     threads: usize,
     attn: AttnDevice,
 ) -> Result<PackEngine> {
-    let dims = pack.dims;
+    let dims = pack.dims();
     let dense: Box<dyn Dense> = match attn {
-        AttnDevice::Npu => Box::new(NpuDense::new(&pack, &cfg)?),
+        AttnDevice::Npu => Box::new(NpuDense::new(&*pack, &cfg)?),
         AttnDevice::Cpu => Box::new(CpuDense::new(pack.clone(), cfg.clone(), threads)),
     };
     let n = consumers_from_env();

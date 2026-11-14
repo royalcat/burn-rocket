@@ -641,6 +641,21 @@ impl Backbone {
         })
     }
 
+    /// Open the AutoRound checkpoint (`moeshawky/clef-omni-int8-autoround`) as stored: no
+    /// repack, experts read from the shards on demand.
+    pub fn open_autoround(dir: &Path) -> Result<Self> {
+        let cfg = TextConfig::from_model_dir(dir)?;
+        let weights = Box::new(super::autoround_store::AutoRoundWeights::open(
+            dir,
+            cfg.clone(),
+        )?);
+        Ok(Self {
+            cfg,
+            weights,
+            engine: None,
+        })
+    }
+
     /// Any weight source (tests, future placements).
     pub fn with_source(cfg: TextConfig, weights: Box<dyn WeightSource + Send>) -> Self {
         Self {

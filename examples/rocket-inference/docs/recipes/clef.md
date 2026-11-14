@@ -74,10 +74,10 @@ request carrying `images`/`audio`/`videos`
   leaves; a schema that alone exceeds the cap is a 422. The record's cost grows with its
   length, so the board wants the small cap.
 - Placement: `--device auto|cpu|npu` (and `--text-device`) as for the other families.
-  `auto` is the NPU on an aarch64 `npu` build **when the model dir is a clef pack** (a BF16
-  checkpoint falls back to the CPU), else the CPU. An explicit `npu` on a CPU build is the
+  `auto` is the NPU on an aarch64 `npu` build **when the model dir is the int8 AutoRound
+  checkpoint or a clef pack** (a BF16 checkpoint falls back to the CPU), else the CPU. An explicit `npu` on a CPU build is the
   shared "requires an aarch64 build with the `npu` feature" error, and on an NPU build with
-  a BF16 checkpoint "needs a clef-pack". Flags of other families (`--dtype`, `--quant`,
+  a BF16 checkpoint "needs the int8 AutoRound checkpoint". Flags of other families (`--dtype`, `--quant`,
   `--defer-towers`, `--text-attn-device`, `--decode-device`, `--vision-*`, ...) are rejected.
   The `placement:` line reads `text=CPU(f32, layer-streamed) head=CPU(f32)`, or
   `text=NPU(int8 g128 streamed experts) head=CPU(f32)`, or (with `ROCKET_CLEF_EMU=1`)
@@ -174,7 +174,7 @@ partials, the host applies `a_scale * w_scale` and sums in f32.
 
 | variable | meaning |
 |---|---|
-| `ROCKET_CLEF_EMU=1` | Test/diagnostic: run the *host emulation* of the NPU path (same bucketing, schedule, quantization and int32-exact group partials; any host, needs a pack). Overrides `--device`. |
+| `ROCKET_CLEF_EMU=1` | Test/diagnostic: run the *host emulation* of the NPU path (same bucketing, schedule, quantization and int32-exact group partials; any host, needs the int8 checkpoint or a pack). Overrides `--device`. |
 | `ROCKET_CLEF_ATTN_DEVICE=cpu|npu` | attention projections on the CPU (f32) or int8 on the NPU/emulation (default). |
 | `ROCKET_CLEF_DEPTH=N` | read-ahead buffers (default 8 x 4.57 MiB). |
 | `ROCKET_CLEF_CONSUMERS=N` | NPU expert consumers (1-6, default 3 = one per core). |
@@ -367,3 +367,100 @@ rocket-inference serve --pack-dir /models/clef-pack-g128 --device npu \
   `mem_limit` 3g is enough (NPU buffers are not charged to the cgroup, ~1 GiB more on top).
 - Not supported yet: image/audio/video inputs (HTTP 422), see the plan's phase 8.
 - The measured per-request times and the knobs are in the phase 6/7 sections above.
+
+## Step 0: serving straight from the AutoRound shards (no repack)
+
+> **STATUS 2026-11-14: code complete, dev-host verified (host emulation, CPU, aarch64
+> cross build, unit tests). NOT run on the board.** The `clef-pack` tool, `--pack-dir` and
+> `PackDir` stay as an explicit opt-in; they are no longer on the default path.
+
+```sh
+rocket-inference serve -hf moeshawky/clef-omni-int8-autoround --device npu ...   # downloads
+rocket-inference serve --model-dir /models/clef-omni-int8-autoround --device npu ...
+rocket-inference decide --model-dir <that dir> --requests ... [--device cpu]
+```
+
+`-hf <owner>/<name>` **without** `:quant` is a safetensors snapshot download
+(`util/hub.rs::resolve_snapshot`): `config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`joint_head.safetensors`, `joint_head_config.json`, `model.safetensors.index.json` and every
+shard that holds a `thinker.*` tensor (shards 1-6 = ~32 GiB for this repo; the talker/code2wav
+shards 7-8 are skipped); a shard already on disk whose size matches its own header is not
+fetched again. The repo (checked against the HF API 2026-11-14) ships `joint_head.safetensors`
+and `joint_head_config.json`, so nothing else is needed. The dir is `$HF_HOME/models/
+moeshawky--clef-omni-int8-autoround` (or `$HF_HUB_CACHE`, else `/tmp/rocket-hf`).
+
+Detection: the config/joint-head rule above gives `Family::Clef`; the pipeline then picks the
+weights by what is in the directory: `manifest.json` = pack, else a shard index that has
+`...experts.0.gate_proj.qweight` = AutoRound shards (CPU f32 or emulated/NPU int8 engine),
+else the BF16 checkpoint (CPU only). `--device npu`/`auto`(NPU build) accept the AutoRound dir.
+
+### Tensor layout in the shards (measured, `model.safetensors.index.json` + shard headers)
+
+8 shards of ~5.37 GB (index `total_size` 41,323,349,090; 65,258 tensors: I32 37,248 qweight/
+qzeros, F16 18,624 scales, BF16 9,386). Layers 0-7 are in shard 1, 8-15 in 2, ... 42-47 in 6;
+shards 7-8 are talker/code2wav only. Layer 0 expert 0 of shard 1 (offsets are absolute file
+offsets, data starts at 1,264,488):
+
+| tensor (`thinker.model.layers.0.mlp.experts.0.`) | dtype, shape | file range |
+|---|---|---|
+| `down_proj.qweight` / `.qzeros` | I32 `[192,2048]` / `[6,512]` | 1,264,488-2,837,352 / -2,849,640 |
+| `gate_proj.qweight` / `.qzeros` | I32 `[512,768]` / `[16,192]` | 2,849,640-4,422,504 / -4,434,792 |
+| `up_proj.qweight` / `.qzeros` | I32 `[512,768]` / `[16,192]` | 4,434,792-6,007,656 / -6,019,944 |
+| expert 1 `down_proj.qweight` | | starts at **6,019,944** (the next expert follows directly) |
+| `down_proj.scales`, `gate_proj.scales`, `up_proj.scales` | F16 `[6,2048]`, `[16,768]`, `[16,768]` | 5,287,779,688-5,287,853,416 (3 x 24,576 B) |
+| expert 1 scales | | start at 5,287,853,416 |
+
+So tensors are written in alphabetical order inside two regions: all `qweight`/`qzeros` of
+the shard's experts (expert-major, down|gate|up, 4,755,456 B per expert) and then, at the end
+of the shard, all `scales` (73,728 B per expert, same order). **An expert is two contiguous
+runs: 2 aligned reads** (4.76 MB + 74 KB, each rounded out to 4 KiB, ~4.84 MB total vs
+4.79 MB in a pack record). The extents are computed from the headers (`plan_extents`, runs
+closer than 64 KiB merge), so another layout would only cost more reads. Attention
+`qweight`/`qzeros`/`scales` sit in the same two regions; BF16 norms/router/`embed_tokens`/
+`lm_head` elsewhere. All `qzeros` words are `0x7f7f7f7f` (checked at every unpack).
+
+### Implementation
+
+`src/clef/autoround_store.rs`: `ShardStore` (`ExpertReader` + `ClefStore`) opens the thinker
+shards (mmap for the headers/resident tensors, one `DiskFile` per shard for aligned `O_DIRECT`
+reads; `CLEF_PACK_NO_DIRECT=1` falls back to buffered + `fadvise(DONTNEED)` as for packs).
+`read_expert` reads the extents into thread-local aligned scratch, then converts in RAM on the
+reader thread with the packer's own `autoround::unpack` into the *pack record layout* (codes
+`q ^ 0x80` as `[N,K]` i8, scales `[N,K/128]` f16, gate|up fused), so the engine, batching and
+workers are untouched and a record is **bit-identical** to the pack's (test
+`real_shards_equal_the_real_pack_bit_for_bit`, 10 experts across layers/shards vs
+`/home/royalcat/models/clef-pack-g128`, skipped when absent; the synthetic-checkpoint tests
+compare every expert and the whole backbone). `autoround::unpack` now writes 16-byte runs
+(4 k-blocks per row): 5.5 -> 3.5 ms of single-core conversion per expert on the dev host
+(2.1 ms wall with all cores). `engine::ClefStore` is the new seam: `PackDir` and `ShardStore`
+implement it; the Emu/CPU/NPU dense paths take `Arc<dyn ClefStore>`. Resident weights are
+used as stored: embeddings/norms/router/`lm_head` BF16 mapped and widened per use; the int8
+attention is unpacked from `qweight` (`resident_linear`: per call on the emulated path, once
+at load into the NPU weights). `AutoRoundWeights` is the backbone's `WeightSource` for the
+f32 CPU path (experts widened from the same records).
+
+Failure policy: `open` validates the index, every shard's presence and exact length (against
+its own header), and the dtype/shape of all 55k+ tensors the text path reads, naming the
+problem (exit code 1, e.g. `shard ... missing` / `inconsistent data offsets`); a read failure
+at run time (`ExpertReader::read`, packs included) prints `clef: FATAL: reading layer L expert
+E failed: ...` and `exit(1)` for the supervisor, no 503 mapping.
+
+### Dev-host results (2026-11-14, page cache warm)
+
+`ROCKET_CLEF_EMU=1 decide` on fixture `checkout-errors` (295 tokens, 5219 expert reads, 8
+threads): shard dir 28.4 s (user 4m41s before the unpack tiling), pack dir 25.4 s (user
+2m32s); the `cases` of both outputs are **identical** (department technical 0.8171, urgency
+1.8781, outage 0.9547). Only the top-level `model` label differs (dir name). Conversion is the
+cost of not repacking: ~3.5 ms of CPU per expert (vs 0 for a pack), ~18 CPU-s per 295-token
+pass on this host, more on the A76s; measure it on the board (reader `read_io`/`read_wait` in
+`ROCKET_PHASE_LOG=1`).
+
+### Board command (for the caller)
+
+```sh
+# dir: the dev checkout, shards copied as is (shards 1-6 + joint head + tokenizer + configs + index)
+ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference decide \
+    --model-dir /mnt/nvme/models/clef-omni-int8-autoround --device npu \
+    --requests tools/clef_fixtures.json --out /tmp/clef-shards.json
+# compare with the pack run: same `cases`; check `read_wait`/`read_io` and the 5219-expert pass wall
+```

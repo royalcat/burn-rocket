@@ -2,8 +2,9 @@
 //! Jev/SystemOne request (`systemone` in the release's `joint_schema_model.py`).
 
 use super::answer::{probabilities, systemone_answer};
+use super::autoround_store::ShardStore;
 use super::encode::{EncodedRecord, encode_record};
-use super::engine::{self, LayerEngine};
+use super::engine::{self, ClefStore, LayerEngine};
 use super::head::{ClefHead, LmHeadFile};
 use super::model::{Backbone, ForwardOpts};
 use super::pack::{Manifest, PackDir};
@@ -99,25 +100,36 @@ impl ClefModel {
     pub fn load_kind(dir: &Path, threads: usize, kind: EngineKind) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
-        // A `clef-pack` directory (manifest.json) streams int8 experts; otherwise the
-        // BF16 checkpoint shards.
-        if kind != EngineKind::Cpu && !PackDir::is_pack(dir) {
+        // A `clef-pack` directory (manifest.json) streams repacked int8 experts; the
+        // AutoRound checkpoint itself (quantized expert tensors in the shard index) is
+        // read as stored; the BF16 checkpoint is the CPU-only oracle path.
+        let is_pack = PackDir::is_pack(dir);
+        let is_autoround = !is_pack && ShardStore::is_autoround(dir);
+        if kind != EngineKind::Cpu && !is_pack && !is_autoround {
             anyhow::bail!(
-                "the NPU/emulated Clef path needs a clef-pack directory (run `clef-pack` on \
-                 the int8 checkpoint, docs/recipes/clef-pack.md); {} has no manifest.json",
+                "the NPU/emulated Clef path needs the int8 AutoRound checkpoint \
+                 (moeshawky/clef-omni-int8-autoround) or a clef-pack directory; {} is neither",
                 dir.display()
             );
         }
-        let (backbone, lm_head) = if PackDir::is_pack(dir) {
-            let mut backbone = Backbone::open_pack(dir).context("open the clef pack")?;
+        let (backbone, lm_head) = if is_pack || is_autoround {
+            let mut backbone = if is_pack {
+                Backbone::open_pack(dir).context("open the clef pack")?
+            } else {
+                Backbone::open_autoround(dir).context("open the AutoRound shards")?
+            };
             if kind != EngineKind::Cpu {
                 let engine = build_engine(dir, &backbone.cfg, threads, kind == EngineKind::Emu)?;
                 eprintln!("clef: thinker engine: {}", engine.label());
                 backbone.set_engine(engine);
             }
-            let lm = Manifest::read(dir)?.lm_head;
-            let lm_head = LmHeadFile::from_file(&dir.join(&lm.file), &lm.tensor)
-                .context("open the pack's lm_head")?;
+            let lm_head = if is_pack {
+                let lm = Manifest::read(dir)?.lm_head;
+                LmHeadFile::from_file(&dir.join(&lm.file), &lm.tensor)
+                    .context("open the pack's lm_head")?
+            } else {
+                LmHeadFile::open(dir).context("open thinker.lm_head.weight")?
+            };
             (backbone, lm_head)
         } else {
             (
@@ -276,7 +288,11 @@ fn build_engine(
     threads: usize,
     emu: bool,
 ) -> Result<Box<dyn LayerEngine>> {
-    let pack = Arc::new(PackDir::open(dir)?);
+    let pack: Arc<dyn ClefStore> = if PackDir::is_pack(dir) {
+        Arc::new(PackDir::open(dir)?)
+    } else {
+        Arc::new(ShardStore::open(dir)?)
+    };
     let attn = engine::attn_device_from_env()?;
     if emu {
         return Ok(Box::new(engine::emu_engine(

@@ -6,6 +6,7 @@
 
 pub mod answer;
 pub mod attn;
+pub mod autoround_store;
 #[cfg(test)]
 mod batch_tests;
 pub mod encode;

@@ -166,13 +166,80 @@ impl ExpertReader for PackDir {
         PackDir::new_buffer(self)
     }
     fn read(&self, layer: usize, expert: usize, buf: &mut AlignedBuf) -> Result<()> {
-        self.read_expert(layer, expert, buf)
+        if let Err(e) = self.read_expert(layer, expert, buf) {
+            fatal_read(layer, expert, &e);
+        }
+        Ok(())
     }
     fn release_layer(&self, layer: usize) {
         self.drop_layer_cache(layer);
     }
     fn release_resident(&self) {
         PackDir::release(self);
+    }
+}
+
+/// A weight read failed at run time (disk error, truncated or corrupted file): the
+/// process cannot serve any request correctly any more, so it exits non-zero for the
+/// supervisor to restart (the server maps no 503 for this).
+pub fn fatal_read(layer: usize, expert: usize, e: &anyhow::Error) -> ! {
+    eprintln!("clef: FATAL: reading layer {layer} expert {expert} failed: {e:#}");
+    std::process::exit(1)
+}
+
+/// Everything an engine needs from the model files: the streamed experts plus the
+/// resident int8 attention projections. Implemented by a [`PackDir`] and by the
+/// AutoRound shards ([`super::autoround_store::ShardStore`]).
+pub trait ClefStore: ExpertReader {
+    /// `[n, k]` int8 codes and `[n, k/group]` f32 scales of `<module>` (borrowed from a
+    /// mapped file when stored that way, else unpacked into an owned buffer).
+    fn resident_linear(
+        &self,
+        module: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<(std::borrow::Cow<'_, [i8]>, Vec<f32>)>;
+    /// `<module>` dequantized to f32 `[n, k]`.
+    fn dequant_linear(&self, module: &str, n: usize, k: usize) -> Result<Vec<f32>>;
+}
+
+impl ClefStore for PackDir {
+    fn resident_linear(
+        &self,
+        module: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<(std::borrow::Cow<'_, [i8]>, Vec<f32>)> {
+        use super::st::Dtype;
+        let g = self.dims.group;
+        let ct = self.tensor(&format!("{module}.codes"))?;
+        let st = self.tensor(&format!("{module}.scales"))?;
+        if ct.dtype != Dtype::I8
+            || ct.shape != [n, k]
+            || st.dtype != Dtype::F16
+            || st.shape != [n, k / g]
+        {
+            bail!(
+                "{module}: unexpected codes/scales shapes {:?} / {:?}",
+                ct.shape,
+                st.shape
+            );
+        }
+        let bytes = self.resident().bytes(ct);
+        // SAFETY: i8 and u8 share a layout; the slice is the tensor's exact byte range.
+        let codes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) };
+        let sb = self.resident().bytes(st);
+        let scales: Vec<f32> = sb
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| super::st::f16_to_f32(u16::from_le_bytes(*c)))
+            .collect();
+        Ok((std::borrow::Cow::Borrowed(codes), scales))
+    }
+
+    fn dequant_linear(&self, module: &str, n: usize, k: usize) -> Result<Vec<f32>> {
+        PackDir::dequant_linear(self, module, n, k)
     }
 }
 
@@ -898,49 +965,14 @@ impl ExpertWorker for EmuWorker {
     }
 }
 
-/// `[n, k]` int8 codes and `[n, k/group]` f32 scales of a resident `<module>.codes/.scales`.
-pub fn resident_linear<'a>(
-    pack: &'a PackDir,
-    module: &str,
-    n: usize,
-    k: usize,
-) -> Result<(&'a [i8], Vec<f32>)> {
-    use super::st::Dtype;
-    let g = pack.dims.group;
-    let ct = pack.tensor(&format!("{module}.codes"))?;
-    let st = pack.tensor(&format!("{module}.scales"))?;
-    if ct.dtype != Dtype::I8
-        || ct.shape != [n, k]
-        || st.dtype != Dtype::F16
-        || st.shape != [n, k / g]
-    {
-        bail!(
-            "{module}: unexpected codes/scales shapes {:?} / {:?}",
-            ct.shape,
-            st.shape
-        );
-    }
-    let bytes = pack.resident().bytes(ct);
-    // SAFETY: i8 and u8 share a layout; the slice is the tensor's exact byte range.
-    let codes = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) };
-    let sb = pack.resident().bytes(st);
-    let scales: Vec<f32> = sb
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| super::st::f16_to_f32(u16::from_le_bytes(*c)))
-        .collect();
-    Ok((codes, scales))
-}
-
 /// Attention projections computed by the host emulation of the W8A8 path.
 pub struct EmuDense {
-    pack: Arc<PackDir>,
+    pack: Arc<dyn ClefStore>,
     cfg: TextConfig,
 }
 
 impl EmuDense {
-    pub fn new(pack: Arc<PackDir>, cfg: TextConfig) -> Self {
+    pub fn new(pack: Arc<dyn ClefStore>, cfg: TextConfig) -> Self {
         Self { pack, cfg }
     }
 }
@@ -952,14 +984,16 @@ impl Dense for EmuDense {
 
     fn qkv(&self, layer: usize, n: &[f32], s: usize) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
         let (h, d) = (self.cfg.hidden, self.cfg.head_dim);
-        let g = self.pack.dims.group;
+        let g = self.pack.dims().group;
         let (mut aq, mut a_s) = (vec![0i8; s * h], vec![0f32; s * h / g]);
         quantize_rows(n, h, g, &mut aq, &mut a_s, true);
         let pre = format!("thinker.model.layers.{layer}.self_attn.");
         let one = |name: &str, rows: usize| -> Result<Vec<f32>> {
-            let (codes, scales) = resident_linear(&self.pack, &format!("{pre}{name}"), rows, h)?;
+            let (codes, scales) = self
+                .pack
+                .resident_linear(&format!("{pre}{name}"), rows, h)?;
             let mut out = vec![0f32; s * rows];
-            emu_matmul_gw(&aq, &a_s, s, h, codes, &scales, rows, g, &mut out, true);
+            emu_matmul_gw(&aq, &a_s, s, h, &codes, &scales, rows, g, &mut out, true);
             Ok(out)
         };
         let q = one("q_proj", self.cfg.heads * d)?;
@@ -970,13 +1004,13 @@ impl Dense for EmuDense {
 
     fn o_proj(&self, layer: usize, ctx: &[f32], s: usize) -> Result<Vec<f32>> {
         let (h, kk) = (self.cfg.hidden, self.cfg.heads * self.cfg.head_dim);
-        let g = self.pack.dims.group;
+        let g = self.pack.dims().group;
         let (mut aq, mut a_s) = (vec![0i8; s * kk], vec![0f32; s * kk / g]);
         quantize_rows(ctx, kk, g, &mut aq, &mut a_s, true);
         let name = format!("thinker.model.layers.{layer}.self_attn.o_proj");
-        let (codes, scales) = resident_linear(&self.pack, &name, h, kk)?;
+        let (codes, scales) = self.pack.resident_linear(&name, h, kk)?;
         let mut out = vec![0f32; s * h];
-        emu_matmul_gw(&aq, &a_s, s, kk, codes, &scales, h, g, &mut out, true);
+        emu_matmul_gw(&aq, &a_s, s, kk, &codes, &scales, h, g, &mut out, true);
         Ok(out)
     }
 }
@@ -984,13 +1018,13 @@ impl Dense for EmuDense {
 /// Attention projections on the CPU in f32 from the dequantized int8 weights
 /// (`ROCKET_CLEF_ATTN_DEVICE=cpu`).
 pub struct CpuDense {
-    pack: Arc<PackDir>,
+    pack: Arc<dyn ClefStore>,
     cfg: TextConfig,
     threads: usize,
 }
 
 impl CpuDense {
-    pub fn new(pack: Arc<PackDir>, cfg: TextConfig, threads: usize) -> Self {
+    pub fn new(pack: Arc<dyn ClefStore>, cfg: TextConfig, threads: usize) -> Self {
         Self { pack, cfg, threads }
     }
 }
@@ -1054,12 +1088,12 @@ pub fn depth_from_env() -> usize {
 
 /// Build the host-emulation engine over an opened pack.
 pub fn emu_engine(
-    pack: Arc<PackDir>,
+    pack: Arc<dyn ClefStore>,
     cfg: TextConfig,
     threads: usize,
     attn: AttnDevice,
 ) -> PackEngine {
-    let dims = pack.dims;
+    let dims = pack.dims();
     let dense: Box<dyn Dense> = match attn {
         AttnDevice::Npu => Box::new(EmuDense::new(pack.clone(), cfg.clone())),
         AttnDevice::Cpu => Box::new(CpuDense::new(pack.clone(), cfg.clone(), threads)),

@@ -130,6 +130,17 @@ impl SafeFile {
         })
     }
 
+    /// Absolute file offset of the first data byte (`8 + header length`).
+    pub fn data_start(&self) -> usize {
+        self.data_start
+    }
+
+    /// The file length this header describes (`data_start` + the end of the last tensor);
+    /// a different on-disk length means a truncated or foreign file.
+    pub fn expected_len(&self) -> usize {
+        self.data_start + self.tensors.values().map(|t| t.end).max().unwrap_or(0)
+    }
+
     pub fn bytes(&self, info: &TensorInfo) -> &[u8] {
         &self.mmap[self.data_start + info.start..self.data_start + info.end]
     }

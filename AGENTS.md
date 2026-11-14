@@ -3354,3 +3354,13 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   there is expected, not proven), the real wall of a batch (estimate ~30 s + 0.1 s/row) and
   peak anon/BO with 8 records; the exact board commands are in `clef.md` "Board test, phase 7".
   Recommended board flags: `--batch-window-ms 5000 --batch-max 8`.
+- **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
+  AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
+  download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`
+  (`ShardStore`, `AutoRoundWeights`) reads each expert as 2 aligned O_DIRECT reads (qweight/qzeros
+  contiguous, scales a separate run) and converts to the pack record in RAM with
+  `autoround::unpack` (bit-identical to the pack; tested vs `clef-pack-g128`); the engines take
+  `Arc<dyn ClefStore>` (`engine.rs`), the pipeline picks pack (manifest.json) / shards / BF16.
+  Startup validates index + shard sizes + tensor dtypes/shapes (exit 1); a runtime read failure
+  `exit(1)`s (`fatal_read`, packs too). Dev-host emu `decide` equals the pack run; **not run on the
+  board**. Details and the measured tensor layout: `docs/recipes/clef.md` "Step 0".

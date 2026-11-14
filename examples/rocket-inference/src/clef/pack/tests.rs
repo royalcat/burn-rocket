@@ -465,3 +465,152 @@ fn the_manifest_validation_rejects_inconsistent_packs() {
     let _ = std::fs::remove_dir_all(src);
     let _ = std::fs::remove_dir_all(out);
 }
+
+// ---------------------------------------------------------------- shard store (step 0)
+
+mod shards {
+    use super::*;
+    use crate::clef::autoround_store::{AutoRoundWeights, ShardStore};
+    use crate::clef::engine::{ClefStore, ExpertReader};
+
+    #[test]
+    fn the_shard_store_reads_records_identical_to_the_pack() {
+        let (src, out, _truth) = pack_synthetic("shard-rec");
+        assert!(ShardStore::is_autoround(&src));
+        assert!(!ShardStore::is_autoround(&out));
+        let store = ShardStore::open(&src).unwrap();
+        let pack = PackDir::open(&out).unwrap();
+        assert_eq!(store.dims(), pack.dims);
+        let stride = pack.stride();
+        let (mut a, mut b) = (store.new_buffer(), pack.new_buffer());
+        for l in 0..LAYERS {
+            for e in 0..EXPERTS {
+                store.read_expert(l, e, &mut a).unwrap();
+                pack.read_expert(l, e, &mut b).unwrap();
+                assert_eq!(a.as_slice()[..stride], b.as_slice()[..stride], "{l}/{e}");
+            }
+        }
+        // resident projections: codes and f32 scales equal the pack's resident tensors
+        for l in 0..LAYERS {
+            let m = format!("thinker.model.layers.{l}.self_attn.q_proj");
+            let (c1, s1) = ClefStore::resident_linear(&store, &m, HEADS * D, H).unwrap();
+            let (c2, s2) = ClefStore::resident_linear(&pack, &m, HEADS * D, H).unwrap();
+            assert_eq!(c1, c2);
+            assert_eq!(s1, s2);
+            let m = format!("thinker.model.layers.{l}.self_attn.o_proj");
+            assert_eq!(
+                ClefStore::dequant_linear(&store, &m, H, HEADS * D).unwrap(),
+                ClefStore::dequant_linear(&pack, &m, H, HEADS * D).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_backbone_on_the_shards_equals_the_backbone_on_the_pack() {
+        let (src, out, _) = pack_synthetic("shard-bb");
+        let cfg = TextConfig::from_model_dir(&src).unwrap();
+        let sw = AutoRoundWeights::open(&src, cfg.clone()).unwrap();
+        let pw = PackedWeights::open(&out, cfg.clone()).unwrap();
+        for l in 0..LAYERS {
+            let (a, b) = (sw.layer_weights(l).unwrap(), pw.layer_weights(l).unwrap());
+            assert_eq!((a.q, a.k, a.v, a.o), (b.q, b.k, b.v, b.o));
+            assert_eq!((a.router, a.input_norm), (b.router, b.input_norm));
+            for e in 0..EXPERTS {
+                let (x, y) = (sw.expert(l, e).unwrap(), pw.expert(l, e).unwrap());
+                assert_eq!((x.gate, x.up, x.down), (y.gate, y.up, y.down));
+            }
+        }
+        let ids = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let opts = ForwardOpts {
+            threads: 2,
+            ..ForwardOpts::default()
+        };
+        let a = Backbone::open_autoround(&src)
+            .unwrap()
+            .forward(&ids, &opts)
+            .unwrap();
+        let b = Backbone::open_pack(&out)
+            .unwrap()
+            .forward(&ids, &opts)
+            .unwrap();
+        assert_eq!(a.final_normed, b.final_normed);
+    }
+
+    #[test]
+    fn startup_validation_names_a_truncated_or_missing_shard() {
+        let (src, _, _) = pack_synthetic("shard-bad");
+        let shard = src.join("model-00001-of-00001.safetensors");
+        let full = std::fs::read(&shard).unwrap();
+        std::fs::write(&shard, &full[..full.len() - 100]).unwrap();
+        let e = format!(
+            "{:#}",
+            ShardStore::open(&src).err().expect("truncated shard")
+        );
+        assert!(e.contains("model-00001-of-00001"), "{e}");
+        std::fs::remove_file(&shard).unwrap();
+        assert!(ShardStore::open(&src).is_err());
+        std::fs::remove_file(src.join("model.safetensors.index.json")).unwrap();
+        assert!(ShardStore::open(&src).is_err());
+    }
+
+    /// The real checkpoint against the real pack: every sampled expert record is
+    /// bit-identical, and an expert is two reads. Skipped when either is absent.
+    #[test]
+    fn real_shards_equal_the_real_pack_bit_for_bit() {
+        let src = Path::new("/home/royalcat/models/clef-omni-int8-autoround");
+        let pack_dir = Path::new("/home/royalcat/models/clef-pack-g128");
+        if !src.join("model.safetensors.index.json").exists()
+            || !pack_dir.join("manifest.json").exists()
+        {
+            eprintln!("skipped: the real checkpoint or pack is absent");
+            return;
+        }
+        let store = ShardStore::open(src).unwrap();
+        let pack = PackDir::open(pack_dir).unwrap();
+        let stride = pack.stride();
+        let (mut a, mut b) = (store.new_buffer(), pack.new_buffer());
+        let mut n = 0;
+        for (l, e) in [
+            (0, 0),
+            (0, 1),
+            (0, 127),
+            (7, 64),
+            (8, 0),
+            (17, 105),
+            (24, 3),
+            (33, 100),
+            (42, 10),
+            (47, 127),
+        ] {
+            assert_eq!(store.reads_per_expert(l, e).unwrap(), 2, "{l}/{e} reads");
+            store.read_expert(l, e, &mut a).unwrap();
+            pack.read_expert(l, e, &mut b).unwrap();
+            assert!(a.as_slice()[..stride] == b.as_slice()[..stride], "{l}/{e}");
+            n += 1;
+        }
+        // informational: wall of one expert read + conversion (set RAYON_NUM_THREADS=1 for
+        // the single-core cost)
+        let t0 = std::time::Instant::now();
+        for e in 0..20 {
+            store.read_expert(30, e, &mut a).unwrap();
+        }
+        let t1 = std::time::Instant::now();
+        for e in 0..20 {
+            pack.read_expert(30, e, &mut b).unwrap();
+        }
+        eprintln!(
+            "per expert: shard read+convert {:.1} ms, pack read {:.1} ms",
+            (t1 - t0).as_secs_f64() * 50.0,
+            t1.elapsed().as_secs_f64() * 50.0
+        );
+        // an attention projection and the dequantized form agree too
+        let m = "thinker.model.layers.3.self_attn.k_proj";
+        let (c1, s1) = ClefStore::resident_linear(&store, m, 512, 2048).unwrap();
+        let (c2, s2) = ClefStore::resident_linear(&pack, m, 512, 2048).unwrap();
+        assert!(c1 == c2 && s1 == s2);
+        eprintln!(
+            "real shards == real pack on {n} experts (direct io: {})",
+            store.is_direct()
+        );
+    }
+}

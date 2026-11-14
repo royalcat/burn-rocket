@@ -74,7 +74,30 @@ pub fn unpack(l: &QLinear<'_>, codes: &mut [i8], scales: &mut [u8]) -> Result<()
         .for_each(|(bi, rows)| {
             let n0 = bi * BLK;
             let nb = rows.len() / k;
-            for kb in 0..k / 4 {
+            let kq = k / 4;
+            // 4 k-blocks at a time: four words per row are 16 contiguous output bytes
+            // (one store instead of four per row).
+            let mut kb = 0;
+            while kb + 4 <= kq {
+                let base = |j: usize| ((kb + j) * n + n0) * 4;
+                for r in 0..nb {
+                    let mut v = [0i8; 16];
+                    for j in 0..4 {
+                        let o = base(j) + r * 4;
+                        let w = u32::from_le_bytes(qw[o..o + 4].try_into().unwrap());
+                        for (d, b) in v[j * 4..j * 4 + 4]
+                            .iter_mut()
+                            .zip((w ^ 0x8080_8080).to_le_bytes())
+                        {
+                            *d = b as i8;
+                        }
+                    }
+                    let o = r * k + kb * 4;
+                    rows[o..o + 16].copy_from_slice(&v);
+                }
+                kb += 4;
+            }
+            for kb in kb..kq {
                 let base = (kb * n + n0) * 4;
                 for r in 0..nb {
                     let w =
@@ -134,12 +157,29 @@ pub fn dequant_reference(l: &QLinear<'_>) -> Vec<f32> {
 pub struct Source {
     pub dir: std::path::PathBuf,
     files: Vec<SafeFile>,
+    /// Shard file names, parallel to `files`.
+    names: Vec<String>,
     map: BTreeMap<String, usize>,
     pub index_sha256: String,
 }
 
+/// Where a tensor lives in its shard file (absolute byte offsets).
+#[derive(Debug, Clone, Copy)]
+pub struct Loc {
+    pub shard: usize,
+    pub start: u64,
+    pub end: u64,
+}
+
 impl Source {
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_filtered(dir, |_| true)
+    }
+
+    /// Like [`Source::open`], but only the tensors `keep` accepts are indexed and only
+    /// the shards holding at least one of them are opened (the talker / code2wav shards
+    /// are never touched by a text-only run).
+    pub fn open_filtered(dir: &Path, keep: impl Fn(&str) -> bool) -> Result<Self> {
         let p = dir.join("model.safetensors.index.json");
         let raw = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
         let idx: serde_json::Value = serde_json::from_slice(&raw)?;
@@ -149,6 +189,9 @@ impl Source {
         let mut names: Vec<String> = Vec::new();
         let mut map = BTreeMap::new();
         for (k, v) in wm {
+            if !keep(k) {
+                continue;
+            }
             let f = v.as_str().context("shard name")?.to_string();
             let i = match names.iter().position(|n| *n == f) {
                 Some(i) => i,
@@ -166,8 +209,28 @@ impl Source {
         Ok(Self {
             dir: dir.to_path_buf(),
             files,
+            names,
             map,
             index_sha256: super::sha256_hex(&raw),
+        })
+    }
+
+    pub fn shard_names(&self) -> &[String] {
+        &self.names
+    }
+
+    pub fn shard_files(&self) -> &[SafeFile] {
+        &self.files
+    }
+
+    /// Absolute file offsets of `name` inside its shard.
+    pub fn locate(&self, name: &str) -> Result<Loc> {
+        let (f, t) = self.get(name)?;
+        let shard = self.map[name];
+        Ok(Loc {
+            shard,
+            start: (f.data_start() + t.start) as u64,
+            end: (f.data_start() + t.end) as u64,
         })
     }
 

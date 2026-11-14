@@ -251,18 +251,20 @@ Clef-Omni (Cloudflare, Qwen3-Omni-30B-A3B thinker + joint schema head; detected
 from a qwen3_omni_moe config.json with joint_head.safetensors, or `--family
 clef`) is text-only: on the CPU the thinker streams one decoder layer at a time
 from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM plus the
-436 MB head); with a `clef-pack` and `--device npu` (or `auto` on an aarch64 `npu`
-build) the attention projections and the 128-expert MoE of every layer run as
-int8 g128 W8A8 on the NPU, streaming the experts from NVMe (docs/recipes/clef.md). Cases are the same objects as above with the release's
+436 MB head); with the int8 AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`
+or its directory, used as stored, no repack) and `--device npu` (or `auto` on an
+aarch64 `npu` build) the attention projections and the 128-expert MoE of every layer
+run as int8 g128 W8A8 on the NPU, streaming the experts from NVMe
+(docs/recipes/clef.md). Cases are the same objects as above with the release's
 `model`, `state` and `questions` (`images`/`audio`/`videos` are refused:
 not implemented yet). --max-state-tokens is the per-record cap (default 8192;
 the release's own default is 64000); --out and --model-name behave the same,
---device npu needs a pack and an aarch64 `npu` build. The
+--device npu needs the int8 checkpoint (or a pack) and an aarch64 `npu` build. The
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
 `legend`/`probabilities` and `noul` (the probability of true).
 --pack-dir <dir> (same as --model-dir; detected from its manifest.json) loads a
-`clef-pack` (docs/recipes/clef-pack.md): the AutoRound int8 weights streamed from
-aligned expert files, dequantized to f32 on the CPU.
+`clef-pack` (docs/recipes/clef-pack.md), an optional repack of the same weights
+into aligned expert files; the AutoRound checkpoint itself needs no pack.
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -694,12 +696,13 @@ impl LoadArgs {
         };
         let placement = Placement {
             text: if family == Family::Clef {
-                // The int8 NPU path needs a clef pack; `auto` falls back to the CPU for
+                // The int8 NPU path needs the AutoRound int8 checkpoint (or a clef pack from it); `auto` falls back to the CPU for
                 // a BF16 checkpoint, an explicit `npu` is an error.
                 clef_text_placement(
                     stage(self.text_device, true, "--text-device")?,
                     self.text_device.unwrap_or(base) == Device::Npu,
-                    crate::clef::pack::PackDir::is_pack(&model_dir),
+                    crate::clef::pack::PackDir::is_pack(&model_dir)
+                        || crate::clef::autoround_store::ShardStore::is_autoround(&model_dir),
                 )?
             } else {
                 stage(self.text_device, true, "--text-device")?
@@ -884,15 +887,16 @@ fn device_flag(f: &mut FlagArgs, flag: &str) -> Result<Option<Device>> {
         .map(|v| Device::parse(&v)))
 }
 
-/// The Clef text stage: the resolved NPU placement, demoted to the CPU for a non-pack
-/// checkpoint unless the NPU was requested explicitly (then it is an error).
-fn clef_text_placement(npu: bool, explicit_npu: bool, is_pack: bool) -> Result<bool> {
-    if npu && !is_pack {
+/// The Clef text stage: the resolved NPU placement, demoted to the CPU for the BF16
+/// checkpoint (`int8`: the dir is the AutoRound checkpoint or a pack) unless the NPU was
+/// requested explicitly (then it is an error).
+fn clef_text_placement(npu: bool, explicit_npu: bool, int8: bool) -> Result<bool> {
+    if npu && !int8 {
         if explicit_npu {
             bail!(
-                "--device npu needs a clef-pack for the clef model (the NPU path streams int8 \
-                 experts; build one with `clef-pack`, docs/recipes/clef-pack.md); this \
-                 checkpoint is the BF16 one"
+                "--device npu needs the int8 AutoRound checkpoint for the clef model \
+                 (moeshawky/clef-omni-int8-autoround, or a clef-pack made from it): the NPU \
+                 path streams int8 experts; this checkpoint is the BF16 one"
             );
         }
         return Ok(false);
@@ -1336,7 +1340,10 @@ mod tests {
         ] {
             let err = format!("{:#}", resolve(list, Family::Clef).unwrap_err());
             if npu_available() {
-                assert!(err.contains("needs a clef-pack"), "{list:?}: {err}");
+                assert!(
+                    err.contains("needs the int8 AutoRound checkpoint"),
+                    "{list:?}: {err}"
+                );
             } else {
                 assert!(
                     err.contains(&format!("{flag} npu requires an aarch64 build")),
@@ -1353,7 +1360,7 @@ mod tests {
         assert!(!clef_text_placement(true, false, false).unwrap());
         // an explicit npu without a pack is an error; the CPU is never promoted
         let err = format!("{:#}", clef_text_placement(true, true, false).unwrap_err());
-        assert!(err.contains("needs a clef-pack"));
+        assert!(err.contains("needs the int8 AutoRound checkpoint"));
         assert!(!clef_text_placement(false, false, true).unwrap());
         assert!(clef_text_placement(true, true, true).unwrap());
     }
