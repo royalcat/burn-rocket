@@ -36,9 +36,28 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         video_fps,
         video_max_frames,
         delta_chunk,
+        batch_window_ms,
+        batch_max,
+        batch_max_tokens,
     } = args;
     let load = resolve(load)?;
-    validate(&load, video_fps, video_max_frames, delta_chunk)?;
+    validate(
+        &load,
+        video_fps,
+        video_max_frames,
+        delta_chunk,
+        [
+            ("--batch-window-ms", batch_window_ms.is_some()),
+            ("--batch-max", batch_max.is_some()),
+            ("--batch-max-tokens", batch_max_tokens.is_some()),
+        ],
+    )?;
+    let batch_defaults = super::BatchSettings::default();
+    let batch = super::BatchSettings {
+        window_ms: batch_window_ms.unwrap_or(batch_defaults.window_ms),
+        max_records: batch_max.unwrap_or(batch_defaults.max_records),
+        max_tokens: batch_max_tokens.unwrap_or(batch_defaults.max_tokens),
+    };
     let model_dir = load.model_dir.clone();
     let family = load.family;
 
@@ -268,7 +287,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
             )?;
             report_clef_load(started.elapsed().as_secs_f64());
             (
-                Engine::Clef(Box::new(ClefEngine { model, max_tokens })),
+                Engine::Clef(Box::new(ClefEngine { model })),
                 Capabilities {
                     decisions: true,
                     ..Default::default()
@@ -293,6 +312,7 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         max_tokens,
         max_new_tokens,
         temperature,
+        batch,
     };
     super::serve(
         &format!("0.0.0.0:{}", port.unwrap_or(8383)),
@@ -327,6 +347,9 @@ struct Args {
     video_fps: Option<f64>,
     video_max_frames: Option<usize>,
     delta_chunk: Option<usize>,
+    batch_window_ms: Option<u64>,
+    batch_max: Option<usize>,
+    batch_max_tokens: Option<usize>,
 }
 
 impl Args {
@@ -360,6 +383,21 @@ impl Args {
         if let Some(v) = f.take_parsed("--delta-chunk")? {
             args.delta_chunk = Some(v);
         }
+        if let Some(v) = f.take_parsed("--batch-window-ms")? {
+            args.batch_window_ms = Some(v);
+        }
+        if let Some(v) = f.take_parsed::<usize>("--batch-max")? {
+            if v == 0 {
+                bail!("--batch-max must be positive");
+            }
+            args.batch_max = Some(v);
+        }
+        if let Some(v) = f.take_parsed::<usize>("--batch-max-tokens")? {
+            if v == 0 {
+                bail!("--batch-max-tokens must be positive");
+            }
+            args.batch_max_tokens = Some(v);
+        }
         f.finish("serve")?;
         Ok(args)
     }
@@ -371,6 +409,7 @@ fn validate(
     video_fps: Option<f64>,
     video_max_frames: Option<usize>,
     delta_chunk: Option<usize>,
+    batch_flags: [(&str, bool); 3],
 ) -> Result<()> {
     if video_fps.is_some() && load.family != Family::Emb2 {
         bail!(
@@ -385,6 +424,15 @@ fn validate(
              (the {} model has no video path)",
             load.family.name()
         );
+    }
+    for (flag, given) in batch_flags {
+        if given && load.family != Family::Clef {
+            bail!(
+                "{flag} only applies to the Clef-Omni model (it batches /v1/systemone records; \
+                 the {} model has no batching)",
+                load.family.name()
+            );
+        }
     }
     if delta_chunk.is_some() && load.family != Family::Intent {
         bail!("--delta-chunk only applies to the intent model");

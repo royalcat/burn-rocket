@@ -48,10 +48,19 @@ pub const MAX_STATE_TOKENS: usize = 32768;
 /// the layer-streamed forward is linear-to-quadratic in the record length.
 pub const CLEF_MAX_TOKENS: usize = 8192;
 
+/// `decide`'s default records / rows per shared Clef thinker pass (`--batch-max`,
+/// `--batch-max-tokens`); the server's defaults are the same.
+pub const CLEF_BATCH_MAX: usize = 8;
+pub const CLEF_BATCH_TOKENS: usize = 4096;
+
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut args = Args::parse(FlagArgs::new(it))?;
     let load = resolve(std::mem::take(&mut args.load))?;
     require_decision(load.family)?;
+    if load.family != Family::Clef && (args.batch_max.is_some() || args.batch_max_tokens.is_some())
+    {
+        bail!("--batch-max/--batch-max-tokens only apply to the Clef-Omni model");
+    }
     if load.family == Family::Clef {
         return run_clef(args, &load);
     }
@@ -188,32 +197,93 @@ fn run_clef(args: Args, load: &ResolvedLoad) -> Result<()> {
                 bail!("{} holds no cases", path.display());
             }
             let total = values.len();
-            let (mut out, mut refused, mut tokens) = (Vec::with_capacity(total), 0usize, 0usize);
-            for (index, value) in values.into_iter().enumerate() {
+            let (mut refused, mut tokens) = (0usize, 0usize);
+            // Parse and encode every case up front: a refusal is that case's alone.
+            let mut names = Vec::with_capacity(total);
+            let mut slots: Vec<Option<Value>> = vec![None; total];
+            let mut ready: Vec<(usize, ClefRequest, crate::clef::EncodedRecord)> = Vec::new();
+            for (index, mut value) in values.into_iter().enumerate() {
                 let name = value
                     .get("name")
                     .or_else(|| value.get("id"))
                     .and_then(Value::as_str)
                     .map_or_else(|| format!("case-{}", index + 1), str::to_string);
-                let t0 = Instant::now();
-                match run_case(value)? {
-                    Ok((response, case_tokens)) => {
-                        tokens += case_tokens;
-                        println!(
-                            "[{}/{total}] {name}: {} question(s), {case_tokens} tokens in {:.1}s",
-                            index + 1,
-                            response["answers"].as_object().map_or(0, |a| a.len()),
-                            t0.elapsed().as_secs_f64()
-                        );
-                        out.push(serde_json::json!({"name": name, "response": response}));
+                names.push(name.clone());
+                if let Value::Object(object) = &mut value {
+                    object.remove("name");
+                    object
+                        .entry("model")
+                        .or_insert_with(|| Value::String(model_name.clone()));
+                }
+                let encoded = ClefRequest::from_value(value).and_then(|request| {
+                    match model.encode(&request, max_length) {
+                        Ok(enc) => Ok((request, enc)),
+                        Err(error) => match error.downcast::<Invalid>() {
+                            Ok(refusal) => Err(refusal),
+                            Err(error) => Err(Invalid(format!("internal error: {error:#}"))),
+                        },
                     }
+                });
+                match encoded {
+                    Ok((request, enc)) => ready.push((index, request, enc)),
                     Err(refusal) => {
                         refused += 1;
                         println!("[{}/{total}] {name}: refused: {refusal}", index + 1);
-                        out.push(serde_json::json!({"name": name, "error": refusal.0}));
+                        slots[index] = Some(serde_json::json!({"name": name, "error": refusal.0}));
                     }
                 }
             }
+            // Cases share thinker passes: records of one batch pay one expert stream.
+            let lens: Vec<usize> = ready.iter().map(|(_, _, e)| e.input_ids.len()).collect();
+            let batch_max = args.batch_max.unwrap_or(CLEF_BATCH_MAX);
+            let batch_tokens = args.batch_max_tokens.unwrap_or(CLEF_BATCH_TOKENS);
+            let plan = crate::clef::model::plan_batches(&lens, batch_tokens, batch_max);
+            let mut ready: Vec<Option<_>> = ready.into_iter().map(Some).collect();
+            for (n, range) in plan.iter().enumerate() {
+                let members: Vec<(usize, ClefRequest, crate::clef::EncodedRecord)> = range
+                    .clone()
+                    .map(|i| ready[i].take().expect("planned once"))
+                    .collect();
+                let reqs: Vec<&ClefRequest> = members.iter().map(|(_, r, _)| r).collect();
+                let rows: usize = members.iter().map(|(_, _, e)| e.input_ids.len()).sum();
+                let encoded = members.iter().map(|(_, _, e)| Ok(e.clone())).collect();
+                let t0 = Instant::now();
+                let done = model.answer_encoded(&reqs, encoded, batch_tokens);
+                println!(
+                    "batch {}/{}: {} record(s), {rows} tokens, {} pass(es), {} expert read(s) in {:.1}s",
+                    n + 1,
+                    plan.len(),
+                    members.len(),
+                    done.chunks.len(),
+                    done.experts_read(),
+                    t0.elapsed().as_secs_f64()
+                );
+                for ((index, _, _), result) in members.iter().zip(done.results) {
+                    let name = &names[*index];
+                    match result {
+                        Ok(answered) => {
+                            tokens += answered.tokens;
+                            println!(
+                                "[{}/{total}] {name}: {} question(s), {} tokens",
+                                index + 1,
+                                answered.questions,
+                                answered.tokens
+                            );
+                            slots[*index] = Some(
+                                serde_json::json!({"name": name, "response": answered.response}),
+                            );
+                        }
+                        Err(error) => {
+                            let refusal = error.downcast::<Invalid>()?;
+                            refused += 1;
+                            println!("[{}/{total}] {name}: refused: {refusal}", index + 1);
+                            slots[*index] =
+                                Some(serde_json::json!({"name": name, "error": refusal.0}));
+                        }
+                    }
+                }
+            }
+            let out: Vec<Value> = slots.into_iter().flatten().collect();
             println!(
                 "decided {} case(s), {tokens} prompt tokens in {:.1}s ({:.0} MiB anon){}",
                 total - refused,
@@ -350,6 +420,8 @@ struct Args {
     dump_prompts: Option<PathBuf>,
     max_state_tokens: Option<usize>,
     model_name: Option<String>,
+    batch_max: Option<usize>,
+    batch_max_tokens: Option<usize>,
 }
 
 impl Args {
@@ -363,6 +435,8 @@ impl Args {
             dump_prompts: None,
             max_state_tokens: None,
             model_name: None,
+            batch_max: None,
+            batch_max_tokens: None,
         };
         if let Some(v) = f.take("--requests")? {
             args.requests = Some(PathBuf::from(v));
@@ -383,6 +457,17 @@ impl Args {
             args.max_state_tokens = Some(v);
         }
         args.model_name = f.take("--model-name")?;
+        for (flag, slot) in [
+            ("--batch-max", &mut args.batch_max),
+            ("--batch-max-tokens", &mut args.batch_max_tokens),
+        ] {
+            if let Some(v) = f.take_parsed::<usize>(flag)? {
+                if v == 0 {
+                    bail!("{flag} must be positive");
+                }
+                *slot = Some(v);
+            }
+        }
         f.finish("decide")?;
         Ok(args)
     }

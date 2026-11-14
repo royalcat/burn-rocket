@@ -465,25 +465,61 @@ pub fn layer_forward(
     rope: &Rope,
     threads: usize,
 ) -> Result<LayerOut> {
-    let (h, nh, nkv, d) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
-    assert_eq!(x.len(), s * h);
-    // ---- attention
-    let n = rms_norm(x, h, &w.input_norm, cfg.eps);
-    let mut q = matmul_nt(&n, s, h, &w.q, nh * d, threads);
-    let mut k = matmul_nt(&n, s, h, &w.k, nkv * d, threads);
-    let v = matmul_nt(&n, s, h, &w.v, nkv * d, threads);
-    rms_norm_rows(&mut q, d, &w.q_norm, cfg.eps);
-    rms_norm_rows(&mut k, d, &w.k_norm, cfg.eps);
-    rope.apply(&mut q, s, nh);
-    rope.apply(&mut k, s, nkv);
-    let ctx = attention(cfg, &q, &k, &v, s);
-    let proj = matmul_nt(&ctx, s, nh * d, &w.o, h, threads);
-    let hid: Vec<f32> = x.iter().zip(&proj).map(|(a, b)| a + b).collect();
+    layer_forward_multi(cfg, w, src, layer, x, &[s], rope, threads)
+}
 
-    // ---- MoE
-    let n2 = rms_norm(&hid, h, &w.post_norm, cfg.eps);
-    let logits = matmul_nt(&n2, s, h, &w.router, cfg.experts, threads);
-    let (ids, wts, margins) = route(cfg, &logits, s);
+/// One decoder layer over several records at once: `x` holds the records' rows
+/// back to back (`lens[i]` rows each). Attention (projections, RoPE with positions
+/// restarting per record, the causal scores) and the router run per record, so no
+/// record sees another; the MoE buckets the rows of ALL records per expert, so each
+/// expert's weights are widened once per layer. `rope` must cover the longest record.
+/// With `lens == [s]` this is exactly [`layer_forward`].
+#[allow(clippy::too_many_arguments)]
+pub fn layer_forward_multi(
+    cfg: &TextConfig,
+    w: &LayerWeights,
+    src: &dyn ExpertSource,
+    layer: usize,
+    x: &[f32],
+    lens: &[usize],
+    rope: &Rope,
+    threads: usize,
+) -> Result<LayerOut> {
+    let (h, nh, nkv, d) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
+    let s: usize = lens.iter().sum();
+    assert_eq!(x.len(), s * h);
+    let mut hid = vec![0f32; s * h];
+    let mut n2 = vec![0f32; s * h];
+    let (mut ids, mut wts, mut margins) = (Vec::new(), Vec::new(), Vec::new());
+    let mut off = 0;
+    for &sr in lens {
+        let xr = &x[off * h..(off + sr) * h];
+        // ---- attention
+        let n = rms_norm(xr, h, &w.input_norm, cfg.eps);
+        let mut q = matmul_nt(&n, sr, h, &w.q, nh * d, threads);
+        let mut k = matmul_nt(&n, sr, h, &w.k, nkv * d, threads);
+        let v = matmul_nt(&n, sr, h, &w.v, nkv * d, threads);
+        rms_norm_rows(&mut q, d, &w.q_norm, cfg.eps);
+        rms_norm_rows(&mut k, d, &w.k_norm, cfg.eps);
+        rope.apply(&mut q, sr, nh);
+        rope.apply(&mut k, sr, nkv);
+        let ctx = attention(cfg, &q, &k, &v, sr);
+        let proj = matmul_nt(&ctx, sr, nh * d, &w.o, h, threads);
+        for ((o, a), b) in hid[off * h..(off + sr) * h].iter_mut().zip(xr).zip(&proj) {
+            *o = a + b;
+        }
+        // ---- router (per record)
+        let n2r = rms_norm(&hid[off * h..(off + sr) * h], h, &w.post_norm, cfg.eps);
+        let logits = matmul_nt(&n2r, sr, h, &w.router, cfg.experts, threads);
+        let (i, wt, mg) = route(cfg, &logits, sr);
+        ids.extend(i);
+        wts.extend(wt);
+        margins.extend(mg);
+        n2[off * h..(off + sr) * h].copy_from_slice(&n2r);
+        off += sr;
+    }
+
+    // ---- MoE over every row
     let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); cfg.experts];
     for t in 0..s {
         for slot in 0..cfg.top_k {
@@ -714,6 +750,188 @@ impl Backbone {
             final_hidden: x,
         })
     }
+
+    /// Run several records through the thinker as ONE pass per chunk: per-record
+    /// attention, one MoE (one expert stream) over the rows of every record of the
+    /// chunk. Records are chunked in order so a chunk holds at most `max_batch_tokens`
+    /// rows (a record over the cap runs alone; `0` = no cap). Every record's output is
+    /// bit-identical to [`Backbone::forward`] on it alone for the engines whose row math
+    /// is independent of the other rows (see `docs/recipes/clef.md`, "Batching").
+    ///
+    /// An empty record fails alone; an error in a chunk's shared pass fails that chunk's
+    /// members with the same message. A panic (an NPU failure) unwinds out of the call.
+    pub fn forward_batch(
+        &self,
+        records: &[&[u32]],
+        opts: &ForwardOpts,
+        max_batch_tokens: usize,
+    ) -> Result<BatchForward> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(opts.threads.max(1))
+            .build()?;
+        let mut outs: Vec<Option<Result<BackboneOut>>> = (0..records.len()).map(|_| None).collect();
+        let live: Vec<usize> = (0..records.len())
+            .filter(|&i| {
+                if records[i].is_empty() {
+                    outs[i] = Some(Err(anyhow::anyhow!("empty input")));
+                }
+                !records[i].is_empty()
+            })
+            .collect();
+        let lens: Vec<usize> = live.iter().map(|&i| records[i].len()).collect();
+        let mut chunks = Vec::new();
+        for range in plan_batches(&lens, max_batch_tokens, usize::MAX) {
+            let members: Vec<&[u32]> = live[range.clone()].iter().map(|&i| records[i]).collect();
+            let tokens: usize = members.iter().map(|m| m.len()).sum();
+            let t0 = std::time::Instant::now();
+            let res = pool.install(|| self.run_batch(&members, opts));
+            let seconds = t0.elapsed().as_secs_f64();
+            let phases = if res.is_ok() {
+                self.last_phases()
+            } else {
+                None
+            };
+            chunks.push(BatchChunk {
+                records: members.len(),
+                tokens,
+                seconds,
+                phases,
+            });
+            match res {
+                Ok(v) => {
+                    for (&i, o) in live[range].iter().zip(v) {
+                        outs[i] = Some(Ok(o));
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    for &i in &live[range] {
+                        outs[i] = Some(Err(anyhow::anyhow!("{msg}")));
+                    }
+                }
+            }
+        }
+        Ok(BatchForward {
+            outs: outs
+                .into_iter()
+                .map(|o| o.expect("every record ran"))
+                .collect(),
+            chunks,
+        })
+    }
+
+    /// One shared pass over `records` (all non-empty).
+    fn run_batch(&self, records: &[&[u32]], opts: &ForwardOpts) -> Result<Vec<BackboneOut>> {
+        let (cfg, h) = (&self.cfg, self.cfg.hidden);
+        let lens: Vec<usize> = records.iter().map(|r| r.len()).collect();
+        let total: usize = lens.iter().sum();
+        let mut x = vec![0f32; total * h];
+        for (r, &id) in x.chunks_mut(h).zip(records.iter().flat_map(|r| r.iter())) {
+            self.weights.embed_row(id, r)?;
+        }
+        let rope = Rope::new(cfg, lens.iter().copied().max().unwrap_or(0));
+        for l in 0..cfg.layers {
+            let out = if let Some(eng) = &self.engine {
+                let w = self.weights.layer_small(l)?;
+                let r = super::engine::engine_layer_forward_multi(
+                    cfg,
+                    &w,
+                    eng.as_ref(),
+                    l,
+                    &x,
+                    &lens,
+                    &rope,
+                    opts.threads,
+                );
+                match r {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eng.abort_request();
+                        return Err(e);
+                    }
+                }
+            } else {
+                let w = self.weights.layer_weights(l)?;
+                layer_forward_multi(
+                    cfg,
+                    &w,
+                    self.weights.experts(),
+                    l,
+                    &x,
+                    &lens,
+                    &rope,
+                    opts.threads,
+                )?
+            };
+            x = out.hidden;
+            if opts.release_pages {
+                self.weights.release();
+            }
+        }
+        if let Some(eng) = &self.engine {
+            eng.finish_request(total);
+        }
+        let nw = self.weights.final_norm()?;
+        let normed = rms_norm(&x, h, &nw, cfg.eps);
+        let mut outs = Vec::with_capacity(records.len());
+        let mut off = 0;
+        for &s in &lens {
+            outs.push(BackboneOut {
+                final_normed: normed[off * h..(off + s) * h].to_vec(),
+                final_hidden: x[off * h..(off + s) * h].to_vec(),
+            });
+            off += s;
+        }
+        Ok(outs)
+    }
+}
+
+/// One shared pass of [`Backbone::forward_batch`].
+#[derive(Debug, Clone)]
+pub struct BatchChunk {
+    pub records: usize,
+    /// Rows (tokens) of the pass.
+    pub tokens: usize,
+    pub seconds: f64,
+    /// The engine's phase totals of the pass (`None` on the plain CPU path); `experts`
+    /// counts the expert records read and run over all layers.
+    pub phases: Option<super::engine::Phases>,
+}
+
+/// The per-record results (input order) and the shared passes of a batch.
+pub struct BatchForward {
+    pub outs: Vec<Result<BackboneOut>>,
+    pub chunks: Vec<BatchChunk>,
+}
+
+/// Greedy, order-preserving grouping of records (by their `lens`) into batches of at
+/// most `max_records` records and `max_tokens` total rows (`0` = no row cap). A record
+/// that alone exceeds the row cap forms a batch of its own. Returns index ranges.
+pub fn plan_batches(
+    lens: &[usize],
+    max_tokens: usize,
+    max_records: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let cap = if max_tokens == 0 {
+        usize::MAX
+    } else {
+        max_tokens
+    };
+    let max_records = max_records.max(1);
+    let mut out = Vec::new();
+    let (mut start, mut rows) = (0usize, 0usize);
+    for (i, &l) in lens.iter().enumerate() {
+        if i > start && (rows + l > cap || i - start >= max_records) {
+            out.push(start..i);
+            start = i;
+            rows = 0;
+        }
+        rows += l;
+    }
+    if start < lens.len() {
+        out.push(start..lens.len());
+    }
+    out
 }
 
 #[cfg(test)]

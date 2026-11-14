@@ -33,8 +33,9 @@ use axum::{
 use serde_json::Value;
 
 use super::AppState;
-use super::engine::DecisionReply;
-use super::error::ApiError;
+use super::clef_batch::ClefJob;
+use super::engine::{DecisionReply, clef_api_error};
+use super::error::{ApiError, blocking};
 use super::log;
 use crate::clef::ClefRequest;
 use crate::decision::DecisionRequest;
@@ -110,8 +111,11 @@ pub(crate) async fn systemone(
 /// `POST /v1/systemone` for Clef-Omni: the release's `systemone()` contract. The body is
 /// validated like the Python entry point (`model` and `state` required, a nonempty
 /// `questions` object, types and criteria); a refusal (including a request carrying
-/// images, audio or videos, which are not implemented yet) is `422 {"detail": "<reason>"}`
-/// and runs nothing. A valid request answers `{"model", "answers", "usage"}`.
+/// images, audio or videos, which are not implemented yet, and a record over the
+/// prompt cap) is `422 {"detail": "<reason>"}` immediately and runs nothing. A valid
+/// request is encoded, queued, answered together with whatever shares its batch
+/// (`--batch-window-ms`, `--batch-max`, `--batch-max-tokens`) and returns
+/// `{"model", "answers", "usage"}`; the answer does not depend on its batch mates.
 pub(crate) async fn systemone_clef(
     State(state): State<AppState>,
     body: Bytes,
@@ -123,12 +127,53 @@ pub(crate) async fn systemone_clef(
     if let Some(refusal) = request.media_refusal() {
         return Err(DecisionError::unprocessable(refusal.0));
     }
-    let (outcome, timing) = state
-        .compute(move |engine| engine.clef_decisions(request))
+    let front = state
+        .clef
+        .clone()
+        .ok_or_else(|| DecisionError::from_api(ApiError::internal("no Clef model is loaded")))?;
+    // Encode before queueing: a record over the cap is a 422 now, and the batcher knows
+    // each job's exact row count.
+    let encoder = front.clone();
+    let (request, enc) = blocking(move || {
+        match crate::clef::encode_record(&encoder.tokenizer, &request, encoder.max_tokens, None) {
+            Ok(enc) => Ok((request, enc)),
+            Err(error) => Err(clef_api_error(&error)),
+        }
+    })
+    .await
+    .map_err(DecisionError::from_api)?;
+    let rows = enc.input_ids.len();
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    front
+        .batcher
+        .submit(
+            ClefJob {
+                req: request,
+                enc,
+                reply,
+            },
+            rows,
+        )
+        .map_err(|_| {
+            DecisionError::from_api(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the server is shutting down",
+            ))
+        })?;
+    let done = answer
         .await
+        .map_err(|_| DecisionError::from_api(ApiError::internal("the batch worker stopped")))?
         .map_err(DecisionError::from_api)?;
-    log::decision(&state, outcome.questions, outcome.tokens, &timing);
-    Ok(Json(outcome.response))
+    log::clef_decision(
+        &state,
+        done.outcome.questions,
+        done.outcome.tokens,
+        done.queue_s,
+        done.compute_s,
+        done.batch_records,
+        done.batch_tokens,
+    );
+    Ok(Json(done.outcome.response))
 }
 
 #[cfg(test)]

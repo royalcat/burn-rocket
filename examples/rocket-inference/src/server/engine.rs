@@ -11,7 +11,7 @@ use tokenizers::Tokenizer;
 
 pub use crate::family::Family;
 
-use crate::clef::{ClefModel, ClefRequest, Invalid};
+use crate::clef::{ClefModel, ClefRequest, EncodedRecord, Invalid};
 use crate::decision::model::{DecisionModel, PrepareError};
 use crate::decision::request::{DecisionRequest, MediaMode};
 use crate::gemma::embeddinggemma::model::Emb2Model;
@@ -236,8 +236,6 @@ pub struct DecisionEngine {
 #[derive(Debug)]
 pub struct ClefEngine {
     pub model: ClefModel,
-    /// Per-record prompt-token cap (the server's `--max-tokens`).
-    pub max_tokens: usize,
 }
 
 /// What one decision request produced, in the terms the log line reports.
@@ -401,15 +399,42 @@ impl Engine {
         }
     }
 
-    /// `/v1/systemone` for Clef-Omni: all questions of the record answered jointly.
-    pub fn clef_decisions(&mut self, req: ClefRequest) -> Result<DecisionOutcome, ApiError> {
+    /// `/v1/systemone` for Clef-Omni: several already validated and encoded records
+    /// answered in shared thinker passes (see [`ClefEngine::decide_batch`]).
+    pub fn clef_batch(
+        &mut self,
+        reqs: &[&ClefRequest],
+        encoded: Vec<EncodedRecord>,
+        max_batch_tokens: usize,
+    ) -> Result<ClefBatchOutcome, ApiError> {
         match self {
-            Self::Clef(engine) => engine.decide(req),
+            Self::Clef(engine) => Ok(engine.decide_batch(reqs, encoded, max_batch_tokens)),
             _ => Err(ApiError::bad_request(
                 "this model does not answer Clef-Omni requests",
             )),
         }
     }
+}
+
+/// The client/server split of an error from the Clef pipeline: an [`Invalid`] is the
+/// client's (422), everything else is internal.
+pub(crate) fn clef_api_error(error: &anyhow::Error) -> ApiError {
+    match error.downcast_ref::<Invalid>() {
+        Some(invalid) => ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, invalid.0.clone()),
+        None => ApiError::internal(format!("{error:#}")),
+    }
+}
+
+/// What one shared Clef batch produced.
+pub struct ClefBatchOutcome {
+    /// Per request, in batch order.
+    pub results: Vec<Result<DecisionOutcome, ApiError>>,
+    /// Rows (tokens) over the whole batch.
+    pub tokens: usize,
+    /// Shared thinker passes the batch needed (> 1 when the row cap split it).
+    pub passes: usize,
+    /// Expert records read over those passes (0 where the engine has no phase counters).
+    pub experts_read: usize,
 }
 
 impl Qwen3Engine {
@@ -841,15 +866,18 @@ impl DecisionEngine {
 }
 
 impl ClefEngine {
-    /// `/v1/systemone`'s compute for Clef-Omni: one streamed forward for the whole
-    /// record. The `clef` span is the child of `inference`; `tokens` is recorded once
-    /// the record is encoded and answered.
+    /// `/v1/systemone`'s compute for Clef-Omni over a batch of validated, encoded
+    /// records: their attention runs per record, the MoE of every layer once over all
+    /// rows. The `clef` span is the child of `inference`; `batch` is the member count
+    /// and `tokens` the rows of the whole batch.
     #[telemetry::instrument(
         name = "clef",
         skip_all,
         fields(
-            questions = req.questions.len(),
+            batch = reqs.len(),
             tokens = tracing::field::Empty,
+            passes = tracing::field::Empty,
+            experts_read = tracing::field::Empty,
             engine = self.model.backbone.engine_label().unwrap_or_else(|| "cpu f32".into()),
             moe_s = tracing::field::Empty,
             attn_s = tracing::field::Empty,
@@ -859,15 +887,23 @@ impl ClefEngine {
             peak_anon_mib = tracing::field::Empty,
         )
     )]
-    fn decide(&mut self, req: ClefRequest) -> Result<DecisionOutcome, ApiError> {
-        let answered = self.model.answer(&req, self.max_tokens).map_err(|error| {
-            match error.downcast_ref::<Invalid>() {
-                Some(invalid) => ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, invalid.0.clone()),
-                None => ApiError::internal(format!("{error:#}")),
-            }
-        })?;
+    fn decide_batch(
+        &mut self,
+        reqs: &[&ClefRequest],
+        encoded: Vec<EncodedRecord>,
+        max_batch_tokens: usize,
+    ) -> ClefBatchOutcome {
+        let tokens: usize = encoded.iter().map(|e| e.input_ids.len()).sum();
+        let done = self.model.answer_encoded(
+            reqs,
+            encoded.into_iter().map(Ok).collect(),
+            max_batch_tokens,
+        );
         let span = tracing::Span::current();
-        span.record("tokens", answered.tokens as u64);
+        span.record("tokens", tokens as u64);
+        span.record("passes", done.chunks.len() as u64);
+        span.record("experts_read", done.experts_read() as u64);
+        // the phase totals of the last pass (a batch is one pass unless the cap split it)
         if let Some(p) = self.model.backbone.last_phases() {
             span.record("moe_s", p.moe);
             span.record("attn_s", p.attn);
@@ -876,11 +912,23 @@ impl ClefEngine {
             span.record("npu_s", p.npu_thread);
             span.record("peak_anon_mib", p.peak_anon_mib);
         }
-        Ok(DecisionOutcome {
-            response: answered.response,
-            questions: answered.questions,
-            tokens: answered.tokens,
-        })
+        ClefBatchOutcome {
+            passes: done.chunks.len(),
+            experts_read: done.experts_read(),
+            tokens,
+            results: done
+                .results
+                .into_iter()
+                .map(|r| match r {
+                    Ok(a) => Ok(DecisionOutcome {
+                        response: a.response,
+                        questions: a.questions,
+                        tokens: a.tokens,
+                    }),
+                    Err(e) => Err(clef_api_error(&e)),
+                })
+                .collect(),
+        }
     }
 }
 

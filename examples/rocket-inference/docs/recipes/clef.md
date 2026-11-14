@@ -202,10 +202,84 @@ attn=..s router=..s combine=..s | thread-s: read_wait=.. rewrite=.. quant=.. npu
 read_io=.. | peak_anon=.. MiB`. The phase-0 probe predicts ~1.4-1.9 s of expert matmul and
 ~0.5 s of disk per layer at M_e=64 (about 72 s of expert time per 1k-token pass).
 
+## Batching (phase 7)
+
+A pass costs a ~30 s floor on the board (all 128 experts of a layer are hit, so ~5.5k
+expert loads/request, each a rewrite + two matmuls) plus ~0.1 s per extra token. The
+expert reads and the per-expert fixed costs are shared by every row of a layer, so
+several records can share ONE expert stream: **batching N records concatenates their
+MoE rows per layer** (bucketed by expert over all rows, combined per token in expert-id
+order); attention (q|k|v and o projections are row-independent and run over all rows
+at once; RoPE with positions restarting per record, the causal scores and the router run
+per record) never mixes records. The workload is background, so latency is traded for
+throughput.
+
+Flags (Clef only; any other family rejects them):
+
+| flag | default | meaning |
+|---|---|---|
+| `serve --batch-window-ms <n>` | 0 | how long the first queued record waits for company, counted from its arrival (a record that queued behind a running batch is not delayed again). 0 = no waiting beyond what is already queued: an isolated request has today's latency |
+| `serve --batch-max <n>` | 8 | most records per shared pass (a batch is dispatched as soon as it holds this many) |
+| `serve --batch-max-tokens <n>` | 4096 | most rows (tokens) per shared pass; a record that would overshoot it opens the next batch, a single record over it runs alone |
+| `decide --batch-max <n>` / `--batch-max-tokens <n>` | 8 / 4096 | the same limits for `--requests`: the cases are grouped in order, one `batch i/n: ... expert read(s) in ...s` line per batch, output order and per-case `error` entries unchanged |
+
+Server semantics: a request is parsed, validated and **encoded in the handler** (media,
+schema and over-cap records are `422` immediately and never queue), then queued; one
+worker thread forms batches and runs each under the model lock (`/health` and
+`/v1/models` never take it). Each request logs its own line with `queue_s`, `compute_s`
+(the shared batch compute, the same for every member), `tokens`, `batch=N` and
+`batch_tokens`, plus one `clef batch` line (`batch`, `batch_tokens`, `passes`,
+`experts_read`). Traces: the `inference` span carries `batch`/`batch_tokens`, its `clef`
+child `batch`, `tokens`, `passes`, `experts_read` and the phase totals. A client that
+disconnects while queued is skipped (its reply channel is closed) or, once running,
+simply not answered; SIGTERM stops accepting, runs everything already queued without
+waiting out the window, then exits. A panic or NPU failure in a shared pass fails every
+member of that pass with the usual mapping (503 NOMEM, 500, device failure exits).
+
+**Memory bound.** Per-expert outputs are `rows * top_k * hidden * 4` B (rows * 8 * 2048 *
+4 = 64 KiB per row, 268 MB at 4096 rows) plus the gathered inputs, so `--batch-max-tokens`
+is the knob: the default 4096 bounds it at about that (dev host, emulation: a 881-row batch peaked at
+718 MiB `RssAnon` vs ~480-615 MiB idle/after singles). The
+per-expert NPU shapes are bucketed in M classes (<= 512 rows per call), so a larger
+batch does not multiply the number of driver shapes.
+
+**Bit-identity.** Quantization is per row per group, the int32 group partials are exact,
+the router is per token and the combine order is per token in expert-id order, so on the
+host emulation (`ROCKET_CLEF_EMU=1`, `Int8Emu`) each record's result is **bit-identical**
+to running it alone, whatever its batch mates (tests: lengths 1/7/23/40, a duplicate,
+chunking under a row cap; and the real-pack gate below). The plain f32 CPU path (no
+engine) is **not** bit-identical: the expert GEMMs run on the bucket's row count and the
+`gemm` crate's summation order depends on it (measured max|d|/peak 6e-7 on the mini
+model: rounding noise). On the NPU engine bit-identity depends on the driver's int8
+group-wise matmul being row-independent for any M class/chunk; that is the property the
+board test checks (it was not measured on the board).
+
+**When to use.** Throughput on a loaded queue: the floor is paid once per batch. On the
+board (floor 30 s, 0.1 s/token) four 250-token records cost ~4 x 55 = 220 s alone and
+should cost ~30 + 0.1 x 1000 = ~130 s as a batch (an estimate from the measured floor, not a
+measurement). Recommended board deployment: `--batch-window-ms 5000 --batch-max 8`
+(`--batch-max-tokens` left at 4096); with an isolated request the only cost is the 5 s
+window. On the dev host the CPU emulation has no streaming floor, so the gain is small.
+
+Dev-host measurements (release, `ROCKET_CLEF_EMU=1`, 8 threads, pack `clef-pack-g128`):
+
+| run | wall | expert reads |
+|---|---|---|
+| 4 records alone (295 + 256 + 800 + 156 tokens) | 122.8 s | 5219 + 5179 + 5579 + 5071 = 21,048 |
+| the same 4 as one batch (1507 rows) | 113.8 s | 5,700 |
+| `serve`, 4 concurrent curls (881 rows), window 3 s | 70.2 s vs 76.7 s for the 4 singles | 5,533 vs 20,426 |
+
+All answers byte-identical to the single runs (probabilities compared as exact f64 in the
+gate, response bodies `cmp`-identical in the smoke). The reads per request collapse 3.7x;
+the dev-host wall gain is only 7-8 % because the emulated expert math (not I/O) dominates
+there. The gate: `cargo test --release -p rocket-inference --no-default-features
+clef_batch_equals_single_records_on_the_emulated_engine -- --ignored --nocapture`.
+
+Board check: see "Board test, phase 7" below.
+
 ## Not done
 
-Image/audio/video inputs (vision and audio towers, the media placeholders), batching several
-records, `media_kwargs`, attention scores/AV on the NPU, a CPU `sdot` expert path.
+Image/audio/video inputs (vision and audio towers, the media placeholders), `media_kwargs`, attention scores/AV on the NPU, a CPU `sdot` expert path.
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 
@@ -228,3 +302,24 @@ Model load 2-4 s, 496 MiB anon, 927 MiB of BOs for the resident attention projec
   severity 2.2406 (2.2751), double_charge 0.969 (0.9674), owners_assigned 0.0163 (0.0169).
   Top-1 equal everywhere; |dp| <= 0.025, in line with the host emulation.
 - Not yet measured on the board: >= 2k tokens, `ROCKET_CLEF_ATTN_DEVICE=cpu`, `serve`, batching.
+
+## Board test, phase 7 (not run yet)
+
+```sh
+# binary: aarch64 npu release build, scp to /root/rocket-inference/rocket-inference-p7
+cd /root/rocket-inference
+# stop home-llm-gateway-embed-1 / -decision-1 as for phase 6; run on cores 4-7
+ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference-p7 serve --pack-dir /root/models/clef-pack-g128 \
+  --device npu --port 8399 --max-tokens 4096 --batch-window-ms 5000 --batch-max 8 &
+# four concurrent requests (tools/clef_fixtures.json cases with "model": "clef-omni"):
+for f in checkout-errors invoice noul-only choice-routing; do
+  curl -s localhost:8399/v1/systemone -H 'Content-Type: application/json' -d @$f.json > b_$f.out & done; wait
+```
+
+Expect: one `clef batch batch=4 ... passes=1 experts_read~5.5k` line and four
+`decision request ... batch=4` lines; `ROCKET_PHASE_LOG` one `clef phases` line for the
+batch; total wall about 30 s + 0.1 s x rows. Then send the same four with
+`--batch-window-ms 0` one at a time and compare the `*.out` files with `cmp`: they must be
+byte-identical (if not, the NPU int8 matmul is not row-independent across M classes: report
+the differing probabilities; the emulation says they should match). Watch `peak_anon`
+(<= ~1 GiB) and the `experts_read` counter against 4 x ~5.2k for the singles.

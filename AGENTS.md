@@ -3252,7 +3252,7 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
   **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
   code complete, dev-host verified, board-verified for 142-800 tokens (2026-11-14: 38.7 s / 51.6 s / 103 s, <= 0.9 GiB anon, answers match the oracle)**, below. Remaining (plan
-  numbering): 7 request batching, 8 media towers (image/audio/video; requests carrying
+  numbering): 8 media towers (image/audio/video; requests carrying
   media get 422 "not implemented yet"), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
   `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
@@ -3311,3 +3311,46 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   record (CPU pack path 21-28 s). Not run on the board: see `docs/recipes/clef.md` "Board
   usage" for the commands and the phase-log lines to check (expected ~1.4-1.9 s expert matmul
   per layer at M_e=64, disk 0.5 s/layer, i.e. ~72 s of expert time per 1k tokens).
+
+- **Phase 7, request batching** (2026-11-14, `docs/recipes/clef.md` "Batching"): several
+  records share ONE thinker pass, i.e. one expert stream per layer. Library:
+  `Backbone::forward_batch(records, opts, max_batch_tokens) -> BatchForward { outs, chunks }`
+  (`clef/model.rs`; `plan_batches` = greedy order-preserving chunking by rows/records, an
+  oversized record runs alone, `0` = no cap; `layer_forward_multi` for the CPU path) and
+  `engine_layer_forward_multi` (`clef/engine.rs`): norms, q|k|v / o projections and the
+  residual over all rows, RoPE (positions restart per record), causal GQA scores and the
+  router per record, ONE `moe_add` over the concatenated rows (`Buckets` over all rows,
+  per-token expert-id-order combine, so nothing in the engine trait changed; `hint_layer`/
+  `finish_request` just see the total row count). `ClefModel::{encode, answer_batch,
+  answer_encoded}` -> `BatchAnswers { results, chunks }` (+ `experts_read()` from the phase
+  counters): a record that fails validation/encoding/the head fails alone, a failed shared
+  pass fails its members with the same message, a panic (NPU failure) unwinds as before.
+  Server: `server/batcher.rs` (generic worker thread: window counted from the first queued
+  job's arrival, `--batch-max` jobs, `--batch-max-tokens` rows, a job that would overshoot
+  opens the next batch, shutdown drains in order and does not wait out the window, a dropped
+  receiver is skipped) and `server/clef_batch.rs` (`ClefFront` = tokenizer clone + queue;
+  `run_batch` skips closed replies, takes the model lock once, `catch_compute`, one
+  `trim_after_request`, replies per member; `inference` span with `batch`/`batch_tokens`, the
+  `clef` span `batch`/`passes`/`experts_read`). The `/v1/systemone` Clef handler parses,
+  validates and encodes (422s are immediate), submits and awaits; per-request log line
+  gains `batch=`/`batch_tokens=` (`log::clef_decision`) plus one `clef batch` line. New
+  flags, Clef only (other families reject them): `serve --batch-window-ms` (0),
+  `--batch-max` (8), `--batch-max-tokens` (4096); `decide --batch-max/--batch-max-tokens`
+  group `--requests` cases in order (`batch i/n:` timing lines, order and per-case `error`
+  entries unchanged). `ClefEngine.max_tokens` is gone (the front owns the per-record cap).
+  **Bit-identity**: batch vs single is bit-identical on `Int8Emu` (mini synthetic model:
+  lengths 7/1/23/40 + a duplicate, row-cap chunking at 30 and 64; real pack: checkout-errors
+  + invoice + long-incident + noul-only as one batch, probabilities exact f64 and answers
+  equal, a media request in the batch refused alone) and the `serve` smoke (4 concurrent
+  curls, window 3 s) returned byte-identical bodies. The plain f32 CPU path is NOT
+  bit-identical (the `gemm` crate's result depends on the row count `m` of the expert
+  bucket; max|d|/peak 6e-7 on the mini model). **Expert reads** (the board-relevant
+  quantity, `Phases.experts`): 4 records alone 5219+5179+5579+5071 = 21,048 vs 5,700 as one
+  batch; serve: 5,533 vs 20,426. Dev-host wall (CPU emulation, no streaming floor): 113.8 s
+  vs 122.8 s (-7 %), serve 70.2 s vs 76.7 s. Tests: `cargo test -p rocket-inference
+  --no-default-features` = 260 pass + 5 ignored (the new real-pack gate is
+  `clef_batch_equals_single_records_on_the_emulated_engine`). **Not measured on the board**:
+  whether the NPU int8 matmul is row-independent across M classes/512-row chunks (bit-identity
+  there is expected, not proven), the real wall of a batch (estimate ~30 s + 0.1 s/row) and
+  peak anon/BO with 8 records; the exact board commands are in `clef.md` "Board test, phase 7".
+  Recommended board flags: `--batch-window-ms 5000 --batch-max 8`.

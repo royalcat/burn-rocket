@@ -740,7 +740,28 @@ pub fn engine_layer_forward(
     rope: &Rope,
     threads: usize,
 ) -> Result<LayerOut> {
+    engine_layer_forward_multi(cfg, w, eng, layer, x, &[s], rope, threads)
+}
+
+/// [`engine_layer_forward`] over several records whose rows are concatenated in `x`
+/// (`lens[i]` rows each). The row-independent steps (norms, the q|k|v and o
+/// projections, the residual) run over all rows at once; RoPE (positions restart per
+/// record), the causal scores and the router run per record, so no record attends to
+/// another; ONE `moe_add` buckets the rows of every record per expert, so each expert
+/// of the layer is read and run once. `rope` must cover the longest record.
+#[allow(clippy::too_many_arguments)]
+pub fn engine_layer_forward_multi(
+    cfg: &TextConfig,
+    w: &LayerSmall,
+    eng: &dyn LayerEngine,
+    layer: usize,
+    x: &[f32],
+    lens: &[usize],
+    rope: &Rope,
+    threads: usize,
+) -> Result<LayerOut> {
     let (h, nh, nkv, d) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
+    let s: usize = lens.iter().sum();
     assert_eq!(x.len(), s * h);
     // reads of this layer's experts start before the attention
     eng.hint_layer(layer, s);
@@ -750,9 +771,24 @@ pub fn engine_layer_forward(
     let t = Instant::now();
     rms_norm_rows(&mut q, d, &w.q_norm, cfg.eps);
     rms_norm_rows(&mut k, d, &w.k_norm, cfg.eps);
-    rope.apply(&mut q, s, nh);
-    rope.apply(&mut k, s, nkv);
-    let ctx = causal_gqa(cfg, &q, &k, &v, s);
+    let mut ctx = Vec::with_capacity(s * nh * d);
+    let mut off = 0;
+    for &sr in lens {
+        let (qr, kr) = (
+            &mut q[off * nh * d..(off + sr) * nh * d],
+            &mut k[off * nkv * d..(off + sr) * nkv * d],
+        );
+        rope.apply(qr, sr, nh);
+        rope.apply(kr, sr, nkv);
+        ctx.extend(causal_gqa(
+            cfg,
+            qr,
+            kr,
+            &v[off * nkv * d..(off + sr) * nkv * d],
+            sr,
+        ));
+        off += sr;
+    }
     eng.note(Phase::Attn, t.elapsed().as_secs_f64());
     drop((q, k, v));
     let proj = eng.o_proj(layer, &ctx, s)?;
@@ -762,8 +798,23 @@ pub fn engine_layer_forward(
 
     let n2 = rms_norm(&hid, h, &w.post_norm, cfg.eps);
     let t = Instant::now();
-    let logits = matmul_nt(&n2, s, h, &w.router, cfg.experts, threads);
-    let (ids, wts, margins) = route(cfg, &logits, s);
+    let (mut ids, mut wts, mut margins) = (Vec::new(), Vec::new(), Vec::new());
+    let mut off = 0;
+    for &sr in lens {
+        let logits = matmul_nt(
+            &n2[off * h..(off + sr) * h],
+            sr,
+            h,
+            &w.router,
+            cfg.experts,
+            threads,
+        );
+        let (i, wt, mg) = route(cfg, &logits, sr);
+        ids.extend(i);
+        wts.extend(wt);
+        margins.extend(mg);
+        off += sr;
+    }
     eng.note(Phase::Router, t.elapsed().as_secs_f64());
     let mut y = hid;
     eng.moe_add(layer, &n2, s, &ids, &wts, &mut y)?;

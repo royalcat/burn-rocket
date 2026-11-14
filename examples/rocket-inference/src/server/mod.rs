@@ -9,6 +9,8 @@
 //! panics are contained so the server survives them, and every inference
 //! request is timed and logged through [`log`].
 
+mod batcher;
+mod clef_batch;
 pub mod cli;
 pub mod engine;
 pub mod error;
@@ -31,6 +33,7 @@ use axum::{
     middleware,
     routing::{get, post},
 };
+pub use clef_batch::BatchSettings;
 use engine::{Capabilities, Engine, Family};
 use error::{ApiError, blocking};
 use log::RequestTiming;
@@ -57,12 +60,16 @@ pub struct Settings {
     pub max_new_tokens: usize,
     /// Default sampling temperature (0 = greedy).
     pub temperature: f32,
+    /// Clef `/v1/systemone` batching (ignored by the other families).
+    pub batch: BatchSettings,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
     pub(crate) inner: Arc<Mutex<Engine>>,
     pub(crate) settings: Arc<Settings>,
+    /// The Clef request queue (`Family::Clef` only).
+    pub(crate) clef: Option<Arc<clef_batch::ClefFront>>,
 }
 
 impl AppState {
@@ -145,9 +152,23 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     crate::util::log_npu_mem();
     let capabilities = settings.capabilities;
     let model_name = settings.model_name.clone();
+    let clef_tokenizer = match &engine {
+        Engine::Clef(c) => Some(c.model.tokenizer().clone()),
+        _ => None,
+    };
+    let inner = Arc::new(Mutex::new(engine));
+    let clef = clef_tokenizer.map(|tokenizer| {
+        Arc::new(clef_batch::ClefFront::start(
+            inner.clone(),
+            tokenizer,
+            settings.max_tokens,
+            settings.batch,
+        ))
+    });
     let state = AppState {
-        inner: Arc::new(Mutex::new(engine)),
+        inner,
         settings: Arc::new(settings),
+        clef: clef.clone(),
     };
 
     let mut app: Router<AppState> = Router::new()
@@ -209,7 +230,11 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
             .await?;
         Ok::<(), anyhow::Error>(())
     })?;
-    // In-flight requests are drained above; export what is still queued.
+    // In-flight requests are drained above (their handlers waited for the batch worker);
+    // stop the Clef batcher and export what is still queued.
+    if let Some(clef) = clef {
+        clef.batcher.shutdown();
+    }
     drop(telemetry);
     Ok(())
 }

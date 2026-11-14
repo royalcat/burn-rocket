@@ -1,4 +1,5 @@
 use super::*;
+use crate::clef::Invalid;
 use crate::clef::encode::EncodedQuestion;
 use crate::clef::testutil::{f32s, read_npz};
 use serde_json::json;
@@ -378,4 +379,87 @@ fn clef_emu_answers_match_the_oracle_and_the_cpu_pack_path() {
     );
     assert!(n > 0, "no record ran");
     assert!(worst_o < 0.05, "emu vs oracle max |dp| {worst_o:.4}");
+}
+
+/// Phase 7 gate: records answered as ONE batch through the host emulation of the NPU
+/// engine equal the same records answered alone, bit for bit (probabilities and answers),
+/// a refused record fails alone, and the batch reads each expert once per layer. Prints
+/// the wall times and the expert-read counts (the quantity that matters on the board).
+#[test]
+#[ignore = "needs the full clef pack (CLEF_PACK_DIR); ~1-2 min on the dev host"]
+fn clef_batch_equals_single_records_on_the_emulated_engine() {
+    let dir = PathBuf::from(std::env::var("CLEF_PACK_DIR").unwrap_or_else(|_| PACK_DIR.into()));
+    if !dir.join("manifest.json").exists() {
+        eprintln!("skipping: no clef pack at {}", dir.display());
+        return;
+    }
+    let ids = std::env::var("CLEF_IDS")
+        .unwrap_or_else(|_| "checkout-errors,invoice,long-incident,noul-only".into());
+    let model = ClefModel::load_kind(&dir, default_threads(), EngineKind::Emu).unwrap();
+    let mut reqs: Vec<ClefRequest> = ids.split(',').map(fixture).collect();
+    // a media request: refused up front, must not take the others down
+    reqs.push(
+        ClefRequest::from_value(json!({
+            "model": "clef-omni", "state": "x", "images": ["data:image/png;base64,AAAA"],
+            "questions": {"q": {"type": "noul"}},
+        }))
+        .unwrap(),
+    );
+    let refs: Vec<&ClefRequest> = reqs.iter().collect();
+
+    let (mut single_wall, mut single_reads) = (0f64, 0usize);
+    let mut singles = Vec::new();
+    for r in &refs[..refs.len() - 1] {
+        let t0 = std::time::Instant::now();
+        singles.push(model.answer(r, 64000).unwrap());
+        single_wall += t0.elapsed().as_secs_f64();
+        let reads = model.backbone.last_phases().map_or(0, |p| p.experts);
+        single_reads += reads;
+        eprintln!(
+            "single: {} tokens, {reads} expert reads, {:.1}s",
+            singles.last().unwrap().tokens,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let batch = model.answer_batch(&refs, 64000, 4096);
+    let batch_wall = t0.elapsed().as_secs_f64();
+    assert_eq!(batch.chunks.len(), 1, "one shared pass");
+    assert!(
+        batch
+            .results
+            .last()
+            .unwrap()
+            .as_ref()
+            .is_err_and(|e| e.downcast_ref::<Invalid>().is_some()),
+        "the media request is refused alone"
+    );
+    for (i, want) in singles.iter().enumerate() {
+        let got = batch.results[i].as_ref().unwrap();
+        assert_eq!(got.tokens, want.tokens, "{i}: tokens");
+        assert_eq!(
+            got.probabilities, want.probabilities,
+            "{i}: probabilities (bit-exact)"
+        );
+        assert!(eq(&got.response, &want.response), "{i}: answers differ");
+    }
+    let batch_reads = batch.experts_read();
+    eprintln!(
+        "batch of {} ({} rows): {} expert reads vs {single_reads} for the singles; \
+         wall {batch_wall:.1}s vs {single_wall:.1}s",
+        singles.len(),
+        batch.chunks[0].tokens,
+        batch_reads
+    );
+    assert!(batch_reads < single_reads);
+    // the same through the row cap: 2 passes, still identical
+    let capped = model.answer_batch(&refs, 64000, 300);
+    assert!(capped.chunks.len() >= 2);
+    for (i, want) in singles.iter().enumerate() {
+        assert_eq!(
+            capped.results[i].as_ref().unwrap().probabilities,
+            want.probabilities,
+            "{i}: capped batch"
+        );
+    }
 }

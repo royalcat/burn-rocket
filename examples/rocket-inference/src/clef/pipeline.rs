@@ -160,6 +160,113 @@ impl ClefModel {
         })?;
         assemble(req, &encoded, &logits)
     }
+
+    /// The tokenizer (a clone is how the server encodes a request before queueing it).
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Validate and encode one request (the client-error half of [`ClefModel::answer`]).
+    pub fn encode(&self, req: &ClefRequest, max_length: usize) -> Result<EncodedRecord> {
+        if let Some(refusal) = req.media_refusal() {
+            return Err(refusal.into());
+        }
+        encode_record(&self.tokenizer, req, max_length, None)
+    }
+
+    /// Answer several requests with their thinker passes shared (see
+    /// [`Backbone::forward_batch`]): results come back in input order, a request that
+    /// fails validation/encoding (or the head) fails alone, a failure of a shared pass
+    /// fails that pass's members. Each answer is bit-identical to [`ClefModel::answer`]
+    /// on the request alone (engine permitting, see the batching notes).
+    /// `max_batch_tokens` caps the rows of one shared pass (`0` = no cap).
+    pub fn answer_batch(
+        &self,
+        reqs: &[&ClefRequest],
+        max_length: usize,
+        max_batch_tokens: usize,
+    ) -> BatchAnswers {
+        let encoded: Vec<Result<EncodedRecord>> =
+            reqs.iter().map(|r| self.encode(r, max_length)).collect();
+        self.answer_encoded(reqs, encoded, max_batch_tokens)
+    }
+
+    /// [`ClefModel::answer_batch`] for records the caller already validated and
+    /// encoded (the server does that before queueing); an `Err` entry fails that
+    /// request alone and keeps its error (so an `Invalid` stays a client error).
+    pub fn answer_encoded(
+        &self,
+        reqs: &[&ClefRequest],
+        encoded: Vec<Result<EncodedRecord>>,
+        max_batch_tokens: usize,
+    ) -> BatchAnswers {
+        assert_eq!(reqs.len(), encoded.len());
+        let mut results: Vec<Option<Result<Answered>>> = (0..reqs.len()).map(|_| None).collect();
+        let (mut idx, mut recs) = (Vec::new(), Vec::new());
+        for (i, e) in encoded.into_iter().enumerate() {
+            match e {
+                Ok(r) => {
+                    idx.push(i);
+                    recs.push(r);
+                }
+                Err(e) => results[i] = Some(Err(e)),
+            }
+        }
+        let ids: Vec<&[u32]> = recs.iter().map(|r| r.input_ids.as_slice()).collect();
+        let mut chunks = Vec::new();
+        match self
+            .backbone
+            .forward_batch(&ids, &self.opts, max_batch_tokens)
+        {
+            Err(e) => {
+                let msg = format!("{e:#}");
+                for &i in &idx {
+                    results[i] = Some(Err(anyhow::anyhow!("{msg}")));
+                }
+            }
+            Ok(fwd) => {
+                chunks = fwd.chunks;
+                for ((&i, enc), out) in idx.iter().zip(&recs).zip(fwd.outs) {
+                    results[i] = Some(out.and_then(|out| {
+                        let spans: Vec<_> = enc.questions.iter().map(|q| q.spans()).collect();
+                        let logits = self.pool.install(|| {
+                            self.head.forward(
+                                &out.final_normed,
+                                &enc.input_ids,
+                                &spans,
+                                &self.lm_head,
+                            )
+                        })?;
+                        assemble(reqs[i], enc, &logits)
+                    }));
+                }
+            }
+        }
+        BatchAnswers {
+            results: results
+                .into_iter()
+                .map(|r| r.expect("every request has a result"))
+                .collect(),
+            chunks,
+        }
+    }
+}
+
+/// The results of [`ClefModel::answer_batch`], in request order, and the shared passes.
+pub struct BatchAnswers {
+    pub results: Vec<Result<Answered>>,
+    pub chunks: Vec<super::model::BatchChunk>,
+}
+
+impl BatchAnswers {
+    /// Expert records read over all passes (0 on the plain CPU path, which has no phases).
+    pub fn experts_read(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter_map(|c| c.phases.as_ref())
+            .map(|p| p.experts)
+            .sum()
+    }
 }
 
 /// The NPU engine of an aarch64 `npu` build, or the host emulation when `emu`.

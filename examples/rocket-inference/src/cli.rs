@@ -84,6 +84,13 @@ server:
   --delta-chunk <n>            delta-rule chunk width (intent, default 64)
   --video-fps <f>              video sampling rate (embeddinggemma, default 1.0)
   --video-max-frames <n>       video frame cap (embeddinggemma, default 32)
+  --batch-window-ms <n>        clef: how long the first queued /v1/systemone record
+                               waits for company before its batch runs (default 0:
+                               batch only what is already queued)
+  --batch-max <n>              clef: most records per shared thinker pass (default 8)
+  --batch-max-tokens <n>       clef: most rows (tokens) per shared pass (default
+                               4096; bounds the per-expert output memory, a record
+                               over the cap runs alone)
 
 placement:
   --device / --text-device / --text-attn-device / --vision-device /
@@ -217,6 +224,8 @@ input:
                                one per merged token of each temporal pair)
 
 output:
+  --batch-max <n>              clef: records per shared thinker pass (default 8)
+  --batch-max-tokens <n>       clef: rows (tokens) per shared pass (default 4096)
   --out <path>                 write the JSON result (default: stdout)
   --model-name <name>          reported model name (default: MODEL_MANIFEST.json
                                `model_name`, else the model dir name)
