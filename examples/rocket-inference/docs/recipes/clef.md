@@ -323,3 +323,47 @@ batch; total wall about 30 s + 0.1 s x rows. Then send the same four with
 byte-identical (if not, the NPU int8 matmul is not row-independent across M classes: report
 the differing probabilities; the emulation says they should match). Watch `peak_anon`
 (<= ~1 GiB) and the `experts_read` counter against 4 x ~5.2k for the singles.
+
+## Board results, phase 7 batching (2026-11-14, rock-5b-plus)
+
+`serve --pack-dir /mnt/nvme/models/clef-pack-g128 --device npu --max-tokens 4096`, `taskset -c 4-7`,
+same board conditions as phase 6 (services stopped for the run, load ~10). Four fixture
+requests (295 + 256 + 174 + 192 tokens):
+
+| mode | wall | expert loads | peak anon |
+|---|---|---|---|
+| 4 concurrent, `--batch-window-ms 5000 --batch-max 8` (one batch, 917 rows) | **107 s** (5 s of it is the window; compute 101.6 s) | 5,590 | 935 MiB |
+| 4 sequential, `--batch-window-ms 0` | 179 s (51.4 + 44.5 + 41.8 + 40.8 s) | 20,497 | 630-705 MiB |
+
+- **The 4 answers are byte-identical** between the batched and the single runs on the NPU, so
+  the int8 `matmul_gw` is row-independent across M classes and chunks (what was only proven on
+  the emulation before).
+- Batching saves the 30 s streaming floor per extra record: 1.67x here; the gain grows with
+  the batch (batch of 8 short records ~ 30 s + 0.1 s/row).
+- The batch compute (101.6 s for 917 rows) is above the 30 s + 0.1 s/row estimate: at ~900 rows
+  the per-row work (expert matmuls at M_e~56, qkv/o 23 s, attention) dominates. Budget
+  ~35-40 s + ~0.08 s/row.
+
+## Deployment (text-only, current)
+
+Prerequisites on the board: the pack at `/mnt/nvme/models/clef-pack-g128` (30 GB, copy with
+`rsync -a` from the dev host or rebuild with `rocket-inference clef-pack --src <autoround dir>
+--out <dir>`), a `rocket` kernel module at 600 MHz (as for the other families), and an image
+or binary built with `--features npu` (CI `ghcr.io/royalcat/rocket-inference:latest` after
+merging this branch).
+
+```sh
+rocket-inference serve --pack-dir /models/clef-pack-g128 --device npu \
+    --max-tokens 4096 --batch-window-ms 5000 --batch-max 8 --batch-max-tokens 4096 \
+    --port 8385 --model-name clef-omni
+```
+
+- `--max-tokens` is the per-record cap (CPU attention is O(S^2) and per-expert outputs are
+  `rows*8*2048*4` bytes; 4096 keeps a batch under ~1.2 GiB anon + ~1 GiB of BOs).
+- Request timeouts on the client side must exceed the batch window plus the batch compute
+  (minutes). `/health` and `/v1/models` answer during a batch.
+- Container: mount the pack read-only (O_DIRECT works on btrfs/ext4 bind mounts; set
+  `CLEF_PACK_NO_DIRECT=1` if the filesystem refuses it), pin CPUs 4-7, expose `/dev/accel`,
+  `mem_limit` 3g is enough (NPU buffers are not charged to the cgroup, ~1 GiB more on top).
+- Not supported yet: image/audio/video inputs (HTTP 422), see the plan's phase 8.
+- The measured per-request times and the knobs are in the phase 6/7 sections above.
