@@ -370,8 +370,8 @@ rocket-inference serve --pack-dir /models/clef-pack-g128 --device npu \
 
 ## Step 0: serving straight from the AutoRound shards (no repack)
 
-> **STATUS 2026-11-14: code complete, dev-host verified (host emulation, CPU, aarch64
-> cross build, unit tests). NOT run on the board.** The `clef-pack` tool, `--pack-dir` and
+> **STATUS 2026-11-14: code complete, dev-host verified, board-verified (see "Board results,
+> step 0" below).** The `clef-pack` tool, `--pack-dir` and
 > `PackDir` stay as an explicit opt-in; they are no longer on the default path.
 
 ```sh
@@ -383,8 +383,8 @@ rocket-inference decide --model-dir <that dir> --requests ... [--device cpu]
 `-hf <owner>/<name>` **without** `:quant` is a safetensors snapshot download
 (`util/hub.rs::resolve_snapshot`): `config.json`, `tokenizer.json`, `tokenizer_config.json`,
 `joint_head.safetensors`, `joint_head_config.json`, `model.safetensors.index.json` and every
-shard that holds a `thinker.*` tensor (shards 1-6 = ~32 GiB for this repo; the talker/code2wav
-shards 7-8 are skipped); a shard already on disk whose size matches its own header is not
+shard that holds a `thinker.*` tensor (shards 1-7 = ~37 GiB for this repo: shard 7 holds
+`embed_tokens`/`lm_head` and the visual/audio towers; only shard 8, talker/code2wav, is skipped); a shard already on disk whose size matches its own header is not
 fetched again. The repo (checked against the HF API 2026-11-14) ships `joint_head.safetensors`
 and `joint_head_config.json`, so nothing else is needed. The dir is `$HF_HOME/models/
 moeshawky--clef-omni-int8-autoround` (or `$HF_HUB_CACHE`, else `/tmp/rocket-hf`).
@@ -464,3 +464,38 @@ ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference decide \
     --requests tools/clef_fixtures.json --out /tmp/clef-shards.json
 # compare with the pack run: same `cases`; check `read_wait`/`read_io` and the 5219-expert pass wall
 ```
+
+## Board results, step 0 (2026-11-14, rock-5b-plus)
+
+`decide --device npu`, `taskset -c 4-7`, 600 MHz module, `home-llm-gateway-embed-1`/`-decision-1`
+stopped for the runs and restored healthy. Shards (shards 1-7, 37 GiB, rsynced to
+`/mnt/nvme/models/clef-omni-int8-autoround`) vs the pack (`--pack-dir
+/mnt/nvme/models/clef-pack-g128`), same window; board disk speed drifts (the pack's own
+`read_io` went 39 -> 58 -> 72 thread-s on checkout-errors during one hour), so only
+interleaved pairs are comparable. **`cases` are byte-identical to the pack run for both
+records, in every shard variant.** Shard 7 must be present (a rsync of shards 1-6 fails at
+open with ENOENT; the hub downloader already fetches 1-7).
+
+| record (tokens) | pack moe wall | shards, reader converts (v0) | converter stage (final) | peak anon pack / shards |
+|---|---|---|---|---|
+| checkout-errors (295) | 41.9 / 61.3 / 72.4 s (drift) | 73.8, 77.4 s | **50.0, 51.6 s** (pack 43.4 s same window) | 686-691 / 819 MiB |
+| long-incident (800) | 73.6, 73.5, 72.8 s | 91.4, 93.0 s | **77.8, 88.5 s** | 896-899 / 1020 MiB |
+
+Phase line (long-incident): pack `read_io=39.5` thread-s (7.1 ms per 4.8 MB expert, 675 MB/s
+O_DIRECT), `read_wait` 1-2; shards v0 `read_io=96-98` (reader thread = read 58 + unpack ~40 serial
+on the A76; `read_wait` 46-56, the reader is the bottleneck: 1.25x the pack wall). Even raw I/O
+of the shard layout is slower than the pack (58 vs 39 thread-s: two reads per expert, 465 vs
+675 MB/s). Tried: (a) 3-way parallel unpack inside the reader: 91 s, no gain (the cores are
+shared with the consumers); (b) unpack on the consumer threads (`glue` 55 thread-s): 96.8 s,
+worse (consumers are the critical path); (c) **kept**: reader thread = I/O only, then
+`ROCKET_CLEF_CONVERTERS` (default 2, max 4) converter threads unpack in parallel and deliver in stream
+order (`ExpertReader::{needs_finish, finish}`, `ShardStore::{read_raw, convert}`, expert buffers
+are `stride + raw extents`), `read_wait` 1-6 thread-s. Result +7-19 % wall vs the pack,
++130 MiB anon (buffers). The remaining cost is CPU: the unpack is ~10-14 ms per expert on
+the A76s (~55-80 CPU-s per pass) on cores shared with the NPU consumers. Verdict: shard
+streaming is usable and gives the same answers; **the pack is still the faster production
+path (~10 %)**, and the lever left is a NEON `autoround::unpack` (the GPTQ word -> `[N,K]` i8
+transpose) or a one-time repack. Dev-host: fmt/clippy clean, `cargo test -p rocket-inference
+--no-default-features` 260+ pass (incl. `real_shards_equal_the_real_pack_bit_for_bit`).
+Board artifacts (scratch, can be deleted): `/root/rocket-clef-s0/` (binaries v0-v3, run logs,
+outputs); the shard dir at `/mnt/nvme/models/clef-omni-int8-autoround` is the working copy.

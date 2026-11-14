@@ -39,8 +39,6 @@ const MODULES: [&str; 3] = ["gate_proj", "up_proj", "down_proj"];
 const KINDS: [&str; 3] = ["qweight", "qzeros", "scales"];
 
 thread_local! {
-    /// Raw (still GPTQ-packed) extents of the expert being read.
-    static RAW: RefCell<Vec<AlignedBuf>> = const { RefCell::new(Vec::new()) };
     /// Record buffer of [`AutoRoundWeights::expert`] (the CPU path).
     static EXPERT_BUF: RefCell<Option<AlignedBuf>> = const { RefCell::new(None) };
 }
@@ -225,77 +223,106 @@ impl ShardStore {
         Ok(self.plan(layer, e)?.len())
     }
 
-    /// Read expert `e` of `layer` into `buf` as a pack record (`stride` bytes): the
-    /// aligned extents are read, then the GPTQ words are unpacked into the record layout.
-    pub fn read_expert(&self, layer: usize, e: usize, buf: &mut AlignedBuf) -> Result<()> {
+    /// Bytes a buffer needs: the record plus the raw extents of any expert.
+    pub fn buffer_bytes(&self) -> usize {
+        let mut raw = 0usize;
+        for l in 0..self.layers {
+            for e in [0, self.experts - 1] {
+                if let Ok(x) = self.plan(l, e) {
+                    raw = raw.max(x.iter().map(|x| (x.a1() - x.a0()) as usize).sum());
+                }
+            }
+        }
+        self.layout.stride + raw + 4 * ALIGN
+    }
+
+    /// Phase 1 (I/O only): read the aligned extents of expert `e` of `layer` into the
+    /// tail of `buf` (after the `stride` bytes the record takes).
+    pub fn read_raw(&self, layer: usize, e: usize, buf: &mut AlignedBuf) -> Result<()> {
         if layer >= self.layers || e >= self.experts {
             bail!("layer {layer} expert {e} out of range");
         }
         let stride = self.layout.stride;
-        if buf.len() < stride {
-            bail!("buffer of {} bytes < stride {stride}", buf.len());
+        let extents = self.plan(layer, e)?;
+        let mut off = stride;
+        for x in &extents {
+            let len = (x.a1() - x.a0()) as usize;
+            if buf.len() < off + len {
+                bail!("buffer of {} bytes < {} needed", buf.len(), off + len);
+            }
+            let name = &self.src.shard_names()[x.shard];
+            let got = self.disk[x.shard]
+                .read_at(&mut buf.as_mut_slice()[off..off + len], x.a0())
+                .with_context(|| format!("read shard {name}"))?;
+            // The last extent of a shard may run past EOF (rounded to 4 KiB).
+            if (got as u64) < x.end - x.a0() {
+                bail!(
+                    "short read of shard {name} at {}: {got} of {} bytes",
+                    x.a0(),
+                    x.end - x.a0()
+                );
+            }
+            off += len;
         }
+        Ok(())
+    }
+
+    /// Phase 2 (CPU only): unpack the GPTQ words read by [`Self::read_raw`] into the
+    /// pack record layout at the head of `buf`.
+    pub fn convert(&self, layer: usize, e: usize, buf: &mut AlignedBuf) -> Result<()> {
+        let stride = self.layout.stride;
         let d = self.dims;
         let extents = self.plan(layer, e)?;
-        RAW.with(|cell| -> Result<()> {
-            let mut raw = cell.borrow_mut();
-            for (i, x) in extents.iter().enumerate() {
-                let len = (x.a1() - x.a0()) as usize;
-                if raw.len() <= i {
-                    raw.push(AlignedBuf::new(len));
-                } else if raw[i].len() < len {
-                    raw[i] = AlignedBuf::new(len);
-                }
-                let name = &self.src.shard_names()[x.shard];
-                let got = self.disk[x.shard]
-                    .read_at(&mut raw[i].as_mut_slice()[..len], x.a0())
-                    .with_context(|| format!("read shard {name}"))?;
-                // The last extent of a shard may run past EOF (rounded to 4 KiB).
-                if (got as u64) < x.end - x.a0() {
-                    bail!(
-                        "short read of shard {name} at {}: {got} of {} bytes",
-                        x.a0(),
-                        x.end - x.a0()
-                    );
-                }
-            }
-            let p = format!("thinker.model.layers.{layer}.mlp.experts.{e}.");
-            let tensor = |m: &str, k: &str| -> Result<&[u8]> {
-                let l = self.src.locate(&format!("{p}{m}.{k}"))?;
-                let (i, x) = extents
-                    .iter()
-                    .enumerate()
-                    .find(|(_, x)| x.shard == l.shard && x.start <= l.start && l.end <= x.end)
-                    .context("tensor outside every planned extent")?;
-                let o = (l.start - x.a0()) as usize;
-                Ok(&raw[i].as_slice()[o..o + (l.end - l.start) as usize])
-            };
-            let ql = |m: &str, n: usize, k: usize| -> Result<QLinear<'_>> {
-                Ok(QLinear {
-                    qweight: tensor(m, "qweight")?,
-                    qzeros: tensor(m, "qzeros")?,
-                    scales: tensor(m, "scales")?,
-                    n,
-                    k,
-                    group: d.group,
-                })
-            };
-            let rec = ExpertRecordMut::split(d, &mut buf.as_mut_slice()[..stride]);
-            let gu_n = d.inter * d.hidden;
-            let gu_s = d.inter * (d.hidden / d.group) * 2;
-            let (g_codes, u_codes) = rec.gu_codes.split_at_mut(gu_n);
-            let (g_sc, u_sc) = rec.gu_scales.split_at_mut(gu_s);
-            for (m, codes, sc) in [("gate_proj", g_codes, g_sc), ("up_proj", u_codes, u_sc)] {
-                autoround::unpack(&ql(m, d.inter, d.hidden)?, codes, sc)
-                    .with_context(|| format!("{p}{m}"))?;
-            }
-            autoround::unpack(
-                &ql("down_proj", d.hidden, d.inter)?,
-                rec.down_codes,
-                rec.down_scales,
-            )
-            .with_context(|| format!("{p}down_proj"))
-        })
+        let mut offs = Vec::with_capacity(extents.len());
+        let mut off = stride;
+        for x in &extents {
+            offs.push(off);
+            off += (x.a1() - x.a0()) as usize;
+        }
+        let (head, raw) = buf.as_mut_slice().split_at_mut(stride);
+        let p = format!("thinker.model.layers.{layer}.mlp.experts.{e}.");
+        let tensor = |m: &str, k: &str| -> Result<&[u8]> {
+            let l = self.src.locate(&format!("{p}{m}.{k}"))?;
+            let (i, x) = extents
+                .iter()
+                .enumerate()
+                .find(|(_, x)| x.shard == l.shard && x.start <= l.start && l.end <= x.end)
+                .context("tensor outside every planned extent")?;
+            let o = offs[i] - stride + (l.start - x.a0()) as usize;
+            Ok(&raw[o..o + (l.end - l.start) as usize])
+        };
+        let ql = |m: &str, n: usize, k: usize| -> Result<QLinear<'_>> {
+            Ok(QLinear {
+                qweight: tensor(m, "qweight")?,
+                qzeros: tensor(m, "qzeros")?,
+                scales: tensor(m, "scales")?,
+                n,
+                k,
+                group: d.group,
+            })
+        };
+        let rec = ExpertRecordMut::split(d, head);
+        let gu_n = d.inter * d.hidden;
+        let gu_s = d.inter * (d.hidden / d.group) * 2;
+        let (g_codes, u_codes) = rec.gu_codes.split_at_mut(gu_n);
+        let (g_sc, u_sc) = rec.gu_scales.split_at_mut(gu_s);
+        for (m, codes, sc) in [("gate_proj", g_codes, g_sc), ("up_proj", u_codes, u_sc)] {
+            autoround::unpack(&ql(m, d.inter, d.hidden)?, codes, sc)
+                .with_context(|| format!("{p}{m}"))?;
+        }
+        autoround::unpack(
+            &ql("down_proj", d.hidden, d.inter)?,
+            rec.down_codes,
+            rec.down_scales,
+        )
+        .with_context(|| format!("{p}down_proj"))
+    }
+
+    /// Read expert `e` of `layer` into `buf` as a pack record (`stride` bytes): the
+    /// aligned extents are read, then the GPTQ words are unpacked into the record layout.
+    pub fn read_expert(&self, layer: usize, e: usize, buf: &mut AlignedBuf) -> Result<()> {
+        self.read_raw(layer, e, buf)?;
+        self.convert(layer, e, buf)
     }
 
     /// Widen a small BF16/F16/F32 tensor to f32 (shape checked).
@@ -347,10 +374,19 @@ impl ExpertReader for ShardStore {
         self.experts
     }
     fn new_buffer(&self) -> AlignedBuf {
-        AlignedBuf::new(self.layout.stride)
+        AlignedBuf::new(self.buffer_bytes())
     }
     fn read(&self, layer: usize, expert: usize, buf: &mut AlignedBuf) -> Result<()> {
-        if let Err(e) = self.read_expert(layer, expert, buf) {
+        if let Err(e) = self.read_raw(layer, expert, buf) {
+            fatal_read(layer, expert, &e);
+        }
+        Ok(())
+    }
+    fn needs_finish(&self) -> bool {
+        true
+    }
+    fn finish(&self, layer: usize, expert: usize, buf: &mut AlignedBuf) -> Result<()> {
+        if let Err(e) = self.convert(layer, expert, buf) {
             fatal_read(layer, expert, &e);
         }
         Ok(())

@@ -3362,5 +3362,4 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   `autoround::unpack` (bit-identical to the pack; tested vs `clef-pack-g128`); the engines take
   `Arc<dyn ClefStore>` (`engine.rs`), the pipeline picks pack (manifest.json) / shards / BF16.
   Startup validates index + shard sizes + tensor dtypes/shapes (exit 1); a runtime read failure
-  `exit(1)`s (`fatal_read`, packs too). Dev-host emu `decide` equals the pack run; **not run on the
-  board**. Details and the measured tensor layout: `docs/recipes/clef.md` "Step 0".
+  `exit(1)`s (`fatal_read`, packs too). Dev-host emu `decide` equals the pack run; **board-verified 2026-11-14** (answers byte-identical to the pack; +7-19 % wall vs the pack even with the converter-thread stage, CPU-bound unpack; needs shards 1-7; `clef.md` "Board results, step 0"). Details and the measured tensor layout: `docs/recipes/clef.md` "Step 0".

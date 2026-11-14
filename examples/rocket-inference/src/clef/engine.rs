@@ -146,6 +146,15 @@ pub trait ExpertReader: Send + Sync {
     fn experts(&self) -> usize;
     fn new_buffer(&self) -> AlignedBuf;
     fn read(&self, layer: usize, expert: usize, buf: &mut AlignedBuf) -> Result<()>;
+    /// Whether [`Self::read`] leaves raw extents that [`Self::finish`] still has to unpack.
+    fn needs_finish(&self) -> bool {
+        false
+    }
+    /// CPU half of a read (the reader thread only does I/O): the shard store unpacks its
+    /// raw extents into the record here, on a converter thread between reader and consumers.
+    fn finish(&self, _layer: usize, _expert: usize, _buf: &mut AlignedBuf) -> Result<()> {
+        Ok(())
+    }
     /// `layer`'s experts were consumed: drop what the page cache holds of them.
     fn release_layer(&self, _layer: usize) {}
     /// Drop mapped resident pages.
@@ -337,6 +346,8 @@ struct Cmd {
 }
 
 struct Item {
+    /// Position in the stream (the converters deliver in this order).
+    seq: u64,
     layer: usize,
     expert: usize,
     buf: std::result::Result<AlignedBuf, String>,
@@ -348,6 +359,7 @@ struct Stream {
     full_rx: Option<Mutex<Receiver<Item>>>,
     free_tx: Option<Sender<AlignedBuf>>,
     reader: Option<std::thread::JoinHandle<()>>,
+    converters: Vec<std::thread::JoinHandle<()>>,
     /// The next layer that has not been queued yet (layers are queued in order).
     next_queue: usize,
     read_ns: Arc<AtomicU64>,
@@ -359,37 +371,98 @@ impl Stream {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (full_tx, full_rx): (SyncSender<Item>, Receiver<Item>) = mpsc::sync_channel(depth);
         let (free_tx, free_rx) = mpsc::channel::<AlignedBuf>();
-        for _ in 0..depth + consumers {
+        let conv = if reader.needs_finish() {
+            std::env::var("ROCKET_CLEF_CONVERTERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(2)
+                .min(4)
+        } else {
+            0
+        };
+        for _ in 0..depth + consumers + conv {
             free_tx.send(reader.new_buffer()).ok();
         }
         let read_ns = Arc::new(AtomicU64::new(0));
         let ns = read_ns.clone();
+        // Raw items go to the converters when the reader has CPU work to finish.
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<Item>(depth);
+        let reader_out = if conv > 0 { raw_tx } else { full_tx.clone() };
+        let rd = reader.clone();
         let handle = std::thread::Builder::new()
             .name("clef-reader".into())
             .spawn(move || {
+                let mut seq = 0u64;
                 for cmd in cmd_rx {
                     for e in cmd.experts {
                         let Ok(mut buf) = free_rx.recv() else { return };
                         let t = Instant::now();
-                        let r = reader.read(cmd.layer, e, &mut buf);
+                        let r = rd.read(cmd.layer, e, &mut buf);
                         ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let item = Item {
+                            seq,
                             layer: cmd.layer,
                             expert: e,
                             buf: r.map(|()| buf).map_err(|e| format!("{e:#}")),
                         };
-                        if full_tx.send(item).is_err() {
+                        seq += 1;
+                        if reader_out.send(item).is_err() {
                             return;
                         }
                     }
                 }
             })
             .expect("spawn the expert reader");
+        // Converters: unpack in parallel, deliver in stream order (a layer's items never
+        // overtake the previous layer's last expert).
+        let raw_rx = Arc::new(Mutex::new(raw_rx));
+        let ticket = Arc::new((Mutex::new(0u64), std::sync::Condvar::new()));
+        let mut converters = Vec::new();
+        for i in 0..conv {
+            let (raw_rx, ticket, full_tx, reader, ns) = (
+                raw_rx.clone(),
+                ticket.clone(),
+                full_tx.clone(),
+                reader.clone(),
+                read_ns.clone(),
+            );
+            converters.push(
+                std::thread::Builder::new()
+                    .name(format!("clef-convert-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let got = lock(&raw_rx).recv();
+                            let Ok(mut it) = got else { return };
+                            if let Ok(buf) = &mut it.buf {
+                                let t = Instant::now();
+                                if let Err(e) = reader.finish(it.layer, it.expert, buf) {
+                                    it.buf = Err(format!("{e:#}"));
+                                }
+                                ns.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                            }
+                            let (m, cv) = &*ticket;
+                            let mut g = lock(m);
+                            while *g != it.seq {
+                                g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                            }
+                            let sent = full_tx.send(it).is_ok();
+                            *g += 1;
+                            cv.notify_all();
+                            drop(g);
+                            if !sent {
+                                return;
+                            }
+                        }
+                    })
+                    .expect("spawn an expert converter"),
+            );
+        }
         Self {
             cmd_tx: Some(cmd_tx),
             full_rx: Some(Mutex::new(full_rx)),
             free_tx: Some(free_tx),
             reader: Some(handle),
+            converters,
             next_queue: 0,
             read_ns,
         }
@@ -411,6 +484,9 @@ impl Drop for Stream {
         drop(self.free_tx.take());
         drop(self.cmd_tx.take());
         if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+        for h in self.converters.drain(..) {
             let _ = h.join();
         }
     }
