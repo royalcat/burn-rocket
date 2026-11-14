@@ -15,6 +15,7 @@
 //!
 //! See `README.md` and `docs/recipes/` for commands and flags.
 
+mod clef;
 mod cli;
 mod commands;
 mod decision;
