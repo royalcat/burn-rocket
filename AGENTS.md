@@ -3252,8 +3252,7 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
   **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
   code complete, dev-host verified, board-verified for 142-800 tokens (2026-11-14: 38.7 s / 51.6 s / 103 s, <= 0.9 GiB anon, answers match the oracle)**, below. Phase 7 batching is **board-verified** (2026-11-14: 4 requests 107 s batched vs 179 s single, byte-identical answers; `clef.md`). Text-only deployment recipe: `clef.md` "Deployment (text-only, current)". Remaining (plan
-  numbering): 8 media towers (image/audio/video; requests carrying
-  media get 422 "not implemented yet"), 9 deploy/docs.
+  numbering): 8 media towers (8c image done, below; audio/video: 422 "not implemented yet"), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
   `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
   (`moeshawky/clef-omni-int8-autoround`, local `/home/royalcat/models/clef-omni-int8-autoround`,
@@ -3362,6 +3361,35 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   spans, positions, rope delta on all 9 media fixtures; BF16 CPU path fed oracle tower outputs matches
   hidden layers/answers (max|dp| <= 1.3e-5), emulated int8 shards top-1 equal (max|dp| <= 1.7e-2);
   details in `clef.md` "Media plumbing". Media requests are still refused (towers = 8c-8f).
+- **Phase 8c, vision tower + image requests (2026-11-14, uncommitted; dev-host verified, NOT run on the
+  board)**: `images` work end to end in `serve` and `decide`; `audio`/`videos`/`media_kwargs` stay a 422.
+  `src/clef/vision.rs` (+ `vision/{preprocess,compute,npu,tests}.rs`): the Qwen3-Omni tower (27 blocks,
+  hidden 1152, 16 x 72 heads, tanh-GELU MLP 4304, 48x48 bilinear position table, axial 2-D rotary, per-frame
+  attention, final merger LN-then-group, DeepStack mergers group-then-LN at blocks 8/16/24) as host f32 per
+  `tools/clef_media.py::manual_vision`; weights are **BF16 in both checkpoints** (`thinker.visual.*`: shard 1 of
+  the BF16 repo, shards 6/7 of the AutoRound repo), mmapped via the index and widened per use; the tower
+  opens lazily on the first image request (`ClefModel::vision_tower`). Preprocessing reuses
+  `gemma::media::{load_image, resize_bicubic_aa, resolve_media_remote}`, `media::smart_resize` (65,536..1,048,576
+  px, factor 32) and `(v-127.5)/127.5`: **pixel values bit-identical to the oracle** (0 differing of 430,080 /
+  3,870,720 / 4,300,800 values for tiny png, cat jpeg, two images). Wiring: `encode::encode_request` (one
+  entry for server/decide/`ClefModel::encode`; `EncodedRecord.media: Option<Arc<RecordMedia>>`, the media
+  block counts toward `--max-tokens`), `ClefModel::media_features` (tower -> `rope_index` ->
+  `MediaFeatures::assemble`) feeding `forward_batch_media`; `ClefFront.images` (a `clef-pack` has no tower:
+  422). **Placements** (`TowerDevice`, `ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu`): CPU f32 (2,520 patches in
+  5.7 s on 8 threads); `emu16` = host emulation of the NPU numerics; `npu` (aarch64 `npu` only, **code
+  compiles, never ran on hardware**) packs all 117 linears as resident fp16 (`RocketCtx`, ~1.07 GiB BOs;
+  chosen over `Bf16Context` because the d3/emb2 towers use it and bf16 has no speed edge; `fc2` K=4304 zero-padded
+  to 4320) and runs per-frame attention through `RocketFaCtx::flash_attn` with the 72-wide head zero-padded to
+  96/80; an fp16 overflow reruns the image on the CPU (`Fp16Range`); `ROCKET_CLEF_TOWER_CHECK=1` logs the
+  placement-vs-f32-CPU cosines for the board. **Gates** (oracle dumps): f32 tower cosine 1.000000000 on every
+  tap (rel-to-peak <= 1.6e-4 at block 26, 2.8e-5 merged/DeepStack); fp16 emulation cosine >= 0.99995 on every
+  tap (0.99998 merged); answers (AutoRound weights, **the BF16 shards were no longer on the host, so the tight
+  BF16 answer gate was not run**): f32 CPU thinker max |dp| 3.0e-3 / 5.5e-3 (small / cat), emulated int8
+  2.5e-3 / 1.8e-2, top-1 equal; `serve` smoke 200s and 422s. Side fixes: `AutoRoundWeights::expert` no longer
+  panics "RefCell already borrowed" under nested rayon (the f32 CPU path on the AutoRound shards never ran
+  before), `Shards::open_with`, `attn::gemm_strided` `pub(crate)`, new `half` dep. Details, tables and the
+  board commands: `clef.md` "Vision tower and image requests". The AutoRound shards 1-7 used for the
+  gates are in `/home/royalcat/.cache/clef-8c-dl/autoround` (37 GiB; the original `models/` dir was gone).
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

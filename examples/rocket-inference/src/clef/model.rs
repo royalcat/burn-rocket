@@ -109,6 +109,14 @@ pub struct Shards {
 
 impl Shards {
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, |k| {
+            k.starts_with("thinker.model.") || k == "thinker.lm_head.weight"
+        })
+    }
+
+    /// Open only the shards that hold a tensor `keep` accepts (the vision tower reads
+    /// `thinker.visual.*`, which sits in other shards than the text decoder).
+    pub fn open_with(dir: &Path, keep: impl Fn(&str) -> bool) -> Result<Self> {
         let p = dir.join("model.safetensors.index.json");
         let idx: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&p).with_context(|| format!("read {}", p.display()))?,
@@ -119,7 +127,7 @@ impl Shards {
         let mut names: Vec<String> = Vec::new();
         let mut map = BTreeMap::new();
         for (k, v) in wm {
-            if !k.starts_with("thinker.model.") && k != "thinker.lm_head.weight" {
+            if !keep(k) {
                 continue;
             }
             let f = v.as_str().context("shard name")?.to_string();

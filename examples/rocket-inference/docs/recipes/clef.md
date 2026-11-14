@@ -3,7 +3,8 @@
 > **STATUS 2026-11-14 (phase 6): text-only. CPU path dev-host verified; the NPU expert
 > streaming path is code complete and verified on the dev host through its host
 > emulation (`ROCKET_CLEF_EMU=1`), an aarch64 cross build and unit tests. NOT yet run on the
-> board.** Images, audio and video are refused (422) until the multimodal towers are ported.
+> board.** Audio and video are refused (422) until their towers are ported; **images are served
+> since phase 8c** (see "Vision tower and image requests").
 > Phase 5 adds `--pack-dir` (the int8 pack, `clef-pack.md`): same flags, packed weights.
 > Phase 6 makes `--device npu` work with a pack (see "NPU placement" below).
 
@@ -63,9 +64,10 @@ in request order, probabilities rounded to 4 digits like the Python `round(x, 4)
 Errors (`/v1/systemone`): `422 {"detail": "<reason>"}` for a body that is not JSON, a failed
 validation (`model and state are required`, `at least one question is required`,
 `<id>: type must be noul, choice, or score`, `<id>: criteria must not be empty`), a
-schema larger than the cap (`schema requires N tokens before state; maximum is M`) and any
-request carrying `images`/`audio`/`videos`
-(`Clef-Omni image/audio/video input is not implemented yet ...`). Compute failures are 500.
+schema larger than the cap (`schema requires N tokens before state; maximum is M`, media
+tokens included), an unreadable/undecodable image (`images[i]: ...`), `media_kwargs`, and any
+request carrying `audio`/`videos`
+(`Clef-Omni audio/video input is not implemented yet ...`). Compute failures are 500.
 
 ## Flags and limits
 
@@ -277,10 +279,10 @@ clef_batch_equals_single_records_on_the_emulated_engine -- --ignored --nocapture
 
 Board check: see "Board test, phase 7" below.
 
-## Media plumbing in the thinker (phase 8b, 2026-11-14; no towers yet)
+## Media plumbing in the thinker (phase 8b, 2026-11-14)
 
 `src/clef/media.rs` is everything between "the towers produced features" and "the decoder
-ran"; requests with `images`/`audio`/`videos` still get the 422 until the towers (8c-8f) exist.
+ran"; the image tower exists since 8c (below), `audio`/`videos` still get the 422 until 8d-8f.
 
 * **Placeholder block**: `MediaLayout { image_grids, video_grids, audio_frames (mel frames, explicit
   clips first then one soundtrack per video iff use_audio_in_video), explicit_audio,
@@ -316,12 +318,133 @@ ran"; requests with `images`/`audio`/`videos` still get the 422 until the towers
   video-audio 1.7e-2 (layer 0-2 cosine >= 0.99993; late layers drift as for text, cosine ~0.98, router sets differ).
   Non-ignored tests also cover the unit cases, the oracle layout/positions/ids, and a mini-model batch
   test (media batched == single, bit-identical on Emu; within 1e-4 on the CPU path).
-* **Not done**: media towers (8c vision, 8d audio, 8e video, 8f decoding/preprocessing), wiring
-  `ClefModel::answer*` and `request.rs` to media (still refused), NPU/board runs of media records.
+* **Not done here**: the audio/video towers (8d, 8e), video/audio decoding (8f), board runs of media
+  records. Images (8c) are wired: see "Vision tower and image requests".
+
+## Vision tower and image requests (phase 8c, 2026-11-14)
+
+`images` requests work end to end: `POST /v1/systemone` and `decide` accept
+`"images": ["<path>" | "data:image/png;base64,..." | "https://..."]` (same fetch/decode helpers as the
+EmbeddingGemma 2 server: 20 MiB, 10 s, 3 redirects, `ROCKET_MEDIA_FETCH=0` disables URLs; relative
+`decide` paths resolve from the working directory). `audio`/`videos` are still a 422 ("not implemented
+yet"), `media_kwargs` is a 422, a source decoded above 16 MP is a 422 (this port's own memory guard).
+A client error in an image is a 422 naming `images[i]`.
+
+Files: `src/clef/vision.rs` (config, tensor index, forward, the lazy tower), `vision/preprocess.rs`,
+`vision/compute.rs` (CPU / fp16 emulation / shared attention + padding helpers), `vision/npu.rs`
+(aarch64 `npu` only), `vision/tests.rs`. Plumbing: `encode::encode_request` (the one entry the server,
+`decide` and `ClefModel::encode` use: prepares the images, builds the placeholder block, counts it
+against the cap, attaches `RecordMedia`), `ClefModel::media_features` (tower -> `rope_index` ->
+`MediaFeatures::assemble` -> `forward_batch_media`), `ClefFront.images` (a `clef-pack` has no tower:
+HTTP 422 for images).
+
+* **Preprocessing** (`vision/preprocess.rs`): decode (PIL `convert("RGB")` semantics, mozjpeg for JPEG),
+  `smart_resize` (factor 32, **65,536..1,048,576 pixels**), the ATen uint8 antialiased bicubic port of
+  `gemma::media::resize_bicubic_aa`, `(v - 127.5) / 127.5` (bit-exact to the processor's fused
+  rescale+normalize; `(v/255 - 0.5)/0.5` is not), patchify into merge-block order with `[channel,
+  temporal, py, px]` rows, a still duplicated into both temporal slots (`patchify_pairs` also takes real
+  frame pairs for video). **Gate**: decoded RGB bytes equal PIL's and the pixel values equal the oracle's
+  `media_pixel_values` with **0 differing values** (bit for bit) for `media-image-small` (430,080 values),
+  `media-image-cat` (3,870,720) and `media-images-two` (4,300,800), grids `14x20`, `42x60`, `14x20+42x60`.
+* **Tower** (`vision.rs`): the `manual_vision` spec, host f32. Weights are **BF16 in both checkpoints**
+  (all 351 `thinker.visual.*` tensors: shard 1 of the BF16 repo, shards 6/7 of the AutoRound repo: the
+  AutoRound recipe quantizes only `thinker.model.layers`), mmapped from the shards named by
+  `model.safetensors.index.json` and widened per use (no host copy, ~1 GiB in the page cache). The
+  tower opens on the **first image request** (`vision tower opened in ...` log line); a request without
+  images never touches it. Position table: the d3 `position_taps` (bilinear, `align_corners=True`) in
+  block order; rotary and per-frame attention exactly as in the spec (a `[2,h,w]` grid equals two
+  `[1,h,w]` runs). Output = `TowerOutputs` (`image`, `image_deepstack[0..3]`), rows concatenated in
+  record order, consumed by `MediaFeatures::assemble`. The CPU attention is the blocked gemm kernel of
+  `attn.rs` made non-causal.
+* **Placements** (`TowerDevice`, `ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu`; default = `npu` when the
+  thinker runs on the NPU, else `cpu`):
+  * `cpu`: f32 gemm. 2,520 patches in **5.7 s**, 280 patches in 1.0 s (dev host, 8 threads, includes
+    widening the weights).
+  * `emu16`: the host emulation of the NPU numerics (fp16 weights, fp16 activations in and out of every
+    linear and the attention, f32 accumulation); an fp16 overflow is a `Fp16Range` error.
+  * `npu` (aarch64 + `npu` builds): all **117 linears** (patch embed, 27 x qkv/proj/fc1/fc2, 4 mergers x 2) are
+    packed once as **resident fp16** weights through `RocketCtx::pack_weight` (canonical tiling, any
+    M >= 4; ~1.07 GiB of BOs that live as long as the tower), the path the EmbeddingGemma 2 and d3
+    towers use: the BF16 -> fp16 conversion is exact for these weights (a non-finite result refuses the
+    pack), and a native bf16 matmul (`Bf16Context`) has no speed advantage on this part and would need
+    its own plumbing, so it was not used. `fc2` has `K = 4304` (not a multiple of 32): weight columns
+    and activation are zero-padded to 4320. Bias, norms, rotary, GELUs and softmax stay on the host in
+    f32. Attention goes per frame through `RocketFaCtx::flash_attn` (fp16 flash attention, no mask, the
+    host fast softmax) with the **72-wide head zero-padded to 96 (q/k) and 80 (v/out)** (the driver wants
+    `head_dim % 32`, `dv % 16`; padding with zeros changes neither the scores nor the softmax). The
+    padding/layout contract is host-tested against a naive f64 model of the driver layout.
+    `ROCKET_CLEF_TOWER_THREADS` (default 3) sizes the contexts; after every request the tower trims its
+    scratch to `ROCKET_KEEP_MB` and releases the shard pages.
+  * An activation that rounds to an fp16 infinity (or a driver `ROCKET_E_RANGE` score) is a `Fp16Range`:
+    **that image reruns on the f32 CPU path** (`fallbacks()` counts them, one stderr line each). A device
+    failure is the usual typed `NpuFailure` panic (503 / exit as for the thinker).
+  * `ROCKET_CLEF_TOWER_CHECK=1` (non-CPU placements): after the tower ran, every image is rerun on the
+    f32 CPU and a `tower check images[i] vs f32 CPU: merged cos ..., deepstack0..2 ...` line is logged: the
+    on-board numerics check, no extra binary.
+* **Tower gates** (dev host, oracle dumps `/tmp/opencode/clef/dump`; the AutoRound checkpoint's tower;
+  `cargo test --release -p rocket-inference --no-default-features clef::vision`, the cat ones are
+  `--ignored`):
+
+  | image | arm | block 0 / 8 / 16 / 24 / 26 cosine | merged (cos, rel-to-peak) | DeepStack 0 / 1 / 2 rel-to-peak |
+  |---|---|---|---|---|
+  | small (280 patches) | f32 CPU | 1.000000000 everywhere; rel 7e-7 / 1.3e-5 / 2.9e-6 / 5.5e-6 / 1.9e-5 | 1.000000000, 1.05e-5 | 3.0e-6 / 9.6e-6 / 1.15e-5 |
+  | cat (2,520 patches) | f32 CPU | 1.000000000 everywhere; rel 1.1e-6 / 1.3e-5 / 3.0e-6 / 1.3e-5 / 1.6e-4 | 1.000000000, 2.8e-5 | 4.3e-6 / 1.0e-5 / 2.8e-5 |
+  | small | fp16 emulation | 0.9999999 / 0.9999973 / 0.9999925 / 0.9999901 / 0.9999596 | 0.99998985, 6.9e-3 | 1.5e-3 / 8.0e-3 / 1.2e-2 (cos 0.9999976 / 0.9999907 / 0.9999803) |
+  | cat | fp16 emulation | 0.9999999 / 0.9999981 / 0.9999949 / 0.9999769 / 0.9999531 | 0.99998962, 1.2e-2 | 7.9e-4 / 9.7e-3 / 2.6e-2 (cos 0.9999991 / 0.9999906 / 0.9999605) |
+
+  (rel = max |d| / peak of the oracle tensor; block 26's peak is ~1.8e3 on a few outlier channels, so its
+  rel value is dominated by them: f32 max |d| 0.28, fp16-emulated 141 = fp16 spacing at 1.8e3.) The f32
+  port is as close to the oracle as the oracle's own HF-vs-plain-torch selfcheck (1e-5..1e-4); the fp16
+  emulation never overflowed (no CPU fallback) and is what the NPU numerics should reach: cosine
+  >= 0.99995 on every tap, 0.99998 on the merged tokens. The same numbers come out of the BF16 repo's
+  tower and the AutoRound repo's (`the_tower_opens_on_the_autoround_shards_too`: cosine 1.0, rel 1e-5).
+* **Answers vs the oracle** (`image_answers_*` tests, `ClefModel::answer` = decode + tower + thinker +
+  head on the AutoRound shards; the oracle is the f32 BF16 stream; **the BF16 checkpoint was not on the
+  host for this round, so the tight BF16 gate was not run**: the test picks a 5e-3 bound when
+  `CLEF_MODEL_DIR` is a BF16 directory):
+
+  | path | `media-image-small` (319 tokens) | `media-image-cat` (980 tokens) |
+  |---|---|---|
+  | thinker f32 CPU on the int8 weights (weight-only quantization) | max \|dp\| 3.0e-3, top-1 equal, 25.8 s | 5.5e-3, top-1 equal, 41.1 s |
+  | emulated int8 W8A8 thinker (`ROCKET_CLEF_EMU=1` semantics) | 2.5e-3, top-1 equal, 27.7 s | 1.8e-2, top-1 equal, 81.8 s |
+
+  (text-only fixtures sit at 0.0136 / 0.026 max \|dp\| on the same paths, so the image records are inside
+  the existing quantization band; with the oracle's own tower outputs the 8b gate gave 1.2e-2 on the
+  small image.) `serve` smoke (emulated engine, tower on the CPU): a `data:` PNG 28.0 s (`tokens=319`,
+  `colorful 0.9059, shape circle 0.9154`), two images by path 34.2 s (`tokens=392`); a missing file,
+  an undecodable `data:` URL and an `audio` entry are 422s with the reason, nothing else is affected.
+* **Memory/time on the board (expected, not measured)**: the tower adds ~1.07 GiB of BOs to the thinker's
+  ~0.93 GiB (resident attention) and the expert streams; pack time ~10-30 s at the first image request (the
+  d3 tower packed 0.28 GiB in 4.3 s); the NPU tower pass for the cat should be a few seconds (the emb2
+  tower at 2,394 patches: 10.6 s, but that has 12 blocks of 1152 with 64-wide heads; this one has 27).
+  The thinker pass is unchanged apart from the extra rows (`+0.1 s/token`, the cat adds 630).
+
+### Board commands for 8c
+
+```sh
+# aarch64 build, copy as /root/rocket-inference/rocket-inference-p8c (+ data/ and tools/clef_fixtures_media.json)
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-features --features npu
+# stop home-llm-gateway-embed-1 / -decision-1 as for phase 6; image cases only:
+python3 -c "import json;a=json.load(open('tools/clef_fixtures_media.json'));json.dump([c for c in a if c['id'] in ('media-image-small','media-image-cat','media-images-two')],open('/tmp/img_cases.json','w'))"
+cd /root/rocket-inference     # relative `data/...` paths resolve from here
+ROCKET_CLEF_TOWER_CHECK=1 ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference-p8c decide \
+    --model-dir /mnt/nvme/models/clef-omni-int8-autoround --device npu \
+    --requests /tmp/img_cases.json --out /tmp/clef-img.json
+```
+
+Expect: `clef: vision tower opened in N s (fp16 resident on the NPU (117 weights, ~1100 MiB of BOs))`, one
+`vision tower: ... patches -> ... tokens in X s` line per record, and per image a `tower check` line
+with merged cosine >= 0.9999 and DeepStack cosines >= 0.9999 (the fp16 emulation above: 0.99996-0.999999; a
+cosine below 0.999 means a real device/layout problem: try `ROCKET_CLEF_TOWER_DEVICE=cpu` for the answers
+and report the check line). The answers should match the host emulation of the shard run (small:
+colorful ~0.90, shape circle ~0.92; cat: animal cat ~0.95) within the usual |dp| <= 0.03. Check the
+thinker's expert-stream wall is unchanged and the peak anon (the tower's mapped pages are dropped after
+every request). To measure the tower alone, compare the `vision tower` seconds against
+`ROCKET_CLEF_TOWER_DEVICE=cpu`.
 
 ## Not done
 
-Image/audio/video inputs (vision and audio towers, the media placeholders), `media_kwargs`, attention scores/AV on the NPU, a CPU `sdot` expert path.
+Audio/video inputs (audio tower 8d, video 8e, decoding 8f: `audio`/`videos` are a 422), `media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a board run of the vision tower.
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 
@@ -407,7 +530,9 @@ rocket-inference serve --pack-dir /models/clef-pack-g128 --device npu \
 - Container: mount the pack read-only (O_DIRECT works on btrfs/ext4 bind mounts; set
   `CLEF_PACK_NO_DIRECT=1` if the filesystem refuses it), pin CPUs 4-7, expose `/dev/accel`,
   `mem_limit` 3g is enough (NPU buffers are not charged to the cgroup, ~1 GiB more on top).
-- Not supported yet: image/audio/video inputs (HTTP 422), see the plan's phase 8.
+- Image inputs work since phase 8c (needs the BF16 checkpoint or the AutoRound shards, a `clef-pack` has no
+  tower: HTTP 422 for images; +~1.07 GiB of NPU BOs on top of the thinker once the first image request has
+  packed the tower). Audio/video inputs are still a 422 (phase 8d-8f).
 - The measured per-request times and the knobs are in the phase 6/7 sections above.
 
 ## Step 0: serving straight from the AutoRound shards (no repack)

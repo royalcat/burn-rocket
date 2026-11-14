@@ -111,8 +111,8 @@ pub(crate) async fn systemone(
 /// `POST /v1/systemone` for Clef-Omni: the release's `systemone()` contract. The body is
 /// validated like the Python entry point (`model` and `state` required, a nonempty
 /// `questions` object, types and criteria); a refusal (including a request carrying
-/// images, audio or videos, which are not implemented yet, and a record over the
-/// prompt cap) is `422 {"detail": "<reason>"}` immediately and runs nothing. A valid
+/// audio or videos, which are not implemented yet, an image the server cannot read or
+/// decode, and a record, images included, over the prompt cap) is `422 {"detail": "<reason>"}` immediately and runs nothing. A valid
 /// request is encoded, queued, answered together with whatever shares its batch
 /// (`--batch-window-ms`, `--batch-max`, `--batch-max-tokens`) and returns
 /// `{"model", "answers", "usage"}`; the answer does not depend on its batch mates.
@@ -133,9 +133,18 @@ pub(crate) async fn systemone_clef(
         .ok_or_else(|| DecisionError::from_api(ApiError::internal("no Clef model is loaded")))?;
     // Encode before queueing: a record over the cap is a 422 now, and the batcher knows
     // each job's exact row count.
+    if !request.images.is_empty() && !front.images {
+        return Err(DecisionError::unprocessable(
+            "this deployment serves a clef-pack, which has no vision tower: image input is \
+             unavailable (serve the BF16 checkpoint or the AutoRound shards)"
+                .to_string(),
+        ));
+    }
     let encoder = front.clone();
+    // Image fetch/decode/resize happen here, on the blocking pool (the tower itself runs in
+    // the batch worker under the model lock).
     let (request, enc) = blocking(move || {
-        match crate::clef::encode_record(&encoder.tokenizer, &request, encoder.max_tokens, None) {
+        match crate::clef::encode_request(&encoder.tokenizer, &request, encoder.max_tokens) {
             Ok(enc) => Ok((request, enc)),
             Err(error) => Err(clef_api_error(&error)),
         }

@@ -444,17 +444,23 @@ impl AutoRoundWeights {
 
 impl ExpertSource for AutoRoundWeights {
     fn expert(&self, layer: usize, e: usize) -> Result<ExpertWeights> {
-        EXPERT_BUF.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let stride = self.store.layout.stride;
-            if slot.as_ref().is_none_or(|b| b.len() < stride) {
-                *slot = Some(self.store.new_buffer());
-            }
-            let buf = slot.as_mut().unwrap();
-            self.store.read_expert(layer, e, buf)?;
+        // Take the buffer out of the thread-local instead of holding a `RefCell` borrow:
+        // `dequant_expert` runs nested rayon work, and a worker waiting on it may steal
+        // another expert task of this same loop, which re-enters this function on the same
+        // thread (that re-entry used to panic with "RefCell already borrowed"; it now simply
+        // allocates its own buffer).
+        let stride = self.store.layout.stride;
+        let mut buf = EXPERT_BUF
+            .with(|cell| cell.borrow_mut().take())
+            .filter(|b| b.len() >= stride)
+            .unwrap_or_else(|| self.store.new_buffer());
+        let out = (|| {
+            self.store.read_expert(layer, e, &mut buf)?;
             let rec = ExpertRecord::parse(self.store.dims, buf.as_slice())?;
             Ok(dequant_expert(&rec))
-        })
+        })();
+        EXPERT_BUF.with(|cell| *cell.borrow_mut() = Some(buf));
+        out
     }
 }
 

@@ -249,15 +249,18 @@ placement / model:
 
 Clef-Omni (Cloudflare, Qwen3-Omni-30B-A3B thinker + joint schema head; detected
 from a qwen3_omni_moe config.json with joint_head.safetensors, or `--family
-clef`) is text-only: on the CPU the thinker streams one decoder layer at a time
+clef`) answers text and image requests: on the CPU the thinker streams one decoder layer at a time
 from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM plus the
 436 MB head); with the int8 AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`
 or its directory, used as stored, no repack) and `--device npu` (or `auto` on an
 aarch64 `npu` build) the attention projections and the 128-expert MoE of every layer
 run as int8 g128 W8A8 on the NPU, streaming the experts from NVMe
 (docs/recipes/clef.md). Cases are the same objects as above with the release's
-`model`, `state` and `questions` (`images`/`audio`/`videos` are refused:
-not implemented yet). --max-state-tokens is the per-record cap (default 8192;
+`model`, `state` and `questions`, plus `images` (file paths, relative ones from the
+current directory, `data:` URLs or http(s) URLs; every image costs its merged tokens
+of the --max-state-tokens cap; the vision tower loads on the first image request,
+f32 on the CPU or fp16 resident on the NPU, `ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu`
+overrides); `audio`/`videos` are refused (not implemented yet). --max-state-tokens is the per-record cap (default 8192;
 the release's own default is 64000); --out and --model-name behave the same,
 --device npu needs the int8 checkpoint (or a pack) and an aarch64 `npu` build. The
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/

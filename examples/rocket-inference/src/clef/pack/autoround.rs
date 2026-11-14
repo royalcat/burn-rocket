@@ -294,9 +294,11 @@ impl Source {
 mod tests {
     use super::*;
 
+    type Tiny = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<i32>, Vec<f32>);
+
     /// Hand-build a packed `[N=8, K=8]` group-4 layer... group must divide K and
     /// `unpack` wants K % 4 == 0 and N % 4 == 0.
-    fn tiny() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<i32>, Vec<f32>) {
+    fn tiny() -> Tiny {
         let (n, k, g) = (8usize, 8usize, 4usize);
         // q[row][col] unsigned, scales per (group, row)
         let q: Vec<i32> = (0..n * k).map(|i| ((i * 37 + 11) % 256) as i32).collect();
@@ -367,7 +369,7 @@ mod tests {
             }
         }
         // the extremes: q=0 -> -128, q=255 -> 127
-        assert_eq!(0u32 ^ 0x80, 128);
+        assert_eq!(0x80u32, 128);
     }
 
     #[test]

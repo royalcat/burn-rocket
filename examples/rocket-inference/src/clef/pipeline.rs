@@ -3,17 +3,19 @@
 
 use super::answer::{probabilities, systemone_answer};
 use super::autoround_store::ShardStore;
-use super::encode::{EncodedRecord, encode_record};
+use super::encode::{EncodedRecord, encode_request};
 use super::engine::{self, ClefStore, LayerEngine};
 use super::head::{ClefHead, LmHeadFile};
-use super::model::{Backbone, ForwardOpts};
+use super::media::{MediaFeatures, rope_index};
+use super::model::{Backbone, ForwardOpts, RecordRef};
 use super::pack::{Manifest, PackDir};
 use super::request::ClefRequest;
+use super::vision::{TowerDevice, VisionTower};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 
 /// The thinker engine actually built (`ROCKET_CLEF_EMU=1` turns any placement into `Emu`).
@@ -40,6 +42,13 @@ pub struct ClefModel {
     tokenizer: Tokenizer,
     opts: ForwardOpts,
     pool: rayon::ThreadPool,
+    /// The checkpoint directory (the vision tower opens its shards from it, lazily).
+    dir: PathBuf,
+    tower_device: TowerDevice,
+    /// The vision tower, opened by the first request with images.
+    vision: Mutex<Option<Arc<VisionTower>>>,
+    /// The directory holds `thinker.visual.*` tensors (a clef-pack does not).
+    images_supported: bool,
 }
 
 impl std::fmt::Debug for ClefModel {
@@ -61,6 +70,16 @@ pub struct Answered {
     pub questions: usize,
     /// Per question (request order): id and the softmax probability of each option.
     pub probabilities: Vec<(String, BTreeMap<String, f64>)>,
+}
+
+/// NPU workers of the vision tower's contexts (`ROCKET_CLEF_TOWER_THREADS`, default 3 = the
+/// part's cores).
+fn tower_threads() -> usize {
+    std::env::var("ROCKET_CLEF_TOWER_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| (1..=8).contains(&n))
+        .unwrap_or(3)
 }
 
 /// Worker threads of the private pools: the machine's cores, at most 8.
@@ -145,6 +164,10 @@ impl ClefModel {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(opts.threads)
             .build()?;
+        let tower_device = TowerDevice::resolve(match kind {
+            EngineKind::Npu => TowerDevice::Npu,
+            EngineKind::Cpu | EngineKind::Emu => TowerDevice::Cpu,
+        })?;
         Ok(Self {
             backbone,
             head,
@@ -152,19 +175,99 @@ impl ClefModel {
             tokenizer,
             opts,
             pool,
+            dir: dir.to_path_buf(),
+            tower_device,
+            vision: Mutex::new(None),
+            images_supported: VisionTower::available(dir),
         })
     }
 
-    /// Answer one request. `max_length` caps the whole record in tokens (the release's
-    /// default is [`DEFAULT_MAX_LENGTH`]); a text-only build refuses media. A client
-    /// error is an [`Invalid`](super::request::Invalid) in the error chain.
-    pub fn answer(&self, req: &ClefRequest, max_length: usize) -> Result<Answered> {
-        if let Some(refusal) = req.media_refusal() {
-            return Err(refusal.into());
+    /// Whether this checkpoint directory can serve `images` (it holds the vision tower).
+    pub fn images_supported(&self) -> bool {
+        self.images_supported
+    }
+
+    /// The vision tower, opened on first use (shards indexed, and on the NPU every linear
+    /// packed as a resident fp16 weight: ~1 GiB of BOs).
+    fn vision_tower(&self) -> Result<Arc<VisionTower>> {
+        let mut slot = self.vision.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = &*slot {
+            return Ok(t.clone());
         }
-        let encoded = encode_record(&self.tokenizer, req, max_length, None)?;
+        anyhow::ensure!(
+            self.images_supported,
+            "{} holds no vision tower (a clef-pack skips `thinker.visual.*`): serve the BF16 \
+             checkpoint or the AutoRound shards to answer image requests",
+            self.dir.display()
+        );
+        let t0 = std::time::Instant::now();
+        let tower = VisionTower::open(&self.dir, self.tower_device, tower_threads())
+            .context("open the vision tower")?;
+        eprintln!(
+            "clef: vision tower opened in {:.1}s ({})",
+            t0.elapsed().as_secs_f64(),
+            tower.label()
+        );
+        let tower = Arc::new(tower);
+        *slot = Some(tower.clone());
+        Ok(tower)
+    }
+
+    /// Run the vision tower over a record's images and line the rows up with its placeholders
+    /// (`None` for a text-only record). A device failure unwinds as the typed panic the server
+    /// maps; anything else fails this record alone.
+    fn media_features(&self, enc: &EncodedRecord) -> Result<Option<MediaFeatures>> {
+        let Some(media) = &enc.media else {
+            return Ok(None);
+        };
+        let tower = self.vision_tower()?;
+        let t0 = std::time::Instant::now();
+        let out = self
+            .pool
+            .install(|| tower.encode_images(&media.images, self.opts.threads))
+            .inspect_err(engine::raise_if_device_failure)
+            .context("vision tower")?;
+        let patches: usize = media.images.iter().map(|i| i.patches()).sum();
+        eprintln!(
+            "clef: vision tower: {} image(s), {patches} patches -> {} tokens in {:.1}s",
+            media.images.len(),
+            patches / 4,
+            t0.elapsed().as_secs_f64()
+        );
+        if tower.device() != TowerDevice::Cpu
+            && std::env::var("ROCKET_CLEF_TOWER_CHECK").is_ok_and(|v| !v.is_empty() && v != "0")
+        {
+            for (i, img) in media.images.iter().enumerate() {
+                match self
+                    .pool
+                    .install(|| tower.check_against_cpu(img, self.opts.threads))
+                {
+                    Ok(report) => eprintln!("clef: tower check images[{i}] vs f32 CPU: {report}"),
+                    Err(e) => eprintln!("clef: tower check images[{i}] failed: {e:#}"),
+                }
+            }
+        }
+        tower.trim(crate::util::mem::keep_scratch_mib() * 1024 * 1024);
+        let positions = rope_index(&enc.input_ids, &media.layout)?;
+        MediaFeatures::assemble(
+            &enc.input_ids,
+            Some(positions),
+            &out,
+            self.backbone.cfg.hidden,
+        )
+        .map(Some)
+    }
+
+    /// Answer one request. `max_length` caps the whole record in tokens (the release's
+    /// default is [`DEFAULT_MAX_LENGTH`]); images count toward it, audio/video are refused. A
+    /// client error is an [`Invalid`](super::request::Invalid) in the error chain.
+    pub fn answer(&self, req: &ClefRequest, max_length: usize) -> Result<Answered> {
+        let encoded = encode_request(&self.tokenizer, req, max_length)?;
         let ids = &encoded.input_ids;
-        let out = self.backbone.forward(ids, &self.opts)?;
+        let features = self.media_features(&encoded)?;
+        let out = self
+            .backbone
+            .forward_media(ids, features.as_ref(), &self.opts)?;
         let spans: Vec<_> = encoded.questions.iter().map(|q| q.spans()).collect();
         let logits = self.pool.install(|| {
             self.head
@@ -180,10 +283,7 @@ impl ClefModel {
 
     /// Validate and encode one request (the client-error half of [`ClefModel::answer`]).
     pub fn encode(&self, req: &ClefRequest, max_length: usize) -> Result<EncodedRecord> {
-        if let Some(refusal) = req.media_refusal() {
-            return Err(refusal.into());
-        }
-        encode_record(&self.tokenizer, req, max_length, None)
+        encode_request(&self.tokenizer, req, max_length)
     }
 
     /// Answer several requests with their thinker passes shared (see
@@ -224,11 +324,33 @@ impl ClefModel {
                 Err(e) => results[i] = Some(Err(e)),
             }
         }
-        let ids: Vec<&[u32]> = recs.iter().map(|r| r.input_ids.as_slice()).collect();
+        // Tower runs first (one record's failure fails that record alone); records whose
+        // tower failed leave the shared thinker pass.
+        let mut features: Vec<Option<MediaFeatures>> = Vec::with_capacity(recs.len());
+        let (mut idx2, mut recs2) = (Vec::new(), Vec::new());
+        for (&i, r) in idx.iter().zip(recs) {
+            match self.media_features(&r) {
+                Ok(f) => {
+                    features.push(f);
+                    idx2.push(i);
+                    recs2.push(r);
+                }
+                Err(e) => results[i] = Some(Err(e)),
+            }
+        }
+        let (idx, recs) = (idx2, recs2);
+        let refs: Vec<RecordRef<'_>> = recs
+            .iter()
+            .zip(&features)
+            .map(|(r, f)| RecordRef {
+                ids: &r.input_ids,
+                media: f.as_ref(),
+            })
+            .collect();
         let mut chunks = Vec::new();
         match self
             .backbone
-            .forward_batch(&ids, &self.opts, max_batch_tokens)
+            .forward_batch_media(&refs, &self.opts, max_batch_tokens)
         {
             Err(e) => {
                 let msg = format!("{e:#}");

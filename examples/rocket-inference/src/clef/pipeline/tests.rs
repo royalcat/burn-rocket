@@ -1,6 +1,7 @@
 use super::*;
 use crate::clef::Invalid;
 use crate::clef::encode::EncodedQuestion;
+use crate::clef::encode::encode_record;
 use crate::clef::testutil::{f32s, read_npz};
 use serde_json::json;
 use std::path::PathBuf;
@@ -51,6 +52,7 @@ fn encoded_for(req: &ClefRequest) -> EncodedRecord {
     EncodedRecord {
         input_ids: vec![0; 42],
         questions,
+        media: None,
     }
 }
 

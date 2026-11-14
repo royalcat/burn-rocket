@@ -17,9 +17,12 @@
 //! Special tokens inside the text pieces (`<|im_start|>` ...) tokenize to their special
 //! ids, as in the Python tokenizer (which is the same Rust `tokenizers` core).
 
+use super::media::{MediaLayout, build_media_ids};
 use super::request::{ClefRequest, Invalid, question_type_index};
+use super::vision::{PreparedImage, VisionConfig, prepare_value};
 use anyhow::{Context, Result};
 use serde_json::{Number, Value};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 pub const SYSTEM_PROMPT: &str = "Read the complete state and schema. Decide every field jointly. \
@@ -203,10 +206,21 @@ impl EncodedQuestion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The prepared media of an encoded record (images only for now): the layout the
+/// placeholder block and the mRoPE positions derive from, and the tower inputs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordMedia {
+    pub layout: MediaLayout,
+    pub images: Vec<PreparedImage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct EncodedRecord {
     pub input_ids: Vec<u32>,
     pub questions: Vec<EncodedQuestion>,
+    /// Decoded + preprocessed media (`None` for a text-only record). Shared so a record
+    /// clones cheaply.
+    pub media: Option<Arc<RecordMedia>>,
 }
 
 fn tokens(tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
@@ -335,7 +349,52 @@ pub fn encode_record_with_media(
     Ok(EncodedRecord {
         input_ids,
         questions,
+        media: None,
     })
+}
+
+/// [`encode_record`] for any request this build serves: text-only, or with `images`.
+///
+/// Images are fetched/decoded/preprocessed here (client errors are [`Invalid`]), their grids
+/// give the placeholder block (`<|vision_start|> <|image_pad|> x n <|vision_end|>` + `\n` per
+/// image, in request order), and the block counts toward `max_length` like the release's
+/// `fixed_length`. The prepared pixel rows travel with the record to the thinker pass.
+/// Audio/video requests are refused ([`ClefRequest::media_refusal`]).
+pub fn encode_request(
+    tok: &Tokenizer,
+    request: &ClefRequest,
+    max_length: usize,
+) -> Result<EncodedRecord> {
+    if let Some(refusal) = request.media_refusal() {
+        return Err(refusal.into());
+    }
+    if request.images.is_empty() {
+        return encode_record(tok, request, max_length, None);
+    }
+    let cfg = VisionConfig::shipped();
+    let mut images = Vec::with_capacity(request.images.len());
+    let mut media_tokens = 0usize;
+    for (i, value) in request.images.iter().enumerate() {
+        let img = prepare_value(value, i, &cfg)?;
+        // + <|vision_start|>, <|vision_end|> and the "\n" after the placeholder
+        media_tokens += img.tokens() + 3;
+        if media_tokens > max_length {
+            return Err(Invalid(format!(
+                "the images need over {max_length} tokens before the state (images[{i}] is the \
+                 one that crosses the limit)"
+            ))
+            .into());
+        }
+        images.push(img);
+    }
+    let layout = MediaLayout {
+        image_grids: images.iter().map(|i| i.grid).collect(),
+        ..Default::default()
+    };
+    let media_ids = build_media_ids(&layout, newline_token(tok)?)?;
+    let mut enc = encode_record_with_media(tok, request, max_length, None, &media_ids)?;
+    enc.media = Some(Arc::new(RecordMedia { layout, images }));
+    Ok(enc)
 }
 
 #[cfg(test)]

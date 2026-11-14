@@ -58,6 +58,8 @@ pub(crate) struct ClefJob {
 /// The handler-side half: the tokenizer the handlers encode with, and the queue.
 pub(crate) struct ClefFront {
     pub tokenizer: Tokenizer,
+    /// The checkpoint holds the vision tower (a clef-pack does not): `images` are served.
+    pub images: bool,
     /// Per-record prompt cap (`--max-tokens`).
     pub max_tokens: usize,
     pub batcher: Batcher<ClefJob>,
@@ -75,6 +77,7 @@ impl ClefFront {
     pub fn start(
         engine: Arc<Mutex<Engine>>,
         tokenizer: Tokenizer,
+        images: bool,
         max_tokens: usize,
         settings: BatchSettings,
     ) -> Self {
@@ -88,6 +91,7 @@ impl ClefFront {
         let batcher = Batcher::start(limits, move |batch| run_batch(&engine, cap, batch));
         Self {
             tokenizer,
+            images,
             max_tokens,
             batcher,
         }

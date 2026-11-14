@@ -19,7 +19,7 @@ const QB: usize = 128;
 /// # Safety
 /// The three slices must cover every element addressed by the strides.
 #[allow(clippy::too_many_arguments)]
-unsafe fn gemm_strided(
+pub(crate) unsafe fn gemm_strided(
     m: usize,
     n: usize,
     k: usize,

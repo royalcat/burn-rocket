@@ -20,9 +20,13 @@ impl fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
-/// What a media request is answered with while the image/audio/video path is missing.
-pub const MEDIA_NOT_IMPLEMENTED: &str = "Clef-Omni image/audio/video input is not implemented yet \
-     (this build answers text-only requests): remove `images`, `audio` and `videos` from the request";
+/// What an audio/video request is answered with while those towers are missing (images work).
+pub const MEDIA_NOT_IMPLEMENTED: &str = "Clef-Omni audio/video input is not implemented yet \
+     (this build answers text and image requests): remove `audio` and `videos` from the request";
+
+/// What a request with `media_kwargs` is answered with (the processor overrides are not ported).
+pub const MEDIA_KWARGS_UNSUPPORTED: &str =
+    "media_kwargs is not supported by this build: remove it from the request";
 
 /// `QUESTION_TYPES` of the release (`noul`, `choice`, `score` -> 0, 1, 2).
 pub fn question_type_index(ty: &str) -> Option<usize> {
@@ -56,6 +60,12 @@ pub struct ClefRequest {
     pub questions: Map<String, Value>,
     /// `images`/`audio`/`videos` entries present (any non-empty list).
     pub has_media: bool,
+    /// `images`: file paths, `data:` URLs or `http(s)` URLs, in request order.
+    pub images: Vec<String>,
+    /// The request has `audio` or `videos` entries (not implemented: refused).
+    pub has_audio_video: bool,
+    /// The request has a non-empty `media_kwargs` (not supported: refused).
+    pub has_media_kwargs: bool,
 }
 
 impl ClefRequest {
@@ -105,21 +115,47 @@ impl ClefRequest {
                 _ => return Err(Invalid(format!("{id}: noul criteria must be an object"))),
             }
         }
-        let has_media = ["images", "audio", "videos"]
-            .iter()
-            .any(|k| object.get(*k).is_some_and(|v| !falsy(v)));
+        let present = |k: &str| object.get(k).is_some_and(|v| !falsy(v));
+        let images = match object.get("images") {
+            None => Vec::new(),
+            Some(v) if falsy(v) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| match item {
+                    Value::String(s) if !s.is_empty() => Ok(s.clone()),
+                    _ => Err(Invalid(format!(
+                        "images[{i}]: expected a file path, a data: URL or an http(s) URL string"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(Invalid(
+                    "images must be a list of file paths, data: URLs or http(s) URLs".into(),
+                ));
+            }
+        };
         Ok(Self {
             model,
             state,
             questions,
-            has_media,
+            has_media: present("images") || present("audio") || present("videos"),
+            images,
+            has_audio_video: present("audio") || present("videos"),
+            has_media_kwargs: present("media_kwargs"),
         })
     }
 
-    /// The refusal for a media request (this build is text-only).
+    /// The refusal for what this build cannot do: audio/video inputs and `media_kwargs`
+    /// (images are served).
     pub fn media_refusal(&self) -> Option<Invalid> {
-        self.has_media
-            .then(|| Invalid(MEDIA_NOT_IMPLEMENTED.into()))
+        if self.has_audio_video {
+            Some(Invalid(MEDIA_NOT_IMPLEMENTED.into()))
+        } else if self.has_media_kwargs {
+            Some(Invalid(MEDIA_KWARGS_UNSUPPORTED.into()))
+        } else {
+            None
+        }
     }
 }
 
@@ -225,16 +261,42 @@ mod tests {
     }
 
     #[test]
-    fn media_is_detected_and_refused_with_a_clear_message() {
-        for key in ["images", "audio", "videos"] {
+    fn audio_and_video_are_detected_and_refused_with_a_clear_message() {
+        for key in ["audio", "videos"] {
             let mut v = ok();
-            v[key] = json!(["data:image/png;base64,AAAA"]);
+            v[key] = json!(["data:audio/wav;base64,AAAA"]);
             let r = parse(v).unwrap();
-            assert!(r.has_media, "{key}");
+            assert!(r.has_media && r.has_audio_video, "{key}");
             let refusal = r.media_refusal().unwrap();
             assert!(refusal.0.contains("not implemented yet"), "{refusal}");
-            assert!(refusal.0.contains("image/audio/video"), "{refusal}");
+            assert!(refusal.0.contains("audio/video"), "{refusal}");
         }
+        // images alone are served; media_kwargs is refused
+        let mut v = ok();
+        v["images"] = json!(["data:image/png;base64,AAAA", "a.png"]);
+        let r = parse(v).unwrap();
+        assert!(r.has_media && !r.has_audio_video && r.media_refusal().is_none());
+        assert_eq!(r.images, ["data:image/png;base64,AAAA", "a.png"]);
+        let mut v = ok();
+        v["media_kwargs"] = json!({"size": {}});
+        assert!(
+            parse(v)
+                .unwrap()
+                .media_refusal()
+                .unwrap()
+                .0
+                .contains("media_kwargs")
+        );
+        // malformed image lists are a 422, not a crash
+        let mut v = ok();
+        v["images"] = json!("cat.png");
+        assert!(parse(v).unwrap_err().contains("must be a list"));
+        let mut v = ok();
+        v["images"] = json!(["a.png", 3]);
+        assert_eq!(
+            parse(v).unwrap_err(),
+            "images[1]: expected a file path, a data: URL or an http(s) URL string"
+        );
         // Empty lists (what the Python `or []` accepts) are not media.
         let mut v = ok();
         v["images"] = json!([]);
