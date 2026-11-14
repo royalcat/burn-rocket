@@ -48,7 +48,7 @@ pub fn require_embedding(family: Family, command: &str) -> Result<()> {
     anyhow::bail!(
         "`{command}` needs an embedding model, but the checkpoint is the {} model; {}",
         family.name(),
-        if family == Family::Decision {
+        if family.is_decision() {
             "`decide` is the decision command"
         } else {
             "`gen` is the chat command"
@@ -64,7 +64,7 @@ pub fn require_chat(family: Family) -> Result<()> {
     anyhow::bail!(
         "`gen` needs a chat model, but the checkpoint is the {} model; {}",
         family.name(),
-        if family == Family::Decision {
+        if family.is_decision() {
             "`decide` is the decision command"
         } else {
             "`embed` is the embedding command"
@@ -72,14 +72,15 @@ pub fn require_chat(family: Family) -> Result<()> {
     )
 }
 
-/// `decide` needs a decision model (a d3 checkpoint).
+/// `decide` needs a decision model (a d3 checkpoint or Clef-Omni).
 pub fn require_decision(family: Family) -> Result<()> {
-    if family == Family::Decision {
+    if family.is_decision() {
         return Ok(());
     }
     anyhow::bail!(
         "`decide` needs a decision model (a d3 checkpoint with decision_config.json \
-         and readout.safetensors), but the checkpoint is the {} model",
+         and readout.safetensors, or Clef-Omni with joint_head.safetensors), but the \
+         checkpoint is the {} model",
         family.name()
     )
 }

@@ -169,10 +169,15 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
         // ~32 MB), so this route takes the reference server's media-sum ceiling
         // instead of the media limit below. `d3_server.py` has no body limit at all;
         // 96 MiB covers the documented payloads with room for the JSON around them.
-        app = app.route(
-            "/v1/systemone",
-            post(systemone::systemone).layer(DefaultBodyLimit::max(DECISION_BODY_LIMIT)),
-        );
+        if state.settings.family == Family::Clef {
+            // Text-only for now: a plain JSON body, no media payloads to size for.
+            app = app.route("/v1/systemone", post(systemone::systemone_clef));
+        } else {
+            app = app.route(
+                "/v1/systemone",
+                post(systemone::systemone).layer(DefaultBodyLimit::max(DECISION_BODY_LIMIT)),
+            );
+        }
     }
     // Base64 images (data URIs) and multi-image batches exceed axum's 2 MiB
     // default JSON body limit. Every other route keeps the media limit the README

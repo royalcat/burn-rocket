@@ -20,8 +20,8 @@ use crate::util::device;
 
 use super::Settings;
 use super::engine::{
-    Capabilities, DecisionEngine, Emb2Engine, Engine, Family, Gemma4Engine, IntentEngine,
-    Qwen3Engine,
+    Capabilities, ClefEngine, DecisionEngine, Emb2Engine, Engine, Family, Gemma4Engine,
+    IntentEngine, Qwen3Engine,
 };
 
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
@@ -59,6 +59,8 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         // cap is the family's own default (images spend ~900 tokens each; see
         // `commands::decide::MAX_STATE_TOKENS`).
         Family::Decision => (crate::commands::decide::MAX_STATE_TOKENS, 64),
+        // One record per request, answered jointly; the cap is per record.
+        Family::Clef => (crate::commands::decide::CLEF_MAX_TOKENS, 64),
     };
     let max_tokens = max_tokens.unwrap_or(default_max_tokens);
     let max_new_tokens = max_new_tokens.unwrap_or(default_max_new);
@@ -252,6 +254,18 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 },
             )
         }
+        Family::Clef => {
+            let started = std::time::Instant::now();
+            let model = crate::clef::ClefModel::load(&model_dir)?;
+            report_clef_load(started.elapsed().as_secs_f64());
+            (
+                Engine::Clef(Box::new(ClefEngine { model, max_tokens })),
+                Capabilities {
+                    decisions: true,
+                    ..Default::default()
+                },
+            )
+        }
     };
 
     let model_name = match model_name {
@@ -276,6 +290,14 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         engine,
         settings,
     )
+}
+
+/// Printed before the log subscriber exists (`serve` installs it later).
+fn report_clef_load(seconds: f64) {
+    println!(
+        "clef model opened in {seconds:.1}s ({:.0} MiB anon)",
+        crate::util::rss_mib()
+    );
 }
 
 fn dir_name(dir: &Path) -> String {

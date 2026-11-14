@@ -111,3 +111,4 @@ numbers remain valid for the corresponding placement; the mapping is:
 | [`intent.md`](intent.md) | Qwen3.5-0.8B intent/query planner |
 | [`gemma4.md`](gemma4.md) | Gemma 4 E2B-it chat |
 | [`decision.md`](decision.md) | vllm-sr Decision 3.0 (d3-lite/d3-nano) typed decisions |
+| [`clef.md`](clef.md) | Cloudflare Clef-Omni typed decisions (text-only, CPU, layer-streamed) |

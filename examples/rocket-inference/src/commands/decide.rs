@@ -22,11 +22,13 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
+use crate::clef::{ClefModel, ClefRequest, Invalid};
 use crate::cli::{FlagArgs, LoadArgs, ResolvedLoad};
 use crate::commands::{require_decision, resolve};
 use crate::decision::load::manifest_model_name;
 use crate::decision::request::{CaseInput, DecisionRequest, MediaMode};
 use crate::decision::{DecisionModel, load_decision_model};
+use crate::family::Family;
 use crate::qwen35_intent::loader::IntentLoadOptions;
 use crate::util::device;
 use crate::util::rss_mib;
@@ -41,10 +43,18 @@ use crate::util::rss_mib;
 /// budget passes the flag (the board recipe uses 8192).
 pub const MAX_STATE_TOKENS: usize = 32768;
 
+/// The default per-record prompt cap of Clef-Omni (`--max-state-tokens` / `serve
+/// --max-tokens`): the release's own default is 64000, but the board recipe is 8192 and
+/// the layer-streamed forward is linear-to-quadratic in the record length.
+pub const CLEF_MAX_TOKENS: usize = 8192;
+
 pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
     let mut args = Args::parse(FlagArgs::new(it))?;
     let load = resolve(std::mem::take(&mut args.load))?;
     require_decision(load.family)?;
+    if load.family == Family::Clef {
+        return run_clef(args, &load);
+    }
     let mut model = load_model(&load, &args)?;
     let model_name = args
         .model_name
@@ -111,6 +121,127 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
                 rss_mib()
             );
             response
+        }
+        (None, None) => bail!("provide --requests <file> or --request <json object>"),
+        (Some(_), Some(_)) => bail!("--requests and --request are mutually exclusive"),
+    };
+    write_output(&output, args.out.as_deref())
+}
+
+/// `decide` for Clef-Omni: the same `--requests`/`--request` inputs, one record per case
+/// (all questions answered jointly in one forward). A case the model refuses (invalid
+/// request, media, a schema over the cap) is reported as `{"name", "error"}` and the
+/// run fails after writing the output; a model failure stops the run.
+fn run_clef(args: Args, load: &ResolvedLoad) -> Result<()> {
+    if args.dump_prompts.is_some() {
+        bail!("--dump-prompts does not apply to the clef model");
+    }
+    let started = Instant::now();
+    let model = ClefModel::load(&load.model_dir)?;
+    println!(
+        "clef model opened in {:.1}s ({:.0} MiB anon)",
+        started.elapsed().as_secs_f64(),
+        rss_mib()
+    );
+    let model_name = args
+        .model_name
+        .clone()
+        .unwrap_or_else(|| dir_name(&load.model_dir));
+    let max_length = args.max_state_tokens.unwrap_or(CLEF_MAX_TOKENS);
+    // One case -> (response or the refusal, prompt tokens).
+    let run_case = |mut value: Value| -> Result<std::result::Result<(Value, usize), Invalid>> {
+        if let Value::Object(object) = &mut value {
+            object.remove("name");
+            object
+                .entry("model")
+                .or_insert_with(|| Value::String(model_name.clone()));
+        }
+        let request = match ClefRequest::from_value(value) {
+            Ok(request) => request,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match model.answer(&request, max_length) {
+            Ok(done) => Ok(Ok((done.response, done.tokens))),
+            Err(error) => match error.downcast::<Invalid>() {
+                Ok(refusal) => Ok(Err(refusal)),
+                Err(error) => Err(error),
+            },
+        }
+    };
+    let output = match (&args.requests, &args.request) {
+        (Some(path), None) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read requests from {}", path.display()))?;
+            let values: Vec<Value> = serde_json::from_str(&text).with_context(|| {
+                format!("parse {} (expected a JSON array of cases)", path.display())
+            })?;
+            if values.is_empty() {
+                bail!("{} holds no cases", path.display());
+            }
+            let total = values.len();
+            let (mut out, mut refused, mut tokens) = (Vec::with_capacity(total), 0usize, 0usize);
+            for (index, value) in values.into_iter().enumerate() {
+                let name = value
+                    .get("name")
+                    .or_else(|| value.get("id"))
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("case-{}", index + 1), str::to_string);
+                let t0 = Instant::now();
+                match run_case(value)? {
+                    Ok((response, case_tokens)) => {
+                        tokens += case_tokens;
+                        println!(
+                            "[{}/{total}] {name}: {} question(s), {case_tokens} tokens in {:.1}s",
+                            index + 1,
+                            response["answers"].as_object().map_or(0, |a| a.len()),
+                            t0.elapsed().as_secs_f64()
+                        );
+                        out.push(serde_json::json!({"name": name, "response": response}));
+                    }
+                    Err(refusal) => {
+                        refused += 1;
+                        println!("[{}/{total}] {name}: refused: {refusal}", index + 1);
+                        out.push(serde_json::json!({"name": name, "error": refusal.0}));
+                    }
+                }
+            }
+            println!(
+                "decided {} case(s), {tokens} prompt tokens in {:.1}s ({:.0} MiB anon){}",
+                total - refused,
+                started.elapsed().as_secs_f64(),
+                rss_mib(),
+                if refused > 0 {
+                    format!(", {refused} refused")
+                } else {
+                    String::new()
+                }
+            );
+            let output = serde_json::json!({
+                "schema": "clef-decision-v1",
+                "model": model_name,
+                "cases": out,
+            });
+            write_output(&output, args.out.as_deref())?;
+            if refused > 0 {
+                bail!("{refused} case(s) were refused (see the `error` entries)");
+            }
+            return Ok(());
+        }
+        (None, Some(json)) => {
+            let value: Value =
+                serde_json::from_str(json).context("parse --request (expected a JSON object)")?;
+            match run_case(value)? {
+                Ok((response, tokens)) => {
+                    println!(
+                        "decided {} question(s), {tokens} prompt tokens in {:.1}s ({:.0} MiB anon)",
+                        response["answers"].as_object().map_or(0, |a| a.len()),
+                        started.elapsed().as_secs_f64(),
+                        rss_mib()
+                    );
+                    response
+                }
+                Err(refusal) => bail!("request refused: {refusal}"),
+            }
         }
         (None, None) => bail!("provide --requests <file> or --request <json object>"),
         (Some(_), Some(_)) => bail!("--requests and --request are mutually exclusive"),

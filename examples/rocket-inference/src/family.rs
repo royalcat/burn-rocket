@@ -18,6 +18,10 @@ pub enum Family {
     /// vllm-sr Decision 3.0 (`d3-code-readout-v1`): a Qwen3.5 text backbone plus a
     /// 255-code readout head; text-only, no generation.
     Decision,
+    /// Cloudflare Clef-Omni: the Qwen3-Omni-30B-A3B MoE thinker plus a joint schema
+    /// head (`joint_head.safetensors`); typed decisions, no generation. Text-only and
+    /// CPU-only for now (layer-streamed from the BF16 shards).
+    Clef,
 }
 
 impl Family {
@@ -29,6 +33,7 @@ impl Family {
             Self::Intent => "intent",
             Self::Gemma4 => "gemma4",
             Self::Decision => "decision",
+            Self::Clef => "clef",
         }
     }
 
@@ -39,9 +44,10 @@ impl Family {
             "intent" => Ok(Self::Intent),
             "gemma4" => Ok(Self::Gemma4),
             "decision" => Ok(Self::Decision),
+            "clef" => Ok(Self::Clef),
             other => bail!(
                 "unknown family '{other}' \
-                 (expected auto|qwen3|embeddinggemma|intent|gemma4|decision)"
+                 (expected auto|qwen3|embeddinggemma|intent|gemma4|decision|clef)"
             ),
         }
     }
@@ -55,7 +61,13 @@ impl Family {
             Self::Gemma4 => "gemma4",
             // d3 is a Qwen3.5 backbone; it has no chat surface of its own.
             Self::Decision => "qwen3_5",
+            Self::Clef => "qwen3_omni_moe",
         }
+    }
+
+    /// The typed-decision families (`/v1/systemone`, the `decide` command).
+    pub fn is_decision(self) -> bool {
+        matches!(self, Self::Decision | Self::Clef)
     }
 
     /// Models this command can embed with.
@@ -156,7 +168,8 @@ impl Family {
 ///
 /// A `decision_config.json` wins over `config.json`: d3 checkpoints report the
 /// backbone's `model_type` (`qwen3_5`), and the readout head is what makes them a
-/// decision model.
+/// decision model. Likewise a `qwen3_omni_moe` checkpoint is Clef-Omni only with its
+/// `joint_head.safetensors` (the plain Qwen3-Omni base is not a supported model).
 pub fn detect_family(model_dir: &Path) -> Result<Family> {
     if model_dir.join("decision_config.json").exists() {
         return crate::decision::config::DecisionConfig::load(model_dir)
@@ -169,7 +182,7 @@ pub fn detect_family(model_dir: &Path) -> Result<Family> {
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let json: serde_json::Value =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-        return detect_from_value(&json)
+        return detect_from_value_in(&json, model_dir.join(CLEF_HEAD_FILE).exists())
             .with_context(|| format!("detect the model family in {}", model_dir.display()));
     }
     // No config.json: assume a GGUF directory and read the architecture.
@@ -190,25 +203,39 @@ fn detect_from_arch(arch: Option<&str>) -> Result<Family> {
         Some("gemma4") => Ok(Family::Gemma4),
         Some(other) => bail!(
             "unsupported GGUF architecture '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision|clef)"
         ),
         None => bail!("checkpoint is neither config.json nor GGUF"),
     }
 }
 
+/// The joint schema head's file name in a Clef-Omni checkpoint.
+pub const CLEF_HEAD_FILE: &str = "joint_head.safetensors";
+
+#[cfg(test)]
 pub(crate) fn detect_from_value(json: &serde_json::Value) -> Result<Family> {
+    detect_from_value_in(json, false)
+}
+
+/// [`detect_from_value`] knowing whether the directory holds a Clef-Omni joint head.
+pub(crate) fn detect_from_value_in(json: &serde_json::Value, clef_head: bool) -> Result<Family> {
     match json.get("model_type").and_then(|v| v.as_str()) {
+        Some("qwen3_omni_moe") if clef_head => Ok(Family::Clef),
+        Some("qwen3_omni_moe") => bail!(
+            "a qwen3_omni_moe checkpoint is only supported as Clef-Omni, which needs \
+             {CLEF_HEAD_FILE} next to config.json (not found)"
+        ),
         Some("qwen3") => Ok(Family::Qwen3Embed),
         Some("embedding_gemma2") => Ok(Family::Emb2),
         Some("qwen3_5") => Ok(Family::Intent),
         Some("gemma4") => Ok(Family::Gemma4),
         Some(other) => bail!(
             "unsupported model_type '{other}' \
-             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision|clef)"
         ),
         None => bail!(
             "config.json has no model_type \
-             (pass --family qwen3|embeddinggemma|intent|gemma4|decision)"
+             (pass --family qwen3|embeddinggemma|intent|gemma4|decision|clef)"
         ),
     }
 }
@@ -225,6 +252,7 @@ mod tests {
             Family::Intent,
             Family::Gemma4,
             Family::Decision,
+            Family::Clef,
         ] {
             assert_eq!(Family::parse(family.name()).unwrap(), family);
         }
@@ -324,6 +352,50 @@ mod tests {
         .unwrap();
         let err = format!("{:#}", detect_family(&dir).unwrap_err());
         assert!(err.contains("d3-code-readout-v1"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clef_is_a_text_decision_family_with_no_optional_stages() {
+        let c = Family::Clef;
+        assert!(c.is_decision() && Family::Decision.is_decision());
+        assert!(!Family::Qwen3Embed.is_decision());
+        assert!(!c.is_embedding() && !c.is_chat());
+        assert!(!c.supports_text_attn() && !c.supports_vision() && !c.supports_decode());
+        assert!(!c.supports_dtype() && !c.supports_quant() && !c.supports_int8());
+        assert!(!c.supports_npu_dtype() && !c.supports_keep_cpu_weights());
+        assert!(!c.supports_defer_towers() && !c.supports_attn_kernel());
+        assert!(!c.supports_embed_f16() && !c.supports_embed_int8());
+        assert_eq!(c.ollama_architecture(), "qwen3_omni_moe");
+    }
+
+    #[test]
+    fn clef_needs_the_joint_head_next_to_a_qwen3_omni_config() {
+        let cfg: serde_json::Value = serde_json::json!({"model_type": "qwen3_omni_moe"});
+        assert_eq!(detect_from_value_in(&cfg, true).unwrap(), Family::Clef);
+        // The plain base model must not match, with or without the pure-config entry.
+        let err = format!("{:#}", detect_from_value_in(&cfg, false).unwrap_err());
+        assert!(err.contains("joint_head.safetensors"), "{err}");
+        assert!(detect_from_value(&cfg).is_err());
+        // The head file does not turn another model type into Clef.
+        let other = serde_json::json!({"model_type": "qwen3"});
+        assert_eq!(
+            detect_from_value_in(&other, true).unwrap(),
+            Family::Qwen3Embed
+        );
+    }
+
+    #[test]
+    fn a_directory_is_clef_only_with_the_head_file() {
+        let dir = temp_dir("clef");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"model_type": "qwen3_omni_moe"}"#,
+        )
+        .unwrap();
+        assert!(detect_family(&dir).is_err(), "the plain base model");
+        std::fs::write(dir.join(CLEF_HEAD_FILE), b"").unwrap();
+        assert_eq!(detect_family(&dir).unwrap(), Family::Clef);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -36,6 +36,7 @@ use super::AppState;
 use super::engine::DecisionReply;
 use super::error::ApiError;
 use super::log;
+use crate::clef::ClefRequest;
 use crate::decision::DecisionRequest;
 
 /// A `/v1/systemone` failure in the official `{"detail": ...}` shape.
@@ -104,6 +105,30 @@ pub(crate) async fn systemone(
             Ok(Json(outcome.response))
         }
     }
+}
+
+/// `POST /v1/systemone` for Clef-Omni: the release's `systemone()` contract. The body is
+/// validated like the Python entry point (`model` and `state` required, a nonempty
+/// `questions` object, types and criteria); a refusal (including a request carrying
+/// images, audio or videos, which are not implemented yet) is `422 {"detail": "<reason>"}`
+/// and runs nothing. A valid request answers `{"model", "answers", "usage"}`.
+pub(crate) async fn systemone_clef(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<Value>, DecisionError> {
+    let value: Value = serde_json::from_slice(&body).map_err(|error| {
+        DecisionError::unprocessable(format!("could not read the body as JSON ({error})"))
+    })?;
+    let request = ClefRequest::from_value(value).map_err(|e| DecisionError::unprocessable(e.0))?;
+    if let Some(refusal) = request.media_refusal() {
+        return Err(DecisionError::unprocessable(refusal.0));
+    }
+    let (outcome, timing) = state
+        .compute(move |engine| engine.clef_decisions(request))
+        .await
+        .map_err(DecisionError::from_api)?;
+    log::decision(&state, outcome.questions, outcome.tokens, &timing);
+    Ok(Json(outcome.response))
 }
 
 #[cfg(test)]

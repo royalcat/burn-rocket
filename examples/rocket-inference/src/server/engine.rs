@@ -11,6 +11,7 @@ use tokenizers::Tokenizer;
 
 pub use crate::family::Family;
 
+use crate::clef::{ClefModel, ClefRequest, Invalid};
 use crate::decision::model::{DecisionModel, PrepareError};
 use crate::decision::request::{DecisionRequest, MediaMode};
 use crate::gemma::embeddinggemma::model::Emb2Model;
@@ -158,6 +159,7 @@ pub enum Engine {
     Intent(Box<IntentEngine>),
     Gemma4(Box<Gemma4Engine>),
     Decision(Box<DecisionEngine>),
+    Clef(Box<ClefEngine>),
 }
 
 #[derive(Debug)]
@@ -227,6 +229,14 @@ pub struct Gemma4Engine {
 pub struct DecisionEngine {
     pub model: DecisionModel,
     /// Per-question prompt-token cap (the server's `--max-tokens`).
+    pub max_tokens: usize,
+}
+
+/// A loaded Clef-Omni model (`/v1/systemone`).
+#[derive(Debug)]
+pub struct ClefEngine {
+    pub model: ClefModel,
+    /// Per-record prompt-token cap (the server's `--max-tokens`).
     pub max_tokens: usize,
 }
 
@@ -352,9 +362,9 @@ impl Engine {
         match self {
             Self::Qwen3(engine) => engine.embed_texts(req),
             Self::Emb2(engine) => engine.embed_texts(req),
-            Self::Intent(_) | Self::Gemma4(_) | Self::Decision(_) => Err(ApiError::bad_request(
-                "this model does not produce embeddings",
-            )),
+            Self::Intent(_) | Self::Gemma4(_) | Self::Decision(_) | Self::Clef(_) => Err(
+                ApiError::bad_request("this model does not produce embeddings"),
+            ),
         }
     }
 
@@ -371,7 +381,7 @@ impl Engine {
         match self {
             Self::Intent(engine) => engine.chat(turn),
             Self::Gemma4(engine) => engine.chat(turn),
-            Self::Qwen3(_) | Self::Emb2(_) | Self::Decision(_) => {
+            Self::Qwen3(_) | Self::Emb2(_) | Self::Decision(_) | Self::Clef(_) => {
                 Err(ApiError::bad_request("this model does not generate text"))
             }
         }
@@ -387,6 +397,16 @@ impl Engine {
             Self::Decision(engine) => engine.decide(model, req),
             _ => Err(ApiError::bad_request(
                 "this model does not answer decision requests",
+            )),
+        }
+    }
+
+    /// `/v1/systemone` for Clef-Omni: all questions of the record answered jointly.
+    pub fn clef_decisions(&mut self, req: ClefRequest) -> Result<DecisionOutcome, ApiError> {
+        match self {
+            Self::Clef(engine) => engine.decide(req),
+            _ => Err(ApiError::bad_request(
+                "this model does not answer Clef-Omni requests",
             )),
         }
     }
@@ -817,6 +837,34 @@ impl DecisionEngine {
             questions,
             tokens,
         }))
+    }
+}
+
+impl ClefEngine {
+    /// `/v1/systemone`'s compute for Clef-Omni: one streamed forward for the whole
+    /// record. The `clef` span is the child of `inference`; `tokens` is recorded once
+    /// the record is encoded and answered.
+    #[telemetry::instrument(
+        name = "clef",
+        skip_all,
+        fields(
+            questions = req.questions.len(),
+            tokens = tracing::field::Empty,
+        )
+    )]
+    fn decide(&mut self, req: ClefRequest) -> Result<DecisionOutcome, ApiError> {
+        let answered = self.model.answer(&req, self.max_tokens).map_err(|error| {
+            match error.downcast_ref::<Invalid>() {
+                Some(invalid) => ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, invalid.0.clone()),
+                None => ApiError::internal(format!("{error:#}")),
+            }
+        })?;
+        tracing::Span::current().record("tokens", answered.tokens as u64);
+        Ok(DecisionOutcome {
+            response: answered.response,
+            questions: answered.questions,
+            tokens: answered.tokens,
+        })
     }
 }
 

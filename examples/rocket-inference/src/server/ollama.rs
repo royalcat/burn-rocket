@@ -126,6 +126,7 @@ fn parameter_size(family: Family) -> &'static str {
         Family::Gemma4 => "5.1B",
         Family::Qwen3Embed => "0.6B",
         Family::Emb2 => "0.4B",
+        Family::Clef => "30B-A3B",
     }
 }
 

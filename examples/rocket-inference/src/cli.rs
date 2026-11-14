@@ -70,14 +70,15 @@ usage: rocket-inference serve --model-dir <dir> [flags]
 
 Routes follow the model: /v1/embeddings (+ /embed for multimodal embedding
 models), /v1/chat/completions and the Ollama API for chat models,
-/v1/systemone for a decision model (d3); /health and /v1/models always.
+/v1/systemone for a decision model (d3, clef); /health and /v1/models always.
 `--family auto` detects the loader from the checkpoint.
 
 server:
   --port <n>                   listen port (default 8383)
   --model-name <name>          served model name (default: the model dir name)
   --max-tokens <n>             prompt/context cap (family default; per question
-                               on decision, default 32768)
+                               on decision, default 32768; per record on clef,
+                               default 8192)
   --max-new-tokens <n>         default generation cap (family default)
   --temperature <f>            default sampling temperature (default 0 = greedy)
   --delta-chunk <n>            delta-rule chunk width (intent, default 64)
@@ -90,7 +91,7 @@ placement:
   --npu-threads / --npu-dtype / --int8-group / --keep-cpu-weights
 
 model and memory:
-  --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision /
+  --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision|clef /
   --cpu-backend / --dtype / --quant / --defer-towers /
   --embed-f16 / --embed-int8 / --attn-chunk / --chunk / --key-block
 
@@ -236,6 +237,18 @@ placement / model:
     block-wise int8 (one scale per 32 values; the default); --embed-f16 keeps
     the exact table;
     --defer-towers loads the vision tower on the first media request.
+
+Clef-Omni (Cloudflare, Qwen3-Omni-30B-A3B thinker + joint schema head; detected
+from a qwen3_omni_moe config.json with joint_head.safetensors, or `--family
+clef`) is text-only and CPU-only for now: the thinker streams one decoder layer
+at a time from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM
+plus the 436 MB head). Cases are the same objects as above with the release's
+`model`, `state` and `questions` (`images`/`audio`/`videos` are refused:
+not implemented yet). --max-state-tokens is the per-record cap (default 8192;
+the release's own default is 64000); --out and --model-name behave the same,
+--device npu is refused (NPU expert streaming arrives in a later phase). The
+answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
+`legend`/`probabilities` and `noul` (the probability of true).
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -647,6 +660,21 @@ impl LoadArgs {
         }
 
         // ---- placement ----
+        // Clef-Omni streams its experts from disk on the CPU for now: an NPU request
+        // is refused explicitly (before the build check, so the message is the same on
+        // every host) and `auto` stays on the CPU even on an NPU build.
+        if family == Family::Clef {
+            let (flag, device) = match self.text_device {
+                Some(d) => ("--text-device", d),
+                None => ("--device", self.device.unwrap_or(Device::Auto)),
+            };
+            if device == Device::Npu {
+                bail!(
+                    "{flag} npu is not available for the clef model: NPU expert streaming \
+                     arrives in a later phase (use `--device cpu` or `auto`)"
+                );
+            }
+        }
         let avail = npu_available();
         let base = self.device.unwrap_or(Device::Auto);
         if base == Device::Npu && !avail {
@@ -657,7 +685,11 @@ impl LoadArgs {
                 .ok_or_else(|| anyhow::anyhow!("{}", npu_build_error(flag)))
         };
         let placement = Placement {
-            text: stage(self.text_device, true, "--text-device")?,
+            text: if family == Family::Clef {
+                false
+            } else {
+                stage(self.text_device, true, "--text-device")?
+            },
             text_attn: if family.supports_text_attn() {
                 stage(self.text_attn_device, true, "--text-attn-device")?
             } else {
@@ -963,6 +995,8 @@ impl ResolvedLoad {
             // One noncausal forward per question; the 255-code readout is tiny and
             // always runs on the CPU. The CPU body is always f32 (the loader reads
             // the backbone in f32), so the checkpoint's native dtype does not apply.
+            // Layer-streamed BF16 thinker widened to f32 per layer, f32 head.
+            Family::Clef => "placement: text=CPU(f32, layer-streamed) head=CPU(f32)".to_string(),
             Family::Decision => {
                 let text = if text_npu {
                     format!("NPU({})", self.npu_dtype.name())
@@ -1245,5 +1279,48 @@ mod tests {
         assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
         let err = resolve(&["--embed-int8"], Family::Gemma4).unwrap_err();
         assert!(format!("{err:#}").contains("--embed-int8 does not apply"));
+    }
+
+    #[test]
+    fn clef_is_cpu_only_and_rejects_npu_with_a_clear_message() {
+        for list in [&[][..], &["--device", "auto"], &["--device", "cpu"]] {
+            let r = resolve(list, Family::Clef).unwrap();
+            assert_eq!(r.placement, Placement::default(), "{list:?}");
+            assert_eq!(
+                r.placement_line(),
+                "placement: text=CPU(f32, layer-streamed) head=CPU(f32)"
+            );
+        }
+        // The text stage is the only stage, so a base `--device npu` is refused too.
+        for list in [
+            &["--device", "npu"][..],
+            &["--text-device", "npu"],
+            &["--device", "cpu", "--text-device", "npu"],
+        ] {
+            let err = format!("{:#}", resolve(list, Family::Clef).unwrap_err());
+            assert!(
+                err.contains("NPU expert streaming arrives in a later phase"),
+                "{list:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_rejects_flags_of_other_families() {
+        for list in [
+            &["--dtype", "f32"][..],
+            &["--quant", "q8"],
+            &["--defer-towers"],
+            &["--text-attn-device", "cpu"],
+            &["--vision-device", "cpu"],
+            &["--decode-device", "cpu"],
+            &["--npu-dtype", "int8"],
+            &["--embed-f16"],
+            &["--embed-int8"],
+            &["--keep-cpu-weights", "yes"],
+            &["--attn-chunk", "512"],
+        ] {
+            assert!(resolve(list, Family::Clef).is_err(), "{list:?}");
+        }
     }
 }

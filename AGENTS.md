@@ -3207,3 +3207,45 @@ Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencod
 the board in `/root/embeddings-fast/data/` (historical) and under
 `examples/rocket-inference/data/`. Regenerate them with the `llama-embedding` invocation
 in "Environment facts" if missing.
+
+## Clef-Omni (in progress, 2026-11-14)
+
+Cloudflare/clef-omni (`model_type qwen3_omni_moe` + `joint_head.safetensors`): the
+Qwen3-Omni-30B-A3B thinker (48 MoE layers, 128 experts, top-8) plus a `JointSchemaHead`,
+sixth family `Family::Clef` (`--family clef`), same `/v1/systemone` contract as d3 but a
+separate implementation under `examples/rocket-inference/src/clef/`. Branch `clef-omni`.
+Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-oracle.md`.
+
+- **Files**: `st.rs` (safetensors/BF16 reader), `math.rs`, `head.rs` (`ClefHead`,
+  `LmHeadFile`), `model.rs` (+ `model/`: `Backbone`, layer-streamed f32 CPU decoder, expert
+  source trait for phase 6), `answer.rs` (`systemone_answer`, `round4`, option order),
+  `encode.rs` (exact port of `encode_record`: piecewise tokenization, `render()` = sorted
+  compact JSON with Python float repr, `max_length`/`max_state_tokens` semantics),
+  `request.rs` (validation = the Python `systemone` checks; `Invalid` = HTTP 422; media is
+  detected and refused), `pipeline.rs` (`ClefModel::load(dir)` / `answer(&ClefRequest,
+  max_length)` -> encode -> backbone -> head -> softmax -> answers). Wiring: `family.rs`
+  (`Family::Clef`, `is_decision()`, detection needs the head file), `cli.rs` (CPU-only
+  placement: `--device npu` is refused with "NPU expert streaming arrives in a later
+  phase", `auto` = CPU), `commands/decide.rs` (`run_clef`, output schema
+  `clef-decision-v1`), `server/{cli,engine,systemone,mod}.rs` (`Engine::Clef`,
+  `systemone_clef`, `clef` span, default `--max-tokens` 8192).
+- **Oracle**: checkpoint `/home/royalcat/models/clef-omni`, venv
+  `/home/royalcat/models/venvs/clef` (run with `python -I`), release code copied as
+  `tools/clef_joint_schema_model.py`, f32 layer-streaming reference `tools/clef_reference.py`,
+  dumps in `/tmp/opencode/clef/dump` (ephemeral; regenerate per `clef-oracle.md`).
+- **Parity tests**: `cargo test -p rocket-inference --no-default-features` runs the encoder
+  identity tests (`clef::encode`, vs `src/clef/testdata/encode_cases.json` made by
+  `tools/clef_encode_expected.py`; skipped when the tokenizer is absent), request
+  validation, family detection and CPU-placement tests, and the head/backbone tests of the
+  earlier phases. The ignored end-to-end gates stream the 66 GiB checkpoint:
+  `cargo test --release -p rocket-inference --no-default-features
+  clef_answers_match_the_oracle -- --ignored --nocapture` (max |dp| 3.1e-7 / 1.3e-8,
+  rounded answers identical on checkout-errors and invoice) and `clef_backbone_parity`.
+- **Measured (dev host, 8 threads, warm cache)**: ~20-21 s per 256-295 token record
+  (Python oracle 60-73 s); 480 MiB anon after load, 590-770 MiB after a request.
+  Model-card example via `serve`: technical 0.8327, urgency 1.8917, outage 0.9552.
+- **Phase status**: 0 expert-streaming probe (`expert_bench`, `I8Context::rewrite_weight`)
+  done; 1 f32 oracle + fixtures done; 2 head port done; 3 CPU layer-streamed backbone
+  done; **4 text-only CPU `decide`/`serve` done** (this section); 5 media towers
+  (image/audio/video; requests carrying media get 422 "not implemented yet") and 6 NPU
+  expert streaming (`--device npu` refused) not started. Nothing was run on the board.
