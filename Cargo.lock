@@ -6472,6 +6472,7 @@ dependencies = [
  "burn-rocket",
  "burn-store",
  "fancy-regex",
+ "gemm",
  "gguf-rs",
  "hf-hub",
  "hound",

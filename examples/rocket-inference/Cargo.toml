@@ -112,6 +112,9 @@ rustfft = "6"
 hound = "3"
 fancy-regex = "0.16"
 memmap2 = "0.9"
+# f32 GEMM for the Clef-Omni thinker port (src/clef/model.rs). Already in the lock file
+# (burn-flex uses it); no new download. `rayon` lets one call fan out over the pool.
+gemm = { version = "0.19", default-features = false, features = ["std", "rayon"] }
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",

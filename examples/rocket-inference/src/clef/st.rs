@@ -109,6 +109,18 @@ impl SafeFile {
         &self.mmap[self.data_start + info.start..self.data_start + info.end]
     }
 
+    /// Tell the kernel the mapped pages are no longer needed (drops them from this
+    /// process's RSS; the page cache keeps them). Safe to call at any time: the mapping
+    /// is a read-only file map, so the pages are simply re-faulted on the next access.
+    pub fn release(&self) {
+        // SAFETY: `DontNeed` on a read-only file mapping only discards resident pages.
+        unsafe {
+            let _ = self
+                .mmap
+                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+        }
+    }
+
     /// Widen a whole tensor to f32.
     pub fn to_f32(&self, info: &TensorInfo) -> Vec<f32> {
         widen(info.dtype, self.bytes(info))

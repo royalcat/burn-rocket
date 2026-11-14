@@ -66,6 +66,48 @@ pub fn linear(x: &[f32], m: usize, k: usize, w: &[f32], o: usize, b: Option<&[f3
     y
 }
 
+/// `y[m, o] = x[m, k] . w[o, k]^T` through the `gemm` crate (no bias). `threads <= 1` runs
+/// on the calling thread; otherwise the call fans out over the current rayon pool.
+pub fn matmul_nt(x: &[f32], m: usize, k: usize, w: &[f32], o: usize, threads: usize) -> Vec<f32> {
+    assert_eq!(x.len(), m * k, "matmul_nt: x shape");
+    assert_eq!(w.len(), o * k, "matmul_nt: w shape");
+    let mut y = vec![0f32; m * o];
+    if m == 0 || o == 0 {
+        return y;
+    }
+    let par = if threads <= 1 {
+        gemm::Parallelism::None
+    } else {
+        gemm::Parallelism::Rayon(threads)
+    };
+    // SAFETY: the slices above are exactly m*k, o*k and m*o elements; strides describe
+    // row-major x, w^T (rs 1, cs k) and row-major y.
+    unsafe {
+        gemm::gemm(
+            m,
+            o,
+            k,
+            y.as_mut_ptr(),
+            1,
+            o as isize,
+            false,
+            x.as_ptr(),
+            1,
+            k as isize,
+            w.as_ptr(),
+            k as isize,
+            1,
+            0.0,
+            1.0,
+            false,
+            false,
+            false,
+            par,
+        );
+    }
+    y
+}
+
 /// `torch.nn.LayerNorm` over the last dim: biased variance, affine.
 pub fn layer_norm(x: &[f32], rows: usize, n: usize, w: &[f32], b: &[f32], eps: f32) -> Vec<f32> {
     assert_eq!(x.len(), rows * n);
