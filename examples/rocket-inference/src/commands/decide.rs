@@ -137,7 +137,16 @@ fn run_clef(args: Args, load: &ResolvedLoad) -> Result<()> {
         bail!("--dump-prompts does not apply to the clef model");
     }
     let started = Instant::now();
-    let model = ClefModel::load(&load.model_dir)?;
+    let device = if load.placement.text {
+        crate::clef::ClefDevice::Npu
+    } else {
+        crate::clef::ClefDevice::Cpu
+    };
+    let model = ClefModel::load_placed(
+        &load.model_dir,
+        crate::clef::pipeline::default_threads(),
+        device,
+    )?;
     println!(
         "clef model opened in {:.1}s ({:.0} MiB anon)",
         started.elapsed().as_secs_f64(),

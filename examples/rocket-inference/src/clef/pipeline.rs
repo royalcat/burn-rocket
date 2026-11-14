@@ -3,6 +3,7 @@
 
 use super::answer::{probabilities, systemone_answer};
 use super::encode::{EncodedRecord, encode_record};
+use super::engine::{self, LayerEngine};
 use super::head::{ClefHead, LmHeadFile};
 use super::model::{Backbone, ForwardOpts};
 use super::pack::{Manifest, PackDir};
@@ -11,7 +12,25 @@ use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokenizers::Tokenizer;
+
+/// The thinker engine actually built (`ROCKET_CLEF_EMU=1` turns any placement into `Emu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineKind {
+    Cpu,
+    Emu,
+    Npu,
+}
+
+/// Where the thinker's heavy math runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClefDevice {
+    /// f32 on the CPU (the phase 3-5 path).
+    Cpu,
+    /// int8 g128 W8A8 on the NPU with streamed experts (a pack, aarch64 `npu` builds).
+    Npu,
+}
 
 pub struct ClefModel {
     pub backbone: Backbone,
@@ -59,12 +78,43 @@ impl ClefModel {
     }
 
     pub fn load_with(dir: &Path, threads: usize) -> Result<Self> {
+        Self::load_placed(dir, threads, ClefDevice::Cpu)
+    }
+
+    /// Like [`ClefModel::load_with`] with the thinker placed on `device`.
+    /// `ROCKET_CLEF_EMU=1` selects the host emulation of the NPU path on any host
+    /// (a test/diagnostic knob; it needs a pack and overrides `device`).
+    pub fn load_placed(dir: &Path, threads: usize, device: ClefDevice) -> Result<Self> {
+        let kind = if engine::emu_from_env() {
+            EngineKind::Emu
+        } else if device == ClefDevice::Npu {
+            EngineKind::Npu
+        } else {
+            EngineKind::Cpu
+        };
+        Self::load_kind(dir, threads, kind)
+    }
+
+    /// Load with an explicit thinker engine.
+    pub fn load_kind(dir: &Path, threads: usize, kind: EngineKind) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
         // A `clef-pack` directory (manifest.json) streams int8 experts; otherwise the
         // BF16 checkpoint shards.
+        if kind != EngineKind::Cpu && !PackDir::is_pack(dir) {
+            anyhow::bail!(
+                "the NPU/emulated Clef path needs a clef-pack directory (run `clef-pack` on \
+                 the int8 checkpoint, docs/recipes/clef-pack.md); {} has no manifest.json",
+                dir.display()
+            );
+        }
         let (backbone, lm_head) = if PackDir::is_pack(dir) {
-            let backbone = Backbone::open_pack(dir).context("open the clef pack")?;
+            let mut backbone = Backbone::open_pack(dir).context("open the clef pack")?;
+            if kind != EngineKind::Cpu {
+                let engine = build_engine(dir, &backbone.cfg, threads, kind == EngineKind::Emu)?;
+                eprintln!("clef: thinker engine: {}", engine.label());
+                backbone.set_engine(engine);
+            }
             let lm = Manifest::read(dir)?.lm_head;
             let lm_head = LmHeadFile::from_file(&dir.join(&lm.file), &lm.tensor)
                 .context("open the pack's lm_head")?;
@@ -109,6 +159,39 @@ impl ClefModel {
                 .forward(&out.final_normed, ids, &spans, &self.lm_head)
         })?;
         assemble(req, &encoded, &logits)
+    }
+}
+
+/// The NPU engine of an aarch64 `npu` build, or the host emulation when `emu`.
+fn build_engine(
+    dir: &Path,
+    cfg: &super::model::TextConfig,
+    threads: usize,
+    emu: bool,
+) -> Result<Box<dyn LayerEngine>> {
+    let pack = Arc::new(PackDir::open(dir)?);
+    let attn = engine::attn_device_from_env()?;
+    if emu {
+        return Ok(Box::new(engine::emu_engine(
+            pack,
+            cfg.clone(),
+            threads,
+            attn,
+        )));
+    }
+    #[cfg(all(feature = "npu", target_arch = "aarch64"))]
+    {
+        Ok(Box::new(super::engine_npu::npu_engine(
+            pack,
+            cfg.clone(),
+            threads,
+            attn,
+        )?))
+    }
+    #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
+    {
+        let _ = (pack, attn);
+        anyhow::bail!("this build has no NPU support (aarch64 + the `npu` feature)")
     }
 }
 

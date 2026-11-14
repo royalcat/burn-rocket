@@ -850,6 +850,13 @@ impl ClefEngine {
         fields(
             questions = req.questions.len(),
             tokens = tracing::field::Empty,
+            engine = self.model.backbone.engine_label().unwrap_or_else(|| "cpu f32".into()),
+            moe_s = tracing::field::Empty,
+            attn_s = tracing::field::Empty,
+            qkv_oproj_s = tracing::field::Empty,
+            read_wait_s = tracing::field::Empty,
+            npu_s = tracing::field::Empty,
+            peak_anon_mib = tracing::field::Empty,
         )
     )]
     fn decide(&mut self, req: ClefRequest) -> Result<DecisionOutcome, ApiError> {
@@ -859,7 +866,16 @@ impl ClefEngine {
                 None => ApiError::internal(format!("{error:#}")),
             }
         })?;
-        tracing::Span::current().record("tokens", answered.tokens as u64);
+        let span = tracing::Span::current();
+        span.record("tokens", answered.tokens as u64);
+        if let Some(p) = self.model.backbone.last_phases() {
+            span.record("moe_s", p.moe);
+            span.record("attn_s", p.attn);
+            span.record("qkv_oproj_s", p.qkv + p.oproj);
+            span.record("read_wait_s", p.read_wait_thread);
+            span.record("npu_s", p.npu_thread);
+            span.record("peak_anon_mib", p.peak_anon_mib);
+        }
         Ok(DecisionOutcome {
             response: answered.response,
             questions: answered.questions,

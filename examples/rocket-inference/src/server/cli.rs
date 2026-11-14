@@ -256,7 +256,16 @@ pub fn run(it: impl Iterator<Item = String>) -> Result<()> {
         }
         Family::Clef => {
             let started = std::time::Instant::now();
-            let model = crate::clef::ClefModel::load(&model_dir)?;
+            let device = if load.placement.text {
+                crate::clef::ClefDevice::Npu
+            } else {
+                crate::clef::ClefDevice::Cpu
+            };
+            let model = crate::clef::ClefModel::load_placed(
+                &model_dir,
+                crate::clef::pipeline::default_threads(),
+                device,
+            )?;
             report_clef_load(started.elapsed().as_secs_f64());
             (
                 Engine::Clef(Box::new(ClefEngine { model, max_tokens })),

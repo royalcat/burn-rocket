@@ -240,13 +240,15 @@ placement / model:
 
 Clef-Omni (Cloudflare, Qwen3-Omni-30B-A3B thinker + joint schema head; detected
 from a qwen3_omni_moe config.json with joint_head.safetensors, or `--family
-clef`) is text-only and CPU-only for now: the thinker streams one decoder layer
-at a time from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM
-plus the 436 MB head). Cases are the same objects as above with the release's
+clef`) is text-only: on the CPU the thinker streams one decoder layer at a time
+from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM plus the
+436 MB head); with a `clef-pack` and `--device npu` (or `auto` on an aarch64 `npu`
+build) the attention projections and the 128-expert MoE of every layer run as
+int8 g128 W8A8 on the NPU, streaming the experts from NVMe (docs/recipes/clef.md). Cases are the same objects as above with the release's
 `model`, `state` and `questions` (`images`/`audio`/`videos` are refused:
 not implemented yet). --max-state-tokens is the per-record cap (default 8192;
 the release's own default is 64000); --out and --model-name behave the same,
---device npu is refused (NPU expert streaming arrives in a later phase). The
+--device npu needs a pack and an aarch64 `npu` build. The
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
 `legend`/`probabilities` and `noul` (the probability of true).
 --pack-dir <dir> (same as --model-dir; detected from its manifest.json) loads a
@@ -672,21 +674,6 @@ impl LoadArgs {
         }
 
         // ---- placement ----
-        // Clef-Omni streams its experts from disk on the CPU for now: an NPU request
-        // is refused explicitly (before the build check, so the message is the same on
-        // every host) and `auto` stays on the CPU even on an NPU build.
-        if family == Family::Clef {
-            let (flag, device) = match self.text_device {
-                Some(d) => ("--text-device", d),
-                None => ("--device", self.device.unwrap_or(Device::Auto)),
-            };
-            if device == Device::Npu {
-                bail!(
-                    "{flag} npu is not available for the clef model: NPU expert streaming \
-                     arrives in a later phase (use `--device cpu` or `auto`)"
-                );
-            }
-        }
         let avail = npu_available();
         let base = self.device.unwrap_or(Device::Auto);
         if base == Device::Npu && !avail {
@@ -698,7 +685,13 @@ impl LoadArgs {
         };
         let placement = Placement {
             text: if family == Family::Clef {
-                false
+                // The int8 NPU path needs a clef pack; `auto` falls back to the CPU for
+                // a BF16 checkpoint, an explicit `npu` is an error.
+                clef_text_placement(
+                    stage(self.text_device, true, "--text-device")?,
+                    self.text_device.unwrap_or(base) == Device::Npu,
+                    crate::clef::pack::PackDir::is_pack(&model_dir),
+                )?
             } else {
                 stage(self.text_device, true, "--text-device")?
             },
@@ -882,6 +875,22 @@ fn device_flag(f: &mut FlagArgs, flag: &str) -> Result<Option<Device>> {
         .map(|v| Device::parse(&v)))
 }
 
+/// The Clef text stage: the resolved NPU placement, demoted to the CPU for a non-pack
+/// checkpoint unless the NPU was requested explicitly (then it is an error).
+fn clef_text_placement(npu: bool, explicit_npu: bool, is_pack: bool) -> Result<bool> {
+    if npu && !is_pack {
+        if explicit_npu {
+            bail!(
+                "--device npu needs a clef-pack for the clef model (the NPU path streams int8 \
+                 experts; build one with `clef-pack`, docs/recipes/clef-pack.md); this \
+                 checkpoint is the BF16 one"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(npu)
+}
+
 fn npu_build_error(flag: &str) -> String {
     format!(
         "{flag} npu requires an aarch64 build with the `npu` feature \
@@ -1008,7 +1017,14 @@ impl ResolvedLoad {
             // always runs on the CPU. The CPU body is always f32 (the loader reads
             // the backbone in f32), so the checkpoint's native dtype does not apply.
             // Layer-streamed BF16 thinker widened to f32 per layer, f32 head.
-            Family::Clef => "placement: text=CPU(f32, layer-streamed) head=CPU(f32)".to_string(),
+            Family::Clef => if crate::clef::engine::emu_from_env() {
+                "placement: text=EMU(int8 g128 W8A8 host emulation, streamed experts) head=CPU(f32)"
+            } else if text_npu {
+                "placement: text=NPU(int8 g128 streamed experts) head=CPU(f32)"
+            } else {
+                "placement: text=CPU(f32, layer-streamed) head=CPU(f32)"
+            }
+            .to_string(),
             Family::Decision => {
                 let text = if text_npu {
                     format!("NPU({})", self.npu_dtype.name())
@@ -1294,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn clef_is_cpu_only_and_rejects_npu_with_a_clear_message() {
+    fn clef_defaults_to_the_cpu_and_npu_needs_an_npu_build() {
         for list in [&[][..], &["--device", "auto"], &["--device", "cpu"]] {
             let r = resolve(list, Family::Clef).unwrap();
             assert_eq!(r.placement, Placement::default(), "{list:?}");
@@ -1303,18 +1319,34 @@ mod tests {
                 "placement: text=CPU(f32, layer-streamed) head=CPU(f32)"
             );
         }
-        // The text stage is the only stage, so a base `--device npu` is refused too.
-        for list in [
-            &["--device", "npu"][..],
-            &["--text-device", "npu"],
-            &["--device", "cpu", "--text-device", "npu"],
+        // Explicit NPU on a build without the NPU keeps the shared error style; on an
+        // NPU build the (non-pack) test directory is the clef-specific refusal.
+        for (list, flag) in [
+            (&["--device", "npu"][..], "--device"),
+            (&["--text-device", "npu"], "--text-device"),
         ] {
             let err = format!("{:#}", resolve(list, Family::Clef).unwrap_err());
-            assert!(
-                err.contains("NPU expert streaming arrives in a later phase"),
-                "{list:?}: {err}"
-            );
+            if npu_available() {
+                assert!(err.contains("needs a clef-pack"), "{list:?}: {err}");
+            } else {
+                assert!(
+                    err.contains(&format!("{flag} npu requires an aarch64 build")),
+                    "{err}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_clef_text_stage_follows_the_pack_and_the_request() {
+        // auto on an NPU build: a pack goes to the NPU, a BF16 checkpoint to the CPU
+        assert!(clef_text_placement(true, false, true).unwrap());
+        assert!(!clef_text_placement(true, false, false).unwrap());
+        // an explicit npu without a pack is an error; the CPU is never promoted
+        let err = format!("{:#}", clef_text_placement(true, true, false).unwrap_err());
+        assert!(err.contains("needs a clef-pack"));
+        assert!(!clef_text_placement(false, false, true).unwrap());
+        assert!(clef_text_placement(true, true, true).unwrap());
     }
 
     #[test]

@@ -336,6 +336,28 @@ impl I8Context {
         Ok(workers)
     }
 
+    /// Live bytes of the cached per-shape scratch BOs (regcmd, input and output cubes of
+    /// every cached `(M,K,N,group)` shape), excluding resident weights.
+    pub fn scratch_bytes(&self) -> usize {
+        self.scratches
+            .values()
+            .flat_map(|ws| ws.iter())
+            .map(|w| {
+                w._guard.len()
+                    + w.regcmd.iter().map(Bo::len).sum::<usize>()
+                    + w.in_all.len()
+                    + w.out_all.iter().map(Bo::len).sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Drop every cached per-shape scratch (the next call of a shape re-allocates it).
+    /// Resident weights ([`I8Weight`]) own their BOs and are untouched.
+    pub fn clear_scratch(&mut self) {
+        self.scratches.clear();
+        self.order.clear();
+    }
+
     fn scratch(&mut self, m: usize, k: usize, n: usize, group: usize) -> Result<&mut Vec<Worker>> {
         let key = (m, k, n, group);
         if !self.scratches.contains_key(&key) {

@@ -130,6 +130,15 @@ impl DiskFile {
         self.direct
     }
 
+    /// Advise the kernel to drop this file's page cache (a no-op for O_DIRECT reads, which
+    /// never populate it).
+    pub fn drop_cache(&self) {
+        if !self.direct {
+            // SAFETY: advisory call on our fd; len 0 = to the end of the file.
+            unsafe { libc::posix_fadvise(self.fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+    }
+
     /// Fill `buf` from `off` (stops short only at EOF); returns the bytes read.
     pub fn read_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
         let mut got = 0usize;
@@ -298,6 +307,13 @@ impl PackDir {
             let rec = ExpertRecord::parse(self.dims, buf.as_slice())?;
             Ok(f(&rec))
         })
+    }
+
+    /// Drop the page cache of `layer`'s expert file (buffered fallback only).
+    pub fn drop_layer_cache(&self, layer: usize) {
+        if let Some((f, _)) = self.layers.get(layer) {
+            f.drop_cache();
+        }
     }
 
     pub fn resident(&self) -> &SafeFile {
@@ -481,5 +497,19 @@ impl WeightSource for PackedWeights {
 
     fn release(&self) {
         self.pack.release();
+    }
+
+    fn layer_small(&self, l: usize) -> Result<crate::clef::model::LayerSmall> {
+        let (c, p) = (&self.cfg, &self.pack);
+        let (h, d) = (c.hidden, c.head_dim);
+        let pre = format!("thinker.model.layers.{l}.");
+        let f = |n: &str, shape: &[usize]| p.f32(&format!("{pre}{n}"), shape);
+        Ok(crate::clef::model::LayerSmall {
+            input_norm: f("input_layernorm.weight", &[h])?,
+            post_norm: f("post_attention_layernorm.weight", &[h])?,
+            q_norm: f("self_attn.q_norm.weight", &[d])?,
+            k_norm: f("self_attn.k_norm.weight", &[d])?,
+            router: f("mlp.gate.weight", &[c.experts, h])?,
+        })
     }
 }

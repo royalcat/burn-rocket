@@ -217,6 +217,30 @@ impl LayerWeights {
     }
 }
 
+/// The small per-layer tensors an engine-driven layer still needs on the host (the big
+/// projections and the experts are the engine's).
+#[derive(Clone)]
+pub struct LayerSmall {
+    pub input_norm: Vec<f32>,
+    pub post_norm: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    /// Router `[experts, hidden]`.
+    pub router: Vec<f32>,
+}
+
+impl From<LayerWeights> for LayerSmall {
+    fn from(w: LayerWeights) -> Self {
+        Self {
+            input_norm: w.input_norm,
+            post_norm: w.post_norm,
+            q_norm: w.q_norm,
+            k_norm: w.k_norm,
+            router: w.router,
+        }
+    }
+}
+
 /// Where the backbone gets everything but the activations: per-layer dense weights, the
 /// experts, the embedding rows and the final norm. Two implementations: the BF16 shards
 /// ([`ShardWeights`]) and a Clef pack (`pack::PackedWeights`, int8 + scales dequantized
@@ -224,6 +248,11 @@ impl LayerWeights {
 pub trait WeightSource: Sync {
     /// Everything of layer `l` except the experts, widened to f32.
     fn layer_weights(&self, l: usize) -> Result<LayerWeights>;
+    /// Only the small tensors of layer `l` (norms, router); sources override it to skip
+    /// widening the attention projections an engine computes itself.
+    fn layer_small(&self, l: usize) -> Result<LayerSmall> {
+        Ok(self.layer_weights(l)?.into())
+    }
     fn experts(&self) -> &dyn ExpertSource;
     /// Embedding row of token `id` into `out` (`hidden` long).
     fn embed_row(&self, id: u32, out: &mut [f32]) -> Result<()>;
@@ -309,7 +338,7 @@ impl Rope {
     }
 
     /// Rotate `x` (`[s, heads, head_dim]`) in place.
-    fn apply(&self, x: &mut [f32], s: usize, heads: usize) {
+    pub(super) fn apply(&self, x: &mut [f32], s: usize, heads: usize) {
         let (h, d) = (self.half, self.half * 2);
         x.par_chunks_mut(heads * d)
             .take(s)
@@ -328,7 +357,7 @@ impl Rope {
 }
 
 /// `w * x * rsqrt(mean(x^2) + eps)` over each `n`-wide row, in place.
-fn rms_norm_rows(x: &mut [f32], n: usize, w: &[f32], eps: f32) {
+pub(super) fn rms_norm_rows(x: &mut [f32], n: usize, w: &[f32], eps: f32) {
     x.par_chunks_mut(n).for_each(|r| {
         let ms = r.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / n as f64;
         let inv = 1.0 / (ms as f32 + eps).sqrt();
@@ -338,7 +367,7 @@ fn rms_norm_rows(x: &mut [f32], n: usize, w: &[f32], eps: f32) {
     });
 }
 
-fn rms_norm(x: &[f32], n: usize, w: &[f32], eps: f32) -> Vec<f32> {
+pub(super) fn rms_norm(x: &[f32], n: usize, w: &[f32], eps: f32) -> Vec<f32> {
     let mut y = x.to_vec();
     rms_norm_rows(&mut y, n, w, eps);
     y
@@ -382,7 +411,7 @@ fn attention(cfg: &TextConfig, q: &[f32], k: &[f32], v: &[f32], s: usize) -> Vec
 /// `torch.topk`), optional renormalization. Returns ids `[s*k]` and weights `[s*k]`.
 /// The third value is, per token, `p[k-th] - p[(k+1)-th]` of the raw softmax (the
 /// near-tie margin that decides whether the selected set is stable).
-fn route(cfg: &TextConfig, logits: &[f32], s: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
+pub(super) fn route(cfg: &TextConfig, logits: &[f32], s: usize) -> (Vec<u32>, Vec<f32>, Vec<f32>) {
     let (e, k) = (cfg.experts, cfg.top_k);
     let mut ids = vec![0u32; s * k];
     let mut wts = vec![0f32; s * k];
@@ -411,7 +440,7 @@ fn route(cfg: &TextConfig, logits: &[f32], s: usize) -> (Vec<u32>, Vec<f32>, Vec
     (ids, wts, margins)
 }
 
-fn silu(x: f32) -> f32 {
+pub(super) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
@@ -548,6 +577,9 @@ pub type LayerTap<'a> = dyn FnMut(&Tap<'_>) + Send + 'a;
 pub struct Backbone {
     pub cfg: TextConfig,
     weights: Box<dyn WeightSource + Send>,
+    /// When set, attention projections and the MoE run through it (the NPU / emulated
+    /// placements); `None` is the f32 CPU path.
+    engine: Option<Box<dyn super::engine::LayerEngine>>,
 }
 
 impl Backbone {
@@ -555,19 +587,45 @@ impl Backbone {
     pub fn open(dir: &Path) -> Result<Self> {
         let cfg = TextConfig::from_model_dir(dir)?;
         let weights = Box::new(ShardWeights::open(dir, cfg.clone())?);
-        Ok(Self { cfg, weights })
+        Ok(Self {
+            cfg,
+            weights,
+            engine: None,
+        })
     }
 
     /// Open a Clef pack directory (`clef-pack` output); `config.json` is read from it.
     pub fn open_pack(dir: &Path) -> Result<Self> {
         let cfg = TextConfig::from_model_dir(dir)?;
         let weights = Box::new(super::pack::PackedWeights::open(dir, cfg.clone())?);
-        Ok(Self { cfg, weights })
+        Ok(Self {
+            cfg,
+            weights,
+            engine: None,
+        })
     }
 
     /// Any weight source (tests, future placements).
     pub fn with_source(cfg: TextConfig, weights: Box<dyn WeightSource + Send>) -> Self {
-        Self { cfg, weights }
+        Self {
+            cfg,
+            weights,
+            engine: None,
+        }
+    }
+
+    /// Route the attention projections and the MoE through `engine` (see
+    /// [`super::engine`]).
+    pub fn set_engine(&mut self, engine: Box<dyn super::engine::LayerEngine>) {
+        self.engine = Some(engine);
+    }
+
+    pub fn last_phases(&self) -> Option<super::engine::Phases> {
+        self.engine.as_ref().and_then(|e| e.last_phases())
+    }
+
+    pub fn engine_label(&self) -> Option<String> {
+        self.engine.as_ref().map(|e| e.label())
     }
 
     pub fn forward(&self, ids: &[u32], opts: &ForwardOpts) -> Result<BackboneOut> {
@@ -602,17 +660,38 @@ impl Backbone {
         }
         let rope = Rope::new(cfg, s);
         for l in 0..cfg.layers {
-            let w = self.weights.layer_weights(l)?;
-            let out = layer_forward(
-                cfg,
-                &w,
-                self.weights.experts(),
-                l,
-                &x,
-                s,
-                &rope,
-                opts.threads,
-            )?;
+            let out = if let Some(eng) = &self.engine {
+                let w = self.weights.layer_small(l)?;
+                let r = super::engine::engine_layer_forward(
+                    cfg,
+                    &w,
+                    eng.as_ref(),
+                    l,
+                    &x,
+                    s,
+                    &rope,
+                    opts.threads,
+                );
+                match r {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eng.abort_request();
+                        return Err(e);
+                    }
+                }
+            } else {
+                let w = self.weights.layer_weights(l)?;
+                layer_forward(
+                    cfg,
+                    &w,
+                    self.weights.experts(),
+                    l,
+                    &x,
+                    s,
+                    &rope,
+                    opts.threads,
+                )?
+            };
             x = out.hidden;
             on_layer(&Tap {
                 layer: l,
@@ -624,6 +703,9 @@ impl Backbone {
             if opts.release_pages {
                 self.weights.release();
             }
+        }
+        if let Some(eng) = &self.engine {
+            eng.finish_request(s);
         }
         let nw = self.weights.final_norm()?;
         let normed = rms_norm(&x, h, &nw, cfg.eps);

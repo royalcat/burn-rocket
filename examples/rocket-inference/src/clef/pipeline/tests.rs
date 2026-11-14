@@ -239,3 +239,143 @@ fn clef_pack_answers_match_the_oracle_top1() {
     // it would point at an unpacking or dequantization bug.
     assert!(worst < 0.1, "max |dp| {worst:.4}");
 }
+
+/// The W8A8 host emulation of the NPU path (`EngineKind::Emu`: int8 activations for the
+/// attention projections and the experts, streamed from the pack) against the f32
+/// BF16-source oracle AND against the CPU-dequant pack path, per question, plus the
+/// per-layer hidden cosine vs the oracle dump (where it has the layer).
+#[test]
+#[ignore = "needs the full clef pack (CLEF_PACK_DIR) and oracle dumps; ~1-2 min per record"]
+fn clef_emu_answers_match_the_oracle_and_the_cpu_pack_path() {
+    let dir = PathBuf::from(std::env::var("CLEF_PACK_DIR").unwrap_or_else(|_| PACK_DIR.into()));
+    if !dir.join("manifest.json").exists() {
+        eprintln!("skipping: no clef pack at {}", dir.display());
+        return;
+    }
+    let ids = std::env::var("CLEF_IDS")
+        .unwrap_or_else(|_| "checkout-errors,invoice,long-incident".into());
+    let threads = default_threads();
+    let cpu = ClefModel::load_kind(&dir, threads, EngineKind::Cpu).unwrap();
+    let emu = ClefModel::load_kind(&dir, threads, EngineKind::Emu).unwrap();
+    let layer_log = std::env::var_os("CLEF_LAYER_LOG").is_some();
+    let (mut worst_o, mut sum_o, mut worst_c, mut sum_c, mut n) = (0f64, 0f64, 0f64, 0f64, 0usize);
+    for id in ids.split(',') {
+        let dump = PathBuf::from(DUMP_DIR);
+        let Ok(text) = std::fs::read_to_string(dump.join(format!("{id}.json"))) else {
+            eprintln!("skipping {id}: no oracle dump in {DUMP_DIR} (docs/recipes/clef-oracle.md)");
+            continue;
+        };
+        let oracle: Value = serde_json::from_str(&text).unwrap();
+        let npz = read_npz(&dump.join(format!("{id}.npz")));
+        let req = fixture(id);
+        let t0 = std::time::Instant::now();
+        let got_cpu = cpu.answer(&req, 64000).unwrap();
+        let t_cpu = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let got_emu = emu.answer(&req, 64000).unwrap();
+        eprintln!(
+            "{id}: {} tokens, cpu-pack {t_cpu:.1}s, emu {:.1}s",
+            got_emu.tokens,
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(
+            got_emu.response["usage"], oracle["usage"],
+            "{id}: token count"
+        );
+        let (mut rw_o, mut rs_o, mut rw_c, mut rs_c, mut rn) = (0f64, 0f64, 0f64, 0f64, 0usize);
+        for (qid, p_emu) in &got_emu.probabilities {
+            let p_cpu = &got_cpu
+                .probabilities
+                .iter()
+                .find(|(q, _)| q == qid)
+                .unwrap()
+                .1;
+            let want = f32s(&npz[&format!("probs_{qid}")].2);
+            let q = oracle["questions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["id"] == qid.as_str())
+                .unwrap();
+            let opts: Vec<&str> = q["option_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_str().unwrap())
+                .collect();
+            let argmax = |f: &dyn Fn(usize) -> f64| {
+                (0..opts.len())
+                    .max_by(|&a, &b| f(a).total_cmp(&f(b)))
+                    .unwrap()
+            };
+            for (i, (opt, w)) in opts.iter().zip(&want).enumerate() {
+                let (pe, pc) = (p_emu[*opt], p_cpu[*opt]);
+                rw_o = rw_o.max((pe - f64::from(*w)).abs());
+                rs_o += (pe - f64::from(*w)).abs();
+                rw_c = rw_c.max((pe - pc).abs());
+                rs_c += (pe - pc).abs();
+                rn += 1;
+                eprintln!("  {id}/{qid}/{opt}: emu {pe:.4} cpu-pack {pc:.4} oracle {w:.4}");
+                let _ = i;
+            }
+            let t_emu = argmax(&|i| p_emu[opts[i]]);
+            let t_orc = argmax(&|i| f64::from(want[i]));
+            assert_eq!(
+                t_emu, t_orc,
+                "{id}/{qid}: emu top-1 differs from the oracle"
+            );
+        }
+        eprintln!(
+            "{id}: emu vs oracle max {rw_o:.4} mean {:.4}; emu vs cpu-pack max {rw_c:.4} mean {:.4}",
+            rs_o / rn as f64,
+            rs_c / rn as f64
+        );
+        worst_o = worst_o.max(rw_o);
+        sum_o += rs_o;
+        worst_c = worst_c.max(rw_c);
+        sum_c += rs_c;
+        n += rn;
+
+        // per-layer hidden cosine vs the oracle, both paths (whole layers the dump has)
+        if layer_log || id == "checkout-errors" {
+            let enc = encode_record(&emu.tokenizer, &req, 64000, None).unwrap();
+            let mut rows: Vec<(usize, f32, f32)> = Vec::new();
+            for (name, model, col) in [("emu", &emu, 0usize), ("cpu-pack", &cpu, 1)] {
+                let _ = name;
+                model
+                    .backbone
+                    .forward_tapped(&enc.input_ids, &model.opts, &mut |t| {
+                        if let Some(w) = npz.get(&format!("hidden_L{}", t.layer)) {
+                            let c = crate::clef::math::cosine(t.hidden, &f32s(&w.2));
+                            if col == 0 {
+                                rows.push((t.layer, c, 0.0));
+                            } else if let Some(r) = rows.iter_mut().find(|r| r.0 == t.layer) {
+                                r.2 = c;
+                            }
+                        }
+                    })
+                    .unwrap();
+            }
+            for (l, ce, cc) in &rows {
+                if layer_log || *l % 8 == 7 || *l == 0 {
+                    eprintln!(
+                        "  {id} layer {l:2}: cosine vs oracle  emu {ce:.6}  cpu-pack {cc:.6}"
+                    );
+                }
+            }
+            if let Some(w) = rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)) {
+                eprintln!(
+                    "  {id}: lowest emu layer cosine {:.6} at layer {}",
+                    w.1, w.0
+                );
+            }
+        }
+    }
+    eprintln!(
+        "all records: emu vs oracle max |dp| {worst_o:.4} mean {:.4}; emu vs cpu-pack max {worst_c:.4} mean {:.4} over {n} options",
+        sum_o / n.max(1) as f64,
+        sum_c / n.max(1) as f64
+    );
+    assert!(n > 0, "no record ran");
+    assert!(worst_o < 0.05, "emu vs oracle max |dp| {worst_o:.4}");
+}

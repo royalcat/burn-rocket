@@ -5,8 +5,13 @@
 #![allow(dead_code)]
 
 pub mod answer;
+pub mod attn;
 pub mod encode;
+pub mod engine;
+#[cfg(all(feature = "npu", target_arch = "aarch64"))]
+pub mod engine_npu;
 pub mod head;
+pub mod int8;
 pub mod math;
 pub mod model;
 pub mod pack;
@@ -24,6 +29,6 @@ pub use model::{Backbone, BackboneOut, ExpertSource, ExpertWeights, ForwardOpts,
 #[allow(unused_imports)]
 pub use encode::{EncodedQuestion, EncodedRecord, encode_record};
 #[allow(unused_imports)]
-pub use pipeline::{Answered, ClefModel};
+pub use pipeline::{Answered, ClefDevice, ClefModel, EngineKind};
 #[allow(unused_imports)]
 pub use request::{ClefRequest, Invalid};

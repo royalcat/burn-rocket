@@ -3250,10 +3250,10 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   (2026-11-14, `clef-phase0.md`): **GO, Format A** (AutoRound g128 int8 codes + fp16
   scales, 4.57 MiB/expert) with one expert per core (3 contexts x 1 worker); expert
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
-  **5 offline packer + pack reader done (2026-11-14)**, below. Remaining (plan numbering):
-  6 NPU expert streaming (`--device npu` refused until then), 7 request batching, 8 media
-  towers (image/audio/video; requests carrying media get 422 "not implemented yet"),
-  9 deploy/docs.
+  **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
+  code complete, dev-host verified, board verification pending**, below. Remaining (plan
+  numbering): 7 request batching, 8 media towers (image/audio/video; requests carrying
+  media get 422 "not implemented yet"), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
   `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
   (`moeshawky/clef-omni-int8-autoround`, local `/home/royalcat/models/clef-omni-int8-autoround`,
@@ -3277,3 +3277,37 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   top-1 agrees on all 7 questions of checkout-errors/invoice/long-incident, max |dp| 0.0136,
   mean 0.0035 vs the f32 BF16 oracle (card: 0.044/0.006); 21-28 s per record on the CPU.
   `rope_theta` is read from `rope_parameters` too (the AutoRound config.json layout).
+- **Phase 6, NPU expert streaming** (2026-11-14, `docs/recipes/clef.md` "NPU placement"):
+  `--device npu` / `--text-device npu` / `auto` (aarch64 `npu` build + a pack) run the whole
+  thinker prefill as int8 g128 W8A8 through `I8Context::matmul_gw`; the placement line reads
+  `text=NPU(int8 g128 streamed experts) head=CPU(f32)`; `auto` demotes a BF16 checkpoint to
+  the CPU, an explicit `npu` without a pack is an error. Files (`src/clef/`): `engine.rs`
+  (`LayerEngine` trait, `PackEngine`: reader thread + bounded queue + one consumer thread per
+  `ExpertWorker`, `Buckets` token bucketing, deterministic per-token expert-id-order `combine`,
+  speculative whole-layer reads when `S*8 >= 512`, `ExpertReader` abstraction over `PackDir`,
+  `EmuWorker`/`EmuDense` = the host emulation `Int8Emu`, `CpuDense`, `Phases` + the
+  `ROCKET_PHASE_LOG` line, `engine_layer_forward`), `engine_npu.rs` (aarch64 + `npu` only:
+  `NpuWorker` = `I8Context::new_at(1, core)` with resident gate|up `K=2048 N=1536` and down
+  `K=768 N=2048` slots refilled by `rewrite_weight_gw`, `NpuDense` = resident q|k|v `N=5120`
+  and `o` weights packed once at load ~0.9 GB BOs on a 3-worker context, `NpuFailure` ->
+  `OpFailure` panic payload, `npu_engine`), `int8.rs` (quantizer mirror of
+  `burn_rocket::host::quantize_row_groups`, `emu_matmul_gw`, the 14 `M_CLASSES` + 512-row
+  chunking that keep the driver's per-exact-shape scratch cache small), `attn.rs` (blocked
+  causal GQA with `gemm`, 128-row query blocks, no `[S,S]`; scores/AV on the NPU is a
+  follow-up), `pipeline.rs` (`ClefDevice`, `EngineKind::{Cpu,Emu,Npu}`, `load_kind`),
+  `model.rs` (`Backbone::set_engine`, `LayerSmall`, `WeightSource::layer_small`). Driver:
+  `I8Context::{scratch_bytes, clear_scratch}` (used by the post-request `ROCKET_KEEP_MB`
+  trim). Knobs: `ROCKET_CLEF_EMU=1` (host emulation on any host, overrides `--device`),
+  `ROCKET_CLEF_ATTN_DEVICE=cpu|npu`, `ROCKET_CLEF_DEPTH` (read-ahead buffers, 8),
+  `ROCKET_CLEF_CONSUMERS` (1-6, 3), `ROCKET_PHASE_LOG=1|2`, `CLEF_PACK_NO_DIRECT`. The
+  `clef` span gains `engine`, `moe_s`, `attn_s`, `qkv_oproj_s`, `read_wait_s`, `npu_s`,
+  `peak_anon_mib`. Dev-host gate (release, 8 threads, pack at `clef-pack-g128`, emulation vs
+  the f32 BF16 oracle dumps; test `clef_emu_answers_match_the_oracle_and_the_cpu_pack_path`,
+  `--ignored`): top-1 agrees on every question (24 options over checkout-errors, invoice, long-incident), max |dp| 0.0262 / mean 0.0064
+  vs the oracle and 0.0150 / 0.0040 vs the CPU-dequant pack path (weight-only max was
+  0.0136); per-layer hidden cosine vs the oracle is within 1e-3 of the CPU-dequant path at
+  every layer (activation quantization adds <= 0.0007, the largest gap at layers 45-47, which
+  both paths share as the lowest cosines, 0.987 at layer 47). Emulation times 20-62 s per
+  record (CPU pack path 21-28 s). Not run on the board: see `docs/recipes/clef.md` "Board
+  usage" for the commands and the phase-log lines to check (expected ~1.4-1.9 s expert matmul
+  per layer at M_e=64, disk 0.5 s/layer, i.e. ~72 s of expert time per 1k tokens).
