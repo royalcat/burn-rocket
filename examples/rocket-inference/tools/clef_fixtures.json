@@ -1,0 +1,203 @@
+[
+ {
+  "id": "checkout-errors",
+  "model": "clef-omni",
+  "state": "Our checkout started returning errors and orders are blocked.",
+  "questions": {
+   "department": {
+    "type": "choice",
+    "instructions": "Which team should handle the message?",
+    "criteria": {
+     "billing": "Payments or invoices",
+     "technical": "Bugs or outages"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today"
+    ]
+   },
+   "outage": {
+    "type": "noul",
+    "instructions": "Is a service down?"
+   }
+  }
+ },
+ {
+  "id": "invoice",
+  "model": "clef-omni",
+  "state": {
+   "invoice": {
+    "vendor": "Acme",
+    "total": 1250.0,
+    "currency": "USD",
+    "status": "overdue"
+   }
+  },
+  "questions": {
+   "status": {
+    "type": "choice",
+    "instructions": "What is the invoice status?",
+    "criteria": {
+     "paid": "Invoice is paid.",
+     "overdue": "Invoice is past due.",
+     "draft": "Not sent."
+    }
+   },
+   "large": {
+    "type": "noul",
+    "instructions": "Is the total above 1000 USD?"
+   }
+  }
+ },
+ {
+  "id": "choice-routing",
+  "model": "clef-omni",
+  "state": "Hi, I was charged twice for my subscription this month and would like one of the payments refunded.",
+  "questions": {
+   "route": {
+    "type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {
+     "billing": "Payments, refunds and invoices",
+     "technical": "Bugs, outages and integrations",
+     "sales": "New purchases and plan changes"
+    }
+   }
+  }
+ },
+ {
+  "id": "score-sentiment",
+  "model": "clef-omni",
+  "state": "The new dashboard is okay, but it loads slowly and I could not find the export button.",
+  "questions": {
+   "sentiment": {
+    "type": "score",
+    "instructions": "How satisfied is the customer?",
+    "criteria": [
+     "Very unhappy",
+     "Unhappy",
+     "Neutral",
+     "Happy",
+     "Very happy"
+    ]
+   }
+  }
+ },
+ {
+  "id": "noul-only",
+  "model": "clef-omni",
+  "state": "The meeting is moved to 15:00 on Thursday in room B.",
+  "questions": {
+   "moved": {
+    "type": "noul",
+    "instructions": "Was the meeting rescheduled?"
+   }
+  }
+ },
+ {
+  "id": "mixed-ticket",
+  "model": "clef-omni",
+  "state": "Order 5521 arrived with a cracked screen. I need a replacement before my trip on Saturday.",
+  "questions": {
+   "category": {
+    "type": "choice",
+    "instructions": "What is the issue category?",
+    "criteria": {
+     "damaged": "Item arrived damaged",
+     "late": "Delivery is late",
+     "wrong": "Wrong item received"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is the request?",
+    "criteria": [
+     "Can wait",
+     "This week",
+     "Today"
+    ]
+   },
+   "refund": {
+    "type": "noul",
+    "instructions": "Is the customer asking for a refund rather than a replacement?"
+   },
+   "deadline": {
+    "type": "noul",
+    "instructions": "Does the customer state a deadline?"
+   }
+  }
+ },
+ {
+  "id": "json-state",
+  "model": "clef-omni",
+  "state": {
+   "user": {
+    "id": 42,
+    "plan": "free",
+    "tenure_days": 9
+   },
+   "event": {
+    "type": "export_attempt",
+    "rows": 120000,
+    "limit": 10000
+   },
+   "flags": [
+    "rate_limited"
+   ]
+  },
+  "questions": {
+   "action": {
+    "type": "choice",
+    "instructions": "What should the system do?",
+    "criteria": {
+     "allow": "Let the export proceed",
+     "block": "Reject the export",
+     "upsell": "Offer an upgrade to a paid plan"
+    }
+   },
+   "abuse": {
+    "type": "noul",
+    "instructions": "Does the event look like abuse?"
+   }
+  }
+ },
+ {
+  "id": "long-incident",
+  "model": "clef-omni",
+  "state": "Incident review notes, week 41. On Monday the payments team deployed version 4.12 of the checkout service, which introduced a new retry policy for card authorisations. By Tuesday morning the support queue showed a sharp rise in tickets from customers in three European regions reporting that the pay button spun forever and then displayed a generic error. Engineers traced the problem to a connection pool that was sized for the old retry policy: each failed authorisation now held a connection for up to thirty seconds, and under normal evening load the pool was exhausted within minutes. While the pool was exhausted, unrelated requests such as cart updates and address lookups also timed out, which is why some customers believed the whole shop was down. The on-call engineer rolled the service back at 18:40 and error rates returned to baseline within ten minutes. Finance has asked whether any customers were charged twice; the preliminary answer is that eleven authorisations were captured twice because the retry fired after a slow success response, and those charges have already been reversed. A customer named Maria Lopez wrote in to say she had been charged twice for order 88213 and wants a refund by Friday, otherwise she will dispute the charge with her bank. The account manager for the enterprise customer Northwind Traders also asked whether the incident affects their service level agreement, since their nightly batch of roughly four thousand orders failed on Tuesday and had to be resubmitted manually on Wednesday. Product management would like a summary of customer impact, the root cause and the remediation plan before the Thursday review. The remediation plan includes sizing the pool independently per dependency, adding a circuit breaker around the authorisation provider, a load test that replays Tuesday evening traffic, and an alert on pool saturation above eighty percent. None of these items has an owner yet, and the post-incident review has not been scheduled.",
+  "questions": {
+   "owner": {
+    "type": "choice",
+    "instructions": "Which team owns the follow-up?",
+    "criteria": {
+     "payments": "Payments engineering",
+     "support": "Customer support",
+     "finance": "Finance and refunds",
+     "product": "Product management"
+    }
+   },
+   "severity": {
+    "type": "score",
+    "instructions": "How severe was the incident?",
+    "criteria": [
+     "Minor",
+     "Moderate",
+     "Major",
+     "Critical"
+    ]
+   },
+   "double_charge": {
+    "type": "noul",
+    "instructions": "Were any customers charged twice?"
+   },
+   "owners_assigned": {
+    "type": "noul",
+    "instructions": "Has every remediation item been assigned an owner?"
+   }
+  }
+ }
+]
