@@ -3246,6 +3246,10 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   Model-card example via `serve`: technical 0.8327, urgency 1.8917, outage 0.9552.
 - **Phase status**: 0 expert-streaming probe (`expert_bench`, `I8Context::rewrite_weight`)
   done; 1 f32 oracle + fixtures done; 2 head port done; 3 CPU layer-streamed backbone
-  done; **4 text-only CPU `decide`/`serve` done** (this section); 5 media towers
-  (image/audio/video; requests carrying media get 422 "not implemented yet") and 6 NPU
-  expert streaming (`--device npu` refused) not started. Nothing was run on the board.
+  done; **4 text-only CPU `decide`/`serve` done** (this section). Board probe
+  (2026-11-14, `clef-phase0.md`): **GO, Format A** (AutoRound g128 int8 codes + fp16
+  scales, 4.57 MiB/expert) with one expert per core (3 contexts x 1 worker); expert
+  matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
+  Remaining (plan numbering): 5 offline packer, 6 NPU expert streaming (`--device npu`
+  refused until then), 7 request batching, 8 media towers (image/audio/video; requests
+  carrying media get 422 "not implemented yet"), 9 deploy/docs.

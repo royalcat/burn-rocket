@@ -81,6 +81,44 @@ accepted): 11-12 GB/s — meaningless for NVMe, it only proves the path runs. Th
 disk-only rows ran (S=128: 128 hit, M_e=8; S=1024: 128 hit, M_e=64). Everything that
 needs `/dev/accel/accel0` fails cleanly with the device error on this host.
 
+## Board results (2026-11-14)
+
+rock-5b-plus, `taskset -c 4-7`, 600 MHz module, `--threads 3`, **board load 10-11 from other
+services** (only `home-llm-gateway-embed-1`/`-decision-1` were stopped, for ~3 min, and
+restored healthy), so read ratios, not absolutes (+-20 %). The disk file was a 4 GiB
+incompressible scratch file on the btrfs (zstd) NVMe at `/mnt/nvme`, deleted afterwards.
+Raw log: `/root/rocket-clef0/run.log` on the board (copied to `/tmp/opencode/clef-board/`).
+
+- **Disk** (O_DIRECT, 4.7 MiB chunks, queue depth 1): **1.0-1.27 GB/s** (chunk p50 ~4 ms).
+  One 128-expert layer is 585 MiB -> 0.5-0.6 s/layer, ~24-29 s per 48-layer pass. Slower than
+  the 3 GB/s assumed earlier; deeper queues were not tried.
+- **Matmul**, int8 group-wise vs resident fp16 (activation quantize included), cosine
+  0.99999 at every shape and group: g128 is 1.9-4.7x slower than fp16 (readback-bound, as
+  log §20), g256 1.1-2.3x, g512 0.6-1.2x (gate|up) and g768 1.2-2.7x (down). fp16 is not a
+  streaming option anyway (2x the disk bytes and no fp16 rewrite API).
+- **Rewrite** (`rewrite_weight_gw`, bit-identical to a fresh pack in all 6 cases): gate|up
+  2.4-3.2 ms, down 0.6-1.1 ms per expert, 2.1-3.1x cheaper than a fresh pack.
+- **Pipeline** (one streamed layer simulated, 48-layer extrapolation, expert matmuls only;
+  no attention, router, SiLU glue or head). Best arrangement is **3 contexts x 1 worker**
+  (one expert per core) in every row, 1.3-1.5x faster than the N-split:
+
+| S | hit | M_e | g128 overlap 3x1w | g256 overlap 3x1w |
+|---|---|---|---|---|
+| 128 | 128 | 8 | 34.5 s | 28.9 s |
+| 1024 | 128 | 64 | **72.0 s** | **49.5 s** |
+| 4096 | 128 | 256 | 186.8 s | 121.1 s |
+
+  Disk-only is 24-29 s per pass, so compute dominates from S~128 up and the prefetch hides
+  the disk fully (overlap ~= compute + ~5 %). All 128 experts are hit at every S tested.
+
+**Decision: GO, Format A** (g128 int8 codes + fp16 scales straight from the AutoRound
+checkpoint, 4.57 MiB/expert, no requantization) with the **3 contexts x 1 worker** layout.
+The expert-matmul floor at 1k tokens is ~72 s per pass, so a full request (attention,
+router, glue, head) should land in the 2-3 minute range the workload allows. Format B (g256,
+-31 % pass time at 1k, scales half the size) stays the fallback if later phases need speed;
+it would need a real-weight numerics gate. Format C is not needed. Note the 4096-token pass
+(187 s g128) is the practical per-request ceiling before attention is added.
+
 ## Decision table
 
 Let `T_pass(S)` be the extrapolated 48-layer pass from the best overlapped arrangement.
