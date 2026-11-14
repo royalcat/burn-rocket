@@ -163,7 +163,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn new(n: usize) -> Pool {
+    fn new(n: usize, base: usize) -> Pool {
         let (done_tx, done) = std::sync::mpsc::channel();
         let mut txs = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
@@ -171,14 +171,13 @@ impl Pool {
             let (tx, rx) = std::sync::mpsc::channel::<Task>();
             let done_tx = done_tx.clone();
             handles.push(thread::spawn(move || {
-                let mut pinned_base = None;
+                // The context's core base (the creating thread's rotation base)
+                // is fixed for the pool's life: pin once, on the first task.
+                let mut pinned = false;
                 while let Ok(Task::Run(f)) = rx.recv() {
-                    let base = crate::device::affinity::base();
-                    // The caller's core base can differ between contexts; re-pin
-                    // only when it changes (a syscall otherwise saved per call).
-                    if pinned_base != Some(base) {
+                    if !pinned {
                         crate::device::affinity::pin_current(i, base);
-                        pinned_base = Some(base);
+                        pinned = true;
                     }
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
                     let _ = done_tx.send(());
@@ -246,6 +245,13 @@ pub struct I8Context {
 
 impl I8Context {
     pub fn new(nthreads: usize) -> Result<I8Context> {
+        Self::new_at(nthreads, crate::device::affinity::base())
+    }
+
+    /// Like [`I8Context::new`], with the pool's worker `i` pinned to big core
+    /// `core_base + i` (modulo the big-core count). Several one-worker contexts
+    /// with distinct bases keep their host-side work on different cores.
+    pub fn new_at(nthreads: usize, core_base: usize) -> Result<I8Context> {
         let threads = nthreads.clamp(1, MAX_WORKERS);
         let mut devs = Vec::with_capacity(threads);
         for _ in 0..threads {
@@ -254,7 +260,7 @@ impl I8Context {
         Ok(I8Context {
             devs,
             threads,
-            pool: std::sync::Arc::new(Pool::new(threads)),
+            pool: std::sync::Arc::new(Pool::new(threads, core_base)),
             canon_mt: std::env::var("ROCKET_I8_MT")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -377,24 +383,7 @@ impl I8Context {
                         {
                             let words = i8_words(&mut bo);
                             words.fill(0);
-                            for ni in 0..w.plan.nnt {
-                                let n0 = ni * w.plan.nt;
-                                let ntile = w.plan.n_tile(ni);
-                                for ki in 0..w.plan.nkt {
-                                    let k0 = ki * w.plan.kt;
-                                    let ktile = w.plan.k_tile(ki);
-                                    let off = (ni * w.plan.nkt + ki) * w.plan.wt_slot;
-                                    layout::wt_scatter_tile_i8(
-                                        &mut words[off..off + w.plan.wt_slot],
-                                        &b[w.n0 * k..],
-                                        k,
-                                        n0,
-                                        k0,
-                                        ntile,
-                                        ktile,
-                                    );
-                                }
-                            }
+                            scatter_weight_slice(&w.plan, words, &b[w.n0 * k..], k);
                         }
                         bo.fini()?;
                         let sig = Sig {
@@ -456,6 +445,62 @@ impl I8Context {
             return Err(Error::shape("int8/pack/group"));
         }
         self.pack_codes(m, k, n, b, group)
+    }
+
+    /// Overwrite the int8 codes of an already-packed weight **in place**: the
+    /// per-worker BOs are re-scattered with the same layout [`I8Context::pack_weight`]
+    /// / [`I8Context::pack_weight_gw`] uses (group-wise or per-channel, whichever `w`
+    /// was packed as), with no BO allocation and no zero-fill — a ragged tile's pad
+    /// lanes were zeroed by the first pack and are never written by the scatter.
+    ///
+    /// The weight keeps its shape (`b` is `[N,K]` int8). Scales live caller-side, so
+    /// swapping them is the caller's business. This is the streamed-expert slot
+    /// refill: one resident slot is rewritten per expert instead of packing fresh.
+    /// The weight must not be in flight (it is not: calls are synchronous).
+    pub fn rewrite_weight(&mut self, w: &mut I8Weight, b: &[i8]) -> Result<()> {
+        let (m, k, n, group) = (w.m, w.k, w.n, w.group);
+        if b.len() != n * k {
+            return Err(Error::shape("int8/rewrite"));
+        }
+        let workers = self.scratch(m, k, n, group)?;
+        if workers.len() != w.bos.len() {
+            return Err(Error::tiling("int8/weight-workers"));
+        }
+        for (i, worker) in workers.iter().enumerate() {
+            if w.sig[i] != sig_of(worker, w.bos[i].len()) {
+                return Err(Error::tiling("int8/weight-layout"));
+            }
+        }
+        let results: Vec<Result<()>> = thread::scope(|scope| {
+            let handles: Vec<_> = workers
+                .iter()
+                .zip(w.bos.iter_mut())
+                .map(|(wk, bo)| {
+                    scope.spawn(move || -> Result<()> {
+                        bo.prep(0)?;
+                        scatter_weight_slice(&wk.plan, i8_words(bo), &b[wk.n0 * k..], k);
+                        bo.fini()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::device("int8/rewrite", 0)))
+                })
+                .collect()
+        });
+        results.into_iter().collect()
+    }
+
+    /// Group-wise spelling of [`I8Context::rewrite_weight`]; `w` must be a group-wise
+    /// weight.
+    pub fn rewrite_weight_gw(&mut self, w: &mut I8Weight, b: &[i8]) -> Result<()> {
+        if w.group == 0 {
+            return Err(Error::shape("int8/rewrite/group"));
+        }
+        self.rewrite_weight(w, b)
     }
 
     /// Run every worker over its N-slice of `a`, accumulating into the worker's
@@ -808,8 +853,83 @@ fn plan_for(canon_mt: usize, m: usize, k: usize, n: usize, group: usize) -> Resu
     Ok(int8_plan(m, k, n, cmt.min(m), kt, nt))
 }
 
+/// Scatter one worker's `[nsub, K]` slice of codes into its weight BO words
+/// (`(N/32, K/32, 32, 32)` per K-tile). Shared by pack and rewrite.
+fn scatter_weight_slice(plan: &Plan, words: &mut [i8], b: &[i8], k: usize) {
+    for ni in 0..plan.nnt {
+        let n0 = ni * plan.nt;
+        let ntile = plan.n_tile(ni);
+        for ki in 0..plan.nkt {
+            let k0 = ki * plan.kt;
+            let ktile = plan.k_tile(ki);
+            let off = (ni * plan.nkt + ki) * plan.wt_slot;
+            layout::wt_scatter_tile_i8(
+                &mut words[off..off + plan.wt_slot],
+                b,
+                k,
+                n0,
+                k0,
+                ntile,
+                ktile,
+            );
+        }
+    }
+}
+
+fn sig_of(worker: &Worker, wt_bytes: usize) -> Sig {
+    Sig {
+        n0: worker.n0,
+        nsub: worker.nsub,
+        kt: worker.plan.kt,
+        nt: worker.plan.nt,
+        nkt: worker.plan.nkt,
+        nnt: worker.plan.nnt,
+        wt_slot: worker.plan.wt_slot,
+        wt_bytes,
+    }
+}
+
 fn fanout_step(n: usize, threads: usize, align: usize) -> usize {
     let threads = threads.max(1);
     let align = align.max(1);
     n.div_ceil(threads).div_ceil(align) * align
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn codes(n: usize, k: usize, seed: u64) -> Vec<i8> {
+        let mut s = seed | 1;
+        (0..n * k)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 33) as i8
+            })
+            .collect()
+    }
+
+    /// Rewriting a scattered buffer in place (no zero-fill) must equal a fresh
+    /// zero-filled scatter of the new codes, for expert shapes (ragged tiles included).
+    #[test]
+    fn a_rewrite_equals_a_fresh_pack() {
+        for &(k, n, group) in &[
+            (2048usize, 512usize, 128usize),
+            (768, 704, 256),
+            (768, 96, 768),
+        ] {
+            let plan = plan_for(256, 64, k, n, group).unwrap();
+            let len = plan.nnt * plan.nkt * plan.wt_slot;
+            let (old, new) = (codes(n, k, 7), codes(n, k, 99));
+            let mut fresh = vec![0i8; len];
+            scatter_weight_slice(&plan, &mut fresh, &new, k);
+            let mut reused = vec![0i8; len];
+            scatter_weight_slice(&plan, &mut reused, &old, k);
+            assert_ne!(reused, fresh);
+            scatter_weight_slice(&plan, &mut reused, &new, k);
+            assert_eq!(reused, fresh, "k={k} n={n} group={group}");
+        }
+    }
 }
