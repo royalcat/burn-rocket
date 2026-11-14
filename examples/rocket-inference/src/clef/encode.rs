@@ -216,6 +216,21 @@ fn tokens(tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     Ok(enc.get_ids().to_vec())
 }
 
+/// The record prefix tokens (system turn + `STATE:\n`), before any media block.
+pub fn prefix_tokens(tok: &Tokenizer) -> Result<Vec<u32>> {
+    tokens(
+        tok,
+        &format!("<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"),
+    )
+}
+
+/// Token id of `"\n"` (the separator after every media placeholder).
+pub fn newline_token(tok: &Tokenizer) -> Result<u32> {
+    let ids = tokens(tok, "\n")?;
+    anyhow::ensure!(ids.len() == 1, "`\\n` is not a single token");
+    Ok(ids[0])
+}
+
 /// `encode_record` for a text-only request. `max_length` caps the whole record (the
 /// state is cut to what the schema leaves; a schema that does not fit is [`Invalid`]);
 /// `max_state_tokens` additionally caps the state before that.
@@ -224,6 +239,21 @@ pub fn encode_record(
     request: &ClefRequest,
     max_length: usize,
     max_state_tokens: Option<usize>,
+) -> Result<EncodedRecord> {
+    encode_record_with_media(tok, request, max_length, max_state_tokens, &[])
+}
+
+/// [`encode_record`] with the record's media block (`media_ids`, see
+/// [`super::media::build_media_ids`]) appended to the prefix, as the release does
+/// (`prefix_ids + media_ids`): it counts toward the fixed length, only the state is cut.
+/// The media block occupies `prefix_len .. prefix_len + media_ids.len()` of the ids
+/// (35 tokens for the shipped tokenizer, see [`prefix_tokens`]).
+pub fn encode_record_with_media(
+    tok: &Tokenizer,
+    request: &ClefRequest,
+    max_length: usize,
+    max_state_tokens: Option<usize>,
+    media_ids: &[u32],
 ) -> Result<EncodedRecord> {
     let mut schema_ids = tokens(tok, "\n\nSCHEMA FIELDS:\n")?;
     let mut questions: Vec<EncodedQuestion> = Vec::new();
@@ -270,10 +300,8 @@ pub fn encode_record(
         });
     }
 
-    let prefix_ids = tokens(
-        tok,
-        &format!("<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"),
-    )?;
+    let mut prefix_ids = prefix_tokens(tok)?;
+    prefix_ids.extend_from_slice(media_ids);
     let suffix_ids = tokens(
         tok,
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",

@@ -7,6 +7,12 @@ use std::path::Path;
 pub(crate) type Npz = BTreeMap<String, (String, Vec<usize>, Vec<u8>)>;
 
 pub(crate) fn read_npz(path: &Path) -> Npz {
+    read_npz_keys(path, |_| true)
+}
+
+/// Like [`read_npz`] but copies only the arrays `want(name)` accepts (the media dumps
+/// are up to 0.55 GB).
+pub(crate) fn read_npz_keys(path: &Path, want: impl Fn(&str) -> bool) -> Npz {
     let f = std::fs::File::open(path).unwrap();
     // SAFETY: read-only mapping of a test fixture.
     let m = unsafe { memmap2::Mmap::map(&f).unwrap() };
@@ -36,6 +42,11 @@ pub(crate) fn read_npz(path: &Path) -> Npz {
                 }
             }
             e += 4 + sz;
+        }
+        let key = name.trim_end_matches(".npy").to_string();
+        if !want(&key) {
+            p = eend + csize;
+            continue;
         }
         let data = &m[eend..eend + csize];
         let _ = usize_;
@@ -68,9 +79,24 @@ pub(crate) fn read_npz(path: &Path) -> Npz {
             .split(',')
             .filter_map(|s| s.trim().parse().ok())
             .collect();
+        let mut bytes = data[hoff + hlen..].to_vec();
+        // numpy writes a Fortran-ordered array (e.g. `expand(...).astype`) column-major:
+        // bring 2-D ones to C order.
+        if header.contains("'fortran_order': True") && shape.len() == 2 {
+            let (r, c) = (shape[0], shape[1]);
+            let es = bytes.len() / (r * c);
+            let mut t = vec![0u8; bytes.len()];
+            for i in 0..r {
+                for j in 0..c {
+                    let (src, dst) = ((j * r + i) * es, (i * c + j) * es);
+                    t[dst..dst + es].copy_from_slice(&bytes[src..src + es]);
+                }
+            }
+            bytes = t;
+        }
         out.insert(
             name.trim_end_matches(".npy").to_string(),
-            (descr.to_string(), shape, data[hoff + hlen..].to_vec()),
+            (descr.to_string(), shape, bytes),
         );
         p = eend + csize;
     }

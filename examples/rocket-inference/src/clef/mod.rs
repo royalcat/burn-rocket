@@ -16,6 +16,7 @@ pub mod engine_npu;
 pub mod head;
 pub mod int8;
 pub mod math;
+pub mod media;
 pub mod model;
 pub mod pack;
 pub mod pipeline;
@@ -30,7 +31,9 @@ pub use head::{ClefHead, HeadConfig, LmHeadFile, LmHeadRows, QuestionSpans};
 pub use model::{Backbone, BackboneOut, ExpertSource, ExpertWeights, ForwardOpts, Tap, TextConfig};
 
 #[allow(unused_imports)]
-pub use encode::{EncodedQuestion, EncodedRecord, encode_record};
+pub use encode::{EncodedQuestion, EncodedRecord, encode_record, encode_record_with_media};
+#[allow(unused_imports)]
+pub use media::{MediaFeatures, MediaLayout, Positions, TowerOutputs, build_media_ids, rope_index};
 #[allow(unused_imports)]
 pub use pipeline::{Answered, BatchAnswers, ClefDevice, ClefModel, EngineKind};
 #[allow(unused_imports)]

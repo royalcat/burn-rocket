@@ -3354,6 +3354,14 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   there is expected, not proven), the real wall of a batch (estimate ~30 s + 0.1 s/row) and
   peak anon/BO with 8 records; the exact board commands are in `clef.md` "Board test, phase 7".
   Recommended board flags: `--batch-window-ms 5000 --batch-max 8`.
+- **Phase 8b, media plumbing in the thinker (2026-11-14, uncommitted)**: `src/clef/media.rs` (placeholder
+  block builder, literal `get_rope_index` port with 3-D interleaved mRoPE, `MediaFeatures` splice +
+  DeepStack after layers 0-2), `Rope::from_positions`, `Backbone::{forward_media[_tapped],
+  forward_batch_media, embed_input}`, `encode_record_with_media`, `RopeSource` (shared or per-record
+  tables). Text-only paths unchanged (all earlier tests pass). Verified against the oracle dumps: ids,
+  spans, positions, rope delta on all 9 media fixtures; BF16 CPU path fed oracle tower outputs matches
+  hidden layers/answers (max|dp| <= 1.3e-5), emulated int8 shards top-1 equal (max|dp| <= 1.7e-2);
+  details in `clef.md` "Media plumbing". Media requests are still refused (towers = 8c-8f).
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

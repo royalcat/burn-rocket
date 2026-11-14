@@ -5,6 +5,8 @@
 
 use super::engine::{Dense, EmuWorker, ExpertReader, ExpertWorker, PackEngine};
 use super::int8::{emu_matmul_gw, quantize_rows};
+use super::media::{MediaFeatures, Positions};
+use super::model::RecordRef;
 use super::model::{
     Backbone, ExpertSource, ExpertWeights, ForwardOpts, LayerWeights, TextConfig, WeightSource,
     plan_batches,
@@ -424,4 +426,99 @@ fn a_batch_of_one_is_the_single_record_path() {
     for bb in [cpu_backbone(&m), emu_backbone(&m, 3)] {
         assert_batch_equals_singles(&bb, &[record(9, 31)], 0);
     }
+}
+
+/// A synthetic media record: grid-like 3-D positions over a span, spliced rows and
+/// DeepStack rows on a sub-span.
+fn media_for(len: usize, seed: u64) -> MediaFeatures {
+    let h = DIMS.hidden;
+    let mut r = Lcg(seed);
+    let mut p = Positions::text(len);
+    // a 2 x 3 "image" at tokens 2..8: shared time, row/col offsets
+    for (k, i) in (2..8.min(len)).enumerate() {
+        p.t[i] = 2.0;
+        p.h[i] = 2.0 + (k / 3) as f32;
+        p.w[i] = 2.0 + (k % 3) as f32;
+    }
+    let n = 6.min(len.saturating_sub(2));
+    let idx: Vec<usize> = (2..2 + n).collect();
+    MediaFeatures {
+        positions: Some(p),
+        splice_rows: r.vec(idx.len() * h, 1.0),
+        deepstack: [r.vec(n * h, 0.5), r.vec(n * h, 0.5), r.vec(n * h, 0.5)],
+        deepstack_idx: idx.clone(),
+        splice_idx: idx,
+    }
+}
+
+#[test]
+fn media_records_batch_like_singles_and_media_changes_the_result() {
+    let m = Arc::new(Mini::new());
+    let recs = [record(11, 12), record(12, 20), record(13, 9), record(14, 5)];
+    let feats = [None, Some(media_for(20, 5)), Some(media_for(9, 6)), None];
+    let refs: Vec<RecordRef<'_>> = recs
+        .iter()
+        .zip(&feats)
+        .map(|(r, f)| RecordRef {
+            ids: r,
+            media: f.as_ref(),
+        })
+        .collect();
+    for (name, bb, exact) in [
+        ("emu", emu_backbone(&m, 3), true),
+        ("cpu", cpu_backbone(&m), false),
+    ] {
+        let fwd = bb.forward_batch_media(&refs, &opts(), 0).unwrap();
+        for (i, r) in refs.iter().enumerate() {
+            let want = bb.forward_media(r.ids, r.media, &opts()).unwrap();
+            let got = fwd.outs[i].as_ref().unwrap();
+            if exact {
+                assert_eq!(
+                    bits(&got.final_normed),
+                    bits(&want.final_normed),
+                    "{name} record {i}"
+                );
+            } else {
+                let peak = want.final_normed.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let d = got
+                    .final_normed
+                    .iter()
+                    .zip(&want.final_normed)
+                    .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                assert!(d / peak < 1e-4, "{name} record {i}: {}", d / peak);
+            }
+        }
+        // media features actually take effect (record 1 differs from its text-only run)
+        let plain = bb.forward(refs[1].ids, &opts()).unwrap();
+        assert_ne!(
+            bits(&plain.final_normed),
+            bits(&fwd.outs[1].as_ref().unwrap().final_normed),
+            "{name}: media had no effect"
+        );
+        // a text-only record batched next to media records is unchanged
+        let text = bb.forward(refs[0].ids, &opts()).unwrap();
+        if exact {
+            assert_eq!(
+                bits(&text.final_normed),
+                bits(&fwd.outs[0].as_ref().unwrap().final_normed)
+            );
+        }
+    }
+    // a malformed feature set fails alone
+    let mut bad = media_for(9, 6);
+    bad.splice_idx[0] = 99;
+    let refs2 = [
+        RecordRef {
+            ids: &recs[0],
+            media: None,
+        },
+        RecordRef {
+            ids: &recs[2],
+            media: Some(&bad),
+        },
+    ];
+    let bb = emu_backbone(&m, 2);
+    let fwd = bb.forward_batch_media(&refs2, &opts(), 0).unwrap();
+    assert!(fwd.outs[0].is_ok());
+    assert!(fwd.outs[1].is_err());
 }

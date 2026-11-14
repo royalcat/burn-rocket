@@ -377,3 +377,24 @@ fn clef_backbone_parity() {
         let _ = h;
     }
 }
+
+#[test]
+fn text_positions_give_exactly_the_plain_rope_tables() {
+    let cfg = mini_cfg();
+    let a = Rope::new(&cfg, 37);
+    let b = Rope::from_positions(&cfg, &Positions::text(37));
+    assert_eq!(a.cos, b.cos);
+    assert_eq!(a.sin, b.sin);
+    // different streams: slot 1 follows the height stream, slot 2 the width, slot 0 time
+    let p = Positions {
+        t: vec![0.0, 5.0],
+        h: vec![0.0, 7.0],
+        w: vec![0.0, 9.0],
+    };
+    let r = Rope::from_positions(&mini_cfg(), &p);
+    let inv = |j: usize| (1.0 / 1e6f64.powf((2 * j) as f64 / 16.0)) as f32;
+    for (j, pos) in [(0usize, 5.0f32), (1, 7.0), (2, 9.0), (3, 5.0)] {
+        let want = ((pos * inv(j)) as f64).cos() as f32;
+        assert_eq!(r.cos[8 + j], want, "slot {j}");
+    }
+}

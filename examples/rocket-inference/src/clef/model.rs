@@ -23,6 +23,7 @@
 //! `threads x 18 MiB`, not a layer's 2.4 GB.
 
 use super::math::{dot, matmul_nt};
+use super::media::{MediaFeatures, Positions};
 use super::st::{SafeFile, TensorInfo};
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
@@ -337,6 +338,27 @@ impl Rope {
         Self { half, cos, sin }
     }
 
+    /// Tables for explicit 3-D mRoPE positions (one row per token): frequency slot `j`
+    /// reads the stream [`Positions::stream_of_slot`] picks. With three equal streams
+    /// (text) this is bit-identical to [`Rope::new`].
+    pub fn from_positions(cfg: &TextConfig, pos: &Positions) -> Self {
+        let half = cfg.head_dim / 2;
+        let inv: Vec<f32> = (0..half)
+            .map(|j| (1.0 / cfg.theta.powf((2 * j) as f64 / cfg.head_dim as f64)) as f32)
+            .collect();
+        let s = pos.len();
+        let mut cos = Vec::with_capacity(s * half);
+        let mut sin = Vec::with_capacity(s * half);
+        for t in 0..s {
+            for (j, &f) in inv.iter().enumerate() {
+                let a = pos.stream(Positions::stream_of_slot(j))[t] * f;
+                cos.push((a as f64).cos() as f32);
+                sin.push((a as f64).sin() as f32);
+            }
+        }
+        Self { half, cos, sin }
+    }
+
     /// Rotate `x` (`[s, heads, head_dim]`) in place.
     pub(super) fn apply(&self, x: &mut [f32], s: usize, heads: usize) {
         let (h, d) = (self.half, self.half * 2);
@@ -353,6 +375,24 @@ impl Rope {
                     }
                 }
             });
+    }
+}
+
+/// The rotary tables of the records of a (batched) pass: one table shared by all records
+/// (plain text positions, covering the longest record) or one per record (mRoPE).
+pub trait RopeSource {
+    fn rope(&self, record: usize) -> &Rope;
+}
+
+impl RopeSource for Rope {
+    fn rope(&self, _record: usize) -> &Rope {
+        self
+    }
+}
+
+impl RopeSource for Vec<Rope> {
+    fn rope(&self, record: usize) -> &Rope {
+        &self[record]
     }
 }
 
@@ -482,7 +522,7 @@ pub fn layer_forward_multi(
     layer: usize,
     x: &[f32],
     lens: &[usize],
-    rope: &Rope,
+    rope: &dyn RopeSource,
     threads: usize,
 ) -> Result<LayerOut> {
     let (h, nh, nkv, d) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
@@ -492,7 +532,8 @@ pub fn layer_forward_multi(
     let mut n2 = vec![0f32; s * h];
     let (mut ids, mut wts, mut margins) = (Vec::new(), Vec::new(), Vec::new());
     let mut off = 0;
-    for &sr in lens {
+    for (ri, &sr) in lens.iter().enumerate() {
+        let rope = rope.rope(ri);
         let xr = &x[off * h..(off + sr) * h];
         // ---- attention
         let n = rms_norm(xr, h, &w.input_norm, cfg.eps);
@@ -689,27 +730,66 @@ impl Backbone {
         opts: &ForwardOpts,
         on_layer: &mut LayerTap<'_>,
     ) -> Result<BackboneOut> {
+        self.forward_media_tapped(ids, None, opts, on_layer)
+    }
+
+    /// [`Backbone::forward`] for a record with media: `media` supplies the mRoPE
+    /// positions, the rows spliced over the placeholder embeddings and the DeepStack rows.
+    pub fn forward_media(
+        &self,
+        ids: &[u32],
+        media: Option<&MediaFeatures>,
+        opts: &ForwardOpts,
+    ) -> Result<BackboneOut> {
+        self.forward_media_tapped(ids, media, opts, &mut |_| {})
+    }
+
+    pub fn forward_media_tapped(
+        &self,
+        ids: &[u32],
+        media: Option<&MediaFeatures>,
+        opts: &ForwardOpts,
+        on_layer: &mut LayerTap<'_>,
+    ) -> Result<BackboneOut> {
         if ids.is_empty() {
             bail!("empty input");
+        }
+        if let Some(m) = media {
+            m.validate(ids.len(), self.cfg.hidden)?;
         }
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(opts.threads.max(1))
             .build()?;
-        pool.install(|| self.run(ids, opts, on_layer))
+        pool.install(|| self.run(ids, media, opts, on_layer))
+    }
+
+    /// The input of layer 0 for one record: the token rows with `media`'s features
+    /// spliced over the placeholder positions.
+    pub fn embed_input(&self, ids: &[u32], media: Option<&MediaFeatures>) -> Result<Vec<f32>> {
+        let h = self.cfg.hidden;
+        let mut x = vec![0f32; ids.len() * h];
+        for (r, &id) in x.chunks_mut(h).zip(ids) {
+            self.weights.embed_row(id, r)?;
+        }
+        if let Some(m) = media {
+            m.splice(&mut x, h);
+        }
+        Ok(x)
     }
 
     fn run(
         &self,
         ids: &[u32],
+        media: Option<&MediaFeatures>,
         opts: &ForwardOpts,
         on_layer: &mut LayerTap<'_>,
     ) -> Result<BackboneOut> {
         let (cfg, s, h) = (&self.cfg, ids.len(), self.cfg.hidden);
-        let mut x = vec![0f32; s * h];
-        for (r, &id) in x.chunks_mut(h).zip(ids) {
-            self.weights.embed_row(id, r)?;
-        }
-        let rope = Rope::new(cfg, s);
+        let mut x = self.embed_input(ids, media)?;
+        let rope = match media.and_then(|m| m.positions.as_ref()) {
+            Some(p) => Rope::from_positions(cfg, p),
+            None => Rope::new(cfg, s),
+        };
         for l in 0..cfg.layers {
             let out = if let Some(eng) = &self.engine {
                 let w = self.weights.layer_small(l)?;
@@ -744,6 +824,9 @@ impl Backbone {
                 )?
             };
             x = out.hidden;
+            if let Some(m) = media {
+                m.inject_deepstack(l, &mut x, h);
+            }
             on_layer(&Tap {
                 layer: l,
                 hidden: &x,
@@ -781,23 +864,47 @@ impl Backbone {
         opts: &ForwardOpts,
         max_batch_tokens: usize,
     ) -> Result<BatchForward> {
+        let recs: Vec<RecordRef<'_>> = records
+            .iter()
+            .map(|&ids| RecordRef { ids, media: None })
+            .collect();
+        self.forward_batch_media(&recs, opts, max_batch_tokens)
+    }
+
+    /// [`Backbone::forward_batch`] with per-record media features (each record keeps its
+    /// own position stream, splice and DeepStack rows; a text-only record next to media
+    /// records keeps plain positions).
+    pub fn forward_batch_media(
+        &self,
+        records: &[RecordRef<'_>],
+        opts: &ForwardOpts,
+        max_batch_tokens: usize,
+    ) -> Result<BatchForward> {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(opts.threads.max(1))
             .build()?;
         let mut outs: Vec<Option<Result<BackboneOut>>> = (0..records.len()).map(|_| None).collect();
         let live: Vec<usize> = (0..records.len())
             .filter(|&i| {
-                if records[i].is_empty() {
-                    outs[i] = Some(Err(anyhow::anyhow!("empty input")));
+                let bad = if records[i].ids.is_empty() {
+                    Some(anyhow::anyhow!("empty input"))
+                } else {
+                    records[i]
+                        .media
+                        .and_then(|m| m.validate(records[i].ids.len(), self.cfg.hidden).err())
+                };
+                if let Some(e) = bad {
+                    outs[i] = Some(Err(e));
                 }
-                !records[i].is_empty()
+                outs[i].is_none()
             })
             .collect();
-        let lens: Vec<usize> = live.iter().map(|&i| records[i].len()).collect();
+        let lens: Vec<usize> = live.iter().map(|&i| records[i].ids.len()).collect();
         let mut chunks = Vec::new();
         for range in plan_batches(&lens, max_batch_tokens, usize::MAX) {
-            let members: Vec<&[u32]> = live[range.clone()].iter().map(|&i| records[i]).collect();
-            let tokens: usize = members.iter().map(|m| m.len()).sum();
+            let members: Vec<RecordRef<'_>> =
+                live[range.clone()].iter().map(|&i| records[i]).collect();
+            let tokens: usize = members.iter().map(|m| m.ids.len()).sum();
             let t0 = std::time::Instant::now();
             let res = pool.install(|| self.run_batch(&members, opts));
             let seconds = t0.elapsed().as_secs_f64();
@@ -835,16 +942,33 @@ impl Backbone {
         })
     }
 
-    /// One shared pass over `records` (all non-empty).
-    fn run_batch(&self, records: &[&[u32]], opts: &ForwardOpts) -> Result<Vec<BackboneOut>> {
+    /// One shared pass over `records` (all non-empty, features validated).
+    fn run_batch(&self, records: &[RecordRef<'_>], opts: &ForwardOpts) -> Result<Vec<BackboneOut>> {
         let (cfg, h) = (&self.cfg, self.cfg.hidden);
-        let lens: Vec<usize> = records.iter().map(|r| r.len()).collect();
+        let lens: Vec<usize> = records.iter().map(|r| r.ids.len()).collect();
         let total: usize = lens.iter().sum();
-        let mut x = vec![0f32; total * h];
-        for (r, &id) in x.chunks_mut(h).zip(records.iter().flat_map(|r| r.iter())) {
-            self.weights.embed_row(id, r)?;
+        let mut x = Vec::with_capacity(total * h);
+        for r in records {
+            x.extend(self.embed_input(r.ids, r.media)?);
         }
-        let rope = Rope::new(cfg, lens.iter().copied().max().unwrap_or(0));
+        // Plain text everywhere: one shared table (unchanged); else one table per record.
+        let any_positions = records
+            .iter()
+            .any(|r| r.media.is_some_and(|m| m.positions.is_some()));
+        let ropes: Box<dyn RopeSource> = if any_positions {
+            Box::new(
+                records
+                    .iter()
+                    .map(|r| match r.media.and_then(|m| m.positions.as_ref()) {
+                        Some(p) => Rope::from_positions(cfg, p),
+                        None => Rope::new(cfg, r.ids.len()),
+                    })
+                    .collect::<Vec<Rope>>(),
+            )
+        } else {
+            Box::new(Rope::new(cfg, lens.iter().copied().max().unwrap_or(0)))
+        };
+        let any_media = records.iter().any(|r| r.media.is_some());
         for l in 0..cfg.layers {
             let out = if let Some(eng) = &self.engine {
                 let w = self.weights.layer_small(l)?;
@@ -855,7 +979,7 @@ impl Backbone {
                     l,
                     &x,
                     &lens,
-                    &rope,
+                    ropes.as_ref(),
                     opts.threads,
                 );
                 match r {
@@ -874,11 +998,21 @@ impl Backbone {
                     l,
                     &x,
                     &lens,
-                    &rope,
+                    ropes.as_ref(),
                     opts.threads,
                 )?
             };
             x = out.hidden;
+            if any_media && l < super::media::DEEPSTACK_LAYERS {
+                let mut off = 0;
+                for r in records {
+                    let s = r.ids.len();
+                    if let Some(m) = r.media {
+                        m.inject_deepstack(l, &mut x[off * h..(off + s) * h], h);
+                    }
+                    off += s;
+                }
+            }
             if opts.release_pages {
                 self.weights.release();
             }
@@ -899,6 +1033,13 @@ impl Backbone {
         }
         Ok(outs)
     }
+}
+
+/// One record of a batched pass: its token ids and optional media features.
+#[derive(Clone, Copy)]
+pub struct RecordRef<'a> {
+    pub ids: &'a [u32],
+    pub media: Option<&'a MediaFeatures>,
 }
 
 /// One shared pass of [`Backbone::forward_batch`].

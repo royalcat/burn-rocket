@@ -27,7 +27,9 @@
 use super::attn::causal_gqa;
 use super::int8::{emu_matmul_gw, f16_scales_to_f32, quantize_rows};
 use super::math::matmul_nt;
-use super::model::{LayerOut, LayerSmall, Rope, TextConfig, rms_norm, rms_norm_rows, route, silu};
+use super::model::{
+    LayerOut, LayerSmall, Rope, RopeSource, TextConfig, rms_norm, rms_norm_rows, route, silu,
+};
 use super::pack::format::{Dims, ExpertRecord};
 use super::pack::reader::{AlignedBuf, PackDir};
 use anyhow::{Result, anyhow, bail};
@@ -900,7 +902,7 @@ pub fn engine_layer_forward_multi(
     layer: usize,
     x: &[f32],
     lens: &[usize],
-    rope: &Rope,
+    rope: &dyn RopeSource,
     threads: usize,
 ) -> Result<LayerOut> {
     let (h, nh, nkv, d) = (cfg.hidden, cfg.heads, cfg.kv_heads, cfg.head_dim);
@@ -916,7 +918,8 @@ pub fn engine_layer_forward_multi(
     rms_norm_rows(&mut k, d, &w.k_norm, cfg.eps);
     let mut ctx = Vec::with_capacity(s * nh * d);
     let mut off = 0;
-    for &sr in lens {
+    for (ri, &sr) in lens.iter().enumerate() {
+        let rope = rope.rope(ri);
         let (qr, kr) = (
             &mut q[off * nh * d..(off + sr) * nh * d],
             &mut k[off * nkv * d..(off + sr) * nkv * d],

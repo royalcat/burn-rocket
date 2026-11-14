@@ -277,6 +277,48 @@ clef_batch_equals_single_records_on_the_emulated_engine -- --ignored --nocapture
 
 Board check: see "Board test, phase 7" below.
 
+## Media plumbing in the thinker (phase 8b, 2026-11-14; no towers yet)
+
+`src/clef/media.rs` is everything between "the towers produced features" and "the decoder
+ran"; requests with `images`/`audio`/`videos` still get the 422 until the towers (8c-8f) exist.
+
+* **Placeholder block**: `MediaLayout { image_grids, video_grids, audio_frames (mel frames, explicit
+  clips first then one soundtrack per video iff use_audio_in_video), explicit_audio,
+  use_audio_in_video, second_per_grid }` -> `build_media_ids(&layout, newline_id)` (images, explicit
+  audio, videos; audio-in-video interleave by `interleave_video_audio`) and
+  `encode::encode_record_with_media(tok, req, max_length, max_state, &media_ids)` (the media block
+  follows the 35-token `encode::prefix_tokens`, counts toward the fixed length; `encode_record` = empty
+  block). Also `audio_out_len(frames)`, `grid_tokens`, `smart_resize` (factor 32, pixel budgets; for 8c).
+  Test: ids of all 9 media fixtures equal the oracle's `input_ids`, question/option spans equal.
+* **Positions**: `rope_index(ids, &layout) -> Positions {t,h,w}` is a literal port of HF
+  `get_rope_index` (3-D branch only when an image or video grid exists; text/audio-only = plain `0..S`;
+  `position_id_per_seconds` 13; audio-in-video merge by time; an error when pad counts disagree with the
+  lengths, which HF would silently mis-position). Equal to the oracle's `position_ids` and `rope_delta`
+  on all 9 fixtures. `Rope::from_positions` builds the interleaved `[24,20,20]` tables (slot `j` reads
+  h if `j%3==1 && j<60`, w if `j%3==2 && j<60`, else t); with text positions it is bit-identical to
+  `Rope::new`.
+* **Splice + DeepStack**: `MediaFeatures { positions, splice_idx/rows, deepstack_idx, deepstack[3] }`
+  (`MediaFeatures::assemble(ids, positions, &TowerOutputs, hidden)` locates the pads and checks counts;
+  `splice`, `inject_deepstack(layer)` add after decoder layers 0-2 at visual rows only, before the tap).
+* **Backbone API**: `forward_media[_tapped](ids, Option<&MediaFeatures>, opts)`,
+  `forward_batch_media(&[RecordRef{ids, media}], opts, cap)` (per-record position streams, splice and
+  DeepStack in a shared pass; one shared `Rope` is kept for all-text batches), `embed_input`. The text
+  entry points delegate with `None`; layer functions take `&dyn RopeSource` (`Rope` = shared,
+  `Vec<Rope>` = per record). CPU, Emu and NPU engines are unchanged for text-only (all existing tests,
+  incl. bit-identity batching, pass).
+* **Gates** (oracle dumps in `/tmp/opencode/clef/dump`, tower outputs fed from the dump):
+  `cargo test --release -p rocket-inference --no-default-features media_backbone_matches_the_oracle_on_the_bf16_cpu_path -- --ignored --nocapture`
+  and `..._on_the_emulated_int8_path` (AutoRound shards, = `ROCKET_CLEF_EMU=1`); `CLEF_IDS=a,b` selects.
+  BF16 f32 CPU (dev host, 8 threads, ~26 s/record): layers 0-2 (DeepStack included) cosine 1.0, max|d|/peak
+  1e-7..8e-7; image-small final_normed cosine 1.000000, max|dp| 2.5e-7; audio-5s 1.0, 3.7e-7; video-audio-small
+  final cosine 0.99998 (25 near-tied router flips over 48 layers x 544 tokens), max|dp| 1.3e-5; all top-1 equal.
+  Emulated int8 W8A8 (AutoRound shards): top-1 equal everywhere, max|dp| image 1.2e-2, audio 8.4e-3,
+  video-audio 1.7e-2 (layer 0-2 cosine >= 0.99993; late layers drift as for text, cosine ~0.98, router sets differ).
+  Non-ignored tests also cover the unit cases, the oracle layout/positions/ids, and a mini-model batch
+  test (media batched == single, bit-identical on Emu; within 1e-4 on the CPU path).
+* **Not done**: media towers (8c vision, 8d audio, 8e video, 8f decoding/preprocessing), wiring
+  `ClefModel::answer*` and `request.rs` to media (still refused), NPU/board runs of media records.
+
 ## Not done
 
 Image/audio/video inputs (vision and audio towers, the media placeholders), `media_kwargs`, attention scores/AV on the NPU, a CPU `sdot` expert path.
