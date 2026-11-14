@@ -1,0 +1,232 @@
+[
+ {
+  "id": "media-image-small",
+  "model": "clef-omni",
+  "state": "The attached image is a small synthetic test picture.",
+  "images": [
+   "data/clef-tiny.png"
+  ],
+  "questions": {
+   "colorful": {
+    "type": "noul",
+    "instructions": "Is the image a smooth color gradient with shapes drawn on it?"
+   },
+   "shape": {
+    "type": "choice",
+    "instructions": "Which shape is filled with solid red?",
+    "criteria": {
+     "circle": "A filled circle or ellipse",
+     "square": "A filled square",
+     "none": "No filled red shape"
+    }
+   }
+  }
+ },
+ {
+  "id": "media-image-cat",
+  "model": "clef-omni",
+  "state": "Describe-and-classify the attached photo.",
+  "images": [
+   "data/cat.jpeg"
+  ],
+  "questions": {
+   "animal": {
+    "type": "choice",
+    "instructions": "Which animal is in the photo?",
+    "criteria": {
+     "cat": "A domestic cat",
+     "dog": "A dog",
+     "bird": "A bird",
+     "none": "No animal"
+    }
+   },
+   "indoors": {
+    "type": "noul",
+    "instructions": "Was the photo taken indoors?"
+   },
+   "cuteness": {
+    "type": "score",
+    "instructions": "How cute is the animal?",
+    "criteria": [
+     "Not at all",
+     "A little",
+     "Quite",
+     "Very"
+    ]
+   }
+  }
+ },
+ {
+  "id": "media-images-two",
+  "model": "clef-omni",
+  "state": "Two images are attached: a synthetic test picture and a photo.",
+  "images": [
+   "data/clef-tiny.png",
+   "data/cat.jpeg"
+  ],
+  "questions": {
+   "same": {
+    "type": "noul",
+    "instructions": "Do both images show the same scene?"
+   },
+   "photo": {
+    "type": "choice",
+    "instructions": "Which of the two images is a photograph?",
+    "criteria": {
+     "first": "The first image",
+     "second": "The second image",
+     "both": "Both"
+    }
+   }
+  }
+ },
+ {
+  "id": "media-audio-5s",
+  "model": "clef-omni",
+  "state": "A five second audio clip is attached.",
+  "audio": [
+   "data/speech5s.wav"
+  ],
+  "questions": {
+   "speech": {
+    "type": "noul",
+    "instructions": "Does the clip contain human speech?"
+   },
+   "kind": {
+    "type": "choice",
+    "instructions": "What is the main content of the clip?",
+    "criteria": {
+     "speech": "Spoken words",
+     "music": "Music",
+     "noise": "Noise or silence"
+    }
+   }
+  }
+ },
+ {
+  "id": "media-video-silent",
+  "model": "clef-omni",
+  "state": "A short video without sound is attached.",
+  "videos": [
+   "data/clef-video-silent.mp4"
+  ],
+  "questions": {
+   "motion": {
+    "type": "noul",
+    "instructions": "Is there visible motion in the video?"
+   },
+   "scene": {
+    "type": "choice",
+    "instructions": "What is the main subject?",
+    "criteria": {
+     "person": "A person",
+     "animal": "An animal",
+     "object": "An object or scene"
+    }
+   }
+  }
+ },
+ {
+  "id": "media-video-audio-small",
+  "model": "clef-omni",
+  "state": "A two second clip with a soundtrack is attached.",
+  "videos": [
+   "data/clef-video-audio-small.mp4"
+  ],
+  "questions": {
+   "sound": {
+    "type": "noul",
+    "instructions": "Is there audible sound in the clip?"
+   },
+   "kind": {
+    "type": "choice",
+    "instructions": "What best describes the clip?",
+    "criteria": {
+     "talk": "Someone talking",
+     "nature": "Nature footage",
+     "other": "Something else"
+    }
+   }
+  }
+ },
+ {
+  "id": "media-video-test",
+  "model": "clef-omni",
+  "state": "A four second video with a soundtrack is attached.",
+  "videos": [
+   "data/test.mp4"
+  ],
+  "questions": {
+   "sound": {
+    "type": "noul",
+    "instructions": "Is there audible sound in the clip?"
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is the situation shown?",
+    "criteria": [
+     "Not urgent",
+     "Somewhat",
+     "Urgent"
+    ]
+   }
+  }
+ },
+ {
+  "id": "media-mixed",
+  "model": "clef-omni",
+  "state": "One image, one audio clip and one silent video accompany the case.",
+  "images": [
+   "data/clef-tiny.png"
+  ],
+  "audio": [
+   "data/speech5s.wav"
+  ],
+  "videos": [
+   "data/clef-video-silent.mp4"
+  ],
+  "questions": {
+   "consistent": {
+    "type": "noul",
+    "instructions": "Do the image, the audio and the video appear to be about the same event?"
+   },
+   "priority": {
+    "type": "score",
+    "instructions": "How important is the case?",
+    "criteria": [
+     "Low",
+     "Medium",
+     "High"
+    ]
+   }
+  }
+ },
+ {
+  "id": "media-mixed-av",
+  "model": "clef-omni",
+  "state": "An image, an audio clip and a video with its own soundtrack accompany the case.",
+  "images": [
+   "data/clef-tiny.png"
+  ],
+  "audio": [
+   "data/speech5s.wav"
+  ],
+  "videos": [
+   "data/clef-video-audio-small.mp4"
+  ],
+  "questions": {
+   "consistent": {
+    "type": "noul",
+    "instructions": "Do the attachments appear to be about the same event?"
+   },
+   "priority": {
+    "type": "choice",
+    "instructions": "Which queue should handle this?",
+    "criteria": {
+     "support": "Customer support",
+     "media": "Media review"
+    }
+   }
+  }
+ }
+]
