@@ -206,3 +206,25 @@ read_io=.. | peak_anon=.. MiB`. The phase-0 probe predicts ~1.4-1.9 s of expert 
 
 Image/audio/video inputs (vision and audio towers, the media placeholders), batching several
 records, `media_kwargs`, attention scores/AV on the NPU, a CPU `sdot` expert path.
+
+## Board results, phase 6 (2026-11-14, rock-5b-plus)
+
+`decide --pack-dir /mnt/nvme/models/clef-pack-g128 --device npu`, `taskset -c 4-7`, 600 MHz
+module, `home-llm-gateway-embed-1`/`-decision-1` stopped for the runs and restored, board
+load ~10 from the other services (+-20 %). Pack on the btrfs NVMe (30 GB, O_DIRECT works).
+Model load 2-4 s, 496 MiB anon, 927 MiB of BOs for the resident attention projections.
+
+| record | tokens | total | moe wall | qkv+oproj | attn (CPU) | peak anon |
+|---|---|---|---|---|---|---|
+| tiny (1 noul question) | 142 | 38.7 s | 29.7 s | 4.8 s | 0.5 s | 618 MiB |
+| checkout-errors | 295 | 51.6 s | 38.2 s | 8.7 s | 1.4 s | 690 MiB |
+| long-incident | 800 | 103.2 s | 66.7 s | 21.8 s | 7.2 s | 887 MiB |
+
+- Floor ~30 s per pass at any short prompt (all 128 experts hit and streamed: 5-6k expert
+  loads per request); roughly +0.1 s per extra token after that. Expert reads are fully hidden
+  (`read_wait` 1-10 thread-s); `npu` thread-s dominate, `rewrite` is 35-38 thread-s.
+- Answers vs the f32 BF16 oracle: checkout-errors technical 0.8171 (oracle 0.8327), urgency
+  0.9272 (0.9341), outage 0.9547 (0.9552); long-incident owner payments 0.8444 (0.8202),
+  severity 2.2406 (2.2751), double_charge 0.969 (0.9674), owners_assigned 0.0163 (0.0169).
+  Top-1 equal everywhere; |dp| <= 0.025, in line with the host emulation.
+- Not yet measured on the board: >= 2k tokens, `ROCKET_CLEF_ATTN_DEVICE=cpu`, `serve`, batching.

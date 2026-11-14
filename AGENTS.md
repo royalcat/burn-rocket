@@ -3251,7 +3251,7 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   scales, 4.57 MiB/expert) with one expert per core (3 contexts x 1 worker); expert
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
   **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
-  code complete, dev-host verified, board verification pending**, below. Remaining (plan
+  code complete, dev-host verified, board-verified for 142-800 tokens (2026-11-14: 38.7 s / 51.6 s / 103 s, <= 0.9 GiB anon, answers match the oracle)**, below. Remaining (plan
   numbering): 7 request batching, 8 media towers (image/audio/video; requests carrying
   media get 422 "not implemented yet"), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
