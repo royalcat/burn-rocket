@@ -79,6 +79,8 @@ reqwest = { version = "0.13", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 libc = "0.2"
+# Clef pack checksums (manifest sha256 of every pack file).
+sha2 = "0.10"
 # Host-side row kernels: the int8 token table's quantize/dequantize passes (the
 # same rayon the flex backend uses; no extra crate in the graph).
 rayon = "1"

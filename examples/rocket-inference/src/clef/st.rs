@@ -11,14 +11,41 @@ pub enum Dtype {
     F32,
     Bf16,
     F16,
+    /// Signed 8-bit codes (the pack's quantized weights).
+    I8,
+    /// Packed GPTQ/AutoRound words (four 8-bit values per word).
+    I32,
 }
 
 impl Dtype {
     pub fn size(self) -> usize {
         match self {
-            Dtype::F32 => 4,
+            Dtype::F32 | Dtype::I32 => 4,
             Dtype::Bf16 | Dtype::F16 => 2,
+            Dtype::I8 => 1,
         }
+    }
+
+    /// The safetensors header spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Dtype::F32 => "F32",
+            Dtype::Bf16 => "BF16",
+            Dtype::F16 => "F16",
+            Dtype::I8 => "I8",
+            Dtype::I32 => "I32",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "F32" => Dtype::F32,
+            "BF16" => Dtype::Bf16,
+            "F16" => Dtype::F16,
+            "I8" => Dtype::I8,
+            "I32" => Dtype::I32,
+            _ => return None,
+        })
     }
 }
 
@@ -67,11 +94,9 @@ impl SafeFile {
             if name == "__metadata__" {
                 continue;
             }
-            let dtype = match v["dtype"].as_str().unwrap_or("") {
-                "F32" => Dtype::F32,
-                "BF16" => Dtype::Bf16,
-                "F16" => Dtype::F16,
-                other => bail!("{name}: unsupported dtype {other}"),
+            let dtype_name = v["dtype"].as_str().unwrap_or("");
+            let Some(dtype) = Dtype::parse(dtype_name) else {
+                bail!("{name}: unsupported dtype {dtype_name}");
             };
             let shape: Vec<usize> = v["shape"]
                 .as_array()
@@ -159,10 +184,17 @@ pub fn widen(dtype: Dtype, b: &[u8]) -> Vec<f32> {
             .iter()
             .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
             .collect(),
+        Dtype::I8 => b.iter().map(|&c| f32::from(c as i8)).collect(),
+        Dtype::I32 => b
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c) as f32)
+            .collect(),
     }
 }
 
-fn f16_to_f32(h: u16) -> f32 {
+pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) as u32) << 31;
     let exp = ((h >> 10) & 0x1f) as u32;
     let man = (h & 0x3ff) as u32;

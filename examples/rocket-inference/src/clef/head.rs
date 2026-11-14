@@ -491,11 +491,16 @@ impl LmHeadFile {
         let shard = idx["weight_map"][NAME]
             .as_str()
             .with_context(|| format!("{NAME} is not in the shard index"))?;
-        let file = SafeFile::open(&dir.join(shard))?;
+        Self::from_file(&dir.join(shard), NAME)
+    }
+
+    /// Open `name` (a 2-D tensor) of one safetensors file.
+    pub fn from_file(path: &Path, name: &str) -> Result<Self> {
+        let file = SafeFile::open(path)?;
         let info = file
             .tensors
-            .get(NAME)
-            .with_context(|| format!("{shard} has no {NAME}"))?
+            .get(name)
+            .with_context(|| format!("{} has no {name}", path.display()))?
             .clone();
         Ok(Self { file, info })
     }

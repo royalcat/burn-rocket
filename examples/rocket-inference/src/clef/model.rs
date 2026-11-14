@@ -67,7 +67,11 @@ impl TextConfig {
             top_k: u("num_experts_per_tok")?,
             inter: u("moe_intermediate_size")?,
             eps: t["rms_norm_eps"].as_f64().context("rms_norm_eps")? as f32,
-            theta: t["rope_theta"].as_f64().context("rope_theta")?,
+            // transformers 5 moves it under `rope_parameters` (the AutoRound export).
+            theta: t["rope_theta"]
+                .as_f64()
+                .or_else(|| t["rope_parameters"]["rope_theta"].as_f64())
+                .context("rope_theta (or rope_parameters.rope_theta)")?,
             norm_topk: t["norm_topk_prob"].as_bool().unwrap_or(true),
         };
         if t["shared_expert_intermediate_size"].as_u64().unwrap_or(0) != 0 {
@@ -180,6 +184,7 @@ impl ExpertSource for ShardExperts<'_> {
 }
 
 /// Everything of a decoder layer except the experts.
+#[derive(Clone)]
 pub struct LayerWeights {
     pub input_norm: Vec<f32>,
     pub post_norm: Vec<f32>,
@@ -209,6 +214,70 @@ impl LayerWeights {
             k_norm: g("self_attn.k_norm.weight", &[d])?,
             router: g("mlp.gate.weight", &[cfg.experts, h])?,
         })
+    }
+}
+
+/// Where the backbone gets everything but the activations: per-layer dense weights, the
+/// experts, the embedding rows and the final norm. Two implementations: the BF16 shards
+/// ([`ShardWeights`]) and a Clef pack (`pack::PackedWeights`, int8 + scales dequantized
+/// to f32 on the CPU).
+pub trait WeightSource: Sync {
+    /// Everything of layer `l` except the experts, widened to f32.
+    fn layer_weights(&self, l: usize) -> Result<LayerWeights>;
+    fn experts(&self) -> &dyn ExpertSource;
+    /// Embedding row of token `id` into `out` (`hidden` long).
+    fn embed_row(&self, id: u32, out: &mut [f32]) -> Result<()>;
+    fn final_norm(&self) -> Result<Vec<f32>>;
+    /// Drop this source's resident mapped pages (called after every layer).
+    fn release(&self);
+}
+
+/// [`WeightSource`] over the BF16 checkpoint shards.
+pub struct ShardWeights {
+    shards: Shards,
+    cfg: TextConfig,
+}
+
+impl ShardWeights {
+    pub fn open(dir: &Path, cfg: TextConfig) -> Result<Self> {
+        Ok(Self {
+            shards: Shards::open(dir)?,
+            cfg,
+        })
+    }
+}
+
+impl ExpertSource for ShardWeights {
+    fn expert(&self, layer: usize, e: usize) -> Result<ExpertWeights> {
+        ShardExperts {
+            shards: &self.shards,
+            cfg: &self.cfg,
+        }
+        .expert(layer, e)
+    }
+}
+
+impl WeightSource for ShardWeights {
+    fn layer_weights(&self, l: usize) -> Result<LayerWeights> {
+        LayerWeights::load(&self.shards, &self.cfg, l)
+    }
+
+    fn experts(&self) -> &dyn ExpertSource {
+        self
+    }
+
+    fn embed_row(&self, id: u32, out: &mut [f32]) -> Result<()> {
+        let (f, t) = self.shards.get("thinker.model.embed_tokens.weight")?;
+        f.row_f32(t, id as usize, out)
+    }
+
+    fn final_norm(&self) -> Result<Vec<f32>> {
+        self.shards
+            .f32("thinker.model.norm.weight", &[self.cfg.hidden])
+    }
+
+    fn release(&self) {
+        self.shards.release();
     }
 }
 
@@ -478,14 +547,27 @@ pub type LayerTap<'a> = dyn FnMut(&Tap<'_>) + Send + 'a;
 
 pub struct Backbone {
     pub cfg: TextConfig,
-    shards: Shards,
+    weights: Box<dyn WeightSource + Send>,
 }
 
 impl Backbone {
+    /// Open the BF16 checkpoint directory.
     pub fn open(dir: &Path) -> Result<Self> {
         let cfg = TextConfig::from_model_dir(dir)?;
-        let shards = Shards::open(dir)?;
-        Ok(Self { cfg, shards })
+        let weights = Box::new(ShardWeights::open(dir, cfg.clone())?);
+        Ok(Self { cfg, weights })
+    }
+
+    /// Open a Clef pack directory (`clef-pack` output); `config.json` is read from it.
+    pub fn open_pack(dir: &Path) -> Result<Self> {
+        let cfg = TextConfig::from_model_dir(dir)?;
+        let weights = Box::new(super::pack::PackedWeights::open(dir, cfg.clone())?);
+        Ok(Self { cfg, weights })
+    }
+
+    /// Any weight source (tests, future placements).
+    pub fn with_source(cfg: TextConfig, weights: Box<dyn WeightSource + Send>) -> Self {
+        Self { cfg, weights }
     }
 
     pub fn forward(&self, ids: &[u32], opts: &ForwardOpts) -> Result<BackboneOut> {
@@ -514,19 +596,23 @@ impl Backbone {
         on_layer: &mut LayerTap<'_>,
     ) -> Result<BackboneOut> {
         let (cfg, s, h) = (&self.cfg, ids.len(), self.cfg.hidden);
-        let (ef, et) = self.shards.get("thinker.model.embed_tokens.weight")?;
         let mut x = vec![0f32; s * h];
         for (r, &id) in x.chunks_mut(h).zip(ids) {
-            ef.row_f32(et, id as usize, r)?;
+            self.weights.embed_row(id, r)?;
         }
         let rope = Rope::new(cfg, s);
-        let src = ShardExperts {
-            shards: &self.shards,
-            cfg,
-        };
         for l in 0..cfg.layers {
-            let w = LayerWeights::load(&self.shards, cfg, l)?;
-            let out = layer_forward(cfg, &w, &src, l, &x, s, &rope, opts.threads)?;
+            let w = self.weights.layer_weights(l)?;
+            let out = layer_forward(
+                cfg,
+                &w,
+                self.weights.experts(),
+                l,
+                &x,
+                s,
+                &rope,
+                opts.threads,
+            )?;
             x = out.hidden;
             on_layer(&Tap {
                 layer: l,
@@ -536,10 +622,10 @@ impl Backbone {
                 router_margins: &out.router_margins,
             });
             if opts.release_pages {
-                self.shards.release();
+                self.weights.release();
             }
         }
-        let nw = self.shards.f32("thinker.model.norm.weight", &[h])?;
+        let nw = self.weights.final_norm()?;
         let normed = rms_norm(&x, h, &nw, cfg.eps);
         Ok(BackboneOut {
             final_normed: normed,

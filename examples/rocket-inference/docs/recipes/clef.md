@@ -3,6 +3,7 @@
 > **STATUS 2026-11-14 (phase 4): text-only, CPU-only, dev host verified. No board run.**
 > Images, audio and video are refused (422) until the multimodal towers are ported;
 > `--device npu` is refused until NPU expert streaming lands (phase 6).
+> Phase 5 adds `--pack-dir` (the int8 pack, `clef-pack.md`): same flags, packed weights.
 
 `Cloudflare/clef-omni` is the Qwen3-Omni-30B-A3B thinker (48 MoE layers, 128 experts,
 top-8) with a `JointSchemaHead`. A request is a `state` plus typed `questions`; one

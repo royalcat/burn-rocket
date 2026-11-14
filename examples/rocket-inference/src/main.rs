@@ -50,6 +50,11 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    // Hidden maintenance command (not in `--help`): repack the AutoRound int8
+    // checkpoint into a Clef pack (docs/recipes/clef-pack.md).
+    if cmd == "clef-pack" {
+        return clef::pack::build::run(it);
+    }
     if !matches!(
         cmd.as_str(),
         "serve" | "embed" | "bench" | "gen" | "decide" | "tokenize" | "gemm"

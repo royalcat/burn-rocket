@@ -9,6 +9,7 @@ pub mod encode;
 pub mod head;
 pub mod math;
 pub mod model;
+pub mod pack;
 pub mod pipeline;
 pub mod request;
 pub mod st;

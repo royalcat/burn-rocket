@@ -3250,6 +3250,30 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   (2026-11-14, `clef-phase0.md`): **GO, Format A** (AutoRound g128 int8 codes + fp16
   scales, 4.57 MiB/expert) with one expert per core (3 contexts x 1 worker); expert
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
-  Remaining (plan numbering): 5 offline packer, 6 NPU expert streaming (`--device npu`
-  refused until then), 7 request batching, 8 media towers (image/audio/video; requests
-  carrying media get 422 "not implemented yet"), 9 deploy/docs.
+  **5 offline packer + pack reader done (2026-11-14)**, below. Remaining (plan numbering):
+  6 NPU expert streaming (`--device npu` refused until then), 7 request batching, 8 media
+  towers (image/audio/video; requests carrying media get 422 "not implemented yet"),
+  9 deploy/docs.
+- **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
+  `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
+  (`moeshawky/clef-omni-int8-autoround`, local `/home/royalcat/models/clef-omni-int8-autoround`,
+  39 GiB) repacked as-is (Format A) into `/home/royalcat/models/clef-pack-g128` (29.68 GiB,
+  55 files): `layer_NN.experts` (4 KiB header + 128 records of 4,792,320 B = one aligned
+  O_DIRECT read per expert: gate|up codes `[1536,2048]` i8, down codes `[2048,768]`, f16
+  scales `[1536,16]`/`[2048,6]`, i.e. `pack_weight_gw`'s `[N,K]` form), `resident.safetensors`
+  (embeddings, norms, router, int8 attention, 1.46 GiB), `lm_head.safetensors`, copies of
+  config/tokenizer/joint head, `manifest.json` (sizes + sha256 + tensor table + skipped
+  media/talker prefixes). Source layout: `qweight` I32 `[K/4,N]` (byte j = k 4*kb+j,
+  unsigned), `qzeros` I32 `[K/128,N/4]` stored zero-1 = `0x7f7f7f7f` (zero 128, symmetric),
+  `scales` F16 `[K/128,N]` (signed), experts are separate modules, no `g_idx`, router BF16;
+  `w = (q-128)*scale`; unpack vs BF16 original: rms rel 0.8-1.2 %, cosine >= 0.99993.
+  Hidden subcommand `rocket-inference clef-pack --src --out [--verify|--verify-only|
+  --compare-bf16 <dir>] [--layers A..B]` (pack 93 s warm, verify 20 s); `--pack-dir` (alias of
+  `--model-dir`, or auto-detected by `manifest.json`) works for `decide`/`serve`.
+  `Backbone` now takes a `WeightSource` (`ShardWeights` = BF16 shards, `PackedWeights` =
+  pack; phase-3 parity unchanged: max |dp| 3e-7); `PackedExperts` is the `ExpertSource`
+  that widens int8 x scale to f32. Gate (`cargo test --release -p rocket-inference
+  --no-default-features clef_pack_answers_match_the_oracle_top1 -- --ignored --nocapture`):
+  top-1 agrees on all 7 questions of checkout-errors/invoice/long-incident, max |dp| 0.0136,
+  mean 0.0035 vs the f32 BF16 oracle (card: 0.044/0.006); 21-28 s per record on the CPU.
+  `rope_theta` is read from `rope_parameters` too (the AutoRound config.json layout).

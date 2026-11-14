@@ -5,6 +5,7 @@ use super::answer::{probabilities, systemone_answer};
 use super::encode::{EncodedRecord, encode_record};
 use super::head::{ClefHead, LmHeadFile};
 use super::model::{Backbone, ForwardOpts};
+use super::pack::{Manifest, PackDir};
 use super::request::ClefRequest;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
@@ -60,9 +61,21 @@ impl ClefModel {
     pub fn load_with(dir: &Path, threads: usize) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("tokenizer.json: {e}"))?;
-        let backbone = Backbone::open(dir).context("open the thinker shards")?;
+        // A `clef-pack` directory (manifest.json) streams int8 experts; otherwise the
+        // BF16 checkpoint shards.
+        let (backbone, lm_head) = if PackDir::is_pack(dir) {
+            let backbone = Backbone::open_pack(dir).context("open the clef pack")?;
+            let lm = Manifest::read(dir)?.lm_head;
+            let lm_head = LmHeadFile::from_file(&dir.join(&lm.file), &lm.tensor)
+                .context("open the pack's lm_head")?;
+            (backbone, lm_head)
+        } else {
+            (
+                Backbone::open(dir).context("open the thinker shards")?,
+                LmHeadFile::open(dir).context("open thinker.lm_head.weight")?,
+            )
+        };
         let head = ClefHead::load(dir).context("load joint_head.safetensors")?;
-        let lm_head = LmHeadFile::open(dir).context("open thinker.lm_head.weight")?;
         let opts = ForwardOpts {
             threads: threads.max(1),
             ..ForwardOpts::default()

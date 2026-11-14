@@ -152,3 +152,90 @@ fn clef_answers_match_the_oracle() {
         assert_eq!(got.response["model"], oracle["model"]);
     }
 }
+
+const PACK_DIR: &str = "/home/royalcat/models/clef-pack-g128";
+
+/// End to end through the int8 pack (CPU, packed experts dequantized to f32) against the
+/// f32 BF16-source oracle dumps. The int8 quantization moves probabilities (the
+/// AutoRound card measured max 0.044, mean 0.006 on its own records); every question's
+/// top option must agree. Prints per-question probabilities, max and mean |dp|.
+#[test]
+#[ignore = "needs the full clef pack (CLEF_PACK_DIR) and oracle dumps; ~1 min per record"]
+fn clef_pack_answers_match_the_oracle_top1() {
+    let dir = PathBuf::from(std::env::var("CLEF_PACK_DIR").unwrap_or_else(|_| PACK_DIR.into()));
+    if !dir.join("manifest.json").exists() {
+        eprintln!("skipping: no clef pack at {}", dir.display());
+        return;
+    }
+    let ids = std::env::var("CLEF_IDS")
+        .unwrap_or_else(|_| "checkout-errors,invoice,long-incident".into());
+    let model = ClefModel::load(&dir).unwrap();
+    let (mut worst, mut sum, mut n) = (0f64, 0f64, 0usize);
+    for id in ids.split(',') {
+        let dump = PathBuf::from(DUMP_DIR);
+        let Ok(text) = std::fs::read_to_string(dump.join(format!("{id}.json"))) else {
+            eprintln!("skipping {id}: no oracle dump in {DUMP_DIR} (docs/recipes/clef-oracle.md)");
+            continue;
+        };
+        let oracle: Value = serde_json::from_str(&text).unwrap();
+        let npz = read_npz(&dump.join(format!("{id}.npz")));
+        let t0 = std::time::Instant::now();
+        let got = model.answer(&fixture(id), 64000).unwrap();
+        eprintln!(
+            "{id}: {} tokens in {:.1}s",
+            got.tokens,
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(got.response["usage"], oracle["usage"], "{id}: token count");
+        let (mut rec_worst, mut rec_sum, mut rec_n) = (0f64, 0f64, 0usize);
+        for (qid, probs) in &got.probabilities {
+            let want = f32s(&npz[&format!("probs_{qid}")].2);
+            let q = oracle["questions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|q| q["id"] == qid.as_str())
+                .unwrap();
+            let opts: Vec<&str> = q["option_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| o.as_str().unwrap())
+                .collect();
+            let mut top = (0usize, f64::MIN);
+            let mut top_want = (0usize, f32::MIN);
+            for (i, (opt, w)) in opts.iter().zip(&want).enumerate() {
+                let p = probs[*opt];
+                rec_worst = rec_worst.max((p - f64::from(*w)).abs());
+                rec_sum += (p - f64::from(*w)).abs();
+                rec_n += 1;
+                if p > top.1 {
+                    top = (i, p);
+                }
+                if *w > top_want.1 {
+                    top_want = (i, *w);
+                }
+                eprintln!("  {id}/{qid}/{opt}: pack {p:.4} oracle {w:.4}");
+            }
+            assert_eq!(
+                top.0, top_want.0,
+                "{id}/{qid}: top-1 differs from the oracle"
+            );
+        }
+        eprintln!(
+            "{id}: max |dp| = {rec_worst:.4}, mean |dp| = {:.4} over {rec_n} options",
+            rec_sum / rec_n as f64
+        );
+        worst = worst.max(rec_worst);
+        sum += rec_sum;
+        n += rec_n;
+    }
+    eprintln!(
+        "all records: max |dp| = {worst:.4}, mean |dp| = {:.4} over {n} options",
+        sum / n.max(1) as f64
+    );
+    assert!(n > 0, "no record ran");
+    // The card's own measurement was 0.044 max / 0.006 mean on other records; far above
+    // it would point at an unpacking or dequantization bug.
+    assert!(worst < 0.1, "max |dp| {worst:.4}");
+}

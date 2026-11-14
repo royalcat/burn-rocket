@@ -171,6 +171,10 @@ impl Family {
 /// decision model. Likewise a `qwen3_omni_moe` checkpoint is Clef-Omni only with its
 /// `joint_head.safetensors` (the plain Qwen3-Omni base is not a supported model).
 pub fn detect_family(model_dir: &Path) -> Result<Family> {
+    // A Clef pack carries a manifest instead of the checkpoint's index/config pair.
+    if crate::clef::pack::PackDir::is_pack(model_dir) {
+        return Ok(Family::Clef);
+    }
     if model_dir.join("decision_config.json").exists() {
         return crate::decision::config::DecisionConfig::load(model_dir)
             .map(|_| Family::Decision)
@@ -395,6 +399,19 @@ mod tests {
         .unwrap();
         assert!(detect_family(&dir).is_err(), "the plain base model");
         std::fs::write(dir.join(CLEF_HEAD_FILE), b"").unwrap();
+        assert_eq!(detect_family(&dir).unwrap(), Family::Clef);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_clef_pack_is_detected_from_its_manifest() {
+        let dir = temp_dir("clef-pack");
+        std::fs::write(dir.join("manifest.json"), r#"{"format": "something-else"}"#).unwrap();
+        assert!(
+            detect_family(&dir).is_err(),
+            "another manifest is not a pack"
+        );
+        std::fs::write(dir.join("manifest.json"), r#"{"format": "clef-pack"}"#).unwrap();
         assert_eq!(detect_family(&dir).unwrap(), Family::Clef);
         std::fs::remove_dir_all(&dir).unwrap();
     }

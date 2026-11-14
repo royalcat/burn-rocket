@@ -249,6 +249,9 @@ the release's own default is 64000); --out and --model-name behave the same,
 --device npu is refused (NPU expert streaming arrives in a later phase). The
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
 `legend`/`probabilities` and `noul` (the probability of true).
+--pack-dir <dir> (same as --model-dir; detected from its manifest.json) loads a
+`clef-pack` (docs/recipes/clef-pack.md): the AutoRound int8 weights streamed from
+aligned expert files, dequantized to f32 on the CPU.
 
 See `rocket-inference help` for the shared placement flags and
 examples/rocket-inference/tools/decision.md for the format contract.";
@@ -456,6 +459,15 @@ impl LoadArgs {
         let mut a = Self::default();
         if let Some(v) = f.take("--model-dir")? {
             a.model_dir = Some(PathBuf::from(v));
+        }
+        // Clef-Omni: a `clef-pack` directory (detected by its manifest.json) is a model
+        // dir too; `--pack-dir` is the explicit spelling.
+        if let Some(v) = f.take("--pack-dir")? {
+            if a.model_dir.is_some() {
+                bail!("--pack-dir and --model-dir are the same setting: pass one of them");
+            }
+            a.model_dir = Some(PathBuf::from(v));
+            a.family.get_or_insert(Family::Clef);
         }
         if let Some(v) = f.take("--family")? {
             a.family = match v.as_str() {
