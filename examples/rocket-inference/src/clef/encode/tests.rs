@@ -1,11 +1,10 @@
 use super::*;
+use crate::clef::testutil::model_dir;
 use serde_json::json;
 use std::path::Path;
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
-
 fn tokenizer() -> Option<Tokenizer> {
-    let p = Path::new(MODEL_DIR).join("tokenizer.json");
+    let p = Path::new(model_dir()).join("tokenizer.json");
     if !p.exists() {
         eprintln!("skipping: {} is absent", p.display());
         return None;

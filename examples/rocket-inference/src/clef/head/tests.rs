@@ -1,10 +1,9 @@
 use super::*;
 use crate::clef::answer;
-use crate::clef::testutil::{f32s, read_npz};
+use crate::clef::testutil::{f32s, model_dir, read_npz};
 use serde_json::Value;
 use std::path::PathBuf;
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 
 // ---- strict loader (synthetic checkpoint) ----------------------------------------
@@ -287,11 +286,12 @@ fn parity(head: &ClefHead, lm: &LmHeadFile, id: &str) -> (f32, f32) {
 
 #[test]
 fn head_matches_the_oracle_dumps() {
-    let dir = PathBuf::from(MODEL_DIR);
+    let dir = PathBuf::from(model_dir());
     let dump = PathBuf::from(DUMP_DIR);
     if !dir.join("joint_head.safetensors").exists() || !dump.join("invoice.npz").exists() {
         eprintln!(
-            "skipping: Clef-Omni checkpoint or oracle dumps absent ({MODEL_DIR}, {DUMP_DIR})"
+            "skipping: Clef-Omni checkpoint or oracle dumps absent ({}, {DUMP_DIR})",
+            model_dir()
         );
         return;
     }

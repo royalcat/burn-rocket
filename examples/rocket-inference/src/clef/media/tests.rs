@@ -5,13 +5,11 @@ use crate::clef::math::softmax;
 use crate::clef::model::{ForwardOpts, Tap};
 use crate::clef::pipeline::{ClefModel, EngineKind};
 use crate::clef::request::ClefRequest;
-use crate::clef::testutil::{Npz, f32s, read_npz_keys};
+use crate::clef::testutil::{Npz, autoround_dir, f32s, model_dir, read_npz_keys};
 use serde_json::Value;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
-const AUTOROUND_DIR: &str = "/home/royalcat/models/clef-omni-int8-autoround";
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 const NL: u32 = 198;
 const ALL_FIXTURES: &[&str] = &[
@@ -309,7 +307,7 @@ fn placeholder_layout_and_positions_match_the_oracle_dumps() {
 
 #[test]
 fn encode_with_media_reproduces_the_oracle_input_ids() {
-    let tok_path = PathBuf::from(MODEL_DIR).join("tokenizer.json");
+    let tok_path = PathBuf::from(model_dir()).join("tokenizer.json");
     if !tok_path.exists() {
         eprintln!("skipping: no tokenizer at {}", tok_path.display());
         return;
@@ -547,7 +545,7 @@ fn run_gate(model: &ClefModel, ids_env: &str, tight: bool) {
 #[test]
 #[ignore = "streams the 66 GiB BF16 checkpoint per record; needs the oracle dumps (CLEF_IDS=a,b)"]
 fn media_backbone_matches_the_oracle_on_the_bf16_cpu_path() {
-    let dir = PathBuf::from(std::env::var("CLEF_MODEL_DIR").unwrap_or_else(|_| MODEL_DIR.into()));
+    let dir = PathBuf::from(std::env::var("CLEF_MODEL_DIR").unwrap_or_else(|_| model_dir().into()));
     if !dir.join("model.safetensors.index.json").exists() {
         eprintln!("skipping: no BF16 checkpoint at {}", dir.display());
         return;
@@ -561,8 +559,9 @@ fn media_backbone_matches_the_oracle_on_the_bf16_cpu_path() {
 #[test]
 #[ignore = "streams the AutoRound shards through the host emulation (ROCKET_CLEF_EMU semantics); needs the oracle dumps"]
 fn media_backbone_matches_the_oracle_on_the_emulated_int8_path() {
-    let dir =
-        PathBuf::from(std::env::var("CLEF_AUTOROUND_DIR").unwrap_or_else(|_| AUTOROUND_DIR.into()));
+    let dir = PathBuf::from(
+        std::env::var("CLEF_AUTOROUND_DIR").unwrap_or_else(|_| autoround_dir().into()),
+    );
     if !dir.join("model.safetensors.index.json").exists() {
         eprintln!("skipping: no AutoRound checkpoint at {}", dir.display());
         return;

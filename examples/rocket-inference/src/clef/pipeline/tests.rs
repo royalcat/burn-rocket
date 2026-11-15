@@ -2,11 +2,10 @@ use super::*;
 use crate::clef::Invalid;
 use crate::clef::encode::EncodedQuestion;
 use crate::clef::encode::encode_record;
-use crate::clef::testutil::{f32s, read_npz};
+use crate::clef::testutil::{f32s, model_dir, read_npz};
 use serde_json::json;
 use std::path::PathBuf;
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 
 fn eq(a: &Value, b: &Value) -> bool {
@@ -103,9 +102,9 @@ fn fixture(id: &str) -> ClefRequest {
 #[test]
 #[ignore = "streams the 66 GiB checkpoint per record; run with --ignored (CLEF_IDS=a,b to select)"]
 fn clef_answers_match_the_oracle() {
-    let dir = PathBuf::from(MODEL_DIR);
+    let dir = PathBuf::from(model_dir());
     if !dir.join("joint_head.safetensors").exists() {
-        eprintln!("skipping: {MODEL_DIR} is absent");
+        eprintln!("skipping: {} is absent", model_dir());
         return;
     }
     let ids = std::env::var("CLEF_IDS").unwrap_or_else(|_| "checkout-errors,invoice".into());

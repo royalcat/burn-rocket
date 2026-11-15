@@ -2,9 +2,9 @@
 (token ids + question/option spans) for the SystemOne fixtures plus edge cases, so the
 Rust encoder (`src/clef/encode.rs`) can be checked for IDENTICAL ids.
 
-    /home/royalcat/models/venvs/clef/bin/python -I \
+    $CLEF_VENV/bin/python -I \
         examples/rocket-inference/tools/clef_encode_expected.py \
-        --model-dir /home/royalcat/models/clef-omni \
+        --model-dir $CLEF_MODEL_DIR \
         --out examples/rocket-inference/src/clef/testdata/encode_cases.json
 
 Uses the verbatim `clef_joint_schema_model.py` next to this file (loaded by explicit path)

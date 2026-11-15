@@ -14,7 +14,7 @@ forward over the whole record answers every question jointly (no generation,
 `usage.output_tokens` is always 0). It is the same Jev/SystemOne `/v1/systemone` contract
 as the d3 family, but a separate implementation (`src/clef/`): the answer format differs.
 
-Checkpoint (66 GiB, 15 BF16 shards + `joint_head.safetensors`): `/home/royalcat/models/clef-omni`.
+Checkpoint (66 GiB, 15 BF16 shards + `joint_head.safetensors`): `$CLEF_MODEL_DIR`.
 Detection: `config.json` `model_type == "qwen3_omni_moe"` **and** `joint_head.safetensors`
 present (the plain Qwen3-Omni base does not match); `--family clef` forces it.
 
@@ -26,14 +26,14 @@ cargo build --release -p rocket-inference --no-default-features
 
 # batch: JSON arrays of cases like d3 (`name`, else `id`, is only the label; `model`
 # defaults to the model dir name)
-$B decide --model-dir /home/royalcat/models/clef-omni \
+$B decide --model-dir $CLEF_MODEL_DIR \
     --requests examples/rocket-inference/tools/clef_fixtures.json --out /tmp/clef-out.json
 # one case
-$B decide --model-dir /home/royalcat/models/clef-omni --request '{"model":"clef-omni",
+$B decide --model-dir $CLEF_MODEL_DIR --request '{"model":"clef-omni",
   "state":"Our checkout started returning errors.","questions":{"outage":{"type":"noul"}}}'
 
 # server
-$B serve --model-dir /home/royalcat/models/clef-omni --port 8399 --max-tokens 8192
+$B serve --model-dir $CLEF_MODEL_DIR --port 8399 --max-tokens 8192
 curl -s localhost:8399/v1/systemone -H 'Content-Type: application/json' -d @request.json
 ```
 
@@ -131,7 +131,7 @@ same host. The first run after a cold cache is bound by reading the 66 GiB of sh
   `tools/clef_encode_expected.py` (see `clef-oracle.md` for the venv).
 - End to end: `cargo test --release -p rocket-inference --no-default-features
   clef_answers_match_the_oracle -- --ignored --nocapture` (`CLEF_IDS=a,b` selects records;
-  needs `/home/royalcat/models/clef-omni` and the oracle dumps in `/tmp/opencode/clef/dump`,
+  needs `$CLEF_MODEL_DIR` and the oracle dumps in `/tmp/opencode/clef/dump`,
   regenerate per `clef-oracle.md`): probabilities within 1e-4 and the rounded answers equal.
 
 ## NPU placement (phase 6)
@@ -666,3 +666,14 @@ transpose) or a one-time repack. Dev-host: fmt/clippy clean, `cargo test -p rock
 --no-default-features` 260+ pass (incl. `real_shards_equal_the_real_pack_bit_for_bit`).
 Board artifacts (scratch, can be deleted): `/root/rocket-clef-s0/` (binaries v0-v3, run logs,
 outputs); the shard dir at `/mnt/nvme/models/clef-omni-int8-autoround` is the working copy.
+
+**Model storage (2026-11-15).** Both checkpoints live only in the shared HF cache
+(`HF_HOME=/mnt/BtrTrashCan/huggingface`): `Cloudflare/clef-omni` (shards 1-13 + config/tokenizer/
+joint head; shards 14-15 are talker/code2wav only and skipped) and
+`moeshawky/clef-omni-int8-autoround` (shards 1-7; shard 8 + `vllm_patch.py` skipped). Tests resolve
+them via `clef::testutil::{model_dir, autoround_dir}` (`CLEF_MODEL_DIR` / `CLEF_AUTOROUND_DIR`, else the
+newest cache snapshot). Oracle venv rebuilt at `/mnt/BtrTrashCan/venvs/clef` (`$CLEF_VENV`). 8c gates re-run
+on the real BF16 checkpoint: f32 tower cosine 1.000000000 (rel-to-peak <= 1.6e-4), image answers max|dp|
+1.9e-3 (small) / 1.6e-4 (cat), top-1 equal. Known: the 8b tight backbone gate
+(`media_backbone_matches_the_oracle_on_the_bf16_cpu_path`) fails on `media-image-cat` (layer cosine 0.99981,
+280 router set mismatches) and `media-video-audio-small` (0.999985, 25), answers still within 1.2e-4.

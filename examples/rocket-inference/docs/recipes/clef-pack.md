@@ -11,8 +11,8 @@ codes and fp16 scales, re-ordered to the `[N, K]` / `[N, K/128]` form the driver
 
 ## Source checkpoint (measured 2026-11-14)
 
-Download: `hf download moeshawky/clef-omni-int8-autoround --local-dir
-/home/royalcat/models/clef-omni-int8-autoround --max-workers 2 --exclude "*.py"` (39 GiB
+Download (into the shared HF cache, `HF_HOME=/mnt/BtrTrashCan/huggingface`; `$CLEF_AUTOROUND_DIR`
+is the newest snapshot there): `hf download moeshawky/clef-omni-int8-autoround --exclude "*.py"` (39 GiB
 = 41.6 GB, 8 shards `model-0000N-of-00008.safetensors`, ~20 min; the `*.py` files are
 not needed and not run). `joint_head.safetensors` is byte-identical to the original's.
 Index sha256 `141e09a801390be0309618ef28871d2f3c6e321ee6d84b26ef2ac4dddda794b4`.
@@ -116,12 +116,12 @@ B=$CARGO_TARGET_DIR/release/rocket-inference     # hidden subcommand, not in --h
 cargo build --release -p rocket-inference --no-default-features
 
 # pack (streaming: one layer at a time, <= 2 layer buffers of 0.6 GB + mmapped pages)
-$B clef-pack --src /home/royalcat/models/clef-omni-int8-autoround \
+$B clef-pack --src $CLEF_AUTOROUND_DIR \
     --out /home/royalcat/models/clef-pack-g128 --threads 8
 # re-read every expert O_DIRECT, compare with a fresh unpack, re-hash all files
 $B clef-pack --src ... --out ... --verify-only        # or --verify after packing
 # quantization error vs the BF16 original (no packing)
-$B clef-pack --src ... --out x --compare-bf16 /home/royalcat/models/clef-omni --layers 0..1
+$B clef-pack --src ... --out x --compare-bf16 $CLEF_MODEL_DIR --layers 0..1
 
 # use it: --pack-dir is --model-dir (a pack is detected by its manifest.json)
 $B decide --pack-dir /home/royalcat/models/clef-pack-g128 --request '{...}'

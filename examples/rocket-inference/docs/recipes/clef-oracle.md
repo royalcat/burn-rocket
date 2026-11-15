@@ -1,8 +1,9 @@
 # Clef-Omni layer-streaming oracle (phase 1)
 
 > **STATUS: VERIFIED 2026-11-14** (transformers 5.23.0, torch 2.15.0+cpu, 8 threads, dev host
-> 62 GB RAM). Checkpoint at `/home/royalcat/models/clef-omni` (66 GiB / 70.74 GB on disk,
-> 15 shards), venv at `/home/royalcat/models/venvs/clef` (1.2 GB).
+> 62 GB RAM). Checkpoint = the newest `Cloudflare/clef-omni` snapshot in the shared HF cache
+> (`$HF_HOME`=/mnt/BtrTrashCan/huggingface; `$CLEF_MODEL_DIR`, 66 GiB / 70.74 GB, 15 shards, of which
+> thinker needs 1-13), venv at `$CLEF_VENV` (1.2 GB).
 
 `tools/clef_reference.py` computes Cloudflare/clef-omni (Qwen3-Omni-30B-A3B thinker
 text decoder + `JointSchemaHead`) for text-only SystemOne records on a CPU host by
@@ -13,12 +14,15 @@ streaming ONE decoder layer at a time in float32. Peak weights in memory: one la
 
 ```sh
 # venv with CPU torch + transformers >= 5 (Qwen3OmniMoe), safetensors, huggingface_hub, numpy
-python3 -m venv /home/royalcat/models/venvs/clef
-/home/royalcat/models/venvs/clef/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
-/home/royalcat/models/venvs/clef/bin/pip install 'transformers>=5.10' safetensors huggingface_hub numpy
-# checkpoint: all 15 shards (each shard mixes layers) + tokenizer/config/joint head, ~70.5 GB
-hf download Cloudflare/clef-omni --local-dir /home/royalcat/models/clef-omni --max-workers 2
-# (do not exclude shards: each one mixes layers)
+export CLEF_VENV=/mnt/BtrTrashCan/venvs/clef      # or any venv path
+python3 -m venv $CLEF_VENV
+$CLEF_VENV/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+$CLEF_VENV/bin/pip install 'transformers>=5.10' safetensors huggingface_hub numpy
+# checkpoint: the shared HF cache (never copy it elsewhere)
+export HF_HOME=/mnt/BtrTrashCan/huggingface
+hf download Cloudflare/clef-omni --exclude 'model-00014-of-00015.safetensors' \
+    --exclude 'model-00015-of-00015.safetensors'   # shards 14-15 are talker/code2wav only
+export CLEF_MODEL_DIR=$(ls -d $HF_HOME/hub/models--Cloudflare--clef-omni/snapshots/*/ | tail -1)
 ```
 
 `tools/clef_joint_schema_model.py` is a verbatim copy of the release's
@@ -31,8 +35,8 @@ copy by explicit file path; do not use the model dir as CWD.
 
 ```sh
 cd /home/royalcat/projects/burn-rocket
-/home/royalcat/models/venvs/clef/bin/python -I examples/rocket-inference/tools/clef_reference.py \
-    --model-dir /home/royalcat/models/clef-omni \
+$CLEF_VENV/bin/python -I examples/rocket-inference/tools/clef_reference.py \
+    --model-dir $CLEF_MODEL_DIR \
     --requests examples/rocket-inference/tools/clef_fixtures.json \
     --out-dir /tmp/clef-dump --only checkout-errors,invoice --selfcheck
 ```
@@ -138,8 +142,8 @@ Determinism: two independent runs of `checkout-errors` give byte-identical array
 
 ```sh
 cd /home/royalcat/projects/burn-rocket
-/home/royalcat/models/venvs/clef/bin/python -I examples/rocket-inference/tools/clef_reference.py \
-    --model-dir /home/royalcat/models/clef-omni \
+$CLEF_VENV/bin/python -I examples/rocket-inference/tools/clef_reference.py \
+    --model-dir $CLEF_MODEL_DIR \
     --requests examples/rocket-inference/tools/clef_fixtures_media.json \
     --out-dir /tmp/opencode/clef/dump --only media-image-small --selfcheck --max-tokens 4096
 ```

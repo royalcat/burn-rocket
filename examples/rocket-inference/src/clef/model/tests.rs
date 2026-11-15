@@ -1,13 +1,12 @@
 use super::*;
 use crate::clef::head::{ClefHead, LmHeadFile, QuestionSpans};
 use crate::clef::math::{cosine, softmax};
-use crate::clef::testutil::{f32s, read_npz};
+use crate::clef::testutil::{f32s, model_dir, read_npz};
 use serde_json::Value;
 use std::path::PathBuf;
 
 include!("mini_expected.in");
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 
 // ---- tiny synthetic model (weights = closed formula, mirrored by tools/clef_mini_gen.py)
@@ -213,10 +212,13 @@ fn span(v: &Value) -> (usize, usize) {
 #[test]
 #[ignore = "streams the 66 GiB checkpoint per record; run with --ignored (CLEF_IDS=a,b to select)"]
 fn clef_backbone_parity() {
-    let dir = PathBuf::from(MODEL_DIR);
+    let dir = PathBuf::from(model_dir());
     let dump = PathBuf::from(DUMP_DIR);
     if !dir.join("model.safetensors.index.json").exists() || !dump.join("invoice.npz").exists() {
-        eprintln!("skipping: checkpoint or oracle dumps absent ({MODEL_DIR}, {DUMP_DIR})");
+        eprintln!(
+            "skipping: checkpoint or oracle dumps absent ({}, {DUMP_DIR})",
+            model_dir()
+        );
         return;
     }
     let ids_env =

@@ -5,14 +5,12 @@ use crate::clef::media::MediaFeatures;
 use crate::clef::pipeline::{ClefModel, EngineKind};
 use crate::clef::request::ClefRequest;
 use crate::clef::st::Dtype;
-use crate::clef::testutil::{f32s, read_npz_keys};
+use crate::clef::testutil::{autoround_dir, f32s, model_dir, read_npz_keys};
 use half::f16;
 use image::RgbImage;
 use serde_json::Value;
 use std::path::PathBuf;
 
-const MODEL_DIR: &str = "/home/royalcat/models/clef-omni";
-const AUTOROUND_DIR: &str = "/home/royalcat/models/clef-omni-int8-autoround";
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 
 fn app_path(rel: &str) -> PathBuf {
@@ -101,7 +99,7 @@ fn the_shipped_config_is_valid_and_matches_the_geometry_of_the_docs() {
         (72, 1536, 32, 4, 48)
     );
     // the real config.json agrees, when a checkpoint is around
-    if let Some(dir) = dir_from_env("CLEF_MODEL_DIR", MODEL_DIR) {
+    if let Some(dir) = dir_from_env("CLEF_MODEL_DIR", model_dir()) {
         assert_eq!(VisionConfig::from_dir(&dir).unwrap(), c);
     }
 }
@@ -177,7 +175,7 @@ fn images_resize_to_the_documented_grids() {
 }
 
 fn tokenizer() -> Option<tokenizers::Tokenizer> {
-    let dir = dir_from_env("CLEF_MODEL_DIR", MODEL_DIR)?;
+    let dir = dir_from_env("CLEF_MODEL_DIR", model_dir())?;
     tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).ok()
 }
 
@@ -587,7 +585,7 @@ fn decode_and_preprocessing_match_the_oracle_bit_for_bit() {
 /// Run the tower on `id`'s image and compare every tapped block, the merger output and the
 /// DeepStack taps with the oracle's f32 dump.
 fn tower_gate(id: &str, device: TowerDevice, min_cos: f64, max_rel_taps: f64, max_rel_out: f64) {
-    let Some(dir) = dir_from_env("CLEF_MODEL_DIR", MODEL_DIR) else {
+    let Some(dir) = dir_from_env("CLEF_MODEL_DIR", model_dir()) else {
         return;
     };
     let Some(path) = dump_of(id) else { return };
@@ -692,7 +690,7 @@ fn the_fp16_emulation_tracks_the_oracle_on_the_cat() {
 #[test]
 fn the_tower_opens_on_the_autoround_shards_too() {
     // the tower tensors are BF16 in both checkpoints (shards 6/7 there)
-    let Some(dir) = dir_from_env("CLEF_AUTOROUND_DIR", AUTOROUND_DIR) else {
+    let Some(dir) = dir_from_env("CLEF_AUTOROUND_DIR", autoround_dir()) else {
         return;
     };
     let Some(path) = dump_of("media-image-small") else {
@@ -787,7 +785,7 @@ fn gate_ids() -> Vec<String> {
 #[test]
 #[ignore = "streams the 66 GiB BF16 checkpoint through the f32 CPU thinker (~30 s/record); needs the dumps"]
 fn image_answers_match_the_oracle_on_the_bf16_cpu_path() {
-    let Some(dir) = dir_from_env("CLEF_MODEL_DIR", MODEL_DIR) else {
+    let Some(dir) = dir_from_env("CLEF_MODEL_DIR", model_dir()) else {
         return;
     };
     let ids = gate_ids();
@@ -805,7 +803,7 @@ fn image_answers_match_the_oracle_on_the_bf16_cpu_path() {
 #[test]
 #[ignore = "streams the AutoRound shards through the emulated int8 thinker; needs the dumps"]
 fn image_answers_stay_close_to_the_oracle_on_the_emulated_int8_path() {
-    let Some(dir) = dir_from_env("CLEF_AUTOROUND_DIR", AUTOROUND_DIR) else {
+    let Some(dir) = dir_from_env("CLEF_AUTOROUND_DIR", autoround_dir()) else {
         return;
     };
     let ids = gate_ids();

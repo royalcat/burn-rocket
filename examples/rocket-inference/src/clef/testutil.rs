@@ -1,7 +1,54 @@
-//! Shared test helpers (oracle `.npz` reader).
+//! Shared test helpers (oracle `.npz` reader, checkpoint directory resolution).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Newest snapshot directory of `repo` (`owner/name`) in the Hugging Face cache
+/// (`$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`).
+pub(crate) fn hf_snapshot(repo: &str) -> Option<PathBuf> {
+    let hub = if let Ok(c) = std::env::var("HF_HUB_CACHE") {
+        PathBuf::from(c)
+    } else if let Ok(h) = std::env::var("HF_HOME") {
+        PathBuf::from(h).join("hub")
+    } else {
+        PathBuf::from(std::env::var("HOME").ok()?).join(".cache/huggingface/hub")
+    };
+    let snaps = hub
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots");
+    std::fs::read_dir(snaps)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+fn resolve(var: &str, repo: &str, cell: &'static OnceLock<String>) -> &'static str {
+    cell.get_or_init(|| {
+        std::env::var(var)
+            .ok()
+            .or_else(|| hf_snapshot(repo).map(|p| p.display().to_string()))
+            .unwrap_or_else(|| format!("<no snapshot of {repo}; set {var} or HF_HOME>"))
+    })
+}
+
+/// BF16 `Cloudflare/clef-omni`: `$CLEF_MODEL_DIR`, else the newest HF cache snapshot.
+pub(crate) fn model_dir() -> &'static str {
+    static C: OnceLock<String> = OnceLock::new();
+    resolve("CLEF_MODEL_DIR", "Cloudflare/clef-omni", &C)
+}
+
+/// `moeshawky/clef-omni-int8-autoround`: `$CLEF_AUTOROUND_DIR`, else the newest snapshot.
+pub(crate) fn autoround_dir() -> &'static str {
+    static C: OnceLock<String> = OnceLock::new();
+    resolve(
+        "CLEF_AUTOROUND_DIR",
+        "moeshawky/clef-omni-int8-autoround",
+        &C,
+    )
+}
 
 /// Arrays of an uncompressed `np.savez` archive (zip64-aware local headers).
 pub(crate) type Npz = BTreeMap<String, (String, Vec<usize>, Vec<u8>)>;

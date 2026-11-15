@@ -3,7 +3,7 @@ Clef-style MoE decoder (hidden 64, 4 heads / 2 kv, head_dim 16, 4 experts top-2,
 inter 32) computed with `manual_layer` of clef_reference.py. The weights follow the
 closed formula in `val()` (mirrored by src/clef/model/tests.rs), so no files are needed.
 
-    /home/royalcat/models/venvs/clef/bin/python -I tools/clef_mini_gen.py <out.in>
+    $CLEF_VENV/bin/python -I tools/clef_mini_gen.py <out.in>
 """
 import importlib.util, math, sys
 from pathlib import Path
