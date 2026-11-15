@@ -224,13 +224,15 @@ impl ClefModel {
         let t0 = std::time::Instant::now();
         let out = self
             .pool
-            .install(|| tower.encode_images(&media.images, self.opts.threads))
+            .install(|| tower.encode_media(&media.images, &media.videos, self.opts.threads))
             .inspect_err(engine::raise_if_device_failure)
             .context("vision tower")?;
-        let patches: usize = media.images.iter().map(|i| i.patches()).sum();
+        let patches: usize = media.images.iter().map(|i| i.patches()).sum::<usize>()
+            + media.videos.iter().map(|v| v.patches()).sum::<usize>();
         eprintln!(
-            "clef: vision tower: {} image(s), {patches} patches -> {} tokens in {:.1}s",
+            "clef: vision tower: {} image(s), {} video(s), {patches} patches -> {} tokens in {:.1}s",
             media.images.len(),
+            media.videos.len(),
             patches / 4,
             t0.elapsed().as_secs_f64()
         );
@@ -244,6 +246,15 @@ impl ClefModel {
                 {
                     Ok(report) => eprintln!("clef: tower check images[{i}] vs f32 CPU: {report}"),
                     Err(e) => eprintln!("clef: tower check images[{i}] failed: {e:#}"),
+                }
+            }
+            for (i, v) in media.videos.iter().enumerate() {
+                match self
+                    .pool
+                    .install(|| tower.check_pixels(&v.pixels, v.grid, self.opts.threads))
+                {
+                    Ok(report) => eprintln!("clef: tower check videos[{i}] vs f32 CPU: {report}"),
+                    Err(e) => eprintln!("clef: tower check videos[{i}] failed: {e:#}"),
                 }
             }
         }

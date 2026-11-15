@@ -514,10 +514,12 @@ fn fixture(id: &str) -> Value {
             .unwrap();
     let mut v = all.into_iter().find(|c| c["id"] == id).expect("fixture");
     // fixtures say `data/...`: make them absolute against the app dir
-    if let Some(images) = v["images"].as_array_mut() {
-        for i in images {
-            let p = i.as_str().unwrap().to_string();
-            *i = Value::String(app_path(&p).to_string_lossy().into());
+    for key in ["images", "videos"] {
+        if let Some(items) = v[key].as_array_mut() {
+            for i in items {
+                let p = i.as_str().unwrap().to_string();
+                *i = Value::String(app_path(&p).to_string_lossy().into());
+            }
         }
     }
     v.as_object_mut().unwrap().remove("id");
@@ -585,42 +587,61 @@ fn decode_and_preprocessing_match_the_oracle_bit_for_bit() {
 /// Run the tower on `id`'s image and compare every tapped block, the merger output and the
 /// DeepStack taps with the oracle's f32 dump.
 fn tower_gate(id: &str, device: TowerDevice, min_cos: f64, max_rel_taps: f64, max_rel_out: f64) {
+    tower_gate_of("image", id, device, min_cos, max_rel_taps, max_rel_out)
+}
+
+/// `kind` is `"image"` or `"video"` (the dump's key prefix and pixel/grid keys).
+fn tower_gate_of(
+    kind: &str,
+    id: &str,
+    device: TowerDevice,
+    min_cos: f64,
+    max_rel_taps: f64,
+    max_rel_out: f64,
+) {
     let Some(dir) = dir_from_env("CLEF_MODEL_DIR", model_dir()) else {
         return;
     };
     let Some(path) = dump_of(id) else { return };
-    let want = oracle(
-        &path,
-        &[
-            "image_block_0",
-            "image_block_8",
-            "image_block_16",
-            "image_block_24",
-            "image_block_26",
-            "image_tower_last",
-            "image_merged",
-            "image_deepstack_0",
-            "image_deepstack_1",
-            "image_deepstack_2",
-            "media_pixel_values",
-            "media_image_grid_thw",
-        ],
+    let (px_key, grid_key) = if kind == "video" {
+        ("media_pixel_values_videos", "media_video_grid_thw")
+    } else {
+        ("media_pixel_values", "media_image_grid_thw")
+    };
+    let mut keys: Vec<String> = [0, 8, 16, 24, 26]
+        .iter()
+        .map(|k| format!("{kind}_block_{k}"))
+        .collect();
+    keys.extend(
+        [
+            "tower_last",
+            "merged",
+            "deepstack_0",
+            "deepstack_1",
+            "deepstack_2",
+        ]
+        .iter()
+        .map(|s| format!("{kind}_{s}")),
     );
-    let px = f32s(&want["media_pixel_values"].2);
-    let g: Vec<usize> = i64s(&want["media_image_grid_thw"].2)
+    keys.extend([px_key.to_string(), grid_key.to_string()]);
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let want = oracle(&path, &keys);
+    let px = f32s(&want[px_key].2);
+    let g: Vec<usize> = i64s(&want[grid_key].2)
         .iter()
         .map(|&v| v as usize)
         .collect();
-    assert_eq!(g.len(), 3, "this gate covers one image");
+    assert_eq!(g.len(), 3, "this gate covers one {kind}");
     let tower = VisionTower::open(&dir, device, 3).unwrap();
     let t0 = std::time::Instant::now();
     let out = tower
         .forward(&px, [g[0], g[1], g[2]], 8, &[0, 8, 16, 24, 26])
         .unwrap();
     eprintln!(
-        "{id}: {} on {} patches in {:.1}s",
+        "{id}: {} on {} patches ({:?}) in {:.1}s",
         tower.label(),
-        g[1] * g[2],
+        g[0] * g[1] * g[2],
+        g,
         t0.elapsed().as_secs_f64()
     );
     assert_eq!(
@@ -638,22 +659,27 @@ fn tower_gate(id: &str, device: TowerDevice, min_cos: f64, max_rel_taps: f64, ma
         check(
             &format!("block {k}"),
             &out.taps[&k],
-            &format!("image_block_{k}"),
+            &format!("{kind}_block_{k}"),
             max_rel_taps,
         );
     }
     check(
         "tower last",
         &out.taps[&26],
-        "image_tower_last",
+        &format!("{kind}_tower_last"),
         max_rel_taps,
     );
-    check("merged", &out.merged, "image_merged", max_rel_out);
+    check(
+        "merged",
+        &out.merged,
+        &format!("{kind}_merged"),
+        max_rel_out,
+    );
     for j in 0..3 {
         check(
             &format!("deepstack {j}"),
             &out.deepstack[j],
-            &format!("image_deepstack_{j}"),
+            &format!("{kind}_deepstack_{j}"),
             max_rel_out,
         );
     }
@@ -1030,4 +1056,436 @@ fn encode_images_concatenates_per_image_rows_for_the_splice() {
     assert!(rel < 1e-5, "{rel}");
     assert!(out.video.is_empty() && out.audio.is_empty());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- videos (phase 8d) ---------------------------------------------------------------
+
+fn have_ffmpeg() -> bool {
+    ["ffmpeg", "ffprobe"].iter().all(|b| {
+        std::process::Command::new(b)
+            .arg("-version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+fn is_invalid(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::clef::request::Invalid>().is_some()
+}
+
+fn video_request(videos: Vec<String>) -> ClefRequest {
+    ClefRequest::from_value(serde_json::json!({
+        "model": "clef-omni", "state": "a clip", "videos": videos,
+        "questions": {"q": {"type": "noul"}},
+    }))
+    .unwrap()
+}
+
+#[test]
+fn video_decode_and_preprocessing_match_the_oracle() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    for id in ["media-video-silent", "media-video-test"] {
+        let Some(path) = dump_of(id) else { return };
+        let fx = fixture(id);
+        let value = fx["videos"][0].as_str().unwrap();
+        let want = oracle(
+            &path,
+            &[
+                "media_video_frames_0",
+                "media_pixel_values_videos",
+                "media_video_grid_thw",
+            ],
+        );
+        let pv = ProbedVideo::open(value, 0).unwrap();
+        let (frames, sampled) = pv.decode_even().unwrap();
+        let oracle_frames = &want["media_video_frames_0"];
+        assert_eq!(
+            (
+                frames.len(),
+                frames[0].height() as usize,
+                frames[0].width() as usize
+            ),
+            (oracle_frames.1[0], oracle_frames.1[1], oracle_frames.1[2]),
+            "{id}: frame count / size ({sampled} sampled)"
+        );
+        let (mut differ, mut max_d) = (0usize, 0u8);
+        let fb = oracle_frames.1[1] * oracle_frames.1[2] * 3;
+        for (i, f) in frames.iter().enumerate() {
+            for (a, b) in f
+                .as_raw()
+                .iter()
+                .zip(&oracle_frames.2[i * fb..(i + 1) * fb])
+            {
+                if a != b {
+                    differ += 1;
+                    max_d = max_d.max(a.abs_diff(*b));
+                }
+            }
+        }
+        let p = pv.prepare(&VisionConfig::shipped(), 100_000).unwrap();
+        let want_grid: Vec<usize> = i64s(&want["media_video_grid_thw"].2)
+            .iter()
+            .map(|&v| v as usize)
+            .collect();
+        assert_eq!(p.grid.to_vec(), want_grid, "{id}: grid");
+        let want_px = f32s(&want["media_pixel_values_videos"].2);
+        assert_eq!(p.pixels.len(), want_px.len(), "{id}");
+        let (mut bad, mut max_px) = (0usize, 0f32);
+        for (a, b) in p.pixels.iter().zip(&want_px) {
+            if a.to_bits() != b.to_bits() {
+                bad += 1;
+                max_px = max_px.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "{id}: {} frames ({sampled} sampled) {}x{} -> {:?}: {differ} of {} decoded bytes differ \
+             (max {max_d}), {bad} of {} pixel values differ (max {max_px:.3e})",
+            frames.len(),
+            frames[0].width(),
+            frames[0].height(),
+            p.grid,
+            frames.len() * fb,
+            want_px.len()
+        );
+        assert_eq!(differ, 0, "{id}: ffmpeg frames differ from PyAV's");
+        assert_eq!(bad, 0, "{id}: pixel values differ");
+    }
+}
+
+#[test]
+fn a_video_record_gets_the_oracle_ids_positions_and_counts() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let (Some(tok), Some(path)) = (tokenizer(), dump_of("media-video-silent")) else {
+        return;
+    };
+    let fx = fixture("media-video-silent");
+    let req = ClefRequest::from_value(fx).unwrap();
+    let enc = encode_request(&tok, &req, 64000).unwrap();
+    let want = oracle(&path, &["input_ids", "position_ids"]);
+    let want_ids: Vec<u32> = i64s(&want["input_ids"].2)
+        .iter()
+        .map(|&v| v as u32)
+        .collect();
+    assert_eq!(enc.input_ids, want_ids, "ids differ from the oracle");
+    let media = enc.media.as_ref().unwrap();
+    assert!(media.images.is_empty() && media.videos.len() == 1);
+    assert_eq!(media.layout.video_grids, [[4, 20, 28]]);
+    assert!(!media.layout.use_audio_in_video);
+    let pos = crate::clef::media::rope_index(&enc.input_ids, &media.layout).unwrap();
+    assert_eq!(
+        pos,
+        crate::clef::media::Positions::from_flat(&f32s(&want["position_ids"].2))
+    );
+    let n_pad = |t: u32| enc.input_ids.iter().filter(|&&x| x == t).count();
+    assert_eq!(n_pad(crate::clef::media::VIDEO_PAD), 560);
+    assert_eq!(n_pad(crate::clef::media::IMAGE_PAD), 0);
+    // the block counts against the cap
+    let err = encode_request(&tok, &req, 300).unwrap_err();
+    assert!(is_invalid(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("videos[0]"), "{err:#}");
+}
+
+#[test]
+fn a_soundtrack_the_release_would_use_is_refused_but_a_silent_video_next_to_it_is_served() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let Some(tok) = tokenizer() else { return };
+    let (silent, sound) = (
+        app_path("data/clef-video-silent.mp4"),
+        app_path("data/test.mp4"),
+    );
+    if !silent.exists() || !sound.exists() {
+        return;
+    }
+    let s = |p: &PathBuf| p.to_string_lossy().to_string();
+    // every video has a track: use_audio_in_video would be true -> 422 until the audio tower
+    let err = encode_request(&tok, &video_request(vec![s(&sound)]), 64000).unwrap_err();
+    assert!(is_invalid(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("audio-in-video"), "{err:#}");
+    let err = encode_request(&tok, &video_request(vec![s(&sound), s(&sound)]), 64000).unwrap_err();
+    assert!(is_invalid(&err));
+    // one silent video makes the release ignore EVERY track: served, two video blocks
+    let enc = encode_request(&tok, &video_request(vec![s(&sound), s(&silent)]), 64000).unwrap();
+    let media = enc.media.as_ref().unwrap();
+    assert_eq!(media.layout.video_grids, [[4, 22, 30], [4, 20, 28]]);
+    assert!(!media.layout.use_audio_in_video);
+    let n_pad = enc
+        .input_ids
+        .iter()
+        .filter(|&&x| x == crate::clef::media::VIDEO_PAD)
+        .count();
+    assert_eq!(n_pad, 660 + 560);
+    // data: URLs go through the same probe
+    let bytes = std::fs::read(&sound).unwrap();
+    let url = format!(
+        "data:video/mp4;base64,{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+    );
+    let err = encode_request(&tok, &video_request(vec![url]), 64000).unwrap_err();
+    assert!(format!("{err:#}").contains("audio-in-video"), "{err:#}");
+    // a file that is no video is a client error naming the entry
+    let png = app_path("data/clef-tiny.png");
+    let not_media = app_path("Cargo.toml");
+    let err = encode_request(&tok, &video_request(vec![s(&not_media)]), 64000).unwrap_err();
+    assert!(
+        is_invalid(&err) && format!("{err:#}").contains("videos[0]"),
+        "{err:#}"
+    );
+    let err =
+        encode_request(&tok, &video_request(vec!["/nonexistent.mp4".into()]), 64000).unwrap_err();
+    assert!(
+        is_invalid(&err) && format!("{err:#}").contains("videos[0]"),
+        "{err:#}"
+    );
+    // images and videos in one record: image block first whatever the JSON order
+    let png_s = s(&png);
+    let req = ClefRequest::from_value(serde_json::json!({
+        "model": "m", "state": "x", "videos": [s(&silent)], "images": [png_s],
+        "questions": {"q": {"type": "noul"}},
+    }))
+    .unwrap();
+    let enc = encode_request(&tok, &req, 64000).unwrap();
+    let ids = &enc.input_ids;
+    let first = |t: u32| ids.iter().position(|&x| x == t).unwrap();
+    assert!(first(crate::clef::media::IMAGE_PAD) < first(crate::clef::media::VIDEO_PAD));
+}
+
+#[test]
+fn a_long_clip_is_refused_by_the_frame_cap_before_any_decode() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("clef-long-video-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let clip = dir.join("long.mp4");
+    // 40 s at 10 fps -> 80 frames sampled at 2 fps (> the default cap of 64); silent
+    let ok = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc=size=64x64:rate=10:duration=40")
+        .args(["-pix_fmt", "yuv420p"])
+        .arg(&clip)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: ffmpeg cannot synthesize the clip");
+        return;
+    }
+    let err = ProbedVideo::open(clip.to_str().unwrap(), 0).err().unwrap();
+    assert!(is_invalid(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("frames sampled"), "{err:#}");
+    // 10 s -> 20 sampled frames (even), 64x64 is upscaled to 131072+ pixels: a 10 group video
+    let short = dir.join("short.mp4");
+    assert!(
+        std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=64x48:rate=10:duration=9.7")
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&short)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let v = ProbedVideo::open(short.to_str().unwrap(), 0).unwrap();
+    assert_eq!(v.keep.len(), 20, "{:?}", v.keep);
+    assert!(!v.probe.has_audio_stream);
+    let p = v.prepare(&VisionConfig::shipped(), 100_000).unwrap();
+    // 64x48 -> smart-resize up to the 131072-pixel floor, 10 temporal groups
+    assert_eq!(p.grid[0], 10);
+    assert!(p.resized.0 * p.resized.1 >= VIDEO_MIN_PIXELS);
+    assert_eq!(p.pixels.len(), p.patches() * 1536);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn encode_media_puts_video_rows_in_the_video_slots_with_per_group_attention() {
+    let dir = synthetic_tower_dir("vid");
+    let t = VisionTower::open(&dir, TowerDevice::Cpu, 1).unwrap();
+    let (gh, gw) = (4usize, 4usize);
+    let mk = |seed: u64, groups: usize| PreparedVideo {
+        pixels: Lcg(seed).vec(groups * gh * gw * 1536),
+        grid: [groups, gh, gw],
+        source: (gh * 16, gw * 16),
+        capped: (gh * 16, gw * 16),
+        resized: (gh * 16, gw * 16),
+        sampled: groups * 2,
+    };
+    let img = PreparedImage {
+        pixels: Lcg(9).vec(gh * gw * 1536),
+        grid: [1, gh, gw],
+        source: (gh * 16, gw * 16),
+        resized: (gh * 16, gw * 16),
+    };
+    let v = mk(3, 3);
+    let out = t
+        .encode_media(std::slice::from_ref(&img), std::slice::from_ref(&v), 2)
+        .unwrap();
+    assert_eq!(out.image.len(), img.tokens() * 24);
+    assert_eq!(out.video.len(), v.tokens() * 24);
+    for d in &out.video_deepstack {
+        assert_eq!(d.len(), out.video.len());
+    }
+    // attention never crosses temporal groups: the groups of a video are independent given
+    // the same patches (a [3,h,w] run equals three [1,h,w] runs, group by group)
+    let per = gh * gw * 1536;
+    let mut stacked = Vec::new();
+    for g in 0..3 {
+        let one = t
+            .forward(&v.pixels[g * per..(g + 1) * per], [1, gh, gw], 2, &[])
+            .unwrap();
+        stacked.extend(one.merged);
+    }
+    let (cos, _, rel) = compare(&out.video, &stacked);
+    assert!(cos > 0.999_999 && rel < 1e-5, "cos {cos} rel {rel}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[ignore = "2240 patches through the f32 tower in release (~10 s); needs the BF16 checkpoint and dumps"]
+fn the_f32_tower_matches_the_oracle_on_the_silent_video() {
+    tower_gate_of(
+        "video",
+        "media-video-silent",
+        TowerDevice::Cpu,
+        0.999999,
+        5e-4,
+        1e-4,
+    );
+}
+
+#[test]
+#[ignore = "2640 patches through the f32 tower in release; needs the BF16 checkpoint and dumps"]
+fn the_f32_tower_matches_the_oracle_on_the_video_with_a_track() {
+    tower_gate_of(
+        "video",
+        "media-video-test",
+        TowerDevice::Cpu,
+        0.999999,
+        5e-4,
+        1e-4,
+    );
+}
+
+#[test]
+#[ignore = "2240 patches through the fp16 emulation; needs the BF16 checkpoint and dumps"]
+fn the_fp16_emulation_tracks_the_oracle_on_the_silent_video() {
+    tower_gate_of(
+        "video",
+        "media-video-silent",
+        TowerDevice::Emu16,
+        0.9999,
+        0.1,
+        0.05,
+    );
+}
+
+#[test]
+#[ignore = "2640 patches through the fp16 emulation; needs the BF16 checkpoint and dumps"]
+fn the_fp16_emulation_tracks_the_oracle_on_the_video_with_a_track() {
+    tower_gate_of(
+        "video",
+        "media-video-test",
+        TowerDevice::Emu16,
+        0.9999,
+        0.1,
+        0.05,
+    );
+}
+
+#[test]
+#[ignore = "streams the BF16 checkpoint through the f32 CPU thinker (~30 s); needs the dumps"]
+fn video_answers_match_the_oracle_on_the_bf16_cpu_path() {
+    let Some(dir) = dir_from_env("CLEF_MODEL_DIR", model_dir()) else {
+        return;
+    };
+    answers_gate(dir, EngineKind::Cpu, &["media-video-silent"], 5e-3);
+}
+
+#[test]
+#[ignore = "streams the AutoRound shards through the emulated int8 thinker; needs the dumps"]
+fn video_answers_stay_close_to_the_oracle_on_the_emulated_int8_path() {
+    let Some(dir) = dir_from_env("CLEF_AUTOROUND_DIR", autoround_dir()) else {
+        return;
+    };
+    // The emulated int8 thinker is far from the f32 oracle on this 796-token record even when
+    // fed the ORACLE's own tower outputs (8b gate with CLEF_IDS=media-video-silent: `motion`
+    // max |dp| 9.7e-2, final-norm cosine 0.945, 17.5k router set mismatches); the answer sits at
+    // p = 0.38, where the softmax is steep. This arm gates the video path (decode, tower,
+    // splice, DeepStack, positions) to within that band (measured 8.0e-2) with top-1 equal;
+    // the tight check is the BF16 CPU arm above (1.2e-3).
+    answers_gate(dir, EngineKind::Emu, &["media-video-silent"], 0.12);
+}
+
+/// Frames above the per-frame cap are converted by swscale to the capped size: compare the
+/// ffmpeg CLI path with the release's PyAV `load_video` on clips made for that
+/// (`/tmp/opencode/clef/vid8d/<name>.{mp4,u8,json}`, written by the PyAV dump script in the
+/// phase 8d notes in `clef.md`). Skips when the dump is absent.
+#[test]
+fn scaled_frames_match_pyav_on_clips_above_the_frame_cap() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let dir = PathBuf::from("/tmp/opencode/clef/vid8d");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        eprintln!("skipping: no {}", dir.display());
+        return;
+    };
+    let mut names: Vec<String> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()?
+                .strip_suffix(".json")
+                .map(String::from)
+        })
+        .collect();
+    names.sort();
+    for name in names {
+        let meta: Value =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{name}.json"))).unwrap())
+                .unwrap();
+        let shape: Vec<usize> = meta["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let want = std::fs::read(dir.join(format!("{name}.u8"))).unwrap();
+        let pv = ProbedVideo::open(dir.join(format!("{name}.mp4")).to_str().unwrap(), 0).unwrap();
+        let (frames, _) = pv.decode_even().unwrap();
+        assert_eq!(
+            (
+                frames.len(),
+                frames[0].height() as usize,
+                frames[0].width() as usize
+            ),
+            (shape[0], shape[1], shape[2]),
+            "{name}: frames / size"
+        );
+        let fb = shape[1] * shape[2] * 3;
+        let (mut differ, mut max_d) = (0usize, 0u8);
+        for (i, f) in frames.iter().enumerate() {
+            for (a, b) in f.as_raw().iter().zip(&want[i * fb..(i + 1) * fb]) {
+                if a != b {
+                    differ += 1;
+                    max_d = max_d.max(a.abs_diff(*b));
+                }
+            }
+        }
+        eprintln!(
+            "{name}: source {}x{} -> {}x{}, {} frames: {differ} of {} bytes differ from PyAV (max {max_d})",
+            pv.probe.width,
+            pv.probe.height,
+            shape[2],
+            shape[1],
+            shape[0],
+            frames.len() * fb
+        );
+        assert_eq!(differ, 0, "{name}: scaled frames differ from PyAV");
+    }
 }

@@ -3252,7 +3252,7 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
   **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
   code complete, dev-host verified, board-verified for 142-800 tokens (2026-11-14: 38.7 s / 51.6 s / 103 s, <= 0.9 GiB anon, answers match the oracle)**, below. Phase 7 batching is **board-verified** (2026-11-14: 4 requests 107 s batched vs 179 s single, byte-identical answers; `clef.md`). Text-only deployment recipe: `clef.md` "Deployment (text-only, current)". Remaining (plan
-  numbering): 8 media towers (8c image done, below; audio/video: 422 "not implemented yet"), 9 deploy/docs.
+  numbering): 8 media towers (8c image and 8d silent video done, below; audio and audio-in-video: 422 "not implemented yet"), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
   `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
   (`moeshawky/clef-omni-int8-autoround`, local `/home/royalcat/models/clef-omni-int8-autoround`,
@@ -3390,6 +3390,33 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   before), `Shards::open_with`, `attn::gemm_strided` `pub(crate)`, new `half` dep. Details, tables and the
   board commands: `clef.md` "Vision tower and image requests". The AutoRound shards 1-7 used for the
   gates are in `/home/royalcat/.cache/clef-8c-dl/autoround` (37 GiB; the original `models/` dir was gone).
+- **Phase 8d, video requests (2026-11-15, uncommitted; dev-host verified, NOT run on the board)**: `videos`
+  work end to end for SILENT videos (path / `data:` / `http(s)`; `serve` + `decide`). The release uses soundtracks only
+  when EVERY video has one (`use_audio_in_video = all(track is not None)`), so a record where it would is a 422
+  `audio-in-video is not implemented yet` (cheap ffprobe + first-audio-stream decode, before any frame decode); one
+  silent video makes the oracle ignore all tracks, so those records are served; `audio` stays a 422. Files:
+  `src/clef/vision/video.rs` (ffprobe pts + the 2 fps time rule `pts*num/den + 1e-6 < kept/2`, the 262,144-px frame cap
+  with Python-round-to-even sizes, ONE ffmpeg run `-noautorotate select=... scale=W:H:flags=bilinear:in_h_chr_pos=0:
+  in_v_chr_pos=128,format=rgb24`, video `smart_resize` 131,072..786,432 px, per-frame bicubic-aa resize, `patchify_pairs`
+  over frame pairs, odd count duplicates the last frame), `ProbedVideo`/`PreparedVideo`, `VisionTower::encode_media`
+  (one tower run per image/video, per-temporal-group attention and DeepStack reuse 8c), `encode::encode_request`
+  (probe all -> soundtrack refusal -> decode with the remaining token budget; images then videos in the block),
+  `RecordMedia.videos`, `ClefRequest.{videos,has_audio}` (`has_audio_video` is gone), `ClefModel::media_features`
+  (log line + `ROCKET_CLEF_TOWER_CHECK` for videos), NPU `matmul` chunking at 4,096 rows, `systemone.rs` clef-pack
+  check covers videos. **Frame cap**: `ROCKET_CLEF_VIDEO_MAX_FRAMES` (default 64 sampled frames) else 422; the video
+  also counts toward `--max-tokens` (refused before any resize). **Trap found**: the ffmpeg scale filter alone differs
+  from PyAV's `to_ndarray(rgb24, w, h)` by up to 66/255 on scaled clips (chroma siting from stream metadata);
+  `in_h_chr_pos=0:in_v_chr_pos=128` makes it bit-identical. **Gates** (dev host): frames and pixel values
+  bit-identical to the oracle for `media-video-silent` (0/3,440,640) and `media-video-test` (0/4,055,040, 480x360);
+  scaled clips (1280x720+AAC, 640x480, NTSC rate) 0 differing bytes vs PyAV 19.0.2 (`tools/clef_pyav_video_dump.py`,
+  the oracle venv has no `av` any more); ids/positions equal; f32 tower cosine 1.0, merged rel 1.9e-5 / 2.2e-5,
+  DeepStack <= 2.7e-5; fp16 emulation cosine >= 0.99998; BF16 CPU answers max |dp| 1.2e-3 (top-1 equal);
+  emulated int8 8.0e-2 (the 8b gate with the oracle's own tower outputs gives 9.7e-2 on that question, so it is the
+  int8 thinker's band); serve smoke 200 for silent videos (path and data URL), 422 for audio-bearing/`audio`/non-video/
+  over-cap. 306 tests pass (+17 ignored); fmt and non-test clippy clean, aarch64 `npu` release build and clippy clean in
+  `src/clef`. Details, tables and board commands: `clef.md` "Video requests". Caveats: ffmpeg-version sensitivity of the
+  YUV->RGB step (board has 7.1.5; not measured for Clef), `ffprobe -show_frames` decodes the whole file, soundtrack
+  videos stay refused until the audio tower (8e/8f).
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

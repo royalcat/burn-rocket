@@ -33,6 +33,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const PACK_M: usize = 512;
 /// `ROCKET_E_RANGE`.
 const E_RANGE: i32 = -6;
+/// Rows per resident matmul call (the d3/emb2 `ROCKET_MATMUL_CHUNK_M` idea, fixed here): a
+/// video's `[P, 4320]` fp16 input BO would otherwise reach hundreds of MiB.
+const MAX_ROWS: usize = 4096;
 
 pub struct NpuExec {
     ctx: Mutex<RocketCtx>,
@@ -136,6 +139,15 @@ impl Exec for NpuExec {
         m: usize,
         _threads: usize,
     ) -> Result<Vec<f32>> {
+        // A video is many thousands of rows (a 2-frame 20x28 group alone is 560): bound the
+        // per-call input/output BOs. Rows are independent, so chunking is bit-identical.
+        if m > MAX_ROWS {
+            let mut y = Vec::with_capacity(m * lin.n);
+            for c in x.chunks(MAX_ROWS * lin.k) {
+                y.extend(self.matmul(lin, _shards, c, c.len() / lin.k, _threads)?);
+            }
+            return Ok(y);
+        }
         let (k, n) = (lin.k, lin.n);
         let (kp, np) = (up(k, 32), up(n, 16));
         let mp = up(m.max(1), 4);

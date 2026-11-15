@@ -46,12 +46,19 @@ mod npu;
 mod preprocess;
 #[cfg(test)]
 mod tests;
+mod video;
 
 pub use compute::{Exec, TowerDevice};
 #[allow(unused_imports)]
 pub use preprocess::{
     IMAGE_MAX_PIXELS, IMAGE_MIN_PIXELS, MAX_SOURCE_PIXELS, PreparedImage, load_rgb,
     normalize_channel, patchify_pairs, prepare_image, prepare_value,
+};
+#[allow(unused_imports)]
+pub use video::{
+    DEFAULT_MAX_VIDEO_FRAMES, PreparedVideo, ProbedVideo, SOUNDTRACK_NOT_IMPLEMENTED, VIDEO_FPS,
+    VIDEO_FRAME_MAX_PIXELS, VIDEO_MAX_PIXELS, VIDEO_MIN_PIXELS, VideoProbe, audio_has_samples,
+    capped_size, decode_frames, max_video_frames, prepare_video, probe_video, sample_frames,
 };
 
 /// `thinker.visual.` tensors of the checkpoint.
@@ -592,6 +599,27 @@ impl VisionTower {
         Ok(out)
     }
 
+    /// Encode a record's images and videos into the thinker's [`TowerOutputs`]: images first
+    /// (their rows and DeepStack taps in `image*`), then videos (`video*`), each item its own
+    /// tower run in record order (HF runs `get_image_features` and `get_video_features`
+    /// apart; the tower attends per temporal group, so a video is `t` independent segments).
+    pub fn encode_media(
+        &self,
+        images: &[PreparedImage],
+        videos: &[PreparedVideo],
+        threads: usize,
+    ) -> Result<TowerOutputs> {
+        let mut out = self.encode_images(images, threads)?;
+        for v in videos {
+            let r = self.forward(&v.pixels, v.grid, threads, &[])?;
+            out.video.extend_from_slice(&r.merged);
+            for (dst, src) in out.video_deepstack.iter_mut().zip(&r.deepstack) {
+                dst.extend_from_slice(src);
+            }
+        }
+        Ok(out)
+    }
+
     /// One tower run over `[P, 1536]` pixel rows of a `[t, h, w]` patch grid; `taps` lists block
     /// outputs to keep (pre-merge). An fp16 range overflow of the placement reruns the whole
     /// tower on the CPU in f32.
@@ -617,8 +645,14 @@ impl VisionTower {
     /// are (cosine, max |d| relative to the peak). This is how the NPU numerics are checked on
     /// the board without a separate probe binary.
     pub fn check_against_cpu(&self, img: &PreparedImage, threads: usize) -> Result<String> {
-        let a = self.forward(&img.pixels, img.grid, threads, &[])?;
-        let b = self.run(&self.cpu, &img.pixels, img.grid, threads, &[])?;
+        self.check_pixels(&img.pixels, img.grid, threads)
+    }
+
+    /// [`VisionTower::check_against_cpu`] for any `[P, 1536]` rows of a `[t, h, w]` grid (a
+    /// video's temporal groups included).
+    pub fn check_pixels(&self, pixels: &[f32], grid: [usize; 3], threads: usize) -> Result<String> {
+        let a = self.forward(pixels, grid, threads, &[])?;
+        let b = self.run(&self.cpu, pixels, grid, threads, &[])?;
         let mut parts = Vec::new();
         for (name, x, y) in std::iter::once(("merged", &a.merged, &b.merged)).chain(
             ["deepstack0", "deepstack1", "deepstack2"]

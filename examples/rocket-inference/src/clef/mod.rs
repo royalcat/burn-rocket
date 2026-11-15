@@ -2,7 +2,7 @@
 //! port of the head (phase 2) and of the layer-streamed thinker text decoder (phase 3).
 //! Phase 4 adds the text-only encoder, request validation and the `ClefModel` pipeline
 //! behind `decide` and `serve`; phase 6 puts the thinker on the NPU, phase 8b adds the media
-//! plumbing and 8c the vision tower (`images` requests).
+//! plumbing, 8c the vision tower (`images` requests) and 8d `videos` (silent ones).
 #![allow(dead_code)]
 
 pub mod answer;

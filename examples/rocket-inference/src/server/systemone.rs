@@ -111,8 +111,9 @@ pub(crate) async fn systemone(
 /// `POST /v1/systemone` for Clef-Omni: the release's `systemone()` contract. The body is
 /// validated like the Python entry point (`model` and `state` required, a nonempty
 /// `questions` object, types and criteria); a refusal (including a request carrying
-/// audio or videos, which are not implemented yet, an image the server cannot read or
-/// decode, and a record, images included, over the prompt cap) is `422 {"detail": "<reason>"}` immediately and runs nothing. A valid
+/// audio (not implemented yet), videos whose soundtracks the model would use (audio-in-video,
+/// not implemented yet), an image or video the server cannot read or decode, and a record, media
+/// included, over the prompt cap) is `422 {"detail": "<reason>"}` immediately and runs nothing. A valid
 /// request is encoded, queued, answered together with whatever shares its batch
 /// (`--batch-window-ms`, `--batch-max`, `--batch-max-tokens`) and returns
 /// `{"model", "answers", "usage"}`; the answer does not depend on its batch mates.
@@ -133,10 +134,10 @@ pub(crate) async fn systemone_clef(
         .ok_or_else(|| DecisionError::from_api(ApiError::internal("no Clef model is loaded")))?;
     // Encode before queueing: a record over the cap is a 422 now, and the batcher knows
     // each job's exact row count.
-    if !request.images.is_empty() && !front.images {
+    if (!request.images.is_empty() || !request.videos.is_empty()) && !front.images {
         return Err(DecisionError::unprocessable(
-            "this deployment serves a clef-pack, which has no vision tower: image input is \
-             unavailable (serve the BF16 checkpoint or the AutoRound shards)"
+            "this deployment serves a clef-pack, which has no vision tower: image and video \
+             input is unavailable (serve the BF16 checkpoint or the AutoRound shards)"
                 .to_string(),
         ));
     }

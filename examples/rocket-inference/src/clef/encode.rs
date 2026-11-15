@@ -19,7 +19,10 @@
 
 use super::media::{MediaLayout, build_media_ids};
 use super::request::{ClefRequest, Invalid, question_type_index};
-use super::vision::{PreparedImage, VisionConfig, prepare_value};
+use super::vision::{
+    PreparedImage, PreparedVideo, ProbedVideo, SOUNDTRACK_NOT_IMPLEMENTED, VisionConfig,
+    prepare_value,
+};
 use anyhow::{Context, Result};
 use serde_json::{Number, Value};
 use std::sync::Arc;
@@ -212,6 +215,7 @@ impl EncodedQuestion {
 pub struct RecordMedia {
     pub layout: MediaLayout,
     pub images: Vec<PreparedImage>,
+    pub videos: Vec<PreparedVideo>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -353,13 +357,20 @@ pub fn encode_record_with_media(
     })
 }
 
-/// [`encode_record`] for any request this build serves: text-only, or with `images`.
+/// [`encode_record`] for any request this build serves: text-only, with `images`, with
+/// `videos`, or both.
 ///
-/// Images are fetched/decoded/preprocessed here (client errors are [`Invalid`]), their grids
-/// give the placeholder block (`<|vision_start|> <|image_pad|> x n <|vision_end|>` + `\n` per
-/// image, in request order), and the block counts toward `max_length` like the release's
-/// `fixed_length`. The prepared pixel rows travel with the record to the thinker pass.
-/// Audio/video requests are refused ([`ClefRequest::media_refusal`]).
+/// Images and videos are fetched/decoded/preprocessed here (client errors are [`Invalid`]);
+/// their grids give the placeholder block (`<|vision_start|> <|image_pad|>|<|video_pad|> x n
+/// <|vision_end|>` + `\n` per item; images, then videos, whatever the JSON order) and the block
+/// counts toward `max_length` like the release's `fixed_length`. The prepared pixel rows travel
+/// with the record to the thinker pass.
+///
+/// Videos (phase 8d) are silent-only: the release feeds the soundtracks to the audio tower
+/// when EVERY video of the record has one (all-or-nothing), which this build cannot do, so such
+/// a record is refused with [`SOUNDTRACK_NOT_IMPLEMENTED`] after a cheap probe (before any
+/// frame is decoded). A record with at least one silent video is served: the release ignores
+/// every track then. `audio` requests are refused ([`ClefRequest::media_refusal`]).
 pub fn encode_request(
     tok: &Tokenizer,
     request: &ClefRequest,
@@ -368,7 +379,7 @@ pub fn encode_request(
     if let Some(refusal) = request.media_refusal() {
         return Err(refusal.into());
     }
-    if request.images.is_empty() {
+    if request.images.is_empty() && request.videos.is_empty() {
         return encode_record(tok, request, max_length, None);
     }
     let cfg = VisionConfig::shipped();
@@ -387,13 +398,54 @@ pub fn encode_request(
         }
         images.push(img);
     }
+    // Probe every video first (cheap), so a soundtrack refusal costs no decode.
+    let probed = request
+        .videos
+        .iter()
+        .enumerate()
+        .map(|(i, value)| ProbedVideo::open(value, i))
+        .collect::<Result<Vec<_>>>()?;
+    // use_audio_in_video = all(track is not None): only when EVERY video is heard is the
+    // record one this build cannot encode; a silent video makes the release ignore all tracks.
+    if !probed.is_empty() && probed.iter().all(|v| v.probe.has_audio_stream) {
+        let tracks = probed
+            .iter()
+            .map(ProbedVideo::has_soundtrack)
+            .collect::<Result<Vec<_>>>()?;
+        if tracks.iter().all(|&t| t) {
+            return Err(Invalid(SOUNDTRACK_NOT_IMPLEMENTED.into()).into());
+        }
+    }
+    let mut videos = Vec::with_capacity(probed.len());
+    for (i, video) in probed.iter().enumerate() {
+        // the grid is known before any pixel work: refuse a video that cannot fit up front
+        let budget = max_length.saturating_sub(media_tokens + 3);
+        let v = video.prepare(&cfg, budget)?;
+        eprintln!(
+            "clef: videos[{i}]: {}x{} source, {} sampled frames at {}x{} -> grid {:?}, {} tokens",
+            v.source.1,
+            v.source.0,
+            v.sampled,
+            v.resized.1,
+            v.resized.0,
+            v.grid,
+            v.tokens()
+        );
+        media_tokens += v.tokens() + 3;
+        videos.push(v);
+    }
     let layout = MediaLayout {
         image_grids: images.iter().map(|i| i.grid).collect(),
+        video_grids: videos.iter().map(|v| v.grid).collect(),
         ..Default::default()
     };
     let media_ids = build_media_ids(&layout, newline_token(tok)?)?;
     let mut enc = encode_record_with_media(tok, request, max_length, None, &media_ids)?;
-    enc.media = Some(Arc::new(RecordMedia { layout, images }));
+    enc.media = Some(Arc::new(RecordMedia {
+        layout,
+        images,
+        videos,
+    }));
     Ok(enc)
 }
 

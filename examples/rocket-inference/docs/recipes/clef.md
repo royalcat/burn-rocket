@@ -3,8 +3,9 @@
 > **STATUS 2026-11-14 (phase 6): text-only. CPU path dev-host verified; the NPU expert
 > streaming path is code complete and verified on the dev host through its host
 > emulation (`ROCKET_CLEF_EMU=1`), an aarch64 cross build and unit tests. NOT yet run on the
-> board.** Audio and video are refused (422) until their towers are ported; **images are served
-> since phase 8c** (see "Vision tower and image requests").
+> board.** Audio (and videos whose soundtrack the model would use) are refused (422) until the
+> audio tower is ported; **images are served since phase 8c** (see "Vision tower and image
+> requests") and **silent videos since phase 8d** (see "Video requests").
 > Phase 5 adds `--pack-dir` (the int8 pack, `clef-pack.md`): same flags, packed weights.
 > Phase 6 makes `--device npu` work with a pack (see "NPU placement" below).
 
@@ -66,8 +67,8 @@ validation (`model and state are required`, `at least one question is required`,
 `<id>: type must be noul, choice, or score`, `<id>: criteria must not be empty`), a
 schema larger than the cap (`schema requires N tokens before state; maximum is M`, media
 tokens included), an unreadable/undecodable image (`images[i]: ...`), `media_kwargs`, and any
-request carrying `audio`/`videos`
-(`Clef-Omni audio/video input is not implemented yet ...`). Compute failures are 500.
+request carrying `audio`, or `videos` that all have a soundtrack
+(`Clef-Omni audio input / audio-in-video is not implemented yet ...`). Compute failures are 500.
 
 ## Flags and limits
 
@@ -282,7 +283,8 @@ Board check: see "Board test, phase 7" below.
 ## Media plumbing in the thinker (phase 8b, 2026-11-14)
 
 `src/clef/media.rs` is everything between "the towers produced features" and "the decoder
-ran"; the image tower exists since 8c (below), `audio`/`videos` still get the 422 until 8d-8f.
+ran"; the image tower exists since 8c (below), `audio` and soundtrack-bearing videos still get the 422 until the audio tower (8e/8f); videos
+without sound are served since 8d (see "Video requests").
 
 * **Placeholder block**: `MediaLayout { image_grids, video_grids, audio_frames (mel frames, explicit
   clips first then one soundtrack per video iff use_audio_in_video), explicit_audio,
@@ -326,7 +328,7 @@ ran"; the image tower exists since 8c (below), `audio`/`videos` still get the 42
 `images` requests work end to end: `POST /v1/systemone` and `decide` accept
 `"images": ["<path>" | "data:image/png;base64,..." | "https://..."]` (same fetch/decode helpers as the
 EmbeddingGemma 2 server: 20 MiB, 10 s, 3 redirects, `ROCKET_MEDIA_FETCH=0` disables URLs; relative
-`decide` paths resolve from the working directory). `audio`/`videos` are still a 422 ("not implemented
+`decide` paths resolve from the working directory). `audio` is still a 422 ("not implemented
 yet"), `media_kwargs` is a 422, a source decoded above 16 MP is a 422 (this port's own memory guard).
 A client error in an image is a 422 naming `images[i]`.
 
@@ -442,9 +444,115 @@ thinker's expert-stream wall is unchanged and the peak anon (the tower's mapped 
 every request). To measure the tower alone, compare the `vision tower` seconds against
 `ROCKET_CLEF_TOWER_DEVICE=cpu`.
 
+## Video requests (phase 8d, 2026-11-15)
+
+`videos` requests work end to end for **silent** videos: `POST /v1/systemone` and `decide` accept
+`"videos": ["<path>" | "data:video/mp4;base64,..." | "https://..."]` (same fetch helpers and limits as
+images: 20 MiB, 10 s, 3 redirects, `ROCKET_MEDIA_FETCH=0`). Files go through ffprobe/ffmpeg (the same
+binaries EmbeddingGemma 2 and d3 use; the image installs them). Several videos and images can share a
+record; the block order is images, then videos whatever the JSON order.
+
+**Soundtrack policy.** The release uses the tracks of the videos only when EVERY video of a record has
+one (`use_audio_in_video = all(track is not None)`); one silent video makes it ignore all tracks. The
+audio tower does not exist yet, so: a record where the release WOULD use the tracks (every video has an
+audio stream with at least one sample) is a **422** `Clef-Omni audio-in-video is not implemented yet ...`,
+decided by a cheap ffprobe/ffmpeg probe before any frame is decoded; a record with at least one silent
+video is served (tracks ignored, exactly as the oracle treats it). An `audio` field is still a 422. The
+probe asks ffprobe for an audio stream and then decodes the first one (16 kHz mono f32) to count samples,
+the release's `_decode_audio is None` rule.
+
+Files: `src/clef/vision/video.rs` (probe, time rule, ffmpeg decode, processor), `ProbedVideo` /
+`PreparedVideo`, `VisionTower::encode_media` (images + videos, one tower run per item), `encode::
+encode_request` (probe all -> soundtrack refusal -> decode/prepare each with the remaining token budget),
+`ClefModel::media_features` (the tower, `rope_index`, `MediaFeatures::assemble`: video pad rows + DeepStack
+for the video pad positions, per `media.rs` of 8b, which already had the video layout/positions),
+`RecordMedia.videos`, `ClefRequest.videos`/`has_audio`.
+
+* **Sampling** (`sample_frames`): the release's time rule, `frame.time is None or frame.time + 1e-6 <
+  len(kept)/2.0` -> skip; `frame.time = pts * time_base` from ffprobe (`frame=pts` of the first video stream
+  in decode/presentation order + the stream `time_base`, computed as `pts * num / den` like PyAV); an odd count
+  repeats the last frame. **Frame cap** (this port's, the release has none): more than
+  `ROCKET_CLEF_VIDEO_MAX_FRAMES` (default 64, i.e. 32 temporal groups) sampled frames is a 422 before any
+  decode. A source above 16 MP, a file without a video stream and an ffmpeg decode failure are 422s naming
+  `videos[i]`.
+* **Per-frame cap** (`capped_size`): `scale = min(1, sqrt(262144 / (w*h)))`, `width = max(2,
+  round(w*scale/2)*2)` (ties to even, applied even when no scaling happens: 481 -> 480). One ffmpeg run:
+  `-noautorotate -map 0:v:0 -vf "select='eq(n\,i)+...',scale=W:H:flags=bilinear:in_h_chr_pos=0:in_v_chr_pos=128,
+  format=rgb24" -fps_mode passthrough -f rawvideo`. **The chroma-position options matter**: PyAV's
+  `to_ndarray(format="rgb24", width, height)` is swscale bilinear with swscale's default siting (4:2:0 =
+  horizontal 0, vertical 128); the ffmpeg scale filter alone derives a different siting from the stream's
+  chroma-location metadata and differs by up to 66/255 on a scaled clip (found by sweeping PyAV's
+  `interpolation` and the filter flags; `-noautorotate` because PyAV ignores rotation side data).
+* **Processor**: `smart_resize` with the VIDEO table (131,072..786,432 px, factor 32; small clips are
+  upscaled), per-frame ATen antialiased bicubic uint8 resize (the same port as images), `(v - 127.5)/127.5`,
+  frames paired into temporal groups, rows `[channel, temporal 2, py, px]` in merge-block order per group
+  (`patchify_pairs`). The grid is `[frames/2, h/16, w/16]`; tokens = `t*h*w/4`, each video adds
+  `tokens + 3` (`<|vision_start|>`, `<|vision_end|>`, `\n`) to the record's count and is refused up front
+  (before any resize) when it does not fit `--max-tokens`.
+* **Tower and thinker**: the 8c tower is reused unchanged (per temporal group attention segments, position
+  table repeated per group, DeepStack taps of the video run feeding the video pad positions; video position
+  ids `13 * group` on the time stream, `second_per_grid = 1.0`). The lazy tower and its NPU contexts are
+  shared with images. NPU: attention already ran per segment (a frame group is at most 3,072 patches); the
+  resident matmul now chunks above 4,096 rows (`MAX_ROWS`, bit-identical: rows are independent) so a video's
+  `[P, 4320]` fp16 input BO stays bounded. `ROCKET_CLEF_TOWER_CHECK=1` also checks `videos[i]` against the f32
+  CPU. aarch64 `npu` release build and clippy are clean; **not run on hardware**.
+
+### Gates (dev host, 8 threads; oracle dumps `/tmp/opencode/clef/dump`, BF16 checkpoint for the towers)
+
+| gate | result |
+|---|---|
+| decoded frames vs the oracle's `media_video_frames_0` (PyAV) | `media-video-silent` 8 frames 192x144: **0 of 663,552 bytes differ**; `media-video-test` 8 frames 480x360: **0 of 4,147,200** |
+| pixel values vs `media_pixel_values_videos`, grids `[4,20,28]` / `[4,22,30]` | **0 of 3,440,640 / 0 of 4,055,040 values differ** (bit-identical) |
+| scaled frames vs PyAV 19.0.2 `load_video` (clips above the frame cap: 1280x720 with AAC -> 682x384, 640x480 -> 592x444, NTSC 30000/1001 fps) | **0 differing bytes** in all three (6 frames each; frame count and sizes equal) |
+| ids vs oracle `input_ids` (`media-video-silent`, 796 tokens, 560 video pads) and `rope_index` vs `position_ids` | equal |
+| tower f32 CPU (`media-video-silent` 2,240 patches in 4.6 s; `media-video-test` 2,640 in 5.4 s) | cosine 1.000000000 on every tap; rel-to-peak: blocks 0/8/16/24 <= 8.1e-6, block 26 5.9e-5 / 1.3e-4, merged **1.9e-5 / 2.2e-5**, DeepStack 3.6e-6 / 2.3e-5 / 2.3e-5 and 2.1e-6 / 1.4e-5 / 2.7e-5 |
+| tower fp16 emulation (what the NPU should reach) | silent: cosine 0.99998739 (block 26), merged 0.99999233, DeepStack 0.99999874 / 0.99999388 / 0.99999146; test: 0.99998322, 0.99999066, 0.99999939 / 0.99999724 / 0.99999285 |
+| answers, BF16 f32 CPU thinker (`media-video-silent`) | max \|dp\| **1.2e-3**, top-1 equal, 796 tokens, 35 s (image-small on the same path: 1.9e-3) |
+| answers, emulated int8 thinker on the AutoRound shards | max \|dp\| 8.0e-2, top-1 equal, 66.7 s. The 8b gate with the ORACLE's own tower outputs gives 9.7e-2 on the same `motion` question (p = 0.38, final-norm cosine 0.945, 17.5k router set mismatches), so this is the int8 thinker's band on a long record, not the video path |
+| `serve` smoke (emulated engine, `--max-tokens 4096`) | silent video by path and as a `data:` URL: 200, 711 tokens, `motion` 0.298 (59 s each); `test.mp4` (has AAC), a `data:` clip with AAC, `audio` field, a non-video file, 8 copies over the token cap: all 422 with the reason; `/health` stays ok |
+
+Unit tests (`cargo test -p rocket-inference --no-default-features`: 306 pass, 17 ignored): the time rule
+(8/25/30 fps, the 1e-6 tolerance, missing pts), the frame-cap rounding, the VIDEO smart-resize table, the
+temporal pairing layout, the budget refusal, the request parsing, soundtrack refusal vs "one silent video
+makes it ignore every track", data-URL probing, the frame cap on a generated 40 s clip, the 20-frame
+upscaled clip, `encode_media` slots + "a `[3,h,w]` run equals three `[1,h,w]` runs". The ignored gates run
+with `cargo test --release -p rocket-inference --no-default-features -- --ignored --nocapture
+clef::vision::tests::the_f32_tower clef::vision::tests::the_fp16 clef::vision::tests::video_answers`
+(`HF_HOME=/mnt/BtrTrashCan/huggingface`). The PyAV scaled-frame dump is `tools/clef_pyav_video_dump.py`
+(needs `av` + `numpy` in a scratch venv; the oracle venv no longer has `av`).
+
+**Caveats.** (1) Decoder-version sensitivity: the bit-identity above is ffmpeg n9.0.2 CLI vs PyAV 19.0.2 (its
+own bundled libswscale). An ffmpeg of another major (the board's Debian 7.1.5) can convert YUV->RGB 1-2/255
+differently (d3 saw 2/255 on the board vs the dev host, AGENTS.md); not measured for Clef. (2) `ffprobe -show_frames`
+decodes the whole video to list pts (cost ~ one decode; fine for the frame cap's clip lengths, slow for long 1080p
+files, which the 20 MiB fetch limit and the 64-frame cap bound for URLs/uploads; local paths are unbounded).
+(3) Frame times use ffprobe's `pts` of the first video stream; a stream with unset pts keeps no frames (PyAV:
+`time is None`). (4) A still image file given as a video (one frame) is accepted, as PyAV would. (5) Videos with a
+soundtrack stay refused until the audio tower; mixing them with a silent video works but the release then also
+ignores the track of the audible one.
+
+### Board commands for 8d
+
+```sh
+# aarch64 build as for 8c; copy as rocket-inference-p8d, plus data/ (the three mp4s) and tools/clef_fixtures_media.json
+python3 -c "import json;a=json.load(open('tools/clef_fixtures_media.json'));json.dump([c for c in a if c['id']=='media-video-silent'],open('/tmp/vid_cases.json','w'))"
+cd /root/rocket-inference
+ROCKET_CLEF_TOWER_CHECK=1 ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference-p8d decide \
+    --model-dir /mnt/nvme/models/clef-omni-int8-autoround --device npu \
+    --requests /tmp/vid_cases.json --out /tmp/clef-vid.json
+```
+
+Expect `clef: videos[0]: 192x144 source, 8 sampled frames at 448x320 -> grid [4, 20, 28], 560 tokens`, the tower
+line (`1 video(s), 2240 patches -> 560 tokens`; the CPU does it in ~4 s here, the NPU tower should be a few seconds), and
+`tower check videos[0] vs f32 CPU: merged cos >= 0.9999, deepstack0..2 >= 0.9999` (fp16 emulation: 0.99998-0.999999;
+below 0.999 is a device/layout problem: try `ROCKET_CLEF_TOWER_DEVICE=cpu`). The answer should be near the dev host's
+`motion 0.298` (emulated int8) within the usual |dp| ~0.1 on this record. Check the ffmpeg frames on the board against
+the dev host (`ffmpeg` 7.1.5 vs n9.0.2): the `video.frames` count and, if answers drift, dump both sides' frames. A
+request with `data/test.mp4` must answer 422 `audio-in-video`.
+
 ## Not done
 
-Audio/video inputs (audio tower 8d, video 8e, decoding 8f: `audio`/`videos` are a 422), `media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a board run of the vision tower.
+Audio inputs and audio-in-video (audio tower, 8e/8f: `audio` and all-soundtrack `videos` are a 422), `media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a board run of the vision tower.
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 
@@ -532,7 +640,7 @@ rocket-inference serve --pack-dir /models/clef-pack-g128 --device npu \
   `mem_limit` 3g is enough (NPU buffers are not charged to the cgroup, ~1 GiB more on top).
 - Image inputs work since phase 8c (needs the BF16 checkpoint or the AutoRound shards, a `clef-pack` has no
   tower: HTTP 422 for images; +~1.07 GiB of NPU BOs on top of the thinker once the first image request has
-  packed the tower). Audio/video inputs are still a 422 (phase 8d-8f).
+  packed the tower). `audio` and soundtrack-bearing videos are still a 422; silent videos work (phase 8d, "Video requests").
 - The measured per-request times and the knobs are in the phase 6/7 sections above.
 
 ## Step 0: serving straight from the AutoRound shards (no repack)
