@@ -3466,6 +3466,25 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   ignored (two new ignored real-model gates), fmt/clippy clean, aarch64 `npu` release build ok (the 6 aarch64
   clippy errors are pre-existing in `rocket-npu`, not `src/clef`). Details + board commands: `clef.md` "Mixed
   batches … (phase 8f)".
+- **Board verification, media (2026-11-16)**: the vision/audio towers, image/video/audio/
+  audio-in-video requests and the mixed batch ran for the first time on `rock-5b-plus`
+  (`clef.md` "Board results, media"). With the AutoRound shards 1-7 (visual tensors in shards
+  6/7 present) and `ROCKET_CLEF_TOWER_CHECK=1`, every tower clears the 0.9999 gate (vision
+  merged 0.9999871-0.9999933, DeepStack >= 0.9999592; audio features 0.9999989-0.9999995);
+  tower packs are 5.2 s / 1,035 MiB BO (vision, 117 weights) and 5.8 s / 1,254 MiB (audio,
+  197 weights), tower forward 2.2-26.2 s (image) / 8-15.5 s (video) / 1.1 s (audio). Answers
+  match the oracle top-1 everywhere (cat 0.9539 vs 0.9521, speech 0.8549 vs 0.8596, motion
+  0.1785 vs 0.3818 — the documented long-record int8 band). Both towers resident = 3,216 MiB
+  of BOs, peak 1,055 MiB anon; `ROCKET_CLEF_TOWER_RELEASE=1` drops end anon 1,306 -> 837 MiB.
+  The 5-record mixed batch (2,257 tokens, 393 s) is answer-identical to the five single runs.
+  Also measured: a 2,405-token text pass (273 s, `attn=54 s`), an 8-short-record pass (131 s)
+  and `ROCKET_CLEF_ATTN_DEVICE=cpu` (63.5 s, top-1 unchanged). ffmpeg 7.1.5 decodes the silent
+  video's frames and `speech5s.wav` bit-identically to the dev host; its AAC track differs
+  (32,693 vs 32,000 samples, max |d| 8.5e-4, 204 vs 200 mel frames) without moving top-1.
+  No crashes and no code changes; fmt, 132 `clef` tests and the aarch64 build are clean.
+  Small (`<= 0.008`) run-to-run probability drift on long media records is board variance,
+  not the release knob (a later default run reproduced the release values). The two live
+  containers were stopped for the runs and restored healthy.
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

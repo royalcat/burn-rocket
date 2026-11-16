@@ -749,10 +749,10 @@ taskset -c 4-7 ./rocket-inference-p8f decide \
 
 ## Not done
 
-`media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a
-board run of the vision and audio towers (including the mixed batch above), an NPU `Conv2d`
-for `conv2d1`. Towers can now be dropped between requests with `ROCKET_CLEF_TOWER_RELEASE=1`,
-but there is no idle timeout/automatic unload.
+`media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, an
+NPU `Conv2d` for `conv2d1`. Towers can now be dropped between requests with
+`ROCKET_CLEF_TOWER_RELEASE=1`, but there is no idle timeout/automatic unload. The board run of
+the towers and of the mixed batch is done below (2026-11-16).
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 
@@ -985,3 +985,87 @@ on the real BF16 checkpoint: f32 tower cosine 1.000000000 (rel-to-peak <= 1.6e-4
 1.9e-3 (small) / 1.6e-4 (cat), top-1 equal. Known: the 8b tight backbone gate
 (`media_backbone_matches_the_oracle_on_the_bf16_cpu_path`) fails on `media-image-cat` (layer cosine 0.99981,
 280 router set mismatches) and `media-video-audio-small` (0.999985, 25), answers still within 1.2e-4.
+
+## Board results, media (2026-11-16, rock-5b-plus)
+
+Aarch64 `npu` release build (`/root/rocket-clef-media/rocket-inference`, sha256
+`2a324469c0…`), model `/mnt/nvme/models/clef-omni-int8-autoround` (shards 1-7; the index
+places 61 visual tensors in shard 6 and 290 in shard 7, plus the audio-tower tensors in shard
+6 — all present). `taskset -c 4-7`, `ROCKET_PHASE_LOG=1 ROCKET_CLEF_TOWER_CHECK=1` on every
+run, `ROCKET_MEM_LOG=1` where noted. `home-llm-gateway-embed-1`/`-decision-1` were stopped for
+the runs and restored healthy afterwards; before the stop 6.1 GiB RAM / 305 GiB disk were
+free (8.4 GiB RAM after). No crashes, no 422s, no code changes: the NPU tower paths work
+first try. `peak anon` is the `clef phases` value; `end anon` is `decided … (N MiB anon)`.
+Answers are compared to the oracle table in `clef-oracle.md` and the dev-host numbers above.
+
+### 1. Image tower on the NPU, and its answers
+
+One `decide` pass over `media-image-small` + `media-image-cat` (2 records, 1,299 tokens):
+vision tower packed as **117 resident fp16 weights / 1,035 MiB of BOs in 5.2 s**, opened in
+6.4 s; 6,038 expert reads, 295.7 s wall, peak anon 1,416 MiB (end 1,286).
+
+| record | tower time | merged cos (rel) | DeepStack 0/1/2 cos | answer (oracle) |
+|---|---|---|---|---|
+| image-small, 280 patches -> 70 tokens | 2.2 s | 0.9999890 (6.86e-3) | 0.9999971 / 0.9999900 / 0.9999766 | colorful 0.9080 (0.9034), circle 0.9218 (0.9171) |
+| image-cat, 2,520 patches -> 630 tokens | 26.2 s | 0.9999871 (9.86e-3) | 0.9999989 / 0.9999891 / 0.9999592 | cat 0.9539 (0.9521), indoors 0.0160 (0.0173), cuteness 2.26 (2.266) |
+
+Every check clears the 0.9999 gate; the lowest value is DeepStack 2 on the cat image
+(0.9999592), above the host fp16 emulation's 0.99996 floor.
+
+### 2. Video, audio, audio-in-video
+
+| record | tower pack / time | tower check (minimum cos) | answer (oracle; dev-host emu) | wall / peak anon |
+|---|---|---|---|---|
+| `media-video-silent` (8 frames, 2,240 patches -> 560 tokens) | vision 4.3 s / 15.5 s | merged 0.9999916, DeepStack 0.9999905 | motion 0.1785 (0.3818; 0.298), object 0.9865 (0.9849) | 199.6 s / 877 MiB |
+| `media-audio-5s` (500 mel frames -> 65 tokens) | audio 197 weights / 1,254 MiB in 5.8 s / 1.1 s | features 0.9999995 (rel 8.62e-4) | speech 0.8549 (0.8596; ~0.89), speech 0.8843 (0.8991) | 91.2 s / 933 MiB |
+| `media-video-audio-small` (4 frames -> 280 tokens + 204 mel frames -> 27 tokens) | vision 8.0 s + audio 1.1 s | merged 0.9999933, DeepStack 0.9999913, audio 0.9999989 | sound 0.1234 (0.1777), other 0.9472 (0.9463) | 150.6 s / 1,082 MiB |
+
+Frames, grids and token counts are the documented ones (`192x144` source -> `448x320`,
+grid `[4,20,28]`; `240x180` -> grid `[2,20,28]`). The `motion` answer is 0.12 below the
+dev-host emulated-int8 run, the long-record int8 band documented in §8d (top-1 unchanged).
+
+**ffmpeg 7.1.5 vs the dev host's n9.0.2**: the silent video's 8 decoded RGB frames (sha256
+`c4926cce…`) and `speech5s.wav`'s 80,000 f32 samples (`4b50c7fc…`) are byte-identical on both
+boards. The AAC track of `clef-video-audio-small.mp4` is *not*: the board decodes 32,693
+samples where n9.0.2 decodes 32,000; over the common prefix 25,121/32,000 samples differ,
+max |d| 8.5e-4, mean 6.5e-8. That shows up as 204 mel frames on the board vs 200 in the
+oracle dump. The answer still agrees on top-1.
+
+### 3. Memory with both towers resident, and `ROCKET_CLEF_TOWER_RELEASE=1`
+
+One `media-mixed` record (947 tokens; image + silent video + audio) in three runs:
+
+| env | BOs resident during the pass | peak anon | end anon | wall |
+|---|---|---|---|---|
+| default | attention 927 + vision 1,035 + audio 1,254 = **3,216 MiB** | 1,055 MiB | 1,306 MiB | 235.1 s |
+| `ROCKET_CLEF_TOWER_RELEASE=1` | same during the pass | 888 MiB | **837 MiB** | 236.7 s |
+
+`ROCKET_MEM_LOG=1` prints no `npu scratch` line in CLI mode (that line is a `serve` hook);
+the BO totals are the three `clef: packed … MiB of BOs` lines. The release line is
+`clef: released tower weights (vision=true, audio=true; the next request reopens them)`.
+A fifth repeat showed the small answer differences between keep/release runs (consistent
+0.0219/0.1271 vs 0.0231/0.1195 on `consistent`/`priority`) are run-to-run variance of this
+long media record (expert reads 6,013 vs 6,016), **not** an effect of the knob: a default
+run after the release runs reproduced the release values exactly. Top-1 is unchanged.
+
+### 4. Mixed batch vs singles
+
+Documented 5-record `decide` pass (`checkout-errors`, `media-image-small`, `media-audio-5s`,
+`media-video-silent`, `media-video-audio-small`), `--max-state-tokens 8192`: 2,257 tokens,
+one pass, 6,052 expert reads, 393.1 s, peak anon 772 MiB (end 1,098 MiB). Both towers were
+opened once. Every answer is **identical to the five separate one-record runs** at the
+printed precision, e.g. outage 0.9547, colorful 0.9080 / circle 0.9218, speech 0.8549,
+motion 0.1785, sound 0.1234. (A 2-record image pass likewise reproduced image-small's single answer.)
+
+### 5. Previously unmeasured gaps
+
+| case | result |
+|---|---|
+| 2,405-token text request (a repeated `long-incident` state, `--max-state-tokens 8192`) | 273.5 s, 5,756 expert reads, `attn=54.17 s` (the dominant phase at this length), peak anon 1,044 MiB, answer `payment 0.9588` |
+| 8 short records in one pass (156 tokens each, 1,248 rows) | 131.1 s, 5,071 expert reads (vs 8x a full pass), peak 1,092 MiB, all eight `moved 0.9841` |
+| `ROCKET_CLEF_ATTN_DEVICE=cpu` on `checkout-errors` | engine line `attention projections f32 on the CPU (dequantized int8)`; 63.5 s vs 60.4 s baseline, peak 793 vs 833 MiB; `technical 0.8342` vs `0.8171`, urgency `1.8983` vs `1.8781`, outage `0.9505` vs `0.9547` (top-1 unchanged) |
+
+**Verification**: `cargo fmt --all -- --check` clean; `cargo test -p rocket-inference
+--no-default-features clef` = 132 passed, 24 ignored; the aarch64 `npu` release build
+succeeds. Artifacts kept in `/root/rocket-clef-media/` (binary, fixtures, `data/`, `logs/`,
+outputs); no large scratch to delete.
