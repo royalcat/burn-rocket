@@ -3,9 +3,9 @@
 > **STATUS 2026-11-14 (phase 6): text-only. CPU path dev-host verified; the NPU expert
 > streaming path is code complete and verified on the dev host through its host
 > emulation (`ROCKET_CLEF_EMU=1`), an aarch64 cross build and unit tests. NOT yet run on the
-> board.** Audio (and videos whose soundtrack the model would use) are refused (422) until the
-> audio tower is ported; **images are served since phase 8c** (see "Vision tower and image
-> requests") and **silent videos since phase 8d** (see "Video requests").
+> board.** **Images are served since phase 8c** (see "Vision tower and image requests"),
+> **videos since phase 8d** (see "Video requests") and **audio plus audio-in-video since phase 8e**
+> (see "Audio requests"); the towers are dev-host verified, not run on the board.
 > Phase 5 adds `--pack-dir` (the int8 pack, `clef-pack.md`): same flags, packed weights.
 > Phase 6 makes `--device npu` work with a pack (see "NPU placement" below).
 
@@ -66,9 +66,9 @@ Errors (`/v1/systemone`): `422 {"detail": "<reason>"}` for a body that is not JS
 validation (`model and state are required`, `at least one question is required`,
 `<id>: type must be noul, choice, or score`, `<id>: criteria must not be empty`), a
 schema larger than the cap (`schema requires N tokens before state; maximum is M`, media
-tokens included), an unreadable/undecodable image (`images[i]: ...`), `media_kwargs`, and any
-request carrying `audio`, or `videos` that all have a soundtrack
-(`Clef-Omni audio input / audio-in-video is not implemented yet ...`). Compute failures are 500.
+tokens included), an unreadable/undecodable image, audio clip or video (`images[i]: ...`,
+`audio[i]: ...`, `videos[i]: ...`), audio over `ROCKET_CLEF_AUDIO_MAX_SECONDS`, and
+`media_kwargs`. Compute failures are 500.
 
 ## Flags and limits
 
@@ -283,8 +283,8 @@ Board check: see "Board test, phase 7" below.
 ## Media plumbing in the thinker (phase 8b, 2026-11-14)
 
 `src/clef/media.rs` is everything between "the towers produced features" and "the decoder
-ran"; the image tower exists since 8c (below), `audio` and soundtrack-bearing videos still get the 422 until the audio tower (8e/8f); videos
-without sound are served since 8d (see "Video requests").
+ran"; the image tower exists since 8c (below), videos since 8d (see "Video requests") and the
+audio tower, `audio` and soundtracks since 8e (see "Audio requests").
 
 * **Placeholder block**: `MediaLayout { image_grids, video_grids, audio_frames (mel frames, explicit
   clips first then one soundtrack per video iff use_audio_in_video), explicit_audio,
@@ -446,20 +446,20 @@ every request). To measure the tower alone, compare the `vision tower` seconds a
 
 ## Video requests (phase 8d, 2026-11-15)
 
-`videos` requests work end to end for **silent** videos: `POST /v1/systemone` and `decide` accept
+`videos` requests work end to end (soundtracks since phase 8e, see "Audio requests"; the
+paragraph "Soundtrack policy" below is the 8d state): `POST /v1/systemone` and `decide` accept
 `"videos": ["<path>" | "data:video/mp4;base64,..." | "https://..."]` (same fetch helpers and limits as
 images: 20 MiB, 10 s, 3 redirects, `ROCKET_MEDIA_FETCH=0`). Files go through ffprobe/ffmpeg (the same
 binaries EmbeddingGemma 2 and d3 use; the image installs them). Several videos and images can share a
 record; the block order is images, then videos whatever the JSON order.
 
 **Soundtrack policy.** The release uses the tracks of the videos only when EVERY video of a record has
-one (`use_audio_in_video = all(track is not None)`); one silent video makes it ignore all tracks. The
-audio tower does not exist yet, so: a record where the release WOULD use the tracks (every video has an
-audio stream with at least one sample) is a **422** `Clef-Omni audio-in-video is not implemented yet ...`,
-decided by a cheap ffprobe/ffmpeg probe before any frame is decoded; a record with at least one silent
-video is served (tracks ignored, exactly as the oracle treats it). An `audio` field is still a 422. The
-probe asks ffprobe for an audio stream and then decodes the first one (16 kHz mono f32) to count samples,
-the release's `_decode_audio is None` rule.
+one (`use_audio_in_video = all(track is not None)`); one silent video makes it ignore all tracks. In 8d
+the audio tower did not exist, so a record where the release WOULD use the tracks was a 422. **Since 8e
+that 422 is gone**: those tracks are decoded and run through the audio tower, interleaved with the video
+tokens (below); a record with at least one silent video is served with every track ignored, exactly as
+the oracle treats it. The probe asks ffprobe for an audio stream and then decodes the first one (16 kHz
+mono f32), the release's `_decode_audio is None` rule.
 
 Files: `src/clef/vision/video.rs` (probe, time rule, ffmpeg decode, processor), `ProbedVideo` /
 `PreparedVideo`, `VisionTower::encode_media` (images + videos, one tower run per item), `encode::
@@ -527,9 +527,8 @@ differently (d3 saw 2/255 on the board vs the dev host, AGENTS.md); not measured
 decodes the whole video to list pts (cost ~ one decode; fine for the frame cap's clip lengths, slow for long 1080p
 files, which the 20 MiB fetch limit and the 64-frame cap bound for URLs/uploads; local paths are unbounded).
 (3) Frame times use ffprobe's `pts` of the first video stream; a stream with unset pts keeps no frames (PyAV:
-`time is None`). (4) A still image file given as a video (one frame) is accepted, as PyAV would. (5) Videos with a
-soundtrack stay refused until the audio tower; mixing them with a silent video works but the release then also
-ignores the track of the audible one.
+`time is None`). (4) A still image file given as a video (one frame) is accepted, as PyAV would. (5) Mixing a video with
+sound and a silent one works, but the release then ignores the track of the audible one too.
 
 ### Board commands for 8d
 
@@ -547,12 +546,136 @@ line (`1 video(s), 2240 patches -> 560 tokens`; the CPU does it in ~4 s here, th
 `tower check videos[0] vs f32 CPU: merged cos >= 0.9999, deepstack0..2 >= 0.9999` (fp16 emulation: 0.99998-0.999999;
 below 0.999 is a device/layout problem: try `ROCKET_CLEF_TOWER_DEVICE=cpu`). The answer should be near the dev host's
 `motion 0.298` (emulated int8) within the usual |dp| ~0.1 on this record. Check the ffmpeg frames on the board against
-the dev host (`ffmpeg` 7.1.5 vs n9.0.2): the `video.frames` count and, if answers drift, dump both sides' frames. A
-request with `data/test.mp4` must answer 422 `audio-in-video`.
+the dev host (`ffmpeg` 7.1.5 vs n9.0.2): the `video.frames` count and, if answers drift, dump both sides' frames. (Since
+8e a request with `data/test.mp4` is served as audio-in-video: see "Board commands for 8e".)
+
+## Audio requests (phase 8e, 2026-11-15)
+
+`audio` requests and audio-in-video work end to end: `POST /v1/systemone` and `decide` accept
+`"audio": ["<path>" | "data:audio/wav;base64,..." | "https://..."]` (same fetch helpers and limits as images and
+videos: 20 MiB, 10 s, 3 redirects, `ROCKET_MEDIA_FETCH=0`). Any container ffmpeg opens works: the FIRST audio
+stream is decoded (an mp4 with a soundtrack is a valid `audio` entry). Block order in the record: images,
+explicit audio clips, videos, whatever the JSON order. A video whose soundtrack the release would use (EVERY video
+of the record has an audio stream with at least one sample) is decoded alongside and interleaved as audio-in-video.
+
+Files: `src/clef/audio.rs` (config, tensor index, the tower, lazy), `audio/mel.rs` (Whisper log-mel),
+`audio/decode.rs` (ffmpeg decode, caps), `audio/tests.rs`; plumbing in `encode::encode_request`
+(`RecordMedia.audio: Option<MelBatch>`), `ClefModel::{audio_tower, media_features}`, `ProbedVideo::soundtrack`,
+`ClefRequest.audio`. The vision tower's `Exec` placements are shared: `compute::make_exec` now takes the linears
+(`&[&Lin]`), so the NPU packing, fp16 emulation and fallback code is common.
+
+* **Decode** (`audio/decode.rs`): `ffmpeg -map 0:a:0 -ac 1 -ar 16000 -t cap+1 -f f32le` = the release's PyAV
+  `_decode_audio` (first stream, mono, 16 kHz, f32). **Bit-identical to the oracle's decoded samples** for every
+  fixture (speech5s.wav 80,000 samples, the AAC 22.05 kHz / 44.1 kHz tracks of `clef-video-audio-small.mp4`
+  32,000 / `test.mp4` 64,000: 0 differing samples). The same decoder gives a video's soundtrack
+  (`None` = no audio stream or no samples = "silent", the release's rule). A clip under 400 samples (one STFT
+  window) is a 422 (`audio[i]: the audio is too short`); a file without an audio stream, a missing file or an
+  undecodable `data:` blob is a 422 naming `audio[i]`/`videos[i]`.
+* **Length cap** (this port's, the release has none): `ROCKET_CLEF_AUDIO_MAX_SECONDS` (default **300**, 3,900
+  tokens) per clip, a 422 over it; decoding stops one second past the cap so a huge file costs bounded memory.
+  The audio block also counts against `--max-tokens` like every media block (`audio[i]` is named in the refusal).
+* **Log-mel** (`audio/mel.rs`): `WhisperFeatureExtractor(feature_size 128, n_fft 400, hop 160, padding=longest)`
+  = periodic Hann(400), `torch.stft(center=True)` (reflect padding 200), power over the first `N/160` frames (the
+  last STFT frame is dropped), the 201x128 Slaney-scale Slaney-norm filter bank (f32-rounded like the extractor),
+  `log10(clamp(1e-10))`, per-clip `max(x, max - 8)`, `(x + 4)/4`; valid frames = `min(ceil(n/160), N/160)` (the
+  mask is `[::160]` trimmed by one when `N % 160 != 0`). **All clips of a record are ONE batch: each is zero-padded
+  to the longest BEFORE the STFT** (a short clip's last frame sees zeros instead of reflect padding, clef-oracle.md
+  §7.4); the explicit clips and the soundtracks share the batch. The FFT is f64 (rustfft) and the filter matmul f64
+  over the f32 filters. Gate vs the oracle's `media_input_features`: `media-audio-5s` **max |d| 4.6e-6**
+  (0 of 64,000 values over 1e-5); the AAC tracks 5.0e-5 / 6.3e-5 on 329 / 608 of 25,600 / 51,200 values over
+  1e-5 **and that is torch's own f32 rounding, not this port**: the same samples through torch f64 differ from
+  the oracle's f32 dump by 4.985e-5 and from this port by 1e-7 (low-energy mel bins 8 decades under the peak
+  where f32 FFT noise shows). `media-mixed-av` (a 5 s explicit clip + a 2 s track, padded together) agrees to 5.0e-5
+  as well, valid lengths `[500, 200]` equal.
+* **Tower** (`audio.rs`): the `manual_audio` spec, host f32, in the order of the oracle doc: 100-frame chunks
+  (the tail zero-padded), 3 x `Conv2d(k3 s2 p1)` + GELU(erf) (480 channels; `conv2d1` has `K = 9` and runs on the
+  host in f32, `conv2d2/3` as im2col matmuls with `K = 4320`, batches of 8 chunks to bound the matrices),
+  `(c, f)` flatten -> `conv_out` (7680 -> 1280, no bias) + the sinusoid table (positions 0..12, restarting per
+  chunk), only the valid steps of each chunk (`audio_out_len`), attention windows of `max_valid * 8` = 104 tokens
+  per clip (full attention inside, never across), 32 pre-LN layers (eps 1e-5, 20 x 64 heads, no rotary, GELU
+  erf FFN 5120), `ln_post`, `proj1` + GELU, `proj2` (-> 2048). Weights are BF16 in both checkpoints (BF16 repo shard
+  1, AutoRound repo shard 6), mmapped and widened per use (nothing copied on the host); the tower opens on the
+  **first request with audio** (`clef: audio tower opened in ...`), independent of the vision tower (an audio-only
+  record never touches it; a clef-pack has neither: 422).
+* **Placements** (`ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu`, the same switch and default as the vision tower):
+  `cpu` f32; `emu16` the fp16 emulation (weights, activations in and out of every linear in fp16, f32 accumulation;
+  an overflow reruns the batch on the CPU); `npu` (aarch64 + `npu` builds, **compiles and clippy-clean, never ran on
+  hardware**): every linear resident fp16 (`conv2d2`, `conv2d3`, `conv_out`, 32 x q/k/v/out/fc1/fc2, `proj1/2` = 197
+  weights, **~1.2 GiB of BOs**, packed when the tower opens: expect 15-40 s of pack time and budget the memory next to
+  the vision tower's 1.07 GiB and the thinker; the tower stays resident once opened). **Window attention stays on
+  the host in f32 in every placement** (`ROCKET_CLEF_AUDIO_ATTN=device` asks the placement to run it via
+  `flash_attn` per window): a 104-token window is dispatch-bound on the NPU (about 1,200 dispatches for 300 s of
+  audio, against ~2 GFLOP per layer for the CPU, ~2 s in all). `ROCKET_CLEF_TOWER_CHECK=1` also reruns the audio batch on
+  the f32 CPU and logs `tower check audio vs f32 CPU: features cos ... rel-to-peak ...`.
+* **Audio-in-video** (`encode_request`): when every video has a soundtrack with samples, the tracks are appended to
+  the explicit clips (explicit first, then one per video in video order), the batch's mel is computed once, and
+  `MediaLayout { audio_frames, explicit_audio, use_audio_in_video: true }` drives `build_media_ids` (the
+  `interleave_video_audio` rule: video token k at time `group * 13`, audio token j at time j, video first on ties) and
+  `rope_index` (the audio rule with the 3-D branch). Each video's `<|vision_start|><|audio_start|> ...
+  <|audio_end|><|vision_end|>` block counts toward the token cap with its audio pads.
+* **Positions**: an audio-only record gets plain `0..S` positions in all three streams (HF `get_rope_index`'s else
+  branch: no image/video grid); audio next to an image/video takes the 3-D branch. Both were already in 8b; the gates
+  below check them against `position_ids`.
+
+### Gates (dev host, 8 threads; oracle dumps `/tmp/opencode/clef/dump`, BF16 checkpoint for the f32 arms)
+
+| gate | result |
+|---|---|
+| decoded samples vs the dump (`media_audio_samples_*`), 5 clips over the 4 audio records | **0 differing samples** in all |
+| log-mel vs `media_input_features` | 4.6e-6 (audio-5s), 5.0e-5 / 6.3e-5 / 5.0e-5 (the AAC tracks and the mixed batch): torch's f32 rounding, see above; valid lengths equal |
+| ids / positions / audio-in-video flag vs the oracle (`audio_records_get_the_oracle_ids_positions_and_counts`) | equal for `media-audio-5s` (65 pads, text positions), `media-video-audio-small` (V\*140 A\*13 interleave, 280 + 26), `media-video-test` (660 + 52), `media-mixed-av` (explicit 65 + track 26, image, video) |
+| f32 tower vs the dumped taps (`the_f32_tower_matches_the_oracle`, release, 0.6-1.8 s per record) | cosine **1.000000000 on every tap** of all four records; rel-to-peak: `conv_out` 3.9e-7, layer 0 1.0e-6, layer 15 1.4e-6, layer 31 4.0e-6..2.3e-5, `ln_post` 1.4e-6..2.7e-5, **features 3.3e-6 / 6.6e-6 / 2.6e-5 / 8.9e-6** (max abs 8.4e-7..4.9e-6) |
+| same tower on the AutoRound repo's shard 6 (`media-audio-5s`) | identical numbers (the tower tensors are the same BF16) |
+| fp16 emulation (`the_fp16_emulated_tower_follows_the_oracle`) | features cosine **0.9999997 / 0.9999996 / 0.9999993 / 0.9999963** (5s / small / test / mixed-av), rel-to-peak 8e-4 .. 1.0e-2 (the mixed-av's 91 tokens peak at layer 31 with rel 5.1e-3, cos 0.9999988) |
+| answers, BF16 f32 CPU thinker (`audio_answers_match_the_oracle_on_the_bf16_cpu_path`) | max \|dp\| **3.6e-7** (`media-audio-5s`, 302 tokens, 23.8 s), **2.3e-5** (`media-video-audio-small`, 544 tokens), **2.1e-6** (`media-video-test`, 952), **2.1e-5** (`media-mixed-av`, 678); top-1 equal everywhere |
+| answers, emulated int8 thinker on the AutoRound shards | max \|dp\| 9.3e-3 / 4.9e-3 / **5.3e-2** (`media-video-test`, the 952-token record, the int8 thinker's band as on the other long records) / 1.4e-3; top-1 equal everywhere |
+| `serve` smoke (emulated engine, `--max-tokens 4096`, tower on the CPU) | `audio` speech5s.wav: **200**, 283 tokens, 25 s, `kind speech 0.8903`; `audio` = an mp4 with a soundtrack: 200, 244 tokens; audio-in-video `clef-video-audio-small.mp4`: 200, 526 tokens, 44 s; audio-in-video `test.mp4`: 200, 932 tokens, 77 s; image + explicit audio + audio-in-video record: 200, 667 tokens, 56 s (the audio tower logs `2 clip(s), 700 mel frames -> 91 tokens`). **422**: a text file (`the file has no audio stream`), a missing path, an undecodable `data:` blob (ffmpeg's reason), a PNG; with `ROCKET_CLEF_AUDIO_MAX_SECONDS=3`: speech5s (`the audio is longer than 3 s`) and a 4 s soundtrack (`videos[0] soundtrack: ...`). `/health` stays ok |
+
+Unit tests (`cargo test -p rocket-inference --no-default-features`: 324 pass, 22 ignored): Slaney scale and filter
+bank, the padding-before-STFT artefact, the trimmed-mask valid length, the log-mel floor, chunking and window
+bounds, the sinusoid table, im2col + matmul == naive stride-2 conv, `conv2d1` == naive conv + GELU, a synthetic
+2-layer tower checkpoint (open, run, deterministic, tokens of another clip and another window do not move a token,
+a clip alone == inside a batch, the fp16 emulation follows f32), the request parsing, encode errors (undecodable,
+missing, no stream, too short, over the cap, over the token cap, data: URL == path). The ignored gates:
+`cargo test --release -p rocket-inference --no-default-features clef::audio -- --ignored --nocapture`
+(`HF_HOME=/mnt/BtrTrashCan/huggingface`; `CLEF_IDS=a,b` selects the answer records). The 8d unit test that expected a
+422 for a soundtrack now expects the audio-in-video layout (`soundtracks_are_used_only_when_every_video_has_one`).
+
+**Caveats.** (1) The f32 tower is as close to the oracle as the oracle's own HF-vs-plain-torch selfcheck (1e-6..3e-5);
+the log-mel differs from the oracle's f32 dump by torch's own rounding at the 1e-5..6e-5 level, which does not move the
+tower output visibly (the tower gates above start from the dumped features, the answer gates from this port's own mel).
+(2) A mel batch whose longest clip is shorter than 25 ms or any clip under 400 samples is a 422. (3) Mel frames beyond a
+clip's valid length are computed but never read (padding, as in HF). (4) Not run on the board: the ~1.2 GiB resident
+fp16 pack, ffmpeg 7.1.5's AAC decode (the CLI of the dev host's n9.0.2 is bit-identical to PyAV; the board's Debian
+7.1.5 was not compared), the NPU numerics. (5) `ROCKET_CLEF_AUDIO_MAX_SECONDS` is read at request time, a clip is
+fully decoded to RAM (300 s = 19 MB of f32 plus 15 MB of mel features).
+
+### Board commands for 8e
+
+```sh
+# aarch64 build as for 8c; copy as rocket-inference-p8e, plus data/ and tools/clef_fixtures_media.json
+python3 -c "import json;a=json.load(open('tools/clef_fixtures_media.json'));json.dump([c for c in a if c['id'] in ('media-audio-5s','media-video-audio-small','media-video-test','media-mixed-av')],open('/tmp/aud_cases.json','w'))"
+cd /root/rocket-inference
+ROCKET_CLEF_TOWER_CHECK=1 ROCKET_PHASE_LOG=1 taskset -c 4-7 ./rocket-inference-p8e decide \
+    --model-dir /mnt/nvme/models/clef-omni-int8-autoround --device npu \
+    --requests /tmp/aud_cases.json --out /tmp/clef-aud.json
+# the tower on the CPU for comparison (answers + wall of the tower alone)
+ROCKET_CLEF_TOWER_DEVICE=cpu taskset -c 4-7 ./rocket-inference-p8e decide ... (same arguments)
+```
+
+Expect `clef: packed a tower on the NPU: 197 weights, ~1240 MiB of BOs in N s` once, `clef: audio tower opened in N
+s (fp16 resident on the NPU (197 weights, ~1240 MiB of BOs), window attention on the host (f32))`, per record
+`clef: audio tower: 1 clip(s), 500 mel frames -> 65 tokens in X s` and `tower check audio vs f32 CPU: features cos
+>= 0.9999 rel-to-peak < 0.02` (the host fp16 emulation above gives 0.9999963..0.9999997; below 0.999 is a
+device/layout problem: rerun with `ROCKET_CLEF_TOWER_DEVICE=cpu` and report the check line). The answers should match
+the dev host's emulated-int8 numbers (`media-audio-5s`: `speech` 0.8596 oracle / ~0.89 int8 emulated) within |dp| ~0.1.
+`ROCKET_CLEF_AUDIO_ATTN=device` is an experiment: compare the tower seconds with the default. Check memory: `RssAnon`
+and the BO total (`ROCKET_MEM_LOG=1`) with both towers opened (1.07 + 1.2 GiB) next to the thinker.
 
 ## Not done
 
-Audio inputs and audio-in-video (audio tower, 8e/8f: `audio` and all-soundtrack `videos` are a 422), `media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a board run of the vision tower.
+`media_kwargs`, the audio/vision tower unload when idle (both stay resident once opened), attention scores/AV on the NPU of
+the thinker, a CPU `sdot` expert path, a board run of the vision and audio towers, an NPU `Conv2d` for `conv2d1`.
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 

@@ -21,7 +21,7 @@
 use super::super::engine_npu::NpuFailure;
 use super::super::model::Shards;
 use super::compute::{Exec, Fp16Range, pad_heads, pad_heads_transposed, unpack_padded};
-use super::{Lin, Plan, widen_par};
+use super::{Lin, widen_par};
 use anyhow::{Context, Result};
 use burn_rocket::half::f16;
 use burn_rocket::{RocketCtx, RocketFaCtx, RocketWeight};
@@ -86,13 +86,13 @@ fn weight_f16(w: &[f32], n: usize, k: usize, np: usize, kp: usize, name: &str) -
 
 impl NpuExec {
     /// Open the contexts and pack every linear of the plan.
-    pub fn pack(plan: &Plan, shards: &Shards, threads: usize) -> Result<Self> {
+    pub fn pack(lins: &[&Lin], shards: &Shards, threads: usize) -> Result<Self> {
         let t0 = std::time::Instant::now();
         let mut ctx = RocketCtx::new(threads).map_err(|e| failure(e, 0, 0, 0))?;
         let fa = RocketFaCtx::new(threads).map_err(|e| failure(e, 0, 0, 0))?;
-        let mut weights = Vec::with_capacity(plan.lins);
+        let mut weights = Vec::with_capacity(lins.len());
         let mut bytes = 0usize;
-        for lin in plan.linears() {
+        for &lin in lins {
             debug_assert_eq!(lin.slot, weights.len());
             let (file, info) = shards.get(&lin.name)?;
             let w = widen_par(file, info);
@@ -108,7 +108,7 @@ impl NpuExec {
             shards.release();
         }
         eprintln!(
-            "clef: packed the vision tower on the NPU: {} weights, {:.0} MiB of BOs in {:.1}s",
+            "clef: packed a tower on the NPU: {} weights, {:.0} MiB of BOs in {:.1}s",
             weights.len(),
             bytes as f64 / (1024.0 * 1024.0),
             t0.elapsed().as_secs_f64()

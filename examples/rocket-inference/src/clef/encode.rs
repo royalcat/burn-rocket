@@ -17,12 +17,10 @@
 //! Special tokens inside the text pieces (`<|im_start|>` ...) tokenize to their special
 //! ids, as in the Python tokenizer (which is the same Rust `tokenizers` core).
 
-use super::media::{MediaLayout, build_media_ids};
+use super::audio::{MelBatch, check_clip_len, load_audio, log_mel_batch};
+use super::media::{MediaLayout, audio_out_len, build_media_ids};
 use super::request::{ClefRequest, Invalid, question_type_index};
-use super::vision::{
-    PreparedImage, PreparedVideo, ProbedVideo, SOUNDTRACK_NOT_IMPLEMENTED, VisionConfig,
-    prepare_value,
-};
+use super::vision::{PreparedImage, PreparedVideo, ProbedVideo, VisionConfig, prepare_value};
 use anyhow::{Context, Result};
 use serde_json::{Number, Value};
 use std::sync::Arc;
@@ -216,6 +214,9 @@ pub struct RecordMedia {
     pub layout: MediaLayout,
     pub images: Vec<PreparedImage>,
     pub videos: Vec<PreparedVideo>,
+    /// The log-mel features of the record's audio clips (explicit clips, then the soundtracks
+    /// of audio-in-video records), one batch; `None` without audio.
+    pub audio: Option<MelBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,20 +358,21 @@ pub fn encode_record_with_media(
     })
 }
 
-/// [`encode_record`] for any request this build serves: text-only, with `images`, with
-/// `videos`, or both.
+/// [`encode_record`] for any request this build serves: text-only, with `images`, `audio`,
+/// `videos`, or any mix.
 ///
-/// Images and videos are fetched/decoded/preprocessed here (client errors are [`Invalid`]);
-/// their grids give the placeholder block (`<|vision_start|> <|image_pad|>|<|video_pad|> x n
-/// <|vision_end|>` + `\n` per item; images, then videos, whatever the JSON order) and the block
-/// counts toward `max_length` like the release's `fixed_length`. The prepared pixel rows travel
-/// with the record to the thinker pass.
+/// Media are fetched/decoded/preprocessed here (client errors are [`Invalid`]); their grids and
+/// mel lengths give the placeholder block (`<|vision_start|> <|image_pad|>|<|video_pad|> x n
+/// <|vision_end|>` / `<|audio_start|> <|audio_pad|> x n <|audio_end|>` + `\n` per item; images,
+/// explicit audio, then videos, whatever the JSON order) and the block counts toward
+/// `max_length` like the release's `fixed_length`. The prepared pixel rows and mel features
+/// travel with the record to the thinker pass.
 ///
-/// Videos (phase 8d) are silent-only: the release feeds the soundtracks to the audio tower
-/// when EVERY video of the record has one (all-or-nothing), which this build cannot do, so such
-/// a record is refused with [`SOUNDTRACK_NOT_IMPLEMENTED`] after a cheap probe (before any
-/// frame is decoded). A record with at least one silent video is served: the release ignores
-/// every track then. `audio` requests are refused ([`ClefRequest::media_refusal`]).
+/// **Audio-in-video** (phase 8e): the release uses the soundtracks of the videos only when
+/// EVERY video of the record has one (all-or-nothing, `use_audio_in_video`): then each
+/// soundtrack joins the explicit clips as one more audio clip of the SAME mel batch (clips are
+/// zero-padded to the longest one before the STFT, so the features depend on the batch) and its
+/// tokens interleave with the video's. One silent video makes the release ignore every track.
 pub fn encode_request(
     tok: &Tokenizer,
     request: &ClefRequest,
@@ -379,7 +381,7 @@ pub fn encode_request(
     if let Some(refusal) = request.media_refusal() {
         return Err(refusal.into());
     }
-    if request.images.is_empty() && request.videos.is_empty() {
+    if request.images.is_empty() && request.videos.is_empty() && request.audio.is_empty() {
         return encode_record(tok, request, max_length, None);
     }
     let cfg = VisionConfig::shipped();
@@ -398,28 +400,67 @@ pub fn encode_request(
         }
         images.push(img);
     }
-    // Probe every video first (cheap), so a soundtrack refusal costs no decode.
+    // Explicit audio clips (decoded to 16 kHz mono, length-capped).
+    let mut clips: Vec<Vec<f32>> = Vec::with_capacity(request.audio.len());
+    for (i, value) in request.audio.iter().enumerate() {
+        let samples = load_audio(value, i)?;
+        check_clip_len(samples.len(), &format!("audio[{i}]"))?;
+        clips.push(samples);
+    }
+    let explicit_audio = clips.len();
+    // Probe every video first (cheap: no frame is decoded yet).
     let probed = request
         .videos
         .iter()
         .enumerate()
         .map(|(i, value)| ProbedVideo::open(value, i))
         .collect::<Result<Vec<_>>>()?;
-    // use_audio_in_video = all(track is not None): only when EVERY video is heard is the
-    // record one this build cannot encode; a silent video makes the release ignore all tracks.
+    // use_audio_in_video = all(track is not None): the soundtracks are used only when EVERY
+    // video is heard; one silent video makes the release ignore all tracks.
+    let mut use_audio_in_video = false;
     if !probed.is_empty() && probed.iter().all(|v| v.probe.has_audio_stream) {
         let tracks = probed
             .iter()
-            .map(ProbedVideo::has_soundtrack)
+            .map(ProbedVideo::soundtrack)
             .collect::<Result<Vec<_>>>()?;
-        if tracks.iter().all(|&t| t) {
-            return Err(Invalid(SOUNDTRACK_NOT_IMPLEMENTED.into()).into());
+        if tracks.iter().all(Option::is_some) {
+            for (i, t) in tracks.into_iter().flatten().enumerate() {
+                check_clip_len(t.len(), &format!("videos[{i}] soundtrack"))?;
+                clips.push(t);
+            }
+            use_audio_in_video = true;
+        }
+    }
+    // ONE mel batch for the explicit clips and the soundtracks (zero-padded to the longest).
+    let mel = if clips.is_empty() {
+        None
+    } else {
+        let refs: Vec<&[f32]> = clips.iter().map(Vec::as_slice).collect();
+        Some(log_mel_batch(&refs))
+    };
+    drop(clips);
+    if let Some(m) = &mel {
+        for (i, &frames) in m.valid[..explicit_audio].iter().enumerate() {
+            // + <|audio_start|>, <|audio_end|> and the "\n"
+            media_tokens += audio_out_len(frames) + 3;
+            if media_tokens > max_length {
+                return Err(Invalid(format!(
+                    "the media need over {max_length} tokens before the state (audio[{i}] is the \
+                     one that crosses the limit)"
+                ))
+                .into());
+            }
         }
     }
     let mut videos = Vec::with_capacity(probed.len());
     for (i, video) in probed.iter().enumerate() {
         // the grid is known before any pixel work: refuse a video that cannot fit up front
-        let budget = max_length.saturating_sub(media_tokens + 3);
+        let own_audio = match (&mel, use_audio_in_video) {
+            // + the soundtrack's pads and its <|audio_start|>/<|audio_end|>
+            (Some(m), true) => audio_out_len(m.valid[explicit_audio + i]) + 2,
+            _ => 0,
+        };
+        let budget = max_length.saturating_sub(media_tokens + 3 + own_audio);
         let v = video.prepare(&cfg, budget)?;
         eprintln!(
             "clef: videos[{i}]: {}x{} source, {} sampled frames at {}x{} -> grid {:?}, {} tokens",
@@ -431,12 +472,15 @@ pub fn encode_request(
             v.grid,
             v.tokens()
         );
-        media_tokens += v.tokens() + 3;
+        media_tokens += v.tokens() + 3 + own_audio;
         videos.push(v);
     }
     let layout = MediaLayout {
         image_grids: images.iter().map(|i| i.grid).collect(),
         video_grids: videos.iter().map(|v| v.grid).collect(),
+        audio_frames: mel.as_ref().map(|m| m.valid.clone()).unwrap_or_default(),
+        explicit_audio,
+        use_audio_in_video,
         ..Default::default()
     };
     let media_ids = build_media_ids(&layout, newline_token(tok)?)?;
@@ -445,6 +489,7 @@ pub fn encode_request(
         layout,
         images,
         videos,
+        audio: mel,
     }));
     Ok(enc)
 }

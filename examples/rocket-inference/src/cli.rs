@@ -260,7 +260,10 @@ run as int8 g128 W8A8 on the NPU, streaming the experts from NVMe
 current directory, `data:` URLs or http(s) URLs; every image costs its merged tokens
 of the --max-state-tokens cap; the vision tower loads on the first image request,
 f32 on the CPU or fp16 resident on the NPU, `ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu`
-overrides); `audio`/`videos` are refused (not implemented yet). --max-state-tokens is the per-record cap (default 8192;
+overrides), `videos` (a soundtrack goes through the audio tower when every video has one,
+`ROCKET_CLEF_VIDEO_MAX_FRAMES`) and `audio` (clips of at most
+`ROCKET_CLEF_AUDIO_MAX_SECONDS` = 300 s; the audio tower loads on the first audio request,
+same placements). --max-state-tokens is the per-record cap (default 8192;
 the release's own default is 64000); --out and --model-name behave the same,
 --device npu needs the int8 checkpoint (or a pack) and an aarch64 `npu` build. The
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/

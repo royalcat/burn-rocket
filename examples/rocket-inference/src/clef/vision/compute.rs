@@ -4,7 +4,7 @@
 use super::super::attn::gemm_strided;
 use super::super::math::matmul_nt;
 use super::super::model::Shards;
-use super::{Lin, Plan, widen_par};
+use super::{Lin, widen_par};
 use anyhow::{Result, bail};
 use half::f16;
 use rayon::prelude::*;
@@ -313,21 +313,22 @@ pub(crate) fn unpack_padded(
         });
 }
 
-/// Build the placement for `device`.
+/// Build the placement for `device`. `lins` are the tower's linears in slot order (the NPU
+/// placement packs them as resident weights; `Lin::slot` is the index into this list).
 pub fn make_exec(
     device: TowerDevice,
-    plan: &Plan,
+    lins: &[&Lin],
     shards: &Shards,
     threads: usize,
 ) -> Result<Box<dyn Exec>> {
-    let _ = (plan, shards, threads);
+    let _ = (lins, shards, threads);
     match device {
         TowerDevice::Cpu => Ok(Box::new(CpuExec)),
         TowerDevice::Emu16 => Ok(Box::new(Emu16Exec)),
         TowerDevice::Npu => {
             #[cfg(all(feature = "npu", target_arch = "aarch64"))]
             {
-                Ok(Box::new(super::npu::NpuExec::pack(plan, shards, threads)?))
+                Ok(Box::new(super::npu::NpuExec::pack(lins, shards, threads)?))
             }
             #[cfg(not(all(feature = "npu", target_arch = "aarch64")))]
             {

@@ -18,9 +18,8 @@
 //!    order per group. The grid is `[frames/2, h/16, w/16]`; the tower attends per temporal group.
 //! 4. **Soundtrack**: the release uses the audio tracks of the videos only when EVERY video has
 //!    one (`use_audio_in_video`, all-or-nothing); a record where any video is silent ignores all
-//!    tracks. Audio towers arrive in a later phase, so a record whose tracks the oracle would
-//!    use is refused with [`SOUNDTRACK_NOT_IMPLEMENTED`] (a 422) after the cheap probe, before
-//!    any frame is decoded.
+//!    tracks. Since phase 8e the tracks are decoded ([`ProbedVideo::soundtrack`], 16 kHz mono)
+//!    and go through the audio tower, interleaved with the video tokens (`encode::encode_request`).
 //!
 //! Decoder-version sensitivity: swscale's YUV->RGB conversion is what PyAV runs; the ffmpeg CLI
 //! of the same libswscale generation is bit-identical on the repo fixtures (checked by the
@@ -49,11 +48,6 @@ pub const VIDEO_MAX_PIXELS: usize = 786_432;
 /// Sampled frames a request may carry (this port's guard; the release has none). 64 frames =
 /// 32 temporal groups, 4,480 merged tokens at the smallest per-frame size.
 pub const DEFAULT_MAX_VIDEO_FRAMES: usize = 64;
-
-/// The refusal for records whose soundtracks the release would feed to the audio tower.
-pub const SOUNDTRACK_NOT_IMPLEMENTED: &str = "Clef-Omni audio-in-video is not implemented yet: \
-     every video of this request has a soundtrack, which the model would use; this build has no \
-     audio tower. Send silent videos (ffmpeg -an), or mix in a video without sound";
 
 /// The `scale` filter options that make the ffmpeg CLI reproduce PyAV's
 /// `frame.to_ndarray(format="rgb24", width, height)`: PyAV's default interpolation is bilinear
@@ -388,15 +382,14 @@ impl ProbedVideo {
         })
     }
 
-    /// The release would use this video's soundtrack (an audio stream with samples).
-    pub fn has_soundtrack(&self) -> Result<bool> {
+    /// The video's soundtrack (16 kHz mono f32 of the first audio stream) or `None` when it has
+    /// no audio stream / no samples: the release's `_decode_audio is None`, which makes the
+    /// video "silent" for the whole record (`use_audio_in_video = all(track is not None)`).
+    pub fn soundtrack(&self) -> Result<Option<Vec<f32>>> {
         if !self.probe.has_audio_stream {
-            return Ok(false);
+            return Ok(None);
         }
-        audio_has_samples(self.resolved.path()).map_err(|e| match e.downcast::<Invalid>() {
-            Ok(Invalid(m)) => Invalid(format!("videos[{}]: {m}", self.index)).into(),
-            Err(e) => e,
-        })
+        crate::clef::audio::soundtrack(self.resolved.path(), self.index)
     }
 
     /// Decode the sampled frames (at the capped size) and duplicate the last one for an odd

@@ -40,12 +40,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-mod compute;
+pub(crate) mod compute;
 #[cfg(all(feature = "npu", target_arch = "aarch64"))]
 mod npu;
 mod preprocess;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod video;
 
 pub use compute::{Exec, TowerDevice};
@@ -56,9 +56,9 @@ pub use preprocess::{
 };
 #[allow(unused_imports)]
 pub use video::{
-    DEFAULT_MAX_VIDEO_FRAMES, PreparedVideo, ProbedVideo, SOUNDTRACK_NOT_IMPLEMENTED, VIDEO_FPS,
-    VIDEO_FRAME_MAX_PIXELS, VIDEO_MAX_PIXELS, VIDEO_MIN_PIXELS, VideoProbe, audio_has_samples,
-    capped_size, decode_frames, max_video_frames, prepare_video, probe_video, sample_frames,
+    DEFAULT_MAX_VIDEO_FRAMES, PreparedVideo, ProbedVideo, VIDEO_FPS, VIDEO_FRAME_MAX_PIXELS,
+    VIDEO_MAX_PIXELS, VIDEO_MIN_PIXELS, VideoProbe, audio_has_samples, capped_size, decode_frames,
+    max_video_frames, prepare_video, probe_video, sample_frames,
 };
 
 /// `thinker.visual.` tensors of the checkpoint.
@@ -562,7 +562,7 @@ impl VisionTower {
         device: TowerDevice,
         threads: usize,
     ) -> Result<Self> {
-        let exec = compute::make_exec(device, &plan, &shards, threads)?;
+        let exec = compute::make_exec(device, &plan.linears(), &shards, threads)?;
         Ok(Self {
             plan,
             shards,

@@ -7,6 +7,7 @@
 
 pub mod answer;
 pub mod attn;
+pub mod audio;
 pub mod autoround_store;
 #[cfg(test)]
 mod batch_tests;

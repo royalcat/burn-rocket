@@ -20,12 +20,6 @@ impl fmt::Display for Invalid {
 
 impl std::error::Error for Invalid {}
 
-/// What an `audio` request is answered with while the audio tower is missing (images and
-/// silent videos work; a video's soundtrack is refused in the encoder, see
-/// `vision::SOUNDTRACK_NOT_IMPLEMENTED`).
-pub const MEDIA_NOT_IMPLEMENTED: &str = "Clef-Omni audio input is not implemented yet \
-     (this build answers text, image and silent-video requests): remove `audio` from the request";
-
 /// What a request with `media_kwargs` is answered with (the processor overrides are not ported).
 pub const MEDIA_KWARGS_UNSUPPORTED: &str =
     "media_kwargs is not supported by this build: remove it from the request";
@@ -66,7 +60,9 @@ pub struct ClefRequest {
     pub images: Vec<String>,
     /// `videos`: file paths, `data:` URLs or `http(s)` URLs, in request order.
     pub videos: Vec<String>,
-    /// The request has `audio` entries (not implemented: refused).
+    /// `audio`: file paths, `data:` URLs or `http(s)` URLs, in request order.
+    pub audio: Vec<String>,
+    /// The request has `audio` entries.
     pub has_audio: bool,
     /// The request has a non-empty `media_kwargs` (not supported: refused).
     pub has_media_kwargs: bool,
@@ -142,6 +138,7 @@ impl ClefRequest {
         };
         let images = media_list("images")?;
         let videos = media_list("videos")?;
+        let audio = media_list("audio")?;
         Ok(Self {
             model,
             state,
@@ -149,18 +146,16 @@ impl ClefRequest {
             has_media: present("images") || present("audio") || present("videos"),
             images,
             videos,
-            has_audio: present("audio"),
+            has_audio: !audio.is_empty(),
+            audio,
             has_media_kwargs: present("media_kwargs"),
         })
     }
 
-    /// The refusal for what this build cannot do: `audio` inputs and `media_kwargs` (images and
-    /// videos are served; a video whose soundtrack the model would use is refused later, by
-    /// the encoder, because that needs a probe of the files).
+    /// The refusal for what this build cannot do: `media_kwargs` (images, audio and videos,
+    /// soundtracks included, are served).
     pub fn media_refusal(&self) -> Option<Invalid> {
-        if self.has_audio {
-            Some(Invalid(MEDIA_NOT_IMPLEMENTED.into()))
-        } else if self.has_media_kwargs {
+        if self.has_media_kwargs {
             Some(Invalid(MEDIA_KWARGS_UNSUPPORTED.into()))
         } else {
             None
@@ -270,14 +265,21 @@ mod tests {
     }
 
     #[test]
-    fn audio_is_refused_with_a_clear_message_and_videos_are_served() {
+    fn audio_and_videos_are_parsed_like_images() {
         let mut v = ok();
-        v["audio"] = json!(["data:audio/wav;base64,AAAA"]);
+        v["audio"] = json!(["data:audio/wav;base64,AAAA", "a.wav"]);
         let r = parse(v).unwrap();
-        assert!(r.has_media && r.has_audio);
-        let refusal = r.media_refusal().unwrap();
-        assert!(refusal.0.contains("not implemented yet"), "{refusal}");
-        assert!(refusal.0.contains("audio"), "{refusal}");
+        assert!(r.has_media && r.has_audio && r.media_refusal().is_none());
+        assert_eq!(r.audio, ["data:audio/wav;base64,AAAA", "a.wav"]);
+        let mut v = ok();
+        v["audio"] = json!(["a.wav", 3]);
+        assert_eq!(
+            parse(v).unwrap_err(),
+            "audio[1]: expected a file path, a data: URL or an http(s) URL string"
+        );
+        let mut v = ok();
+        v["audio"] = json!("a.wav");
+        assert!(parse(v).unwrap_err().contains("audio must be a list"));
         // videos are parsed like images (their soundtrack check happens in the encoder)
         let mut v = ok();
         v["videos"] = json!(["data:video/mp4;base64,AAAA", "a.mp4"]);

@@ -13,11 +13,11 @@ use std::path::PathBuf;
 
 const DUMP_DIR: &str = "/tmp/opencode/clef/dump";
 
-fn app_path(rel: &str) -> PathBuf {
+pub(crate) fn app_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-fn dir_from_env(var: &str, default: &str) -> Option<PathBuf> {
+pub(crate) fn dir_from_env(var: &str, default: &str) -> Option<PathBuf> {
     let d = PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.into()));
     if d.join("model.safetensors.index.json").exists() {
         Some(d)
@@ -27,7 +27,7 @@ fn dir_from_env(var: &str, default: &str) -> Option<PathBuf> {
     }
 }
 
-fn dump_of(id: &str) -> Option<PathBuf> {
+pub(crate) fn dump_of(id: &str) -> Option<PathBuf> {
     let p = PathBuf::from(DUMP_DIR).join(format!("{id}.npz"));
     if p.exists() {
         Some(p)
@@ -54,7 +54,7 @@ impl Lcg {
 }
 
 /// `(cosine, max |d|, max |d| / peak of want)`.
-fn compare(got: &[f32], want: &[f32]) -> (f64, f64, f64) {
+pub(crate) fn compare(got: &[f32], want: &[f32]) -> (f64, f64, f64) {
     assert_eq!(got.len(), want.len());
     let (mut dot, mut ng, mut nw, mut md, mut peak) = (0f64, 0f64, 0f64, 0f64, 0f64);
     for (&g, &w) in got.iter().zip(want) {
@@ -174,7 +174,7 @@ fn images_resize_to_the_documented_grids() {
     );
 }
 
-fn tokenizer() -> Option<tokenizers::Tokenizer> {
+pub(crate) fn tokenizer() -> Option<tokenizers::Tokenizer> {
     let dir = dir_from_env("CLEF_MODEL_DIR", model_dir())?;
     tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).ok()
 }
@@ -495,12 +495,12 @@ fn fp16_emulation_flags_values_outside_the_range() {
 
 // ---- oracle gates (need the dumps; the checkpoint where a tower runs) -----------------
 
-fn oracle(path: &std::path::Path, keys: &[&str]) -> crate::clef::testutil::Npz {
+pub(crate) fn oracle(path: &std::path::Path, keys: &[&str]) -> crate::clef::testutil::Npz {
     let keys: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
     read_npz_keys(path, |k| keys.iter().any(|w| w == k))
 }
 
-fn i64s(b: &[u8]) -> Vec<i64> {
+pub(crate) fn i64s(b: &[u8]) -> Vec<i64> {
     b.as_chunks::<8>()
         .0
         .iter()
@@ -508,13 +508,13 @@ fn i64s(b: &[u8]) -> Vec<i64> {
         .collect()
 }
 
-fn fixture(id: &str) -> Value {
+pub(crate) fn fixture(id: &str) -> Value {
     let all: Vec<Value> =
         serde_json::from_slice(&std::fs::read(app_path("tools/clef_fixtures_media.json")).unwrap())
             .unwrap();
     let mut v = all.into_iter().find(|c| c["id"] == id).expect("fixture");
     // fixtures say `data/...`: make them absolute against the app dir
-    for key in ["images", "videos"] {
+    for key in ["images", "videos", "audio"] {
         if let Some(items) = v[key].as_array_mut() {
             for i in items {
                 let p = i.as_str().unwrap().to_string();
@@ -753,7 +753,7 @@ fn pack_directories_have_no_tower() {
 
 /// Image requests end to end through `ClefModel` (decode -> tower -> splice/DeepStack ->
 /// thinker -> head) against the oracle's per-question probabilities.
-fn answers_gate(dir: PathBuf, kind: EngineKind, ids: &[&str], max_dp: f64) {
+pub(crate) fn answers_gate(dir: PathBuf, kind: EngineKind, ids: &[&str], max_dp: f64) {
     let model = ClefModel::load_kind(&dir, 8, kind).unwrap();
     assert!(model.images_supported());
     for id in ids {
@@ -800,7 +800,7 @@ fn answers_gate(dir: PathBuf, kind: EngineKind, ids: &[&str], max_dp: f64) {
     }
 }
 
-fn gate_ids() -> Vec<String> {
+pub(crate) fn gate_ids() -> Vec<String> {
     std::env::var("CLEF_IDS")
         .unwrap_or_else(|_| "media-image-small,media-image-cat".into())
         .split(',')
@@ -1060,7 +1060,7 @@ fn encode_images_concatenates_per_image_rows_for_the_splice() {
 
 // ---- videos (phase 8d) ---------------------------------------------------------------
 
-fn have_ffmpeg() -> bool {
+pub(crate) fn have_ffmpeg() -> bool {
     ["ffmpeg", "ffprobe"].iter().all(|b| {
         std::process::Command::new(b)
             .arg("-version")
@@ -1069,7 +1069,7 @@ fn have_ffmpeg() -> bool {
     })
 }
 
-fn is_invalid(e: &anyhow::Error) -> bool {
+pub(crate) fn is_invalid(e: &anyhow::Error) -> bool {
     e.downcast_ref::<crate::clef::request::Invalid>().is_some()
 }
 
@@ -1191,7 +1191,7 @@ fn a_video_record_gets_the_oracle_ids_positions_and_counts() {
 }
 
 #[test]
-fn a_soundtrack_the_release_would_use_is_refused_but_a_silent_video_next_to_it_is_served() {
+fn soundtracks_are_used_only_when_every_video_has_one() {
     if !have_ffmpeg() {
         return;
     }
@@ -1204,12 +1204,22 @@ fn a_soundtrack_the_release_would_use_is_refused_but_a_silent_video_next_to_it_i
         return;
     }
     let s = |p: &PathBuf| p.to_string_lossy().to_string();
-    // every video has a track: use_audio_in_video would be true -> 422 until the audio tower
-    let err = encode_request(&tok, &video_request(vec![s(&sound)]), 64000).unwrap_err();
-    assert!(is_invalid(&err), "{err:#}");
-    assert!(format!("{err:#}").contains("audio-in-video"), "{err:#}");
-    let err = encode_request(&tok, &video_request(vec![s(&sound), s(&sound)]), 64000).unwrap_err();
-    assert!(is_invalid(&err));
+    // every video has a track: use_audio_in_video, the track joins the mel batch (400 frames)
+    let enc = encode_request(&tok, &video_request(vec![s(&sound)]), 64000).unwrap();
+    let media = enc.media.as_ref().unwrap();
+    assert!(media.layout.use_audio_in_video);
+    assert_eq!(media.layout.audio_frames, [400]);
+    assert_eq!(media.audio.as_ref().unwrap().valid, [400]);
+    let n = |t: u32| enc.input_ids.iter().filter(|&&x| x == t).count();
+    assert_eq!(
+        (
+            n(crate::clef::media::VIDEO_PAD),
+            n(crate::clef::media::AUDIO_PAD)
+        ),
+        (660, 52)
+    );
+    let enc2 = encode_request(&tok, &video_request(vec![s(&sound), s(&sound)]), 64000).unwrap();
+    assert_eq!(enc2.media.as_ref().unwrap().layout.audio_frames, [400, 400]);
     // one silent video makes the release ignore EVERY track: served, two video blocks
     let enc = encode_request(&tok, &video_request(vec![s(&sound), s(&silent)]), 64000).unwrap();
     let media = enc.media.as_ref().unwrap();
@@ -1227,8 +1237,8 @@ fn a_soundtrack_the_release_would_use_is_refused_but_a_silent_video_next_to_it_i
         "data:video/mp4;base64,{}",
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
     );
-    let err = encode_request(&tok, &video_request(vec![url]), 64000).unwrap_err();
-    assert!(format!("{err:#}").contains("audio-in-video"), "{err:#}");
+    let enc = encode_request(&tok, &video_request(vec![url]), 64000).unwrap();
+    assert!(enc.media.as_ref().unwrap().layout.use_audio_in_video);
     // a file that is no video is a client error naming the entry
     let png = app_path("data/clef-tiny.png");
     let not_media = app_path("Cargo.toml");

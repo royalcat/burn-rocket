@@ -3252,7 +3252,7 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   matmuls ~72 s per 1k-token pass (g128) / 49.5 s (g256 fallback), disk 1.0-1.27 GB/s.
   **5 offline packer + pack reader done (2026-11-14)**, below. **6 NPU expert streaming:
   code complete, dev-host verified, board-verified for 142-800 tokens (2026-11-14: 38.7 s / 51.6 s / 103 s, <= 0.9 GiB anon, answers match the oracle)**, below. Phase 7 batching is **board-verified** (2026-11-14: 4 requests 107 s batched vs 179 s single, byte-identical answers; `clef.md`). Text-only deployment recipe: `clef.md` "Deployment (text-only, current)". Remaining (plan
-  numbering): 8 media towers (8c image and 8d silent video done, below; audio and audio-in-video: 422 "not implemented yet"), 9 deploy/docs.
+  numbering): 8 media towers (8c image, 8d video and 8e audio + audio-in-video all done, below), 9 deploy/docs.
 - **Phase 5, the Clef pack** (`src/clef/pack/{format,autoround,build,reader}.rs`,
   `docs/recipes/clef-pack.md`): the AutoRound int8 checkpoint
   (`moeshawky/clef-omni-int8-autoround`, local `/home/royalcat/models/clef-omni-int8-autoround`,
@@ -3416,7 +3416,40 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   over-cap. 306 tests pass (+17 ignored); fmt and non-test clippy clean, aarch64 `npu` release build and clippy clean in
   `src/clef`. Details, tables and board commands: `clef.md` "Video requests". Caveats: ffmpeg-version sensitivity of the
   YUV->RGB step (board has 7.1.5; not measured for Clef), `ffprobe -show_frames` decodes the whole file, soundtrack
-  videos stay refused until the audio tower (8e/8f).
+  videos stay refused until the audio tower (8e/8f). **Superseded by 8e below** (the 422 is gone).
+- **Phase 8e, audio tower + audio requests + audio-in-video (2026-11-15, uncommitted; dev-host verified, NOT run
+  on the board)**: `audio` requests and videos whose every soundtrack exists work end to end in `serve` and
+  `decide`; only `media_kwargs` stays a 422. New: `src/clef/audio.rs` (+ `audio/{mel,decode,tests}.rs`). **Decode**
+  = ffmpeg `-map 0:a:0 -ac 1 -ar 16000 -f f32le` (first stream, like PyAV's `_decode_audio`): samples
+  **bit-identical** to the oracle's (5 clips, 0 differ). **Log-mel** = `WhisperFeatureExtractor` (Slaney 128-bin
+  bank, `torch.stft` reflect, drop the last frame, per-clip floor `max-8`, `(x+4)/4`), ONE batch for the explicit
+  clips and the soundtracks, each zero-padded to the longest BEFORE the STFT (the oracle pitfall, ported and unit
+  tested); valid frames `min(ceil(n/160), N/160)`. Gate vs `media_input_features`: 4.6e-6 (audio-5s), 5.0e-5 /
+  6.3e-5 on the AAC tracks = **torch's own f32 rounding** (torch f64 vs the f32 dump differs by the same 4.985e-5;
+  this port is 1e-7 from torch f64). **Tower** = `manual_audio` on the host in f32 (3 stride-2 convs as im2col
+  matmuls, `conv2d1` on the host, sinusoid per 13-step chunk, 104-token windows, 32 layers, proj to 2048), BF16
+  weights mmapped and widened per use (BF16 repo shard 1, AutoRound shard 6), lazy independent `AudioTower` slot in
+  `ClefModel` (`audio_tower()`), placements `ROCKET_CLEF_TOWER_DEVICE=cpu|emu16|npu` shared with vision (the
+  `vision::compute` `Exec`/`make_exec` now take `&[&Lin]`, `pub(crate)`); NPU = 197 resident fp16 weights (~1.2 GiB
+  of BOs, compiles + aarch64 clippy clean, never run on hardware), **window attention stays on the host f32** in
+  every placement (`ROCKET_CLEF_AUDIO_ATTN=device` to test it), `ROCKET_CLEF_TOWER_CHECK=1` also checks audio. Caps:
+  `ROCKET_CLEF_AUDIO_MAX_SECONDS` (default 300), clips under 400 samples 422, the audio block counts against
+  `--max-tokens`. Wiring: `request.rs` (`audio` list; `MEDIA_NOT_IMPLEMENTED` and
+  `SOUNDTRACK_NOT_IMPLEMENTED` are gone), `encode_request` (explicit clips -> probe videos -> all-or-nothing
+  soundtracks -> one mel batch -> `MediaLayout{audio_frames, explicit_audio, use_audio_in_video}` ->
+  `RecordMedia.audio`), `ProbedVideo::soundtrack`, `ClefModel::media_features` (vision and audio towers run
+  independently; an audio-only record never opens the vision tower and gets text positions per 8b), the server's
+  clef-pack 422 now covers audio too. **Gates**: f32 tower vs `audio_{conv_out,layer_0,15,31,ln_post,features}` cosine
+  1.000000000 on every tap, features rel-to-peak 3.3e-6 / 6.6e-6 / 2.6e-5 / 8.9e-6 (audio-5s / video-audio-small /
+  video-test / mixed-av, 0.6-1.8 s each); fp16 emulation features cosine 0.9999997 / 0.9999996 / 0.9999993 /
+  0.9999963; ids, positions and the audio-in-video interleave equal the oracle on all four audio records; answers
+  (BF16 f32 CPU thinker) max |dp| 3.6e-7 / 2.3e-5 / 2.1e-6 / 2.1e-5, emulated int8 9.3e-3 / 4.9e-3 / 5.3e-2
+  (video-test, long record) / 1.4e-3, top-1 equal everywhere; `serve` smoke 200 for audio (wav and an mp4 as audio),
+  audio-in-video (small, test.mp4) and a mixed image+audio+video record, 422 for a text file / missing path / bad
+  `data:` blob / PNG and (with `ROCKET_CLEF_AUDIO_MAX_SECONDS=3`) a 5 s clip and a 4 s soundtrack. 324 tests pass
+  (22 ignored), fmt and clippy clean (host and aarch64 `npu`), aarch64 `npu` release build ok. Details, tables and
+  board commands: `clef.md` "Audio requests". Caveats: the board's ffmpeg 7.1.5 AAC decode and the NPU numerics are
+  unmeasured, both towers (1.07 + 1.2 GiB of BOs) stay resident once opened.
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

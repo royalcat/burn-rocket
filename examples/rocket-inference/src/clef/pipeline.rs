@@ -2,11 +2,12 @@
 //! Jev/SystemOne request (`systemone` in the release's `joint_schema_model.py`).
 
 use super::answer::{probabilities, systemone_answer};
+use super::audio::AudioTower;
 use super::autoround_store::ShardStore;
 use super::encode::{EncodedRecord, encode_request};
 use super::engine::{self, ClefStore, LayerEngine};
 use super::head::{ClefHead, LmHeadFile};
-use super::media::{MediaFeatures, rope_index};
+use super::media::{MediaFeatures, TowerOutputs, rope_index};
 use super::model::{Backbone, ForwardOpts, RecordRef};
 use super::pack::{Manifest, PackDir};
 use super::request::ClefRequest;
@@ -49,6 +50,11 @@ pub struct ClefModel {
     vision: Mutex<Option<Arc<VisionTower>>>,
     /// The directory holds `thinker.visual.*` tensors (a clef-pack does not).
     images_supported: bool,
+    /// The audio tower, opened by the first request with audio (or a soundtrack in use);
+    /// lazy and independent of the vision tower.
+    audio: Mutex<Option<Arc<AudioTower>>>,
+    /// The directory holds `thinker.audio_tower.*` tensors (a clef-pack does not).
+    audio_supported: bool,
 }
 
 impl std::fmt::Debug for ClefModel {
@@ -179,12 +185,47 @@ impl ClefModel {
             tower_device,
             vision: Mutex::new(None),
             images_supported: VisionTower::available(dir),
+            audio: Mutex::new(None),
+            audio_supported: AudioTower::available(dir),
         })
     }
 
-    /// Whether this checkpoint directory can serve `images` (it holds the vision tower).
+    /// Whether this checkpoint directory can serve `images` and `videos` (it holds the vision
+    /// tower).
     pub fn images_supported(&self) -> bool {
         self.images_supported
+    }
+
+    /// Whether this checkpoint directory can serve `audio` and soundtracks (it holds the audio
+    /// tower).
+    pub fn audio_supported(&self) -> bool {
+        self.audio_supported
+    }
+
+    /// The audio tower, opened on first use (shards indexed, and on the NPU every linear
+    /// packed as a resident fp16 weight: ~1.2 GiB of BOs).
+    fn audio_tower(&self) -> Result<Arc<AudioTower>> {
+        let mut slot = self.audio.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = &*slot {
+            return Ok(t.clone());
+        }
+        anyhow::ensure!(
+            self.audio_supported,
+            "{} holds no audio tower (a clef-pack skips `thinker.audio_tower.*`): serve the BF16 \
+             checkpoint or the AutoRound shards to answer audio requests",
+            self.dir.display()
+        );
+        let t0 = std::time::Instant::now();
+        let tower = AudioTower::open(&self.dir, self.tower_device, tower_threads())
+            .context("open the audio tower")?;
+        eprintln!(
+            "clef: audio tower opened in {:.1}s ({})",
+            t0.elapsed().as_secs_f64(),
+            tower.label()
+        );
+        let tower = Arc::new(tower);
+        *slot = Some(tower.clone());
+        Ok(tower)
     }
 
     /// The vision tower, opened on first use (shards indexed, and on the NPU every linear
@@ -220,45 +261,79 @@ impl ClefModel {
         let Some(media) = &enc.media else {
             return Ok(None);
         };
-        let tower = self.vision_tower()?;
-        let t0 = std::time::Instant::now();
-        let out = self
-            .pool
-            .install(|| tower.encode_media(&media.images, &media.videos, self.opts.threads))
-            .inspect_err(engine::raise_if_device_failure)
-            .context("vision tower")?;
-        let patches: usize = media.images.iter().map(|i| i.patches()).sum::<usize>()
-            + media.videos.iter().map(|v| v.patches()).sum::<usize>();
-        eprintln!(
-            "clef: vision tower: {} image(s), {} video(s), {patches} patches -> {} tokens in {:.1}s",
-            media.images.len(),
-            media.videos.len(),
-            patches / 4,
-            t0.elapsed().as_secs_f64()
-        );
-        if tower.device() != TowerDevice::Cpu
-            && std::env::var("ROCKET_CLEF_TOWER_CHECK").is_ok_and(|v| !v.is_empty() && v != "0")
-        {
-            for (i, img) in media.images.iter().enumerate() {
-                match self
-                    .pool
-                    .install(|| tower.check_against_cpu(img, self.opts.threads))
-                {
-                    Ok(report) => eprintln!("clef: tower check images[{i}] vs f32 CPU: {report}"),
-                    Err(e) => eprintln!("clef: tower check images[{i}] failed: {e:#}"),
+        let check =
+            std::env::var("ROCKET_CLEF_TOWER_CHECK").is_ok_and(|v| !v.is_empty() && v != "0");
+        let mut out = TowerOutputs::default();
+        if !media.images.is_empty() || !media.videos.is_empty() {
+            let tower = self.vision_tower()?;
+            let t0 = std::time::Instant::now();
+            out = self
+                .pool
+                .install(|| tower.encode_media(&media.images, &media.videos, self.opts.threads))
+                .inspect_err(engine::raise_if_device_failure)
+                .context("vision tower")?;
+            let patches: usize = media.images.iter().map(|i| i.patches()).sum::<usize>()
+                + media.videos.iter().map(|v| v.patches()).sum::<usize>();
+            eprintln!(
+                "clef: vision tower: {} image(s), {} video(s), {patches} patches -> {} tokens in {:.1}s",
+                media.images.len(),
+                media.videos.len(),
+                patches / 4,
+                t0.elapsed().as_secs_f64()
+            );
+            if tower.device() != TowerDevice::Cpu && check {
+                for (i, img) in media.images.iter().enumerate() {
+                    match self
+                        .pool
+                        .install(|| tower.check_against_cpu(img, self.opts.threads))
+                    {
+                        Ok(report) => {
+                            eprintln!("clef: tower check images[{i}] vs f32 CPU: {report}")
+                        }
+                        Err(e) => eprintln!("clef: tower check images[{i}] failed: {e:#}"),
+                    }
+                }
+                for (i, v) in media.videos.iter().enumerate() {
+                    match self
+                        .pool
+                        .install(|| tower.check_pixels(&v.pixels, v.grid, self.opts.threads))
+                    {
+                        Ok(report) => {
+                            eprintln!("clef: tower check videos[{i}] vs f32 CPU: {report}")
+                        }
+                        Err(e) => eprintln!("clef: tower check videos[{i}] failed: {e:#}"),
+                    }
                 }
             }
-            for (i, v) in media.videos.iter().enumerate() {
-                match self
-                    .pool
-                    .install(|| tower.check_pixels(&v.pixels, v.grid, self.opts.threads))
-                {
-                    Ok(report) => eprintln!("clef: tower check videos[{i}] vs f32 CPU: {report}"),
-                    Err(e) => eprintln!("clef: tower check videos[{i}] failed: {e:#}"),
-                }
-            }
+            tower.trim(crate::util::mem::keep_scratch_mib() * 1024 * 1024);
         }
-        tower.trim(crate::util::mem::keep_scratch_mib() * 1024 * 1024);
+        if let Some(mel) = &media.audio {
+            let tower = self.audio_tower()?;
+            let t0 = std::time::Instant::now();
+            let a = self
+                .pool
+                .install(|| tower.forward(mel, self.opts.threads, &[]))
+                .inspect_err(engine::raise_if_device_failure)
+                .context("audio tower")?;
+            eprintln!(
+                "clef: audio tower: {} clip(s), {} mel frames -> {} tokens in {:.1}s",
+                mel.clips(),
+                mel.valid.iter().sum::<usize>(),
+                a.features.len() / self.backbone.cfg.hidden,
+                t0.elapsed().as_secs_f64()
+            );
+            out.audio = a.features;
+            if tower.device() != TowerDevice::Cpu && check {
+                match self
+                    .pool
+                    .install(|| tower.check_against_cpu(mel, self.opts.threads))
+                {
+                    Ok(report) => eprintln!("clef: tower check audio vs f32 CPU: {report}"),
+                    Err(e) => eprintln!("clef: tower check audio failed: {e:#}"),
+                }
+            }
+            tower.trim(crate::util::mem::keep_scratch_mib() * 1024 * 1024);
+        }
         let positions = rope_index(&enc.input_ids, &media.layout)?;
         MediaFeatures::assemble(
             &enc.input_ids,
