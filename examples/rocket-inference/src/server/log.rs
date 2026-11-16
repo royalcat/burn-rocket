@@ -158,6 +158,7 @@ pub(crate) fn decision(state: &AppState, questions: usize, tokens: usize, timing
 
 /// `/v1/systemone` for Clef-Omni: the decision line plus the batch the request ran in.
 /// `compute_s` is the shared batch compute, `batch_tokens` the rows of the whole batch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn clef_decision(
     state: &AppState,
     questions: usize,
@@ -166,6 +167,7 @@ pub(crate) fn clef_decision(
     compute_s: f64,
     batch: usize,
     batch_tokens: usize,
+    peak_anon_mib: f64,
 ) {
     const ENDPOINT: &str = "/v1/systemone";
     let rss = rss_mib();
@@ -178,6 +180,7 @@ pub(crate) fn clef_decision(
     span.set_attribute("compute_s", compute_s);
     span.set_attribute("batch", as_i64(batch));
     span.set_attribute("batch_tokens", as_i64(batch_tokens));
+    span.set_attribute("peak_anon_mib", peak_anon_mib);
     span.set_attribute("rss_mib", rss);
 
     info!(
@@ -189,6 +192,7 @@ pub(crate) fn clef_decision(
         compute_s = round(compute_s, 1000.0),
         batch,
         batch_tokens,
+        peak_anon_mib = round(peak_anon_mib, 10.0),
         rss_mib = round(rss, 10.0),
         "decision request"
     );

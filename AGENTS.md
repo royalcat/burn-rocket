@@ -3450,6 +3450,22 @@ Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-or
   (22 ignored), fmt and clippy clean (host and aarch64 `npu`), aarch64 `npu` release build ok. Details, tables and
   board commands: `clef.md` "Audio requests". Caveats: the board's ffmpeg 7.1.5 AAC decode and the NPU numerics are
   unmeasured, both towers (1.07 + 1.2 GiB of BOs) stay resident once opened.
+- **Phase 8f, mixed media batches + tower lifetime (2026-11-16, dev-host verified, NOT run on the board)**:
+  the media path through the batcher needed no new plumbing (`ClefModel::answer_encoded` already runs each
+  record's towers before `forward_batch_media` with per-record positions/splice/DeepStack; decode/tower errors
+  fail only that record; rows count media tokens). Added: `ClefModel::media_supported()` (vision ∪ audio) guards
+  the server's media refusal; structured `clef tower loaded (lazy, first use) modality="vision"|"audio"` logs;
+  `peak_anon_mib` on the `clef batch`/`decision request` lines; `ROCKET_CLEF_TOWER_RELEASE=1` (default off) drops
+  both towers' resident weights after each `answer`/`answer_batch` (verified: two image batches reopen the tower
+  twice, 770 vs 1,017 MiB anon at the end). Gates: `ROCKET_CLEF_EMU=1` AutoRound mixed batch (checkout-errors +
+  image-small + audio-5s + video-silent + video-audio-small, 2,256 rows) answers **byte-identical** to singles,
+  6,048 vs 28,071 expert reads, 176 vs 197-211 s over two runs; BF16 CPU hidden-state <1e-4 rel-to-peak but head amplifies to
+  max |dp| 1.88e-3 (gate 5e-3, pinned by the mini-model test); 422/200 failure isolation; `serve
+  --batch-window-ms 3000 --batch-max 8` 5 concurrent mixed = all 200, 176 s, bodies byte-identical to sequential
+  (204 s), `/health` 6 ms during the batch; `decide --requests` 5 mixed = 1 pass, 173.6 s. Tests: 324 pass + 24
+  ignored (two new ignored real-model gates), fmt/clippy clean, aarch64 `npu` release build ok (the 6 aarch64
+  clippy errors are pre-existing in `rocket-npu`, not `src/clef`). Details + board commands: `clef.md` "Mixed
+  batches … (phase 8f)".
 - **Step 0 (shard streaming, 2026-11-14)**: `serve`/`decide` for Clef work directly from the
   AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`, no `:quant` = snapshot
   download of the thinker shards, or `--model-dir <dir>`); no repack. `src/clef/autoround_store.rs`

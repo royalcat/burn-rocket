@@ -2,7 +2,7 @@ use super::*;
 use crate::clef::Invalid;
 use crate::clef::encode::EncodedQuestion;
 use crate::clef::encode::encode_record;
-use crate::clef::testutil::{f32s, model_dir, read_npz};
+use crate::clef::testutil::{autoround_dir, f32s, model_dir, read_npz};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -463,4 +463,192 @@ fn clef_batch_equals_single_records_on_the_emulated_engine() {
             "{i}: capped batch"
         );
     }
+}
+
+// ---- Phase 8f: mixed media batches (server + decide share `answer_encoded`)
+
+/// A media fixture with its `data/...` paths made absolute against the app dir (cargo runs
+/// tests with the package root as CWD, but the server may not).
+fn media_fixture(id: &str) -> ClefRequest {
+    let all: Vec<Value> =
+        serde_json::from_str(include_str!("../../../tools/clef_fixtures_media.json")).unwrap();
+    let mut v = all
+        .into_iter()
+        .find(|c| c["id"] == id)
+        .expect("media fixture");
+    for key in ["images", "videos", "audio"] {
+        if let Some(items) = v[key].as_array_mut() {
+            for item in items {
+                let rel = item.as_str().unwrap().trim_start_matches("./");
+                *item = Value::String(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join(rel)
+                        .to_string_lossy()
+                        .into(),
+                );
+            }
+        }
+    }
+    v.as_object_mut().unwrap().remove("id");
+    ClefRequest::from_value(v).unwrap()
+}
+
+/// The exact mixed batch of the 8f gate: one text record, an image, an audio clip, a silent
+/// video and an audio-in-video record. Plus one undecodable image for the isolation check.
+fn mixed_media_ids() -> Vec<&'static str> {
+    vec![
+        "checkout-errors", // text (from the text fixtures)
+        "media-image-small",
+        "media-audio-5s",
+        "media-video-silent",
+        "media-video-audio-small",
+    ]
+}
+
+fn mixed_requests() -> Vec<ClefRequest> {
+    let mut out = vec![fixture("checkout-errors")];
+    out.extend(mixed_media_ids().into_iter().skip(1).map(media_fixture));
+    out
+}
+
+/// Compare a mixed batch with the same records answered alone. `emu` selects the host
+/// emulation of the int8 engine (the `ROCKET_CLEF_EMU=1` AutoRound path); otherwise the
+/// plain bf16 CPU path is used. `tol` is the probability tolerance: `0` pins exact f64
+/// equality (EMU, where the batch is byte-identical to the singles), while the `gemm`
+/// CPU path uses a small envelope — the batch changes the expert bucket's row count, so
+/// its f32 summation order shifts (hidden-state relative-to-peak stays < 1e-4, pinned by
+/// `batch_tests::the_cpu_f32_path_batches_to_within_float_rounding`; the head amplifies
+/// that into ~2e-3 of probability).
+fn mixed_media_batch_gate(dir: &Path, kind: EngineKind, tol: f64) {
+    if !dir.join("model.safetensors.index.json").exists() {
+        eprintln!("skipping: no checkpoint at {}", dir.display());
+        return;
+    }
+    let model = ClefModel::load_kind(dir, default_threads(), kind).unwrap();
+    let requests = mixed_requests();
+    let refs: Vec<&ClefRequest> = requests.iter().collect();
+
+    let (mut single_wall, mut single_reads) = (0f64, 0usize);
+    let mut singles = Vec::new();
+    for r in &refs {
+        let t0 = std::time::Instant::now();
+        singles.push(model.answer(r, 64000).unwrap());
+        single_wall += t0.elapsed().as_secs_f64();
+        single_reads += model.backbone.last_phases().map_or(0, |p| p.experts);
+        let done = singles.last().unwrap();
+        eprintln!(
+            "single: {} tokens, {} questions, {:.1}s",
+            done.tokens,
+            done.questions,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+
+    let t0 = std::time::Instant::now();
+    let batch = model.answer_batch(&refs, 64000, 0); // one shared pass
+    let batch_wall = t0.elapsed().as_secs_f64();
+    assert_eq!(batch.chunks.len(), 1, "one shared thinker pass");
+    for (i, (want, got)) in singles.iter().zip(&batch.results).enumerate() {
+        let got = got.as_ref().unwrap_or_else(|e| panic!("record {i}: {e:#}"));
+        assert_eq!(got.tokens, want.tokens, "record {i}: tokens");
+        assert_eq!(got.questions, want.questions, "record {i}: questions");
+        if tol == 0.0 {
+            assert!(eq(&got.response, &want.response), "record {i}: answers");
+            assert_eq!(
+                got.probabilities, want.probabilities,
+                "record {i}: probabilities (bit-exact)"
+            );
+        } else {
+            // The plain f32 CPU path runs expert GEMMs on the row count of the bucket,
+            // so a batch changes the f32 summation order. The hidden-state difference is
+            // < 1e-4 relative to peak; the head amplifies it into a small probability
+            // drift, and a discrete answer may flip only on such a near-tie (logged).
+            assert_eq!(got.probabilities.len(), want.probabilities.len());
+            let mut worst = 0.0f64;
+            for ((qid, got_p), (want_qid, want_p)) in
+                got.probabilities.iter().zip(&want.probabilities)
+            {
+                assert_eq!(qid, want_qid, "record {i}: question order");
+                for (opt, p) in want_p {
+                    let q = got_p.get(opt).unwrap();
+                    worst = worst.max((p - q).abs());
+                    assert!(
+                        (p - q).abs() <= tol,
+                        "record {i} question {qid} option {opt}: |{p} - {q}| > {tol}"
+                    );
+                }
+            }
+            if !eq(&got.response, &want.response) {
+                eprintln!(
+                    "record {i}: rounded confidences differ (max |dp| {worst:.2e}); \
+                     single vs batch: {} / {}",
+                    want.response["answers"], got.response["answers"]
+                );
+            }
+        }
+    }
+    let batch_reads = batch.experts_read();
+    eprintln!(
+        "batch of {} mixed records ({} rows): {} expert reads vs {single_reads} singles; \
+         wall {batch_wall:.1}s vs {single_wall:.1}s",
+        refs.len(),
+        batch.chunks[0].tokens,
+        batch_reads
+    );
+
+    // Failure isolation: one undecodable media fails alone; the valid records still answer
+    // bit-identical to their single runs (the bad record is never part of the shared pass).
+    let mut broken = requests.clone();
+    broken.push(
+        ClefRequest::from_value(json!({
+            "model": "clef-omni", "state": "x",
+            "images": ["data:image/png;base64,AAAA"],
+            "questions": {"q": {"type": "noul"}},
+        }))
+        .unwrap(),
+    );
+    let broken_refs: Vec<&ClefRequest> = broken.iter().collect();
+    let isolated = model.answer_batch(&broken_refs, 64000, 0);
+    assert!(
+        isolated.results.last().unwrap().is_err(),
+        "the undecodable image must fail alone"
+    );
+    for (i, want) in singles.iter().enumerate() {
+        let got = isolated.results[i]
+            .as_ref()
+            .unwrap_or_else(|e| panic!("isolation record {i}: {e:#}"));
+        if tol == 0.0 {
+            assert_eq!(
+                got.probabilities, want.probabilities,
+                "isolation record {i}"
+            );
+        } else {
+            for ((_, got_p), (_, want_p)) in got.probabilities.iter().zip(&want.probabilities) {
+                for (opt, p) in want_p {
+                    let q = got_p.get(opt).unwrap();
+                    assert!(
+                        (p - q).abs() <= tol,
+                        "isolation record {i} option {opt}: |{p} - {q}| > {tol}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Gate: `ROCKET_CLEF_EMU=1` on the AutoRound shards, mixed text/image/audio/video batch
+/// answers byte-identical to the same records alone (and a bad media fails only itself).
+#[test]
+#[ignore = "needs the AutoRound shards; ~2-4 min on the dev host (CLEF_AUTOROUND_DIR)"]
+fn clef_mixed_media_batch_equals_singles_on_the_emulated_engine() {
+    mixed_media_batch_gate(&PathBuf::from(autoround_dir()), EngineKind::Emu, 0.0);
+}
+
+/// Gate: the BF16 CPU thinker's mixed media batch stays inside the `gemm` path's
+/// float-rounding envelope (hidden state < 1e-4 relative-to-peak; the head amplifies that
+/// to ~2e-3 of probability). CLEF_MODEL_DIR.
+#[test]
+#[ignore = "needs the BF16 checkpoint; ~2-4 min on the dev host (CLEF_MODEL_DIR)"]
+fn clef_mixed_media_batch_within_the_cpu_rounding_envelope() {
+    mixed_media_batch_gate(&PathBuf::from(model_dir()), EngineKind::Cpu, 5e-3);
 }

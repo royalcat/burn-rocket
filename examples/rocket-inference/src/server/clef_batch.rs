@@ -47,6 +47,8 @@ pub(crate) struct ClefDone {
     pub compute_s: f64,
     pub batch_records: usize,
     pub batch_tokens: usize,
+    /// Peak anon over the batch (MiB), from the phase counters.
+    pub peak_anon_mib: f64,
 }
 
 pub(crate) struct ClefJob {
@@ -172,6 +174,7 @@ fn run_locked(
                 batch_tokens = done.tokens,
                 passes = done.passes,
                 experts_read = done.experts_read,
+                peak_anon_mib = (done.peak_anon_mib * 10.0).round() / 10.0,
                 compute_s = (compute_s * 1000.0).round() / 1000.0,
                 "clef batch"
             );
@@ -182,6 +185,7 @@ fn run_locked(
                     compute_s,
                     batch_records: records,
                     batch_tokens: done.tokens,
+                    peak_anon_mib: done.peak_anon_mib,
                 });
                 // a client that disconnected meanwhile is simply not answered
                 let _ = reply.send(msg);

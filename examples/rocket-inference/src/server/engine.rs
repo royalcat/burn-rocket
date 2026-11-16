@@ -435,6 +435,8 @@ pub struct ClefBatchOutcome {
     pub passes: usize,
     /// Expert records read over those passes (0 where the engine has no phase counters).
     pub experts_read: usize,
+    /// Peak anonymous resident set over the batch (MiB); from the phase counters.
+    pub peak_anon_mib: f64,
 }
 
 impl Qwen3Engine {
@@ -904,6 +906,7 @@ impl ClefEngine {
         span.record("passes", done.chunks.len() as u64);
         span.record("experts_read", done.experts_read() as u64);
         // the phase totals of the last pass (a batch is one pass unless the cap split it)
+        let mut peak_anon_mib = 0.0;
         if let Some(p) = self.model.backbone.last_phases() {
             span.record("moe_s", p.moe);
             span.record("attn_s", p.attn);
@@ -911,11 +914,13 @@ impl ClefEngine {
             span.record("read_wait_s", p.read_wait_thread);
             span.record("npu_s", p.npu_thread);
             span.record("peak_anon_mib", p.peak_anon_mib);
+            peak_anon_mib = p.peak_anon_mib;
         }
         ClefBatchOutcome {
             passes: done.chunks.len(),
             experts_read: done.experts_read(),
             tokens,
+            peak_anon_mib,
             results: done
                 .results
                 .into_iter()

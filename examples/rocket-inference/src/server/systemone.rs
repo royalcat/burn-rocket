@@ -185,6 +185,7 @@ pub(crate) async fn systemone_clef(
         done.compute_s,
         done.batch_records,
         done.batch_tokens,
+        done.peak_anon_mib,
     );
     Ok(Json(done.outcome.response))
 }

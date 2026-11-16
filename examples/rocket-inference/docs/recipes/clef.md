@@ -672,10 +672,87 @@ the dev host's emulated-int8 numbers (`media-audio-5s`: `speech` 0.8596 oracle /
 `ROCKET_CLEF_AUDIO_ATTN=device` is an experiment: compare the tower seconds with the default. Check memory: `RssAnon`
 and the BO total (`ROCKET_MEM_LOG=1`) with both towers opened (1.07 + 1.2 GiB) next to the thinker.
 
+## Mixed batches: serve, decide and tower lifetime (phase 8f, 2026-11-16)
+
+Audited and finished the media path through the existing batcher: the batch record already
+carries decoded media (`EncodedRecord.media`), so `ClefModel::answer_encoded` runs each
+record's vision/audio tower **before** the shared thinker pass and hands per-record
+`MediaFeatures` (positions, placeholder splice, three DeepStack taps) to
+`Backbone::forward_batch_media`. No batch-layer code was needed: the per-record plumbing
+landed in 8b-8e and the generic batcher in phase 7. What was missing is below.
+
+- **Failure isolation** (already in `answer_encoded`): a validation/decode failure happens in
+  `encode` before queueing and fails that record alone; a tower failure in `media_features`
+  leaves the shared pass with that record omitted; a failure of the shared pass fails its
+  members. The server's `/v1/systemone` returns 422 for the failed record and 200 for the rest.
+- **Row caps count media tokens**: `rows = enc.input_ids.len()` includes the image/video/audio
+  placeholders (the 5-record gate below is 2,256 rows, of which 1,044 are media), both in the
+  batcher's `cost` and in `decide`'s `plan_batches`. A job over `--batch-max-tokens` opens the
+  next pass.
+- **Lazy-load tracking in serve logs**: the first use of each tower prints a structured line
+  `clef tower loaded (lazy, first use) modality="vision"|"audio" seconds=… placement=…`
+  alongside the human `clef: … tower opened in …s` line. `/health` and `/v1/models` never take
+  the model lock, so they stay responsive (measured 6 ms / 200 while the batch held the lock
+  and loaded towers).
+- **Peak anon**: the `clef batch` line and every `decision request` line now carry
+  `peak_anon_mib`; the `clef` OTel span already records it. Media bytes/tensors live in the
+  `EncodedRecord`s and are dropped when the batch returns; `tower.trim(ROCKET_KEEP_MB)` runs
+  after each tower use, and `run_locked` calls `trim_after_request()` + `log_npu_mem()` once per
+  batch. Five sequential media requests showed flat `RssAnon` (1,587 -> 1,587 MiB).
+- **`ROCKET_CLEF_TOWER_RELEASE=1`** (default **off**): drop both towers' resident weights and
+  mmapped shards after each `answer`/`answer_batch` call, so the next request of a modality
+  reopens/repacks only that tower. Useful when vision (~1.07 GiB of BOs) and audio (~1.2 GiB)
+  cannot stay resident next to the thinker; off by default because packing costs seconds.
+  Verified with two image batches in one process: default opens the vision tower once and
+  ends at 1,017 MiB anon; with the knob it opens twice, logs two
+  `clef: released tower weights (vision=true, audio=false …)` lines and ends at 770 MiB.
+  `ClefModel::media_supported()` (the union of vision/audio support) now guards the server's
+  media refusal, so an audio-only checkpoint no longer refuses audio.
+
+### Gates (dev host, release build, 8 threads, AutoRound shards in the HF cache)
+
+| gate | result |
+|---|---|
+| `ROCKET_CLEF_EMU=1` mixed batch (`checkout-errors` + `media-image-small` + `media-audio-5s` + `media-video-silent` + `media-video-audio-small`), one pass | answers **byte-identical** to the five single runs; probabilities bit-exact; 6,048 vs 28,071 expert reads; 176 s vs 197-211 s over two runs |
+| BF16 CPU path, same mixed batch | hidden-state difference < 1e-4 relative-to-peak (pinned by `batch_tests::the_cpu_f32_path_batches_to_within_float_rounding`); the head amplifies it to max \|dp\| 1.88e-3, so the gate tolerance is 5e-3 and rounded confidences may differ on a near-tie. 52.3 s vs 147.8 s |
+| failure isolation (one `data:image/png;base64,AAAA` among valid records) | bad record fails alone (422 over HTTP); valid records' probabilities unchanged |
+| `serve --batch-window-ms 3000 --batch-max 8`, 5 concurrent mixed requests | all 200 in 176 s (compute 173.0 s, 2,256 rows, peak anon 2,050 MiB); bodies **byte-identical** to the same five requests run sequentially (204 s) |
+| `decide --requests` with the 5 mixed cases | one pass, 6,048 expert reads, 173.6 s, all five cases answered |
+| `cargo test -p rocket-inference --no-default-features` | 324 pass, 24 ignored |
+| fmt, host clippy, aarch64 `npu` release build + scoped clippy | clean |
+
+The two new ignored tests are `clef_mixed_media_batch_equals_singles_on_the_emulated_engine`
+(and its BF16 counterpart `clef_mixed_media_batch_within_the_cpu_rounding_envelope`); both
+resolve the checkpoints through `clef::testutil` and `data/` fixtures relative to
+`CARGO_MANIFEST_DIR`. Note the BF16 CPU `gemm` path is **not** bit-identical under batching —
+the expert bucket's row count changes the f32 summation order; use `ROCKET_CLEF_EMU=1` (or the
+NPU) when byte-identical batch answers matter.
+
+### Board commands for a mixed batch (8f, not yet run)
+
+```sh
+# aarch64 npu release build, copy as /root/rocket-inference/rocket-inference-p8f, plus data/
+# and tools/clef_fixtures_media.json. Stop home-llm-gateway-embed-1 / -decision-1 first.
+cd /root/rocket-inference
+python3 -c "import json;t=json.load(open('tools/clef_fixtures.json'));\
+m=json.load(open('tools/clef_fixtures_media.json'));\
+ids=['checkout-errors','media-image-small','media-audio-5s','media-video-silent','media-video-audio-small'];\
+json.dump([next(x for x in (t+m) if x['id']==i) for i in ids],open('/tmp/mixed.json','w'))"
+taskset -c 4-7 ./rocket-inference-p8f decide \
+    --model-dir /mnt/nvme/models/clef-omni-int8-autoround --device npu \
+    --requests /tmp/mixed.json --out /tmp/clef-mixed.json --max-state-tokens 8192
+# Expect one `clef batch batch=5 …` line, `peak_anon_mib` ~2 GiB + the tower BOs
+# (vision ~1.07 + audio ~1.2 GiB), and answers matching the EMU numbers above.
+# For serve: ROCKET_CLEF_TOWER_RELEASE=1 as needed to drop both towers between requests;
+# ROCKET_MEM_LOG=1 for the BO split, ROCKET_CLEF_TOWER_CHECK=1 for vision-vs-f32 cosines.
+```
+
 ## Not done
 
-`media_kwargs`, the audio/vision tower unload when idle (both stay resident once opened), attention scores/AV on the NPU of
-the thinker, a CPU `sdot` expert path, a board run of the vision and audio towers, an NPU `Conv2d` for `conv2d1`.
+`media_kwargs`, attention scores/AV on the NPU of the thinker, a CPU `sdot` expert path, a
+board run of the vision and audio towers (including the mixed batch above), an NPU `Conv2d`
+for `conv2d1`. Towers can now be dropped between requests with `ROCKET_CLEF_TOWER_RELEASE=1`,
+but there is no idle timeout/automatic unload.
 
 ## Board results, phase 6 (2026-11-14, rock-5b-plus)
 

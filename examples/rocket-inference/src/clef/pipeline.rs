@@ -55,6 +55,11 @@ pub struct ClefModel {
     audio: Mutex<Option<Arc<AudioTower>>>,
     /// The directory holds `thinker.audio_tower.*` tensors (a clef-pack does not).
     audio_supported: bool,
+    /// `ROCKET_CLEF_TOWER_RELEASE=1`: drop a tower's resident NPU weights (BOs) after
+    /// each request instead of keeping them for the process lifetime. The tower is
+    /// reopened lazily on the next request of that modality; off by default because
+    /// packing vision (~1.07 GiB) + audio (~1.2 GiB) costs seconds.
+    tower_release: bool,
 }
 
 impl std::fmt::Debug for ClefModel {
@@ -93,6 +98,12 @@ pub fn default_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8)
+}
+
+/// `ROCKET_CLEF_TOWER_RELEASE=1` drops a tower's resident NPU weights after each
+/// request (off by default: the next request of that modality reopens/repacks it).
+fn tower_release_from_env() -> bool {
+    std::env::var("ROCKET_CLEF_TOWER_RELEASE").is_ok_and(|v| v == "1")
 }
 
 impl ClefModel {
@@ -187,6 +198,7 @@ impl ClefModel {
             images_supported: VisionTower::available(dir),
             audio: Mutex::new(None),
             audio_supported: AudioTower::available(dir),
+            tower_release: tower_release_from_env(),
         })
     }
 
@@ -200,6 +212,36 @@ impl ClefModel {
     /// tower).
     pub fn audio_supported(&self) -> bool {
         self.audio_supported
+    }
+
+    /// Whether any media is served (the union used by the HTTP front's guards).
+    pub fn media_supported(&self) -> bool {
+        self.images_supported || self.audio_supported
+    }
+
+    /// Drop both towers after a request when `ROCKET_CLEF_TOWER_RELEASE=1`: this frees their
+    /// resident NPU weights (~1.07 GiB vision + ~1.2 GiB audio of BOs) and mmapped shards.
+    /// The slots are `None` again, so the next request of each modality reopens/repacks only
+    /// the tower it needs. A no-op by default (the towers stay resident for the process).
+    pub fn release_towers(&self) {
+        if !self.tower_release {
+            return;
+        }
+        let vision = self.vision.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let audio = self.audio.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if vision.is_some() || audio.is_some() {
+            crate::util::mem::trim_heap();
+            tracing::info!(
+                vision = vision.is_some(),
+                audio = audio.is_some(),
+                "clef towers released (ROCKET_CLEF_TOWER_RELEASE=1)"
+            );
+            eprintln!(
+                "clef: released tower weights (vision={}, audio={}; the next request reopens them)",
+                vision.is_some(),
+                audio.is_some()
+            );
+        }
     }
 
     /// The audio tower, opened on first use (shards indexed, and on the NPU every linear
@@ -218,10 +260,16 @@ impl ClefModel {
         let t0 = std::time::Instant::now();
         let tower = AudioTower::open(&self.dir, self.tower_device, tower_threads())
             .context("open the audio tower")?;
+        let seconds = t0.elapsed().as_secs_f64();
         eprintln!(
-            "clef: audio tower opened in {:.1}s ({})",
-            t0.elapsed().as_secs_f64(),
+            "clef: audio tower opened in {seconds:.1}s ({})",
             tower.label()
+        );
+        tracing::info!(
+            modality = "audio",
+            seconds,
+            placement = %tower.label(),
+            "clef tower loaded (lazy, first use)"
         );
         let tower = Arc::new(tower);
         *slot = Some(tower.clone());
@@ -244,10 +292,16 @@ impl ClefModel {
         let t0 = std::time::Instant::now();
         let tower = VisionTower::open(&self.dir, self.tower_device, tower_threads())
             .context("open the vision tower")?;
+        let seconds = t0.elapsed().as_secs_f64();
         eprintln!(
-            "clef: vision tower opened in {:.1}s ({})",
-            t0.elapsed().as_secs_f64(),
+            "clef: vision tower opened in {seconds:.1}s ({})",
             tower.label()
+        );
+        tracing::info!(
+            modality = "vision",
+            seconds,
+            placement = %tower.label(),
+            "clef tower loaded (lazy, first use)"
         );
         let tower = Arc::new(tower);
         *slot = Some(tower.clone());
@@ -348,6 +402,12 @@ impl ClefModel {
     /// default is [`DEFAULT_MAX_LENGTH`]); images count toward it, audio/video are refused. A
     /// client error is an [`Invalid`](super::request::Invalid) in the error chain.
     pub fn answer(&self, req: &ClefRequest, max_length: usize) -> Result<Answered> {
+        let result = self.answer_inner(req, max_length);
+        self.release_towers();
+        result
+    }
+
+    fn answer_inner(&self, req: &ClefRequest, max_length: usize) -> Result<Answered> {
         let encoded = encode_request(&self.tokenizer, req, max_length)?;
         let ids = &encoded.input_ids;
         let features = self.media_features(&encoded)?;
@@ -393,6 +453,17 @@ impl ClefModel {
     /// encoded (the server does that before queueing); an `Err` entry fails that
     /// request alone and keeps its error (so an `Invalid` stays a client error).
     pub fn answer_encoded(
+        &self,
+        reqs: &[&ClefRequest],
+        encoded: Vec<Result<EncodedRecord>>,
+        max_batch_tokens: usize,
+    ) -> BatchAnswers {
+        let result = self.answer_encoded_inner(reqs, encoded, max_batch_tokens);
+        self.release_towers();
+        result
+    }
+
+    fn answer_encoded_inner(
         &self,
         reqs: &[&ClefRequest],
         encoded: Vec<Result<EncodedRecord>>,

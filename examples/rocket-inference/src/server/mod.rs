@@ -153,7 +153,7 @@ pub fn serve(addr: &str, engine: Engine, settings: Settings) -> Result<()> {
     let capabilities = settings.capabilities;
     let model_name = settings.model_name.clone();
     let clef_tokenizer = match &engine {
-        Engine::Clef(c) => Some((c.model.tokenizer().clone(), c.model.images_supported())),
+        Engine::Clef(c) => Some((c.model.tokenizer().clone(), c.model.media_supported())),
         _ => None,
     };
     let inner = Arc::new(Mutex::new(engine));
