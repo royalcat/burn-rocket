@@ -1,6 +1,6 @@
 //! Clef pack format v1: the on-disk layout shared by the packer and the reader.
 //!
-//! See `docs/recipes/clef-pack.md` for the prose description. Everything is little-endian.
+//! See `docs/experiments/clef-pack.md` for the prose description. Everything is little-endian.
 //!
 //! ```text
 //! layer_NN.experts

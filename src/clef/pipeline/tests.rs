@@ -112,7 +112,9 @@ fn clef_answers_match_the_oracle() {
     for id in ids.split(',') {
         let dump = PathBuf::from(DUMP_DIR);
         let Ok(text) = std::fs::read_to_string(dump.join(format!("{id}.json"))) else {
-            eprintln!("skipping {id}: no oracle dump in {DUMP_DIR} (docs/recipes/clef-oracle.md)");
+            eprintln!(
+                "skipping {id}: no oracle dump in {DUMP_DIR} (docs/experiments/clef-oracle.md)"
+            );
             continue;
         };
         let oracle: Value = serde_json::from_str(&text).unwrap();
@@ -176,7 +178,9 @@ fn clef_pack_answers_match_the_oracle_top1() {
     for id in ids.split(',') {
         let dump = PathBuf::from(DUMP_DIR);
         let Ok(text) = std::fs::read_to_string(dump.join(format!("{id}.json"))) else {
-            eprintln!("skipping {id}: no oracle dump in {DUMP_DIR} (docs/recipes/clef-oracle.md)");
+            eprintln!(
+                "skipping {id}: no oracle dump in {DUMP_DIR} (docs/experiments/clef-oracle.md)"
+            );
             continue;
         };
         let oracle: Value = serde_json::from_str(&text).unwrap();
@@ -264,7 +268,9 @@ fn clef_emu_answers_match_the_oracle_and_the_cpu_pack_path() {
     for id in ids.split(',') {
         let dump = PathBuf::from(DUMP_DIR);
         let Ok(text) = std::fs::read_to_string(dump.join(format!("{id}.json"))) else {
-            eprintln!("skipping {id}: no oracle dump in {DUMP_DIR} (docs/recipes/clef-oracle.md)");
+            eprintln!(
+                "skipping {id}: no oracle dump in {DUMP_DIR} (docs/experiments/clef-oracle.md)"
+            );
             continue;
         };
         let oracle: Value = serde_json::from_str(&text).unwrap();

@@ -15,7 +15,7 @@ release's `joint_schema_model.py`).
 Records with `images`/`audio`/`videos` additionally run the vision/audio towers in f32 (clef_media.py), splice
 their features into the embeddings, use the 3-D mRoPE positions of the real HF `get_rope_index`, and inject
 the DeepStack features after decoder layers 0-2. Relative media paths resolve against `--media-base`
-(default: examples/rocket-inference). See docs/recipes/clef-oracle.md for the dump format.
+(default: examples/rocket-inference). See docs/experiments/clef-oracle.md for the dump format.
 
 The checkpoint is untrusted data: run with `python -I`, and never use the model dir as CWD.
 This script imports only the local copy of joint_schema_model.py (by explicit file path).

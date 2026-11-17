@@ -15,7 +15,7 @@
 //!
 //! **A clip's features depend on its batch mates**: a short clip is zero-padded to the longest
 //! clip BEFORE the STFT, so its last valid frames see zeros where an unpadded clip would see
-//! reflect padding (clef-oracle.md §1 / §7.4). The explicit `audio` clips and the soundtracks
+//! reflect padding (docs/experiments/clef-oracle.md §1 / §7.4). The explicit `audio` clips and the soundtracks
 //! of audio-in-video records are ONE batch.
 
 use rayon::prelude::*;

@@ -1,7 +1,7 @@
 //! The Clef pack: the AutoRound int8 checkpoint repacked for streaming (phase 5).
 //!
 //! * [`format`]: layer-file header, expert record layout, alignment (documented in
-//!   `docs/recipes/clef-pack.md`).
+//!   `docs/experiments/clef-pack.md`).
 //! * [`autoround`]: reading the `moeshawky/clef-omni-int8-autoround` shards and unpacking
 //!   GPTQ words into `[N, K]` int8 codes + `[N, K/128]` f16 scales.
 //! * [`build`]: the `clef-pack` command (checkpoint dir -> pack dir, `--verify`).

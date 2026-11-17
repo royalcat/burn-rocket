@@ -1434,7 +1434,7 @@ fn video_answers_stay_close_to_the_oracle_on_the_emulated_int8_path() {
 /// Frames above the per-frame cap are converted by swscale to the capped size: compare the
 /// ffmpeg CLI path with the release's PyAV `load_video` on clips made for that
 /// (`/tmp/opencode/clef/vid8d/<name>.{mp4,u8,json}`, written by the PyAV dump script in the
-/// phase 8d notes in `clef.md`). Skips when the dump is absent.
+/// phase 8d notes in `docs/experiments/clef-omni.md`). Skips when the dump is absent.
 #[test]
 fn scaled_frames_match_pyav_on_clips_above_the_frame_cap() {
     if !have_ffmpeg() {

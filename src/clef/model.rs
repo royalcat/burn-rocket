@@ -862,7 +862,7 @@ impl Backbone {
     /// chunk. Records are chunked in order so a chunk holds at most `max_batch_tokens`
     /// rows (a record over the cap runs alone; `0` = no cap). Every record's output is
     /// bit-identical to [`Backbone::forward`] on it alone for the engines whose row math
-    /// is independent of the other rows (see `docs/recipes/clef.md`, "Batching").
+    /// is independent of the other rows (see `docs/experiments/clef-omni.md`, "Batching").
     ///
     /// An empty record fails alone; an error in a chunk's shared pass fails that chunk's
     /// members with the same message. A panic (an NPU failure) unwinds out of the call.

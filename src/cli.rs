@@ -47,7 +47,7 @@ stage (decode included) on the NPU. A `placement:` line reports the resolved
 split at load.
 
 Flags are documented per command (`rocket-inference help <command>`), in
-README.md and in docs/recipes/.";
+AGENTS.md (App reference section) and in docs/recipes/.";
 
 /// Usage text for one command (`rocket-inference help <command>`).
 pub fn command_usage(cmd: &str) -> Option<&'static str> {
@@ -102,7 +102,7 @@ model and memory:
   --cpu-backend / --dtype / --quant / --defer-towers /
   --embed-f16 / --embed-int8 / --attn-chunk / --chunk / --key-block
 
-See `rocket-inference help` for the shared placement flags and README.md for
+See `rocket-inference help` for the shared placement flags and AGENTS.md for
 the endpoints.";
 
 const EMBED_USAGE: &str = "\
@@ -255,7 +255,7 @@ from the BF16 shards (~1-2 min per record on 8 cores, ~2.5 GB RAM plus the
 or its directory, used as stored, no repack) and `--device npu` (or `auto` on an
 aarch64 `npu` build) the attention projections and the 128-expert MoE of every layer
 run as int8 g128 W8A8 on the NPU, streaming the experts from NVMe
-(docs/recipes/clef.md). Cases are the same objects as above with the release's
+(docs/experiments/clef-omni.md). Cases are the same objects as above with the release's
 `model`, `state` and `questions`, plus `images` (file paths, relative ones from the
 current directory, `data:` URLs or http(s) URLs; every image costs its merged tokens
 of the --max-state-tokens cap; the vision tower loads on the first image request,
@@ -269,7 +269,7 @@ the release's own default is 64000); --out and --model-name behave the same,
 answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
 `legend`/`probabilities` and `noul` (the probability of true).
 --pack-dir <dir> (same as --model-dir; detected from its manifest.json) loads a
-`clef-pack` (docs/recipes/clef-pack.md), an optional repack of the same weights
+`clef-pack` (docs/experiments/clef-pack.md), an optional repack of the same weights
 into aligned expert files; the AutoRound checkpoint itself needs no pack.
 
 See `rocket-inference help` for the shared placement flags and

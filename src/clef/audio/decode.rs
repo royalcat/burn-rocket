@@ -1,6 +1,6 @@
 //! Audio decoding of Clef-Omni (phase 8e): the release's `_decode_audio` (PyAV: the FIRST audio
 //! stream, `AudioResampler(format="flt", layout="mono", rate=16000)`, frames concatenated) done
-//! with the ffmpeg CLI: `-map 0:a:0 -ac 1 -ar 16000 -f f32le`. The oracle notes (clef-oracle.md
+//! with the ffmpeg CLI: `-map 0:a:0 -ac 1 -ar 16000 -f f32le`. The oracle notes (docs/experiments/clef-oracle.md
 //! §7.8) measured the CLI bit-identical to PyAV on `test.mp4` (AAC 44.1 kHz -> 16 kHz); the
 //! gates in `audio::tests` repeat that against the dumped samples of every fixture.
 //!

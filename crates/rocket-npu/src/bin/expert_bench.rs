@@ -1,7 +1,7 @@
 //! Clef-Omni phase-0 probe: can an RK3588 stream Qwen3-Omni-30B-A3B's experts
 //! (128 per layer, top-8, hidden 2048, expert intermediate 768) from NVMe through
 //! the NPU? It decides the resident weight format (see
-//! `docs/recipes/clef-phase0.md`).
+//! `docs/experiments/clef-phase0.md`).
 //!
 //!   expert_bench [--mode all|matmul|rewrite|disk|pipeline] [--reps R]
 //!                [--threads T] [--file PATH] [--chunk-mib 4.7] [--max-mib 2048]

@@ -34,7 +34,7 @@ usage: rocket-inference clef-pack --src <autoround dir> --out <pack dir> [flags]
 
 Repack the moeshawky/clef-omni-int8-autoround checkpoint (AutoRound int8, group 128)
 into the Clef pack: one 4 KiB-aligned layer_NN.experts file per layer, a resident
-safetensors file and a manifest (docs/recipes/clef-pack.md).
+safetensors file and a manifest (docs/experiments/clef-pack.md).
 
   --src <dir>             the AutoRound checkpoint (index + shards + config)
   --out <dir>             the pack directory (created; existing pack files are replaced)

@@ -35,7 +35,7 @@ class CompatProcessor:
     `videos_kwargs={'fps': 2.0, 'do_sample_frames': False, 'use_audio_in_video': True}` with the track audio
     appended to `audio` (release 5.10 semantics). transformers >= 5.23 rejects that (the track must be declared
     through `load_audio_from_video` + `audio_from_video_indices`); this proxy does exactly that translation and
-    changes nothing else. The token layout it produces is the one documented in clef-oracle.md."""
+    changes nothing else. The token layout it produces is the one documented in docs/experiments/clef-oracle.md."""
 
     def __init__(self, proc):
         self._p = proc

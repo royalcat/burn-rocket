@@ -15,7 +15,7 @@
 //!   the visual pad positions only. [`MediaFeatures::assemble`] builds it from the tower
 //!   outputs and the token ids.
 //!
-//! Reference: `tools/clef_media.py` and `docs/recipes/clef-oracle.md` "Media records".
+//! Reference: `tools/clef_media.py` and `docs/experiments/clef-oracle.md` "Media records".
 
 use anyhow::{Result, bail, ensure};
 

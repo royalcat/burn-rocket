@@ -1,7 +1,7 @@
 //! Serving straight from the AutoRound checkpoint (`moeshawky/clef-omni-int8-autoround`,
 //! safetensors shards) with no repack: [`ShardStore`].
 //!
-//! Layout of an expert in the shards (measured, `docs/recipes/clef.md` "Step 0"): for one
+//! Layout of an expert in the shards (measured, `docs/experiments/clef-omni.md` "Step 0"): for one
 //! expert the six `qweight`/`qzeros` tensors (down, gate, up) are **one contiguous run**
 //! (4.76 MB, consecutive experts follow each other) and the three f16 `scales` tensors
 //! are a **second contiguous run** (72 KB) in a separate region at the end of the shard,

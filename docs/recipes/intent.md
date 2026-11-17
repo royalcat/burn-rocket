@@ -1,6 +1,6 @@
 # Qwen3.5-0.8B intent recipes
 
-Best-effort: the numbers are from `docs/experiment-log.md` §14 (166-token v7
+Best-effort: the numbers are from `docs/experiments/experiment-log.md` §14 (166-token v7
 planner prompt, 32 generated tokens, busy board), not re-measured in the
 2026-10-31 round. The command lines use the current unified flags.
 

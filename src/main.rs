@@ -13,7 +13,7 @@
 //! | `tokenize` | any detected family |
 //! | `gemm` | no model (flex matmul microbenchmark) |
 //!
-//! See `README.md` and `docs/recipes/` for commands and flags.
+//! See `AGENTS.md` (App reference section) and `docs/recipes/` for commands and flags.
 
 mod clef;
 mod cli;
@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     // Hidden maintenance command (not in `--help`): repack the AutoRound int8
-    // checkpoint into a Clef pack (docs/recipes/clef-pack.md).
+    // checkpoint into a Clef pack (docs/experiments/clef-pack.md).
     if cmd == "clef-pack" {
         return clef::pack::build::run(it);
     }

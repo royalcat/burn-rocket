@@ -3,7 +3,7 @@
 Best-effort: the board has not completed a Gemma 4 run since the memory
 rounds (the checkpoint is 8.9 GiB at f16 / 12.5 GiB f32, and the board shares
 ~15.8 GiB with its services). The numbers below are from
-`docs/experiment-log-gemma.md` §13 on the dev host; the command lines use the
+`docs/experiments/experiment-log-gemma.md` §13 on the dev host; the command lines use the
 current unified flags. The QAT mobile checkpoint is the board-friendly one.
 
 ```sh

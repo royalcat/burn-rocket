@@ -19,7 +19,7 @@ Codes are `A..Z, AA..JT` (255, the ones that are single tokens).
 
 Phases M1-M6 changed what a d3 deployment costs, not what it answers: the
 request/answer contract, the caps and the refusals below are unchanged. This
-block is the summary; `docs/recipes/decision.md` (`## Deployment (current)`)
+block is the summary; `docs/experiments/decision-d3.md` (`## Deployment (current)`)
 carries the same figures as a recipe, and the per-phase evidence is at the end
 of this file.
 
@@ -849,7 +849,7 @@ by up to **6.6e-3** in probability (`noul-refund-window`, 3.1e-3 at
 phase-1 text section gives for lite.
 
 Not measured in phase 4: **the board NPU run** (it came later; the d3 board window and
-the memory round are `docs/recipes/decision.md`'s Board section and this file's
+the memory round are `docs/experiments/decision-d3.md`'s Board section and this file's
 `## Current state`). This round is the dev host only (f32 compute, no device); the NPU
 offload needs the aarch64 build plus the RK3588's 600 MHz module, and the numbers above
 say nothing about it. Also noted for a
@@ -964,7 +964,7 @@ weights, while the d3 board round measured 1,006.7 MiB of fp16 weight BO). It is
 opt-in (fp16 stays the default), requires `--device npu` / `--text-device npu` (the
 pack-and-drop load needs the packed stage), and is independent of the token table's
 `--embed-int8`. **Phase M6 measured it and rejected it for this family** (quality,
-wall time and the BO bytes are in `docs/recipes/decision.md`, `### Memory, int8 and
+wall time and the BO bytes are in `docs/experiments/decision-d3.md`, `### Memory, int8 and
 tower round`): `--int8-group 512` halves the weights BO (474.0 vs 966.0 MiB) but
 costs +6.5 % wall and +18 % user CPU and moves text by 3.4e-2 / image by 4.4e-2
 against the max |Δp| ≤ 1e-2 bar; `--int8-group 128` is both slower and less accurate
@@ -974,7 +974,7 @@ fp16.
 ## Memory round (phases M4-M6, 2026-11-02)
 
 The evidence behind `## Current state`; the per-arm tables are in
-`docs/recipes/decision.md` (`### Prefill memory`, `### Text body storage`,
+`docs/experiments/decision-d3.md` (`### Prefill memory`, `### Text body storage`,
 `### Memory, int8 and tower round` and `#### Token table block scales`), which is
 the recipe view of the same runs. Summarised here so this file's per-phase
 history stays readable in order.

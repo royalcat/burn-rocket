@@ -1,7 +1,7 @@
 # Qwen3-Embedding-0.6B recipes
 
 Best-effort: the numbers below are derived from the dated experiment logs
-(`docs/experiment-log.md` §9/§17), not re-measured in the 2026-10-31 round.
+(`docs/experiments/experiment-log.md` §9/§17), not re-measured in the 2026-10-31 round.
 The command lines use the current unified flags.
 
 ```sh
