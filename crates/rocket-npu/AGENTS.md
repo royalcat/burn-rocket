@@ -45,10 +45,7 @@ The parity oracle needs a host build of the C library pinned at `88cae6d`; see
 
 ## Known issues
 
-- On the current stable toolchain `cargo clippy -p rocket-npu --all-targets -- -D warnings`
-  reports 6 `needless_range_loop` lints (`matmul/bf16.rs:293`, `matmul/int4_context.rs:145`,
-  `ops/activation.rs:449/464/500`). They predate the 2026-11-17 repo restructure; the CI
-  clippy step fails until they are fixed.
+None open. (The six `needless_range_loop` clippy lints that predated the 2026-11-17 restructure were fixed the same day; clippy is clean on host and aarch64 with `-D warnings`.)
 
 ## Conventions
 
