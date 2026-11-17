@@ -23,7 +23,7 @@
 //!        I_SCALE_BITS W_SCALE_BITS O_SCALE_BITS IN_ZP W_ZP OUT_ZP INT8_OUT [DW_GROUP]
 //!
 //! The emitters take the TILE dims (Mt Kt Nt), not the full problem dims, and a
-//! plan prints `Mt Kt Nt jobs` or `-1`, matching `tools/c-oracle/oracle`.
+//! plan prints `Mt Kt Nt jobs` or `-1`, matching `crates/rocket-npu/tools/c-oracle/oracle`.
 //!
 //! `recip` prints the fp16 average-pool reciprocal bits of K
 //! (`regcmd::pool::ppu_recip_kernel_fp16`). `pool` prints the spatial-reduce
@@ -114,7 +114,7 @@ fn emit_program(kind: &str, params: &MatmulParams) -> ExitCode {
 
 /// The conv family: `conv` (the plan code), `emit-conv` / `emit-conv-act` (the program).
 ///
-/// The argument layout is `tools/c-oracle/oracle`'s: 13 scalars after the mode, then the
+/// The argument layout is `crates/rocket-npu/tools/c-oracle/oracle`'s: 13 scalars after the mode, then the
 /// mode's own tail (OH/OW for the plan, `FP32TOFP16|KIND IN WT OUT [DSY DSX]` for the
 /// emitters).
 fn conv_mode(mode: &str, args: &[String]) -> ExitCode {
@@ -231,7 +231,7 @@ fn conv_mode(mode: &str, args: &[String]) -> ExitCode {
 /// `emit-conv-dw-int8` (the depthwise int8-out requant, or its int32-raw diagnostic
 /// form with `INT8_OUT = 0`).
 ///
-/// The argument layout is `tools/c-oracle/oracle`'s: 12 geometry scalars, the three
+/// The argument layout is `crates/rocket-npu/tools/c-oracle/oracle`'s: 12 geometry scalars, the three
 /// IOVAs, then the quant tail. The scales are raw `f32` bit patterns in hex.
 fn conv_int8_mode(mode: &str, args: &[String]) -> ExitCode {
     if args.len() < 17 {

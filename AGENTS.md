@@ -1,28 +1,35 @@
 # AGENTS.md — burn-rocket
 
-`burn-rocket` is the main crate: RK3588 NPU offload for Burn models — the pure-Rust
-`rocket-npu` driver (`crates/rocket-npu`) plus the `RocketOps` Burn backend extension
-(projections and attention on the mainline `rocket` driver). No C toolchain, CMake,
-kernel headers, or vendor archive are involved. The inference app is
-`examples/rocket-inference/` (one binary, five model families: `qwen3`
-Qwen3-Embedding-0.6B, `intent` Qwen3.5-0.8B, `gemma` EmbeddingGemma 2, Gemma 4
-E2B-it and `decision` vllm-sr d3). Read `README.md` (library) and
-`examples/rocket-inference/README.md` (app)
-first; measurements live in `examples/rocket-inference/docs/experiment-log.md`
-(Qwen3 + intent) and `examples/rocket-inference/docs/experiment-log-gemma.md`
-(Gemma); d3's are in `examples/rocket-inference/docs/recipes/decision.md`
-(dev host + board) and `examples/rocket-inference/tools/decision.md` (parity).
-The root README opens with
+**Layout (inverted again on 2026-11-17, `git mv` only, no functional changes)**: the
+repo root is the `rocket-inference` package (the app: one binary, six model families —
+`qwen3` Qwen3-Embedding-0.6B, `intent` Qwen3.5-0.8B, `embeddinggemma` EmbeddingGemma 2,
+`gemma4` Gemma 4 E2B-it, `decision` vllm-sr d3 and `clef` Clef-Omni) and the Cargo
+workspace root, with `crates/burn-rocket` (the `RocketOps` Burn backend extension:
+projections and attention on the mainline `rocket` driver; former root package) and
+`crates/rocket-npu` (the pure-Rust driver) as members. No C toolchain, CMake, kernel
+headers, or vendor archive are involved. Path map from before the move (older dated
+notes and the experiment logs still use the old paths and commands as they were run):
+`examples/rocket-inference/X` -> `X`, root `src/`, `examples/probe.rs`, library
+`README.md` -> `crates/burn-rocket/...`, `tools/c-oracle` ->
+`crates/rocket-npu/tools/c-oracle`. `[profile.release]` lives in the root `Cargo.toml`
+(the workspace root). `cargo build` at the root builds `rocket-inference` with its
+default `cpu` feature (CubeCL LLVM); cross-builds pass `--no-default-features`. Read
+`README.md` (app) and `crates/burn-rocket/README.md` (library) first; measurements
+live in `docs/experiment-log.md` (Qwen3 + intent) and `docs/experiment-log-gemma.md`
+(Gemma); d3's are in `docs/recipes/decision.md` (dev host + board) and
+`tools/decision.md` (parity).
+The root README (the app README since 2026-11-17) opens with
 `## AI Disclosure` and `## Inference server` (the five servers with their API
 endpoints and commands, plus the production embedding deployment and its board
-speeds) before "What it provides"; the speeds there mirror the experiment logs —
+speeds); the speeds there mirror the experiment logs —
 keep both in sync when measurements change.
 
-The repo was inverted on 2026-10-06 with no functional changes (commits `8c7eabb`
-structure + `cb2f872` docs): the former root package `embeddings-fast` moved to
-`examples/rocket-inference/` (renamed from `examples/qwen3-embeddings/` on 2026-10-06 when it
-gained the Qwen3.5 intent-model server), the former `crates/burn-rocket` became the root
-package.
+History: the repo was first inverted on 2026-10-06 (commits `8c7eabb` structure +
+`cb2f872` docs): the former root package `embeddings-fast` moved to
+`examples/rocket-inference/` (renamed from `examples/qwen3-embeddings/` when it gained the
+Qwen3.5 intent-model server) and `crates/burn-rocket` became the root package. The
+2026-11-17 move above reversed that: the app is the root again and the library is back in
+`crates/burn-rocket`. The notes below that cite the 2026-10-06 layout predate it.
 The inversion is verified on the dev host: `cargo check -p burn-rocket` (default `npu`,
 plus `--no-default-features` and `flex`) and `-p rocket-inference` (default `cpu` and
 `--no-default-features`), aarch64
@@ -59,8 +66,8 @@ the intent model gained an OpenAI chat surface and Gemma 4 gained the Ollama API
 detected from the checkpoint (`config.json` / GGUF arch, a d3 package's
 `decision_config.json`) and `--family auto|qwen3|embeddinggemma|intent|gemma4|
 decision` overrides it. `--model-dir` is required (or `-hf`). The commands
-are documented in `examples/rocket-inference/README.md`, with per-model
-balanced/full-offload/speed command lines in `examples/rocket-inference/docs/recipes/`
+are documented in `README.md`, with per-model
+balanced/full-offload/speed command lines in `docs/recipes/`
 (which also maps the old flag names used by the dated bullets below).
 
 Placement is per stage: `--device auto|cpu|npu` sets the base, and
@@ -92,7 +99,7 @@ four `npu-parity-2` follow-ups): the RK3588 surface of `librocketnpu` is impleme
 `crates/rocket-npu` with the same planners, register programs and numerics. The
 per-milestone write-up is in "Port status" below (M0-M12, including M5c tiled MLA, M11
 cube-resident FFN/MLP, M12 resident bf16 and `ROCKET_CONV_BATCH`); the app measurements
-are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
+are in `docs/experiment-log.md` §19-§21. Start from
 `crates/rocket-npu/src/lib.rs` ("Surface covered and deliberately missing") and
 `README.md` ("Missing surface") rather than re-deriving the surface.
 
@@ -100,15 +107,15 @@ are in `examples/rocket-inference/docs/experiment-log.md` §19-§21. Start from
   RK3588 port itself was validated against `b43a9ae` and the later 2026-11-02 round
   ported the RK3588-relevant deltas — see "Upstream re-pin round" below); the read-only
   copy used for the port was `/tmp/opencode/ref-rocket-userspace` (ephemeral). Re-sync it
-  and build the host oracle with `tools/c-oracle/README.md` (the oracle needs a host
-  build of `librocketnpu`; `tools/c-oracle/build.sh <src> <host-build> [out]`).
-  `python3 tools/c-oracle/parity.py` must print `RESULT: PASS`: byte-identical plans
+  and build the host oracle with `crates/rocket-npu/tools/c-oracle/README.md` (the oracle needs a host
+  build of `librocketnpu`; `crates/rocket-npu/tools/c-oracle/build.sh <src> <host-build> [out]`).
+  `python3 crates/rocket-npu/tools/c-oracle/parity.py` must print `RESULT: PASS`: byte-identical plans
   and programs for the six matmul dtypes, the PPU pool, conv (direct/depthwise/act)
   and int8 conv. The board selftests are `selftest`, `attn_selftest`, `int8_selftest`,
   `int4_selftest`, `int16_selftest`, `bf16_selftest`, `tf32_selftest`,
   `activation_selftest`, `reduce_selftest`, `ops_selftest`, `conv_selftest`,
   `encoders_selftest`, `q8_bench`, `causal_attn_bench` and `rope_bench`; the C A/B
-  driver is `tools/c-oracle/ab_compare.py` (its `ab_board` must be built natively on
+  driver is `crates/rocket-npu/tools/c-oracle/ab_compare.py` (its `ab_board` must be built natively on
   the board — a cross-built C binary cannot open the device).
 - **App-visible changes**: defaults and flags are unchanged. The NPU build gained the
   chained per-head attention (`ROCKET_FA_CHAIN`, default on), the tiled long-context
@@ -215,7 +222,7 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   them on an idle board before quoting. A redeploy needs no flag change (resident
   weights are repacked with the streamed layout at load; the numerics shift within
   fp16 noise, as the 8-token cosine 0.9999976 vs the pre-round binary shows). The
-  parity oracle must be rebuilt from `88cae6d` (`tools/c-oracle/README.md`); the old
+  parity oracle must be rebuilt from `88cae6d` (`crates/rocket-npu/tools/c-oracle/README.md`); the old
   `b43a9ae` tree no longer matches the emitters.
 
 ## Status (2026-10-06, extended 2026-10-07/08)
@@ -612,7 +619,7 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   (not Q8_0-native, worse weight fidelity) only ties on K=1024 and wins ~1.35x on
   the K=4096 down projection alone (log §20).
 - **Vulkan GPU probe — negative** (2026-10-06, log §13): the Mali-G610 via Mesa panvk
-  + Burn's wgpu backend was measured with `examples/rocket-inference/src/bin/wgpu_probe.rs`.
+  + Burn's wgpu backend was measured with `src/bin/wgpu_probe.rs`.
   Only the WGSL path works (CubeCL's SPIR-V shaders segfault panvk's compiler); the best
   attention throughput is **34 GF/s at seq 1024** (gate was >=200-300), the real qkv shape
   trips the panthor job watchdog (device lost), and the tuner OOMs at seq 512/1024.
@@ -626,7 +633,7 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   (`ghcr.io/royalcat/rocket-inference`): the aarch64 (NPU) image takes
   `<sha>`/`latest`, amd64 takes `<sha>-amd64`/`latest-amd64` (tag names unchanged:
   `type=sha,format=short,prefix=` plus the `-amd64` `flavor` suffix; a `v*` tag push
-  adds `<v-tag>`/`<v-tag>-amd64`). `examples/rocket-inference/Dockerfile`
+  adds `<v-tag>`/`<v-tag>-amd64`). `Dockerfile`
   branches on Docker's `TARGETARCH`: arm64 = `--features npu` + the staged archive,
   amd64 = `RUSTFLAGS=-C target-cpu=x86-64-v3`, flex only (the amd64 image needs an
   AVX2-capable CPU). `serve` now defaults to NPU offload on NPU builds (`--no-npu`
@@ -790,13 +797,13 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   reallocate-and-zero touched the whole prefix for every chunk of every layer); exact
   slices go to `fill_heads`/`flash_attn`, so nothing else changed. No driver change was
   needed (`crates/rocket-npu` untouched).
-  App side: `examples/rocket-inference/src/util/causal.rs` — `causal_chunk_plan` (pure;
+  App side: `src/util/causal.rs` — `causal_chunk_plan` (pure;
   host tests cover ragged tails, `q_offset`, a shorter key axis and the window band) and
   `causal_attention`, used by qwen3's `npu_attn` path and Gemma 4's NPU prefill. Chunk
   width `ROCKET_CAUSAL_CHUNK` (default 1024, `0` = the dense op); keys `[0, q1)` for
   causal, `[q0 - (w - 1), q1)` for a sliding layer; below the threshold the dense op runs
   unchanged (bit-identical to the pre-P2a binary). The probe
-  `examples/rocket-inference/src/bin/causal_attn_bench.rs` (chunked vs dense vs
+  `src/bin/causal_attn_bench.rs` (chunked vs dense vs
   `attn::flash_attn_ref`, `--window`, `--kv N` for a single long-context chunk) is the
   numeric gate.
   Numerics (board, cores 0-3): **chunked == dense bit for bit for pure causal at 512
@@ -909,7 +916,7 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   (max_rel 2.3e-7), cumsum 4x16..128x256 all four variants (bit-exact after the fp16
   read-back), softmax/logsoftmax/CE at 4x8/64x1000/257x4096 **and 257x151936**
   (softmax cosine 0.9999999, logsoftmax abs <= 7.8e-3, CE abs <= 4.2e-5; the LM-head
-  shape is 3.7 s softmax / 1.8 s CE). A C-vs-Rust A/B (`tools/c-oracle/ab_compare.py`
+  shape is 3.7 s softmax / 1.8 s CE). A C-vs-Rust A/B (`crates/rocket-npu/tools/c-oracle/ab_compare.py`
   with `ab_board.c` built natively on the board) is **bit-identical for every family**,
   including the average pools and softmax — both sides run the same program and the same
   host glue, so even the reciprocal quantization cancels. `cargo test -p rocket-npu`
@@ -987,7 +994,7 @@ prepacked-int8 BO sizing, the fp16 depthwise group 32), so the round is these de
   fp16 quarter-ULP of the pre-cancellation magnitude). The FFN/MLP relative gate is
   2e-2; the absolute norm gate is 4e-2 and the encoder's is 1e-1 (the
   brief's 1e-2 is *below* the fp16 pipeline's own noise at `d_ff = 256`).
-  **C-vs-Rust A/B** (`tools/c-oracle/ab_board.c` extended with `rmsnorm`, `layernorm`,
+  **C-vs-Rust A/B** (`crates/rocket-npu/tools/c-oracle/ab_board.c` extended with `rmsnorm`, `layernorm`,
   `batchnorm`, `groupnorm`, `instancenorm`, `l2norm`, `geglu`, `ffn`, `ffn_fused`,
   `mlp_fused`, `encoder` — same argument layout as `ops_selftest --io`, `-` for the C
   `NULL`, and the C side built natively on the board): **bit-identical for every norm,
@@ -1759,7 +1766,7 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
   scales). **Recommended serve line** (every default implicit):
   `serve --model-dir /root/models/d3-lite --device npu --defer-towers
   --max-tokens 8192 --port 8384`. The per-window tables are in
-  `examples/rocket-inference/docs/recipes/decision.md` (`## Deployment (current)`).
+  `docs/recipes/decision.md` (`## Deployment (current)`).
 - **Deferred tower + bf16 tower storage** (phase M1): the `visual.*` matmul
   weights are read in the checkpoint's own dtype (bf16 for every shipped package)
   and widened per linear — exact, and the widening goes through the stored
@@ -1957,46 +1964,46 @@ image/video splice); plus `commands/decide.rs` and `server/systemone.rs`.
 
 | path | contents |
 |---|---|
-| `src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
+| `crates/burn-rocket/src/lib.rs` | compatibility wrappers (`RocketCtx`/`RocketWeight`/`RocketFaCtx`), driver/counter helpers, `Error`/`OpFailure` |
 | `crates/rocket-npu/` | **the pure-Rust driver**: `device/` (uAPI, BO, submit, fence, sysfs, affinity), `regcmd/` (desc + the fp16/int8/int4/bf16/tf32 emitters, `activation` (the LUT flying-mode program), `pool` (the PPU pooling program + `ppu_recip_kernel_fp16`) and `conv` (`gen_conv2d_fp16`/`gen_conv2d_dw_fp16`: the direct/depthwise conv program with the fused-activation epilogue and the CNA deconvolution fields; `gen_conv2d_int8`/`gen_conv2d_dw_int8`: the int8 direct program, its `+1` CBUF bank slack and int32 writer, and the depthwise int8-out requant with the BS-ALU bias)), `matmul/` (plan — including `Plan::canonical_geom`, the M-independent pin the resident bf16 weight uses —, layout, bos, run, context + the int8/int4/tf32 one-shots, the resident int4 `I4Context`, the native bf16 stream (`bf16.rs`) *and* its resident-weight extension (`Bf16Context`/`Bf16Weight`/`resident_plan`); `Plan::pinned` is the `mm_plan_init_pin` port the fused FFN/MLP need, and `run`'s `alloc_cube`/`compute_kacc_cube`/`compute_kacc_from`/`compute_cpu_from` + `layout::scatter_bias_cube` are the cross-op cube path those entries drive), `attn/` (flash attention + the fast host softmax), `ops/` (the activation/elementwise family: LUT builders, refs, the DPU LUT model, the EW conv-main ops; `reduce` (PPU global pools + feature reduce + cumsum), `softmax`, `norm` (the per-row scale, RMSNorm, LayerNorm, `square_prescale_k`), `normvision` (BatchNorm/GroupNorm/InstanceNorm/L2), `ffn` (geglu, the block, the cube-resident fused pair, the encoder MLP), `encoder` (the pre-norm block), `conv` (the fp16 CNA conv: planner, host cube scatter, OC/spatial/channel tiling, `ConvContext`, the deconvolution route, the reference; plus the int8 half: the int32-raw direct conv with its tiler and multicore `ConvInt8Pool`, the int8-out depthwise requant with its host model, the int8 cube index math) and `conv_transpose` (both routes + the scatter-add reference), `pool` (the PPU MaxPool/AveragePool family with the int8/uint8 route, the plan classes and the references), `resize` (nearest/bilinear upsample as a depthwise transposed conv, the kernel builder and the half-pixel references), `sam` and `siglip` (the two model encoders: the `*_extract.py` blob loaders, the device-free host references, the one-shot entries and the resident prepacked contexts, plus their geometry/weight structs and the `f16_from_f64` exact narrow shared with the reference paths)), `hw`, `knobs`, `error`; `src/bin/` has the parity dump, the dtype/attention/activation/reduce/norm-FFN board self-tests (`activation_selftest`: `--kind`, `--n`, `--shape M K N`, `--all`, `--ew`, `--dump-lut`, `--dump-gen`, `--write-in`/`--run-in`/`--model-in`/`--cross`/`--ew-in` for the C A/B; `reduce_selftest`: `--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape C H W`, `--reps`, and the `--io` raw-file exchange for the C A/B; `ops_selftest`: `--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, `--norm-shape M H`/`--vision-shape N C P`/`--ffn-shape M H I`/`--encoder-shape T D H DFF`, `--reps`, and its own `--io` exchange; `conv_selftest`: `--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`, the per-family shape flags, `--reps` and its `--io`; `encoders_selftest`: `--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps R`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, and the `--io` mode for the M9 A/B) |
-| `src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`, `attention_window`/`_block`, `attention_causal_window`, `attention_causal_block`/`_window`) |
-| `src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
-| `src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
-| `tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
+| `crates/burn-rocket/src/ext.rs` | the `RocketOps` Burn backend extension, the global NPU engine (`init`, `WeightId`, `burn_rocket::stats`) and the `Tensor`-level helpers (`pack`/`matmul`/`attention`, `attention_window`/`_block`, `attention_causal_window`, `attention_causal_block`/`_window`) |
+| `crates/burn-rocket/src/masks.rs` | host-built additive attention masks (causal, bidirectional band, causal sliding window, query-chunk band, query-chunk causal and causal-window) with unit tests |
+| `crates/burn-rocket/src/host.rs` | fused host kernels for the NPU build's CPU glue (gelu·up, RMSNorm, RoPE) with unit tests |
+| `crates/rocket-npu/tools/c-oracle/` | host-side C oracle (planner + regcmd dump for every matmul dtype, the PPU pool program and the average reciprocal, the conv plan/direct/dw/act programs and the int8 direct/depthwise programs), the `parity.py` dtype+pool+conv+int8conv parity harness, the board A/B benches used to validate the port (`ab_board.c` + `ab_compare.py` for the reduce/softmax, norm/vision/FFN/encoder, conv/transpose, int8-conv/pool/resize and – M9 – `sam|sam_ref|siglip|siglip_ref` raw-file A/B), and `build.sh` for the oracle itself |
 | `crates/rocket-npu/src/bin/` | `regcmd_dump` (planner/emitter parity, including `recip`/`emit-pool`, `conv`/`emit-conv`/`emit-conv-act` and `emit-conv-int8`/`emit-conv-dw-int8`), `selftest` (fp16 matmul), `attn_selftest` (attention: the chained A/B by default, `--oneshot` for the stateless entries vs the f64 ref, `--mha` for the encoder pair, `--host-sm 0|1` for the softmax placement, `--sm-ab` for the host-vs-on-NPU arm report, `--rowmajor-ab` for the row-handoff-vs-cube bit-identity gate, `--sat` for the planted score-saturation refusal, and an `--io flash|mha` raw-file mode for the C A/B), `int8_selftest` (`--dense`/`--prepacked-dense`/`--gw-one-shot`/`--prepacked-gw`), `int4_selftest` (`--dense`/`--prepacked`/`--gw-one-shot G`/`--prepacked-gw G`, plus `--kt-cap`), `int16_selftest`, `bf16_selftest` (the streaming engine vs the resident-weight extension and an f64 reference over an `M = 4/64/256/512` ladder, `--stream`/`--canon`/`--resident`/`--f16`/`--no-ref`/`--threads`/`--reps`, plus `[M K N]` for one shape), `tf32_selftest` (no args = the built-in shape list, vs a tf32-rounded f64 reference), `activation_selftest`, `reduce_selftest` (`--pool`/`--feature`/`--cumsum`/`--softmax`/`--shape C H W`/`--reps`, plus the `--io` raw-file mode), `ops_selftest` (`--norm`/`--vision`/`--ffn`/`--encoder`/`--all`, per-family `--*-shape`, `--reps`, plus its own `--io` raw-file mode), `conv_selftest` (`--conv`/`--dw`/`--act`/`--conv1d`/`--transpose`/`--int8`/`--int8-mt`/`--int8-dw`/`--pool`/`--resize`/`--all`, `--shape`/`--dw-shape`/`--conv1d-shape`/`--transpose-shape`, `--reps`, plus its own `--io` raw-file mode covering `conv_int8`, `conv_dw_int8`, the three pools and the two upscales), `encoders_selftest` (`--write-blob DIR`, `sam`/`siglip` with `--ref`/`--npu`/`--ctx N`/`--reps`/`--out`/`--hidden`/`--ref-in`/`--ref-out`, plus the `--io` mode covering `sam_ref`/`sam_npu`/`sam_ctx`/`siglip_ref`/`siglip_npu`/`siglip_ctx`), `q8_bench` (Q8_0-native projection probe: resident f16 `Context` vs group-wise `I8Context` at qwen3's shapes, `--reps`/`--threads`/`--groups 32,128,512`/`--rows`/`--only`, log §20) |
-| `examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
-| `examples/rocket-inference/Cargo.toml` | workspace member `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on the root crate), `gpu*`; `wgpu_probe` bin behind `gpu` |
-| `examples/rocket-inference/src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`decide`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
-| `examples/rocket-inference/src/family.rs` | the five families, checkpoint detection (`config.json` `model_type`, a d3 package's `decision_config.json`, a GGUF arch) and the per-family stage-support predicates |
-| `examples/rocket-inference/src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`) and the shared embedding input assembly (`embed_input`) |
-| `examples/rocket-inference/src/decision/` | vllm-sr d3 family: `request` (the `d3_server.py` contract), `format` (answer records), `load` (package + readout + model name), `model` (prepare/run/respond, media guards), `mrope`, `vision/` (the tower and the image/video splice) |
-| `examples/rocket-inference/src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `systemone` (`/v1/systemone`), `ollama` (`/`, `/api/*`) |
-| `examples/rocket-inference/src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
-| `examples/rocket-inference/src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loader (f32/f16/bf16, `--quant q8`, per-stage NPU pack-and-drop + `load_cpu_projections`) |
-| `examples/rocket-inference/src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`) |
-| `examples/rocket-inference/src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs`, and the `TowerSet` selector the deferred vision/audio half loads use |
-| `examples/rocket-inference/src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, per-stage NPU loaders |
-| `examples/rocket-inference/src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`) |
-| `examples/rocket-inference/src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
-| `examples/rocket-inference/src/bin/vision_attn_bench.rs` | vision-tower attention/softmax microbenchmark (`fused-f16/bf16`, `npu`, `npu-chunk`, `matmul`, `attn-batch`, `softmax`; `npu` feature, log-gemma §18.4/§19/§20) |
-| `examples/rocket-inference/src/bin/causal_attn_bench.rs` | causal block attention probe (P2a): the chunked NPU path (`util/causal.rs` compiled from the same source) vs the dense masked op and `attn::flash_attn_ref`, `--window`/`--ref`/`--reps` (`npu` feature) |
-| `examples/rocket-inference/src/bin/rope_bench.rs` | RoPE probe (P2c): `burn_rocket::rope_apply` (fused host kernel) vs `RopeCache::apply` (composite) vs an `ops::activation::ew_mul`/`ew_add` composition on the NPU, at qwen3's q/k shapes, `--tokens`/`--dtypes`/`--layers`/`--reps`/`--skip-npu` (`npu` feature, log §21) |
-| `examples/rocket-inference/data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
-| `examples/rocket-inference/docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
-| `examples/rocket-inference/docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
-| `examples/rocket-inference/docs/recipes/` | the deployment recipes: `README.md` (profile definitions, placement matrix, board protocol, old→new flag map) + `embeddinggemma2.md` (measured 2026-10-31), `qwen3.md`, `intent.md`, `gemma4.md` (derived from the logs), `decision.md` (dev host + board measured) |
-| `examples/rocket-inference/tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`), the d3 harness (`decision_reference.py`, `decision_parity.py`, `vision_parity.py`, `decision_fixtures*.json`, `decision.md`) and the OTLP capture receiver (`otel_capture.py`) |
-| `examples/rocket-inference/Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f examples/rocket-inference/Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
+| `crates/burn-rocket/examples/probe.rs` | low-level driver probe (open device, pack, matmul, verify vs CPU) |
+| `Cargo.toml` | workspace root + package `rocket-inference`: features `cpu` (default), `npu` (aarch64-gated path dep on `crates/burn-rocket`), `gpu*`; `wgpu_probe` bin behind `gpu` |
+| `src/main.rs`, `src/cli.rs` | dispatch (`serve`/`embed`/`bench`/`gen`/`decide`/`tokenize`/`gemm`), shared flag parser, per-stage placement resolution, usage/help |
+| `src/family.rs` | the five families, checkpoint detection (`config.json` `model_type`, a d3 package's `decision_config.json`, a GGUF arch) and the per-family stage-support predicates |
+| `src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`) and the shared embedding input assembly (`embed_input`) |
+| `src/decision/` | vllm-sr d3 family: `request` (the `d3_server.py` contract), `format` (answer records), `load` (package + readout + model name), `model` (prepare/run/respond, media guards), `mrope`, `vision/` (the tower and the image/video splice) |
+| `src/server/` | one HTTP server: `cli` (flags + model loading), `engine` (capabilities, per-model compute), `error` (panic/NPU mapping), `log` (per-request speed lines), `telemetry` (opt-in OpenTelemetry trace export), `openai` (`/v1/embeddings`, `/v1/chat/completions`, `/v1/models`), `multimodal` (`/embed`), `systemone` (`/v1/systemone`), `ollama` (`/`, `/api/*`) |
+| `src/util/` | shared infra: backend/device, `rss_mib`, server lock/panic helpers (`http`), Q8 low-RAM mapper (`quant`), `Proj`/`ProjKind`/`FusedGroup` (`proj`), `RopeCache` (`rope`), load-report checks (`store`), the shared checkpoint trait (`checkpoint`), GGUF access (`gguf`), the GGUF tokenizer builder (`gguf_tokenizer`), query-chunked causal attention for the NPU path (`causal`), and `hf-hub` model resolution (`hub`) |
+| `src/qwen3_embedding/` | Qwen3-Embedding family: model (layers, RoPE, attention paths, stage timers), loader (f32/f16/bf16, `--quant q8`, per-stage NPU pack-and-drop + `load_cpu_projections`) |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent family: model (chunked/recurrent gated delta rule, gated full attention, caches, greedy generation), loader (`model.language_model.*`, NPU pack-and-drop, `load_for_serving`) |
+| `src/gemma/` | shared Gemma 4 building blocks: `config` schemas, `layers` (NPU/SRQ/`ClippableLinear`), `qat`, `media`, `audio` + `audio_frontend`, `vision`, `inputs`, and the `TowerSet` selector the deferred vision/audio half loads use |
+| `src/gemma/embeddinggemma/` | EmbeddingGemma 2 family: text backbone, multimodal assembly, per-stage NPU loaders |
+| `src/gemma/gemma4/` | Gemma 4 E2B-it family: causal decoder, loader (f32/f16/q8/QAT, `pack_text_for_prefill`), chat template + sampling (`GenStats.stopped`) |
+| `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features) |
+| `src/bin/vision_attn_bench.rs` | vision-tower attention/softmax microbenchmark (`fused-f16/bf16`, `npu`, `npu-chunk`, `matmul`, `attn-batch`, `softmax`; `npu` feature, log-gemma §18.4/§19/§20) |
+| `src/bin/causal_attn_bench.rs` | causal block attention probe (P2a): the chunked NPU path (`util/causal.rs` compiled from the same source) vs the dense masked op and `attn::flash_attn_ref`, `--window`/`--ref`/`--reps` (`npu` feature) |
+| `src/bin/rope_bench.rs` | RoPE probe (P2c): `burn_rocket::rope_apply` (fused host kernel) vs `RopeCache::apply` (composite) vs an `ops::activation::ew_mul`/`ew_add` composition on the NPU, at qwen3's q/k shapes, `--tokens`/`--dtypes`/`--layers`/`--reps`/`--skip-npu` (`npu` feature, log §21) |
+| `data/` | bench/embedding/media fixtures (`bench_text.txt`, `cat.jpeg`, audio/video samples) |
+| `docs/experiment-log.md` | Qwen3-Embedding + intent measurements: §1-8 dev-host, §9 board A/B, §10 NPU, §11 extension-ops refactor + CPU-loading fix, §12 serving robustness, §13 Vulkan, §14 intent model, §15-18 bf16/maintenance + production A/B, §19 tiled attention (M5b), §20 Q8_0-native int8 (P2b), §21 RoPE on the NPU (P2c) |
+| `docs/experiment-log-gemma.md` | EmbeddingGemma 2 + Gemma 4 measurements (multimodal parity, Q8/NPU, QAT mobile, NPU prefill) |
+| `docs/recipes/` | the deployment recipes: `README.md` (profile definitions, placement matrix, board protocol, old→new flag map) + `embeddinggemma2.md` (measured 2026-10-31), `qwen3.md`, `intent.md`, `gemma4.md` (derived from the logs), `decision.md` (dev host + board measured) |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the int8 group-wise probe (`w8a8_probe.py`), the GGUF tokenizer parity check (`tokenizer_parity.py`), the video parity check (`video_parity.py`), the d3 harness (`decision_reference.py`, `decision_parity.py`, `vision_parity.py`, `decision_fixtures*.json`, `decision.md`) and the OTLP capture receiver (`otel_capture.py`) |
+| `Dockerfile`, `docker/build.sh` | one Dockerfile for both architectures: `docker build -f Dockerfile .` on aarch64 (NPU; needs the staged archive) or x86-64 (x86-64-v3 flex); `build.sh` builds/pushes the board image at the Forgejo registry |
 | `.github/workflows/build-images.yml` | CI: `docker/build-push-action` (buildx, `docker/metadata-action` tags, per-arch `gha` cache) on native runners for every push to `main`/`v*` tag → GHCR `ghcr.io/royalcat/rocket-inference` (aarch64 `:sha`+`:latest` primary, amd64 `:sha-amd64`+`:latest-amd64`); PRs build without pushing |
 | `.cargo/config.toml` | aarch64 linker + `target-feature=+fp16` |
 
-## Gemma family (`examples/rocket-inference/src/gemma/`)
+## Gemma family (`src/gemma/`)
 
 Full multimodal inference for `google/embeddinggemma-2` (Gemma 4 towers): text,
 image, video and audio embeddings, plus an OpenAI-compatible server
 (`/v1/embeddings` + native multimodal `/embed`). Verified against the HF f32
 reference (transformers 5.19) — see
-`examples/rocket-inference/docs/experiment-log-gemma.md`: all modalities
+`docs/experiment-log-gemma.md`: all modalities
 cosine 1.00000000 (JPEG decode via mozjpeg = libjpeg-turbo parity; the resize
 is a bit-exact port of ATen's antialiased bicubic uint8 kernel). `--quant q8`
 keeps Q8-resident projections (1216 MiB vs 2845 MiB resident) at 0.9996-0.9999
@@ -2140,7 +2147,7 @@ ssh root@rock-5b-plus.lan 'mkdir -p /root/rocket-inference'
 scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/rocket-inference \
     root@rock-5b-plus.lan:/root/rocket-inference/
 # the bench needs data/ relative to the deploy dir
-scp -r examples/rocket-inference/data root@rock-5b-plus.lan:/root/rocket-inference/
+scp -r data root@rock-5b-plus.lan:/root/rocket-inference/
 # CPU-only build: drop --features npu (binary name is the same)
 ```
 
@@ -2168,9 +2175,9 @@ compiles the extension on any host (no linking); `cargo build --release -p burn-
 driver probe. `--no-default-features` gives the no-Burn crate (helpers and masks only).
 
 Container image: one Dockerfile serves both architectures, chosen by the build
-platform — `docker build -f examples/rocket-inference/Dockerfile .` (context = repo
+platform — `docker build -f Dockerfile .` (context = repo
 root) on an aarch64 host builds the NPU image, on x86-64 it builds the
-x86-64-v3 (AVX2) flex CPU image. `examples/rocket-inference/docker/build.sh
+x86-64-v3 (AVX2) flex CPU image. `docker/build.sh
 [git-ref]` stages the tree, builds the aarch64 image on the board and pushes
 `git.kmsign.org/royalcat/rocket-inference:<sha>` (needs the archive — `VENDOR_SRC`
 overrides — and registry credentials on the control host; run it from anywhere in
@@ -2251,7 +2258,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   it. Historically (2026-10-05) the backend was qwen3 on
   `git.kmsign.org/royalcat/embeddings-fast:0c99eed`, CPUs 4-7, `mem_limit` 8g,
   weights at `/root/models/qwen3-embedding-0.6b`; that image predates the repo
-  inversion. `examples/rocket-inference/docker/build.sh` pushes
+  inversion. `docker/build.sh` pushes
   `git.kmsign.org/royalcat/rocket-inference:<sha>`.
 - **A/B against the live service without touching it**: port 8383 is
   container-internal (not published on the host). Run the candidate binary as a
@@ -2302,13 +2309,13 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 
 ## NPU offload (`--npu`, aarch64)
 
-- `burn-rocket` (repo root) = the pure-Rust `rocket-npu` driver plus the `RocketOps`
+- `burn-rocket` (`crates/burn-rocket`) = the pure-Rust `rocket-npu` driver plus the `RocketOps`
   Burn backend extension. `npu` is the crate's **default** feature; `--no-default-features`
   gives the no-Burn crate and `--no-default-features --features flex` the Burn dependency
   without the extension (feature-graph check). `npu` implies `flex` (required because
   Burn's `#[backend_extension(Flex)]` reads `feature = "flex"` in the consuming crate) and
   `dep:rocket-npu`. Build the example with `--no-default-features --features npu`;
-  aarch64 only: the dep is target-gated in `examples/rocket-inference/Cargo.toml`.
+  aarch64 only: the dep is target-gated in `Cargo.toml`.
 - Call `burn_rocket::init(threads)` once, then `pack`/`pack2`/`pack3` (weights ->
   `WeightId`s), `matmul` and `attention` — the model calls these directly. All ops share
   one global engine behind a mutex (the driver contexts are not thread-safe), so NPU calls
@@ -2456,7 +2463,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
 - The board's GPU is reachable only through **Mesa panvk** (armbian 26.8.3 trixie, Mesa
   26.1.6 backports; Vendor `libmali` needs the vendor kernel, rusticl exposes no device).
   `vulkaninfo` shows Vulkan 1.4.354 on `Mali-G610 MC4` with all features CubeCL needs.
-- Probe: `examples/rocket-inference/src/bin/wgpu_probe.rs`, built with the `gpu-wgsl`
+- Probe: `src/bin/wgpu_probe.rs`, built with the `gpu-wgsl`
   (+ optional `gpu-autotune`) cargo feature. `gpu-spirv` (burn's `vulkan` feature,
   CubeCL's SPIR-V compiler) segfaults inside `libvulkan_panfrost.so` at the first shader
   compile — use `gpu-wgsl`.
@@ -2610,7 +2617,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   numerics were fine at cos 0.999999935, and the arm's host half alone is 1.8x the
   fused arm). No app path, no flag — do not retry without a resident-EW context *and*
   a broadcast operand, and even then the host round-trip dominates. The probe stays as
-  `examples/rocket-inference/src/bin/rope_bench.rs`. Side finding, fixed in the same
+  `src/bin/rope_bench.rs`. Side finding, fixed in the same
   round: `--npu`'s `qkv_fused` branch called the composite `RopeCache::apply`, not the
   fused `rope_apply`; it now uses the fused kernel (bit-identical to the previous
   binary, **64.8 -> 58.8 s at 2777 tokens, 42.9 -> 47.2 tok/s, cosine 1.0**).
@@ -2653,7 +2660,7 @@ example's `src/qwen3_embedding/model.rs` (`stage_stats`).
   (168 EW calls, 1.1-1.3 ms each): the probe measures **18.8-19.2x** the fused kernel
   (34.35 vs 1.79 s for 28 layers, f32, 8.9x the CPU; cos 0.999999935) and the arm's
   host half alone (3.29 s) exceeds the whole fused arm. No app path, no flag; the
-  permanent probe is `examples/rocket-inference/src/bin/rope_bench.rs` (the P2c gate
+  permanent probe is `src/bin/rope_bench.rs` (the P2c gate
   matrix: 82/2777 tokens x f32/bf16, `--skip-npu` for the host arms, `--layers/--reps`).
   Side finding, fixed: `--npu`'s `qkv_fused` branch used the composite `rope.apply`
   (1.88-1.91x the fused kernel); it now calls `rope_apply`, bit-identical and
@@ -2700,14 +2707,14 @@ cargo test -p rocket-npu
 # section (4 row-major operand programs). The default run uses the streamed fp16
 # plan; `--env ROCKET_MM_STREAM=0` must pass byte-identically too (the legacy matrix)
 cargo build -p rocket-npu --bin regcmd_dump
-python3 tools/c-oracle/parity.py
-python3 tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
+python3 crates/rocket-npu/tools/c-oracle/parity.py
+python3 crates/rocket-npu/tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
 # ... or just one section:
-python3 tools/c-oracle/parity.py --kind pool
-python3 tools/c-oracle/parity.py --kind conv --verbose
-python3 tools/c-oracle/parity.py --kind int8conv --verbose
-python3 tools/c-oracle/parity.py --kind rowmajor --verbose
-python3 tools/c-oracle/parity.py --kind int8 --env ROCKET_MM_STREAM_INT8=1
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind pool
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind conv --verbose
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind int8conv --verbose
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind rowmajor --verbose
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind int8 --env ROCKET_MM_STREAM_INT8=1
 # activation/elementwise: LUT + epilogue and program byte-parity vs the C builder
 # (a throwaway C dumper in /tmp links build-host/librocketnpu.a and prints
 # `rocket_lut_epilogue_build` for kinds 0..=18 plus `gen_lut_activation_fp16` for a
@@ -2814,7 +2821,7 @@ done
 # the one-shot and resident arms vs it (cosine >= 0.9999 per layer + the neck/final).
 cargo build --release -p rocket-npu --target aarch64-unknown-linux-gnu --bin encoders_selftest
 scp $CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/encoders_selftest \
-    tools/c-oracle/ab_board.c tools/c-oracle/ab_compare.py root@rock-5b-plus.lan:/root/rocket-m9/
+    crates/rocket-npu/tools/c-oracle/ab_board.c crates/rocket-npu/tools/c-oracle/ab_compare.py root@rock-5b-plus.lan:/root/rocket-m9/
 # the C side links librocketnpu built NATIVELY on the board (a cross-built one cannot
 # open the device; `sam_ref`/`siglip_ref` alone work on x86 too)
 ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && gcc -O2 -ffp-contract=off \
@@ -2826,7 +2833,7 @@ ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 python3 ab_compa
 # the same fixture blobs drive the C `fd < 0` reference on the DEV HOST (the host
 # librocketnpu needs no device for sam_ref/siglip_ref):
 gcc -O2 -ffp-contract=off -I /tmp/opencode/ref-rocket-userspace/include \
-    -I /tmp/opencode/ref-rocket-userspace tools/c-oracle/ab_board.c \
+    -I /tmp/opencode/ref-rocket-userspace crates/rocket-npu/tools/c-oracle/ab_board.c \
     /tmp/opencode/ref-rocket-userspace/build-host/librocketnpu.a -lm -lpthread -o /tmp/opencode/ab_board_host
 # the per-arm cosine table (each arm is scored against the in-process host reference):
 ssh root@rock-5b-plus.lan 'cd /root/rocket-m9 && taskset -c 0-3 ./encoders_selftest sam --ref --npu --ctx 3 --reps 2'
@@ -2885,7 +2892,7 @@ cargo check -p rocket-inference --target aarch64-unknown-linux-gnu --no-default-
 cargo fmt --all -- --check
 cargo clippy -p rocket-inference --no-default-features
 # container image for this architecture (context = repo root)
-docker build -f examples/rocket-inference/Dockerfile -t rocket-inference:local .
+docker build -f Dockerfile -t rocket-inference:local .
 docker run --rm rocket-inference:local --help
 # lint the CI workflow; actionlint catches expression bugs (e.g. the buildx
 # round's `id.meta.outputs.*`, which must be `steps.meta.*`), but not runtime
@@ -2901,12 +2908,12 @@ cargo run --release -- embed --model-dir ~/models/qwen3-embedding-0.6b --device 
 # GGUF tokenizer parity: our `<family> tokenize` == the reference tokenizer.json ==
 # llama-tokenize (built-in German regression words; --text/--text-file extend it);
 # needs a python with `tokenizers` (the emb2 venv on this host)
-/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/tokenizer_parity.py \
+/mnt/hub/venvs/emb2/bin/python tools/tokenizer_parity.py \
     --gguf /tmp/opencode/emb-compare/embeddinggemma-2-Q8_0.gguf \
     --ref /mnt/hub/models/embeddinggemma-2/tokenizer.json
 # video parity (embeddinggemma): ids, sampled-frame count and cosine vs the HF f32
 # reference for video-only, text+image+video and a 40 s overflow clip (log-gemma §21)
-/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/video_parity.py \
+/mnt/hub/venvs/emb2/bin/python tools/video_parity.py \
     --bin $CARGO_TARGET_DIR/release/rocket-inference
 # server smoke test (one command for every model; family auto-detected)
 cargo run --release -- serve --model-dir ~/models/qwen3-embedding-0.6b --backend flex --dtype f32 --quant q8 --port 8383 &
@@ -2980,7 +2987,7 @@ curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
   "dimensions": 256}'
 # HF parity for a 2-image block (the reference takes several --image files;
 # its text must use the same placeholder spacing as the server: one space)
-/mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/ref_embeddinggemma2.py \
+/mnt/hub/venvs/emb2/bin/python tools/ref_embeddinggemma2.py \
     image --image data/cat.jpeg /tmp/cat_small.png --text '<|image|> <|image|>' --out /tmp/ref2.json
 ```
 
@@ -2990,7 +2997,7 @@ OTLP/HTTP protobuf POST so `protoc --decode_raw` can show the resource, spans
 and events without the OTLP proto files:
 
 ```sh
-python3 examples/rocket-inference/tools/otel_capture.py --port 4318 --out /tmp/otel-capture &
+python3 tools/otel_capture.py --port 4318 --out /tmp/otel-capture &
 OTEL_SDK_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
   OTEL_SERVICE_NAME=smoke-rocket OTEL_RESOURCE_ATTRIBUTES=deployment.environment=smoke \
   OTEL_BSP_SCHEDULE_DELAY=500 RUST_LOG=info \
@@ -3205,7 +3212,7 @@ see "Vulkan GPU probe" in this file for the verdict):
 Reference JSONs used for the cosine checks live on the dev host in `/tmp/opencode/`
 (`ref_causal.json`, `ref1_{64,512,3633}.json`, `one_{64,512,3633}.txt`) and partially on
 the board in `/root/embeddings-fast/data/` (historical) and under
-`examples/rocket-inference/data/`. Regenerate them with the `llama-embedding` invocation
+`data/`. Regenerate them with the `llama-embedding` invocation
 in "Environment facts" if missing.
 
 ## Clef-Omni (in progress, 2026-11-14)
@@ -3213,8 +3220,8 @@ in "Environment facts" if missing.
 Cloudflare/clef-omni (`model_type qwen3_omni_moe` + `joint_head.safetensors`): the
 Qwen3-Omni-30B-A3B thinker (48 MoE layers, 128 experts, top-8) plus a `JointSchemaHead`,
 sixth family `Family::Clef` (`--family clef`), same `/v1/systemone` contract as d3 but a
-separate implementation under `examples/rocket-inference/src/clef/`. Branch `clef-omni`.
-Usage/limits: `examples/rocket-inference/docs/recipes/clef.md`; oracle: `clef-oracle.md`.
+separate implementation under `src/clef/`. Branch `clef-omni`.
+Usage/limits: `docs/recipes/clef.md`; oracle: `clef-oracle.md`.
 
 - **Files**: `st.rs` (safetensors/BF16 reader), `math.rs`, `head.rs` (`ClefHead`,
   `LmHeadFile`), `model.rs` (+ `model/`: `Backbone`, layer-streamed f32 CPU decoder, expert

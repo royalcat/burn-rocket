@@ -34,12 +34,12 @@ line instead of failing. Any mismatch exits nonzero and prints the first
 differing line with both values.
 
 Usage:
-  python3 tools/c-oracle/parity.py
-  python3 tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
-  python3 tools/c-oracle/parity.py --kind fp16,int8
-  python3 tools/c-oracle/parity.py --kind pool
-  python3 tools/c-oracle/parity.py --kind conv
-  python3 tools/c-oracle/parity.py --kind int8conv
+  python3 crates/rocket-npu/tools/c-oracle/parity.py
+  python3 crates/rocket-npu/tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
+  python3 crates/rocket-npu/tools/c-oracle/parity.py --kind fp16,int8
+  python3 crates/rocket-npu/tools/c-oracle/parity.py --kind pool
+  python3 crates/rocket-npu/tools/c-oracle/parity.py --kind conv
+  python3 crates/rocket-npu/tools/c-oracle/parity.py --kind int8conv
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_ORACLE = "/tmp/opencode/c-oracle/oracle"
 
 # Fixed DMA addresses so the emitted programs are stable across runs.

@@ -1,6 +1,6 @@
 # C oracle + dtype parity harness
 
-`tools/c-oracle/` holds the host-side **C oracle** used to check the pure-Rust
+`crates/rocket-npu/tools/c-oracle/` holds the host-side **C oracle** used to check the pure-Rust
 `crates/rocket-npu` port against the reference `librocketnpu`, plus the
 `parity.py` harness that drives it.
 
@@ -53,9 +53,9 @@ cmake --build build-host -j
 ## Build the oracle
 
 ```sh
-tools/c-oracle/build.sh <src> <build-host> [out]
+crates/rocket-npu/tools/c-oracle/build.sh <src> <build-host> [out]
 # e.g.
-tools/c-oracle/build.sh /tmp/opencode/ref-rocket-userspace \
+crates/rocket-npu/tools/c-oracle/build.sh /tmp/opencode/ref-rocket-userspace \
     /tmp/opencode/ref-rocket-userspace/build-host /tmp/opencode/c-oracle
 # -> /tmp/opencode/c-oracle/oracle
 ```
@@ -95,11 +95,11 @@ applied host-side on readback, so the program is dense-int8's.
 
 ```sh
 cargo build -p rocket-npu --bin regcmd_dump     # debug profile is enough
-python3 tools/c-oracle/parity.py                # oracle + newest regcmd_dump
-python3 tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
-python3 tools/c-oracle/parity.py --kind fp16,int8-gw
+python3 crates/rocket-npu/tools/c-oracle/parity.py                # oracle + newest regcmd_dump
+python3 crates/rocket-npu/tools/c-oracle/parity.py --dump /path/to/regcmd_dump --verbose
+python3 crates/rocket-npu/tools/c-oracle/parity.py --kind fp16,int8-gw
 # The legacy whole-tile plan matrix (pre-streaming): byte-identical too.
-python3 tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
+python3 crates/rocket-npu/tools/c-oracle/parity.py --env ROCKET_MM_STREAM=0
 ```
 
 Options:

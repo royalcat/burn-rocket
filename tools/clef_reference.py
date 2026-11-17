@@ -8,8 +8,8 @@ module is built from them, run, and freed), then the final RMSNorm and the uncha
 `JointSchemaHead` from the release (`clef_joint_schema_model.py`, a verbatim copy of the
 release's `joint_schema_model.py`).
 
-    python -I examples/rocket-inference/tools/clef_reference.py \
-        --model-dir /path/to/clef-omni --requests examples/rocket-inference/tools/clef_fixtures.json \
+    python -I tools/clef_reference.py \
+        --model-dir /path/to/clef-omni --requests tools/clef_fixtures.json \
         --out-dir /tmp/clef-dump [--only checkout-errors] [--selfcheck] [--dump-layers 0,1,23,47]
 
 Records with `images`/`audio`/`videos` additionally run the vision/audio towers in f32 (clef_media.py), splice

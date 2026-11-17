@@ -31,5 +31,7 @@ jobs:
         run: cargo clippy -p rocket-npu -p burn-rocket --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test -p rocket-npu -p burn-rocket
-      - name: Flex CPU example
-        run: cargo check -p rocket-inference --no-default-features
+      - name: Clippy (inference app, flex CPU)
+        run: cargo clippy -p rocket-inference --no-default-features -- -D warnings
+      - name: Inference app tests (flex CPU)
+        run: cargo test -p rocket-inference --no-default-features

@@ -1,5 +1,7 @@
 # EmbeddingGemma 2 — experiment log
 
+> **Path note (2026-11-17):** the app moved to the repo root and the library to `crates/burn-rocket`. Commands and paths below are quoted as they were run: `examples/rocket-inference/X` is now `X`, `tools/c-oracle` is `crates/rocket-npu/tools/c-oracle`.
+
 Dev host: 32-thread x86_64, f32, `flex` backend, release build
 (`cargo build --release -p rocket-inference --no-default-features`),
 model `google/embeddinggemma-2` (1.49 GB safetensors, 1376 tensors).

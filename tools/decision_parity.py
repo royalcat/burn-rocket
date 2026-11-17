@@ -74,7 +74,7 @@ def parse_args(argv=None):
 def media_base(args) -> Path:
     """Where relative `images`/`videos` paths are resolved from.
 
-    The fixtures live in `examples/rocket-inference/tools/` and name their media
+    The fixtures live in `tools/` and name their media
     relative to `examples/rocket-inference` (`data/cat.jpeg`, `data/test.mp4`);
     the CLI resolves a path against its own working directory, so the gate must
     work from any cwd. The default is the parent of the requests file's directory.

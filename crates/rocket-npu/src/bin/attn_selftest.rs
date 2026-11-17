@@ -565,8 +565,8 @@ fn sm_ab_block(
 
 // ── Raw-file mode (`--io`), the C A/B layout ────────────────────────────────
 //
-// Shared with `tools/c-oracle/ab_board.c` (the same argument layout on both sides),
-// driven by `tools/c-oracle/ab_compare.py --attn`. Floats travel as f32 bit patterns in
+// Shared with `crates/rocket-npu/tools/c-oracle/ab_board.c` (the same argument layout on both sides),
+// driven by `crates/rocket-npu/tools/c-oracle/ab_compare.py --attn`. Floats travel as f32 bit patterns in
 // hex so neither side parses a decimal differently; `-` is a NULL tensor.
 
 fn read_f16(path: &str, n: usize) -> Result<Vec<f16>, Box<dyn std::error::Error>> {

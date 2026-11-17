@@ -3,7 +3,7 @@
 # rocket-inference — the merged inference app (Qwen3-Embedding-0.6B, Qwen3.5-0.8B
 # intent, EmbeddingGemma 2, Gemma 4 E2B-it; Rust/Burn, flex backend) for the
 # openviking stack on rock-5b-plus. Built on the burn-rocket library at the repo
-# root; see examples/rocket-inference. The default command is the Qwen3
+# crates/burn-rocket (see the repo root). The default command is the Qwen3
 # embedding server.
 #
 # One Dockerfile, two architectures; the build platform picks the branch:
@@ -13,8 +13,8 @@
 #   amd64/x86_64  — flex CPU build for x86-64-v3 (AVX2), no NPU support.
 #
 # The build context is the repo root:
-#   docker build -f examples/rocket-inference/Dockerfile .
-# examples/rocket-inference/docker/build.sh assembles the same context for the board. The default command is identical on both
+#   docker build -f Dockerfile .
+# docker/build.sh assembles the same context for the board. The default command is identical on both
 # architectures: `serve` picks the NPU on aarch64 builds that have it (pass
 # `--no-npu` for the flex CPU path) and stays on flex elsewhere.
 

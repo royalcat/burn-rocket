@@ -8,7 +8,7 @@
 //!
 //! * `dense` — `burn_rocket::attention(.., is_causal = true)` or
 //!   `attention_causal_window(.., window)` over the whole sequence;
-//! * `chunk-N` — the app helper (`examples/rocket-inference/src/util/causal.rs`,
+//! * `chunk-N` — the app helper (`src/util/causal.rs`,
 //!   compiled from the same source file) with a chunk width of `N`;
 //! * `ref` — `rocket_npu::attn::flash_attn_ref`, the device-free f64 oracle, run
 //!   over the whole sequence with a locally built causal mask (`--ref`).

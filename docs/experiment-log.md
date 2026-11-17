@@ -1,5 +1,7 @@
 # Experiment log: Qwen3-Embedding-0.6B on Burn
 
+> **Path note (2026-11-17):** the app moved to the repo root and the library to `crates/burn-rocket`. Commands and paths below are quoted as they were run: `examples/rocket-inference/X` is now `X`, `tools/c-oracle` is `crates/rocket-npu/tools/c-oracle`.
+
 > Layout note (2026-10-06): the repository was inverted — `burn-rocket` is now the
 > root crate and this app lives in `examples/rocket-inference/` (renamed from
 > `examples/qwen3-embeddings/` on 2026-10-06, when it gained the Qwen3.5 intent-model

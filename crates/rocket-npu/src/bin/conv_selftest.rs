@@ -38,7 +38,7 @@
 //! Every tensor is raw little-endian fp16. `W` is `[OC][IC][KH][KW]` for a direct conv
 //! (`[C][KH][KW]` depthwise), `[OC][IC][KW]` for conv1d and `[IC][OC][KH][KW]` for a
 //! direct transposed conv (`[C][KH][KW]` depthwise). This is the exchange format of
-//! `tools/c-oracle/ab_board.c` on the board.
+//! `crates/rocket-npu/tools/c-oracle/ab_board.c` on the board.
 
 use std::process::ExitCode;
 use std::time::Instant;

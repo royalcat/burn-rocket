@@ -1,17 +1,4 @@
-# burn-rocket
-
-RK3588 NPU offload for [Burn](https://burn.dev) models, through the mainline `rocket`
-driver: a pure-Rust userspace driver (`rocket-npu`, in `crates/rocket-npu`) and a set
-of Burn **backend-extension** ops that run a model's projection matmuls and masked
-grouped-query attention on the RK3588 NPU while everything else stays on the CPU
-backend.
-
-The library is `aarch64`-only for anything that touches the NPU: the driver talks to
-`/dev/accel/accel0` through the in-kernel `rocket` driver. There is no C toolchain,
-CMake, kernel-header, or vendor-archive step: the register programs, tiling planner,
-buffer objects, matmul and attention are all Rust in `crates/rocket-npu` (an
-interface-compatible port of `librocketnpu`, byte-identical register programs and
-planner output).
+# rocket-inference
 
 ## AI Disclosure
 
@@ -22,7 +9,7 @@ Rock 5B+ board — nothing is taken on trust.
 
 ## Inference server
 
-The examples are complete HTTP servers with OpenAI- and Ollama-compatible APIs, so
+rocket-inference ships complete HTTP servers with OpenAI- and Ollama-compatible APIs, so
 standard clients work unchanged:
 
 | model | API | command |
@@ -73,8 +60,8 @@ service and reads 147.3 s compute / 160.2 s wall for the same text case (CPU
 265.6 / 270.1 s). `--npu-dtype int8` exists for d3 but is not recommended
 (+6.5 % wall, text 3.4e-2). The vision tower, the backbone attention and the
 readout stay on the CPU. Flags, endpoints, recipes and
-deployment: [examples/rocket-inference/README.md](examples/rocket-inference/README.md),
-[docs/recipes/decision.md](examples/rocket-inference/docs/recipes/decision.md).
+deployment: [README.md](README.md),
+[docs/recipes/decision.md](docs/recipes/decision.md).
 
 Container images for both architectures are built and published to GHCR on every
 push to `main`: `ghcr.io/royalcat/rocket-inference:<sha>` / `:latest` is the aarch64
@@ -82,582 +69,928 @@ RK3588 image (`--device auto` is NPU-first there; `--device cpu` forces the flex
 path) and `:latest-amd64` is an x86-64-v3 (AVX2) flex-only CPU image
 (`.github/workflows/build-images.yml`).
 
-## What it provides
+Burn inference for the RK3588 (Rock 5B+) built on the [`burn-rocket`](crates/burn-rocket)
+library: one binary, family-agnostic commands, `flex` CPU backend by default
+with per-stage RK3588 NPU offload. The model family is detected from the
+checkpoint (`config.json` `model_type`, a d3 package's `decision_config.json`,
+or the GGUF architecture) and `--family` overrides it.
 
-- **Burn backend extension** (`#[backend_extension(Flex)]`, default `npu` feature): ordinary
-  `Tensor`s in and out, no FFI in model code.
+| model | checkpoint | commands | served endpoints |
+|---|---|---|---|
+| EmbeddingGemma 2 (text/image/video/audio) | `google/embeddinggemma-2` | `embed`, `bench`, `tokenize` | OpenAI/OpenRouter `/v1/embeddings` + native multimodal `/embed` |
+| Qwen3-Embedding-0.6B | `Qwen/Qwen3-Embedding-0.6B` | `embed`, `bench`, `tokenize` | OpenAI `/v1/embeddings`, `/v1/models`, `/health` |
+| Qwen3.5-0.8B intent/query-planner | `guoxuter/ov_intent_analysis_sft:v7_q8` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| Gemma 4 E2B-it chat (text/image/audio) | `google/gemma-4-E2B-it` | `gen` | OpenAI `/v1/chat/completions`; Ollama `/api/chat`, `/api/generate`, `/api/tags`, `/api/show` |
+| Decision 3.0 (text/image/video typed decisions, prefill only) | `vllm-sr/d3-lite`, `vllm-sr/d3-nano` | `decide`, `serve` | `POST /v1/systemone`, `/v1/models`, `/health` |
 
-  ```rust,ignore
-  burn_rocket::init(5)?;                       // once, before any op
+```
+usage: rocket-inference <command> [flags]
 
-  let qkv = burn_rocket::pack3(wq, wk, wv);    // [N, K] f32 weights, pack-and-drop
-  let qkv_out = burn_rocket::matmul(x, &qkv);  // [.., M, K] @ [N, K]^T -> [.., M, N]
-
-  let out = burn_rocket::attention(
-      q, k, v, 16, 8, 128, scale, None, true,  // n_head, n_kv_heads, head_dim, scale, softcap, causal
-  );
-
-  // bidirectional band attention (encoders): |q - kv| <= window, window < 0 = no mask
-  // (a no-mask block may have n_k != n_q, which is how full layers are chunked)
-  let out = burn_rocket::attention_window(
-      q, k, v, 4, 2, 256, 1.0, None, 512,
-  );
-
-  // causal attention over a query chunk against its key prefix (decoders): the
-  // mask/score matrix is [n_q, n_kv], not the model's whole [n, n]
-  let out = burn_rocket::attention_causal_block(
-      qc, kc, vc, 16, 8, 128, scale, None, q_start, kv_start,
-  );
-  // ... and with a sliding window (t - window < j <= t)
-  let out = burn_rocket::attention_causal_block_window(
-      qc, kc, vc, 16, 8, 128, scale, None, 512, q_start, kv_start,
-  );
-  ```
-
-  `pack`/`pack2`/`pack3` consume f32/f16 weights and keep fp16 resident copies in NPU
-  memory for the process lifetime (`WeightId` handles), and bf16 weights pack the same
-  way via an exact bf16->f16 conversion. Fused packs
-  concatenate several weights that share one input along N, so one matmul produces all
-  their outputs (the example packs q|k|v and gate|up that way). Matmuls are chunked
-  above `ROCKET_MATMUL_CHUNK_M` rows (env, default 8192, `0` disables) to bound the
-  per-call input buffer; rows are independent, so chunking is bit-identical.
-
-  The per-shape scratch cache is bounded: `M` is keyed by capacity classes (≤25 %
-  padding, live rows planned per call so padded rows are never computed), the
-  streaming-weight and CPU-accumulation BOs are allocated lazily, and
-  `ROCKET_SCRATCH_MB` (default 1024, `0` = unlimited) caps the cache with
-  free-before-allocate LRU. A served request keeps its own shape set; the next
-  request's trim drops earlier sets (`burn_rocket::trim_scratch`, run by the
-  example after each request; `ROCKET_TRIM=0` disables it). `ROCKET_M_BUCKET=0`
-  restores exact-`M` slots, and `ROCKET_MEM_LOG=1` prints the live split
-  (weights / matmul BO+host / attention BO+host).
-
-  Causal decoding attention has a chunked entry too: `attention_causal_block` (and
-  `attention_causal_block_window` for a sliding layer) takes `q_start`/`kv_start` as the
-  chunk's absolute positions, so one call covers a query chunk against just its key
-  prefix and the additive mask and score matrix stay `[n_q, n_kv]`. That is what lets
-  a causal model run 30k-token prompts without the dense `[n, n]` f16 mask
-  (~1.8 GiB at 30k) — see the example's NPU causal path, which chunks at
-  `ROCKET_CAUSAL_CHUNK` (default 1024, `0` = dense).
-
-- **Low-level driver API** (`rocket_npu::Device`, `rocket_npu::matmul::Context`,
-  `rocket_npu::matmul::Weight`, `rocket_npu::attn::Attention` and its stateless
-  `flash_attn`/`flash_attn_mt`/`flash_attn_ref`/`mha_self`/`mha_self_ref` siblings,
-  the `rocket_npu::ops` families — activation/elementwise, reduce/softmax, the
-  transformer and vision norms, the gated FFN, the encoder block and the fp16
-  convolution family (direct/depthwise/1D, the conv→activation fusion and the
-  transposed conv) — each with its device-free `*_ref`,
-  `f16` helpers, driver/counter helpers) for callers that do not want Burn tensor
-  routing. The `RocketCtx`/`RocketFaCtx` compatibility wrappers expose the old
-  surface. See `examples/probe.rs` for a runnable smoke test.
-
-The ops are **inference-only**: the extension macro generates no autodiff and calling
-them with an autodiff context panics inside Burn. The driver contexts are not
-thread-safe; the extension routes every call through one global engine behind a mutex
-(`burn_rocket::stats()` reports accumulated convert/NPU time). Resident weights use
-the canonical tiling (`M >= 4`; `ROCKET_CTX_CANONICAL=0` restores the legacy
-`M >= 256` padding). The planner's default is the **CBUF weight-streaming** plan
-(`ROCKET_MM_STREAM=0` restores the whole-tile plan): one task covers a whole N slice
-with the weights cycling through the banks the input tile leaves, and a resident
-weight is packed on the streamed max-tile plan so it still serves every `M`. The
-KACC EW stride is the tile's own row count, so every M tile accumulates on the NPU.
-
-## Features
-
-| feature | effect |
-|---|---|
-| `default` | `npu` — NPU offload is the first-class target |
-| `flex` | compiles against Burn's `Flex` backend (required by the extension catalog; the feature name must stay exactly `flex`) |
-| `npu` | the `RocketOps` extension ops on the pure-Rust driver (implies `flex`) |
-
-`--no-default-features` gives the no-Burn crate (helpers and masks only);
-`--no-default-features --features flex` the Burn dependency without the extension
-(feature-graph check).
-
-## Building
-
-There is no external driver archive to build. `rocket-npu` is a workspace member and
-compiles on any host (device access is runtime-only):
-
-```sh
-# compile check (npu is the default; works on any target, no linking)
-cargo check -p burn-rocket
-
-# aarch64 build of the probe example
-cargo build --release -p burn-rocket --example probe \
-  --target aarch64-unknown-linux-gnu
+  serve      HTTP server for the detected checkpoint
+  embed      one embedding for text and/or media (embedding models)
+  bench      embedding throughput over repeated forwards (embedding models)
+  gen        one chat completion (chat models)
+  decide     typed System One decisions (decision models)
+  tokenize   tokenize text with the checkpoint's tokenizer
+  gemm       flex matmul microbenchmark (no model)
+  help       this text; `help <command>` for one command
 ```
 
-The example app builds with `--no-default-features --features npu` (aarch64) or
-`--no-default-features` (flex CPU on any target).
+`--model-dir <dir>` is required (or `-hf <owner>/<name>:<quant>`, below).
+EmbeddingGemma 2 is the first-class model; the other families keep their full
+support but are maintained best-effort.
 
-Port status: the fp16 matmul (one-shot, streaming, resident, segmented weights),
-dense and group-wise int8 (one-shot, plus resident per-channel/group-wise weights),
-dense and group-wise int4 (one-shot with the C's int16-saturation `kt_cap`, plus the
-resident `I4Context` in both modes and its planner), `int16_exact`, the native bf16
-stream **and its resident-weight extension** (`Bf16Context`/`Bf16Weight`: pack once per
-`(K,N)` under the canonical M-independent tiling, reuse across `M` — the C library has
-no resident bf16 variant), the tf32 one-shot (raw-f32 operands; the MAC truncates to a
-10-bit mantissa,
-fp32 out with f64 host K-accumulation), masked GQA attention, the activation +
-elementwise family (`rocket_activation.c`: every `ROCKET_ACTIVATION_*` kind, the
-parametric LeakyReLU/ELU/SELU/PReLU, the conv-main EW mul/add/sub/max/min, clip and
-divide), the reduce + softmax family (`rocket_reduce.c`, `rocket_softmax.c` and
-`rocket_scale_rows_fp16`: the PPU global average/max/min pools with the telescoping
-decomposition, the feature-axis ones-matmul reduce, the triangular-ones cumsum, row
-softmax/log-softmax/cross-entropy and the per-row broadcast scale), the transformer
-norms (`rocket_norm.c`: RMSNorm — fp16 square under the exact power-of-two prescale,
-fp32-accumulated mean-square, host rsqrt, one folded scale — and LayerNorm with the
-C's stacked `[x ; x²]` single-reduce job and the `x·A + B` affine fold), the vision
-norms (`rocket_normvision.c`: inference BatchNorm from running stats, GroupNorm,
-InstanceNorm and L2-Normalize over the `[N,C,P]` channels-major layout), the gated FFN
-family (`rocket_ffn.c`: the GeGLU/SwiGLU core, the three-matmul block, the pinned-tile
-`ffn_fused` and `mlp_fused` — cube-resident, so `gate/up → act⊙up → down` never leaves
-the NPU cube layout — and the host-handoff `mlp`) and the encoder block
-(`rocket_encoder.c`: one pre-norm Whisper layer over the two norms, `mha_self`, the
-residual adds and the fused MLP), the fp16 convolution family (`rocket_conv.c`: the
-native CNA conv — direct, depthwise, 1D and the conv→activation fusion, with the OC /
-spatial / channel tiling and the resident-BO context — and `rocket_conv_transpose.c`:
-the hardware deconvolution route and the dilated-input lowering), the native int8
-convolution (`rocket_conv.c`'s other half: the direct int8→int32 accumulator with its
-multicore pool and the int8-out depthwise requant), the PPU pooling family
-(`rocket_pool.c`: MaxPool/AveragePool plus the int8/uint8 entries) and the
-integer-factor upsample (`rocket_resize.c`: nearest and bilinear as a depthwise
-transposed conv) are ported and validated on the board. Planner and regcmd output are byte-equal to the C library for
-every matmul dtype
-(fp16/int8/int8-group-wise/int4/tf32/bf16), for the activation program (1070 words,
-word-for-word) and for the PPU pool program (30 words, over an 18-case
-shape/method/pad/stride matrix), the pool decomposition (20 `C H W` shapes: the plan
-reason code and both factor lists), the fp16 average-reciprocal convention and the
-convolution family (`conv`: 23 plan cases over the direct/depthwise/dilation/stride/
-explicit-extent matrix, `emit-conv`: 18 programs including the CNA deconvolution
-strides and the refusals, `emit-conv-act`: 6 fused-activation programs) and the int8
-convolution (`emit-conv-int8`: 11 direct programs incl. the +1 CBUF bank slack and the
-int32-output stride quirk, `emit-conv-dw-int8`: 9 depthwise programs over a
-zero-point/scale matrix, including the int32-raw diagnostic form and both refusals);
-the LUT tables and epilogue constants are byte-identical to the C builder. fp16/bf16 cosine
->= 0.99999, int8 matches its dequantized reference, int4 is int32-exact against
-the int64 CPU reference and tf32 matches a tf32-rounded f64 reference.
+Deployment profiles (balanced / full offload / speed) with measured commands
+for every model live in [`docs/recipes/`](docs/recipes/). The model-level
+measurements are in `docs/experiment-log.md` (Qwen3-Embedding + intent) and
+`docs/experiment-log-gemma.md` (EmbeddingGemma 2 + Gemma 4); those logs predate
+the CLI refactor and keep their historical flag names (the recipes README has
+the mapping).
 
-The activation/elementwise device output is **bit-identical to the C library on the
-board for all 19 activation kinds and the six EW ops** (same table, same program, same
-BO layout); the EW add/mul/sub/max/min are exact against the host arithmetic, and a
-`lut_apply` host model of the DPU LUT chain (BN mul/bias, LE/LO interpolation with the
-unsigned table clamp, OUT_CVT decode) tracks the device to within a fraction of an
-fp16 ULP. Qwen3 3,633-token NPU bench 59.4 s vs the C library's 61.5 s; int8 and bf16
-microbenchmarks are at or above the C library's speed.
+## Layout
 
-The bf16 resident weight (`Bf16Context`/`Bf16Weight`) has no C counterpart, so its gate
-is the f64 reference plus the C-shaped stream: on the board (cores 0-3, busy) it is
-**bit-identical to the same stream over the canonical tiling at every `M`**, and to the
-plain stream at `M >= max_tile` (below that the canonical pin's `Kt` re-partitions the K
-sum: `max_abs <= 3.1e-6`, cosine 1.000000000, both arms 1.00000000 against an f64
-reference). Per call it is 0.72-0.87x the stream's wall at `K=1024 N=768` (7.8-9.6 vs
-10.2-11.2 ms) and 0.64-0.79x at `K=4096 N=1024` (18.6-21.7 vs 27.5-30.9 ms), the
-difference being the per-call weight re-scatter the stream pays; the one-time pack
-(8-14 / 40-55 ms for 2.0 / 8.4 MiB of resident BOs) breaks even after 3-8 / 4-8 calls,
-so a long-lived process wins and a one-shot benchmark does not. Memory follows the same
-shape: the stream caches one weight BO set per `(M,K,N)`, the resident weight is one set
-for every `M`.
+| path | contents |
+|---|---|
+| `src/main.rs`, `src/cli.rs` | dispatch, shared flag parser, per-stage placement resolution, usage/help |
+| `src/family.rs` | the five families, checkpoint detection (`config.json` / GGUF architecture) and per-family stage support |
+| `src/commands/` | the family-agnostic commands (`embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`) and the shared embedding input assembly |
+| `src/decision/` | Decision 3.0 (d3): request contract, Qwen3.5 backbone + 255-code readout, mRoPE, vision tower + image/video splice, loader |
+| `src/server/` | the one server: capability routing, OpenAI + multimodal + Ollama endpoints, `/v1/systemone` for a decision model |
+| `src/util/` | shared infra: backend/device selection, RSS readout, `Proj`/`RopeCache`, the shared checkpoint trait + GGUF access + tokenizer, `hf-hub` resolution |
+| `src/qwen3_embedding/` | Qwen3-Embedding-0.6B: model, loader (f32/f16/bf16/Q8/NPU) |
+| `src/qwen35_intent/` | Qwen3.5-0.8B intent model: model, loader (safetensors/GGUF) + NPU pack-and-drop |
+| `src/gemma/` | shared Gemma 4 building blocks: config schemas, low-RAM/NPU linear helpers (`layers`), QAT (`qat`), media decoding, USM audio frontend, vision/audio towers, input assembly |
+| `src/gemma/embeddinggemma/` | EmbeddingGemma 2: text backbone + tower assembly, loaders |
+| `src/gemma/gemma4/` | Gemma 4 E2B-it: causal decoder, loader (f32/f16/q8/QAT), chat template + sampling |
+| `src/bin/wgpu_probe.rs` | Vulkan/wgpu GPU probe (`gpu-*` features; see §13 of the Qwen log) |
+| `data/` | bench/embedding fixtures, image/audio/video inputs |
+| `tools/` | HF reference scripts (`ref_embeddinggemma2.py`, `ref_gemma4.py`, `debug_audio_hf.py`), the video parity check (`video_parity.py`), the d3 harness (`decision_reference.py` official-runtime reference, `decision_parity.py`, `vision_parity.py`, `decision_fixtures*.json`, `decision.md` format contract) and the OTLP capture receiver (`otel_capture.py`) |
 
-The reduce/softmax device output is **bit-identical to the C library on the board for
-every family** (`tools/c-oracle/ab_compare.py`: average/max/min pools including the
-host-fallback shape, the feature reduce in sum and mean modes, all four cumsum
-variants, softmax/log-softmax/cross-entropy up to 257x1000 and the per-row scale) —
-both sides run the same program and the same host glue, so even the fp16 reciprocal
-quantization cancels. Against the device-free fp64 references: max/min pools are
-exact, the feature reduce is within 2.3e-7 relative (fp32 accumulator), cumsum is
-bit-exact after its fp16 read-back, softmax sits at cosine 0.99999992, log-softmax's
-absolute error is <= 7.8e-3 and cross-entropy's <= 4.2e-5. Board wall for the families
-at 257 rows: a 4096-wide softmax 97 ms, the 151936-wide LM-head softmax 3.4 s, the
-same log-softmax 3.7 s and cross-entropy 1.8 s (busy board, load ~8.4).
+## GGUF models (`-hf`)
 
-The M7 norm / vision-norm / FFN family is also **bit-identical to the C library on the
-board** (`ab_compare.py` again: RMSNorm with a real and a unit weight, LayerNorm with
-and without beta, BatchNorm/GroupNorm/InstanceNorm/L2-Normalize over two `[N,C,P]`
-shapes, GeGLU in both GELU and SiLU form, `ffn`, `ffn_fused` and `mlp_fused` with and
-without the fc1 bias, at 4x256x1024 and 64x512x2048, plus two shapes that force the
-fused entries' host-handoff fallback — `M = 1` (the `M % 4` pin refusal; the old
-`M = 260` KACC EW-stride case now accumulates on the NPU since the 2026-11-02 round) —
-so both sides have to make the same fallback decision). The encoder block is
-the only case that is not bit-identical (198/512 and 2040/8192 elements exact): its
-attention sublayer is `attn::mha_self`, whose host fast softmax is the documented
-deviation from the C's on-NPU softmax (set `ROCKET_ATTN_HOST_SOFTMAX=0` for the on-NPU
-arm, which is bit-identical to the C — see the placement section below). Against the device-free fp64 references:
-RMSNorm/LayerNorm cosine
-0.99999992-0.99999994 with <= 2.9e-3 absolute and <= 2.1e-3 relative error on the
-significant elements, the vision norms 0.9999999 with <= 2.1e-3 relative, GeGLU
-0.99999993 (1.5e-3), the FFN/MLP 0.9999998-0.9999999 (<= 5e-3 relative at a peak of
-1.2e3) and the encoder block 0.9999985-0.9999992 (1.9e-2 relative on the significant
-elements, 4.7e-2 absolute at a peak of 20.6) — the fp16 pipeline's own K-accumulation
-noise. Its two MLP routes are bit-identical to each other on the measured shapes
-(`ROCKET_ENCODER_NOFUSE` vs the fused default, 512/512 and 8192/8192), because the
-pinned `Kt = 256` equals the planner's own choice below `d_ff = 512`. Board wall (cores
-0-3, busy board): a 257x1024 LayerNorm 69 ms, RMSNorm 44 ms,
-a 64x512x2048 FFN 36 ms and the encoder blocks 32 ms / 48 ms.
+Every family also loads **GGUF** checkpoints, locally or straight from the Hub:
 
-The fused FFN/MLP are **cube-resident**, exactly as `rocket_ffn.c`: `gate`/`up` (or
-`fc1`) are left as their full `[nMt][nNt]` output cubes by `mm_compute_kacc_cube`, the
-gated product / bias / activation run element-wise over the cube's fp16 bytes (the
-C's `mm_scatter_bias_cube` + `rocket_ew_add_fp16` for the non-gated bias) and the
-down/fc2 matmul reads the product cube directly as its A operand
-(`compute_kacc_from`, with `compute_cpu_from` on a `Tiling` refusal), so no `[M,I]`
-intermediate is de-tiled and re-packed. An `A/B` against the previous binary on
-identical raw fixtures is **bit-identical for every case** (`ffn`, `ffn_fused`,
-`mlp_fused` with and without the fc1 bias at 4x256x1024 and 64x512x2048, and both
-encoder blocks), and the C A/B above stays bit-identical too. Wall is neutral for
-`ffn_fused` (19.0 vs 19.9 ms at 4x256x1024, 64.8 vs 63.5 ms at 64x512x2048, on a board
-whose load average was ~9 and whose identical-code arm scatters by ~10 %), and the
-`mlp_fused`/encoder path pays 2-5 ms for the C's on-NPU bias EW add (14.9 vs 12.2 ms
-and 48.5 vs 43.6 ms; the row-major route added the bias on the host in f32) — CPU time
-is unchanged (user 2.58 s vs 2.66 s for the 64x512x2048 run). `ROCKET_FFN_DEBUG=1`
-prints the routing decision, like the C's knob.
+```sh
+# llama.cpp-style <owner>/<name>:<quant> (quant required). Downloads the main GGUF
+# plus a matching mmproj-<quant>.gguf for the multimodal families, then runs.
+./rocket-inference embed -hf Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0 --quant q8 --text "Hello"
+./rocket-inference embed -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --quant q8 --image data/cat.jpeg
+./rocket-inference gen   -hf unsloth/gemma-4-E2B-it-GGUF:Q8_0 --text "Hi"
+./rocket-inference gen   -hf unsloth/Qwen3.5-0.8B-GGUF:Q8_0 --text "Hello!"
 
-The M8a convolution family is **bit-identical to the C library on the board across the
-whole measured matrix** (`ab_compare.py` again): direct convs over the kernel/stride/
-pad/dilation sweep, the RGB stem (`IC = 3` zero-padded to 32), an `OC = 24` head (padded
-to 32), the tiling shapes that force OC-only and OC+spatial bands (64x56x56 k3,
-128x28x28 k3 s2, 32x112x112 k3), four depthwise shapes, conv1d at both strides,
-the fused SiLU/tanh/GELU epilogues, and seven transposed convs covering both routes
-(hardware deconvolution at strides 2/4, the lowering at `IC = 24`, stride 3 and
-stride 1) plus depthwise. Against the device-free fp32-accumulate references: the
-direct/depthwise/1D convs hold cosine 1.0 with <= 1e-3 relative on the significant
-elements (>= 99.7 % of elements bit-identical per shape, the rest one fp16 ULP), the
-transposed convs the same against the route-independent scatter-add oracle, and the
-fused activation sits at <= 2e-3 relative on the significant elements with the C's own
-single-pass table artifacts reported separately (the `x≈0` mux spike and gelu's
-saturated tail). Board wall (cores 0-3, busy board at load ~7, 600 MHz module): 32x16x16
-k3 1.3 ms through the alloc-per-call entry and 0.5 ms on a resident context, a
-64x56x56 k3 5.3 ms, a 128x28x28 k3 s2 5.8 ms, a 32x112x112 k3 7.4 ms, a 32x56x56
-depthwise 4.7 ms, the Whisper front-end conv1d (80x3000 k3 s1, 384 outputs) 80 ms and
-its stride-2 form 31 ms, and the transposed convs 1.6-3.9 ms.
+# serve straight from the Hub
+./rocket-inference serve -hf unsloth/embeddinggemma-2-GGUF:Q8_0 --port 8383
 
-The M8b families are **bit-identical to the C library on the board across the whole
-measured matrix** as well (`ab_compare.py`): nine int8 direct convs (3x3/1x1/k7,
-stride 1/2, the RGB stem at `IC = 3`, an `OC = 16` head padded to 32, and the tiling
-shapes 64x56x56 k3 / 32x112x112 k3 / 128x28x28 k3 s2), six int8 depthwise convs
-(`C = 64`/`128`, strides 1/2, asymmetric strides, 5x5, zero points at both ends of the
-int8 range, with and without the bias cube), nine pools (fp16 max/avg with and without
-padding plus int8 and uint8 max/avg) and eight upsamples (nearest and bilinear at
-scales 2/3/4, non-square factors). Against the device-free references the int8 direct
-conv is **int32-exact** on every shape (int8 × int8 → int32 is exact integer
-arithmetic; a float gate would hide an accumulator bug), the int8 depthwise output is
-**bit-exact against the DPU requant model** (nearest, ties to even — the rule measured
-on the part, in `conv2d_dw_int8_model`), max pooling is exact, an average sits within
-the `fp16(65536/k)` reciprocal's tolerance (<= 1e-3 absolute at the array peak), the
-int8/uint8 averages are within one rounding step, nearest upsampling is bit-exact and
-bilinear is within the fp16 triangle kernel's rounding. Board wall (cores 0-3, busy
-board, 600 MHz module): an int8 3x3 32x16x16 0.4-1.0 ms (alloc-per-call entry 2.1 ms for
-the 3x32x32 RGB tile), 64x56x56 k3 5.6 ms, 32x112x112 k3 6.6 ms, 128x28x28 k3 s2
-4.9-23 ms depending on load; the int8 depthwise jobs 1.0-7.9 ms; fp16 pools 0.5-0.7 ms;
-the upsamples 1.4-5.8 ms.
+# a local directory with a *.gguf (and optionally mmproj-*.gguf) works the same
+./rocket-inference serve --model-dir /path/to/gguf-dir --port 8383
+```
 
-Two *encoder-level* envelopes the C library does not check showed up while measuring,
-and this port mirrors them because it emits the same programs: the PPU's pooling
-window is only reliable up to a kernel of 8 when more than one output window is
-needed (a 9x9 or larger kernel, or a stride larger than the kernel, writes zeros or
-garbage — a 14x14 kernel is fine only when the plane is exactly one window, which is
-what the global-pool decomposition uses), and the int8 depthwise writer walks channels
-in `G = 64` groups, so a `C` that is a multiple of 16 but not of 64 (32, 96) produces
-an identically-wrong surface on both sides. The self-test matrix stays inside those
-envelopes; the A/B keeps one case of each to pin the bit-identity.
+`--mmproj <quant|file>` overrides the mmproj choice, `--revision` pins a revision, and
+`HF_HOME`/`HF_HUB_CACHE`/`HF_TOKEN` configure the cache and auth. The tokenizer and
+config come from the GGUF itself (config falls back to the base repo's `config.json`
+for the dense Gemma checkpoints). Main quant target: Q8_0; F16/BF16/F32 also load.
 
-Attention also has its long-context form, the opt-in tiled path
-(`ROCKET_FA_TILE_KV`, off by default, `ROCKET_FA_TILE_MIN_KV` sets the crossover):
-one key tile at a time with the online softmax, instead of the `[Tp, Kn]` score
-matrix. It is bit-for-bit independent of `ROCKET_FA_CHAIN`, matches the f64 reference
-at cosine 0.9999999 (30,016 keys, causal, GQA 8/2) and cuts the attention scratch
-14x at that length (37 vs 529 MiB) and 6.4x at 16k (248 vs 1597 MiB), which is what
-takes a 30k-key request from OOM to a 1 GiB working set. Wall is parity to ±20 %:
-it wins once the key axis dominates the query block (0.88-0.95x measured) and pays
-more, smaller submits at a square 8k with a 2k tile.
+## Build
 
-It also covers an MLA head geometry, where the value dim differs from the head dim
-(`dv != dk`): the tiles carry `dk` and `dv` separately (`kh [wp,dk]`, `vh [dv,wp]`,
-the AV matmul `Tp x wp x dv` and the fp32 `acc [Tp,dv]`), so a 576/512 geometry tiles
-like any other. That is a Rust extension — the C `fa_heads_range_tiled` takes a single
-`d` and has no MLA variant, so there is no C byte parity there; the gate is the device-free
-`flash_attn_ref` plus the materialized arm. Board (T=64 kv=2048 GQA 8/2 dk 576 dv 512,
-tile 512, causal): tiled cosine 0.99999994 vs the f64 reference (materialized
-0.99999996), 0.99999992 between the arms, and 23.6+20.1 → 8.6+6.3 MiB of scratch; at
-512x8,192 170.8+140.4 → 58.8+45.4 MiB (2.9x) at wall 1.09x, i.e. the same trade as the
-`dv == dk` path (memory for submits, never faster below the crossover). A `dv == dk`
-geometry is bit-for-bit unaffected by the change.
+```sh
+# dev host (flex backend; `--no-default-features` skips the CubeCL LLVM backend)
+cargo build --release -p rocket-inference --no-default-features
+# default build (adds the CubeCL/LLVM `cpu` backend)
+cargo build --release -p rocket-inference
+# aarch64 cross-build (board); `--features npu` enables the pure-Rust driver
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features
+cargo build --release -p rocket-inference --target aarch64-unknown-linux-gnu \
+    --no-default-features --features npu
+```
 
-### Row-major score/P handoff (`ROCKET_FA_ROWMAJOR`)
+The aarch64 binaries and models on the board live under `/root/rocket-inference/`
+(binary) and `/root/models/`; run from the deploy dir when passing relative
+fixtures such as `data/one_long.txt`. The NPU build is self-contained
+(the pure-Rust driver is statically linked) and needs `/dev/accel/accel0` at run
+time for any stage placed on the NPU. `--device auto` (the default) is
+NPU-first on that build; `--device cpu` is the explicit CPU path.
 
-The chained path's QK and AV jobs exchange the score matrix through the NPU's cube
-layout by default, which costs two host passes over it (QK's de-tile and P's pack).
-With the row-major handoff (the default, `ROCKET_FA_ROWMAJOR=0` restores the cube
-handoff) QK writes the scores as plain rows into a resident BO through the matmul's
-row-major C form, the host softmax rewrites them as P in place, and AV reads its K
-slices as rows. Past `ROCKET_FA_RM_MAX_ROW` bytes a score row (default 4096, i.e. 2048
-keys) QK writes each N tile as its own block of rows and P lands in a second BO. The
-two handoffs produce the same f16 bits (the row-form programs are byte-identical to the
-cube programs except the stride fields), and the board A/B confirms it: 0 differing
-values of 524,288 at 512x4096 (8 heads), 1,838,592 at the vision-tower shape
-(2394x2400, 12 heads) and 524,288 at 512x8192 (the blocked form). At 512x4096 it also
-drops the attention scratch from 146.6 to 26.5 MiB of BO and 31.0 to 15.0 MiB of host
-memory per worker, because the cube's `BATCH`-slot output BO and the group's host
-score/P matrices are never allocated. An AV whose K axis does not fit one K tile keeps
-the per-head fp16 KACC path (so `ROCKET_FA_CHAIN=0` vs `1` stays bit-identical) and
-reads P out of the row BO. The score surface itself saturates at ±65504: a real key
-whose raw score reaches that is reported as `ROCKET_E_RANGE` (`-6`) instead of being
-softmaxed as a tied row (`attn_selftest --sat`).
+The container image builds both architectures from the same Dockerfile, chosen by the
+build platform; on x86-64 the same command produces the x86-64-v3 (AVX2) flex CPU
+image:
 
-### Softmax placement: host vs on-NPU (`ROCKET_ATTN_HOST_SOFTMAX`)
+```sh
+# on the board (or any aarch64 host)
+docker build -f Dockerfile -t rocket-inference:local .
+```
 
-The C library's attention entries can run their row softmax either host-side or through
-`rocket_softmax_fp16`, the composition of host row-max plus the DPU `EXP` LUT, the
-feature-axis row sum and the per-row scale. Both arms are ported: `attn::RowSoftmax`
-owns the host pass (`attn::Softmax`, the default) and the on-NPU arm, which writes the
-same f16 masked scores the C does (`fa_score` in f32, one f16 narrowing, pad columns at
-the `-30000` clamp) and hands them to `ops::softmax::softmax` — the same composition the
-M6b gate already found bit-identical to C. `ROCKET_ATTN_HOST_SOFTMAX=0` selects the
-on-NPU arm, `1`/unset the host one (the port's default everywhere; the C's `mha_self`
-defaults to on-NPU, so `=0` is what reproduces it). The **materialized** paths honor
-the knob — `Attention::flash`'s per-head and chained group paths, and `mha_self` — while
-the tiled `ROCKET_FA_TILE_KV` path stays host-only by construction (its online
-running max/rescale is sequential across key tiles, and the C tiled range takes no
-`host_sm` either). `ROCKET_FA_CHAIN=0/1` and the `mha_self` thread fan-out stay
-bit-identical under either placement.
+The runtime stage is `debian:trixie-slim` plus `curl`, `ca-certificates` and
+`ffmpeg`/`ffprobe` (video decoding and non-WAV audio; the build fails if the
+package stops shipping either binary). The ffmpeg install adds ~426 MiB of
+packages (a 464 MB layer; the amd64 runtime image is 809 MB), which is the price
+of decoding without linking libav* into the binary. Smoke-tested in the image:
+`/embed` video and `/v1/embeddings` `input_video` (data URI) both reproduce the
+CLI f32 vector at cosine 1.000000000000 (log §21.3).
 
-The knob is global — `burn_rocket`'s attention ops ride the same `Attention::flash`, so
-setting it also switches the app's NPU attention — and the on-NPU arm is a
-parity/comparison knob, not a default; the measurements say why
-(board, cores 0-3, busy board at load ~10; `attn_selftest --sm-ab`): at T=257 kv=257 with
-8 heads / 2 kv heads and dk 64 it costs **1.8-2.2x the host wall** (128.1 vs 59.7 ms in
-one run, 100.5 vs 56.3 in another — the board scatters ±20 %) with a single fd and
-**1.2-1.3x** through the 4-worker fan-out, and at kv=1024 **2.55x / 1.76x**: the gap grows
-with the key count, as the C's own comment predicts, but it is far wider here because the
-C compares against a scalar `expf` pass and this port has the S1 fast host softmax.
-`mha_self` reads 1.1-1.25x (T=257) and 1.75x at the kv=1024 run's T=256. Numerics against
-the device-free f64 references: cosine 0.99999990 (flash) and 0.99999887-0.99999989
-(`mha_self`) — the `EXP` LUT's approximation, as documented for `rocket_softmax_fp16`.
+## Serving
 
-The C-vs-Rust A/B closes the surface (`ab_board` grew `flash`/`mha` families with the
-`attn_selftest --io` layout; `ab_compare.py --attn-only`): the **on-NPU arms are
-bit-identical on every case** — flash causal, unmasked, soft-cap 8, MLA (`dv != dk`) and
-a one-hot `n_kv > T` prefix, plus `mha_self` at T=8/5/33 with the `Tp`/`Tn` padding —
-while the host arms differ by at most ~2.4 f16 ULP at the output peak (cosine
-0.9999992-1.0), which is exactly the documented f32-vs-f16 score write. The C's
-single-fd entry chains its heads by default (`ROCKET_FA_CHAIN`), and so does the Rust
-one, so those cases pin the chained path's placement too.
+One command serves every model:
 
-### The model encoders (M9): SAM ViT-Det and SigLIP
+```sh
+rocket-inference serve (-hf <model> | --model-dir <dir>) [--family auto|qwen3|embeddinggemma|intent|gemma4|decision] [flags]
+```
 
-`rocket-npu` also carries the two **model-level** encoders of the C library — complete
-graphs assembled from the primitives above, not new kernels. Each has a flat fp16 weight
-blob (the `tools/sam_extract.py` / `tools/siglip_extract.py` format), a **device-free
-host reference** (the C `fd < 0` datapath), a one-shot device entry and a **resident**
-context that packs the static GEMMs once and reuses them across images.
+`--family auto` (the default) reads `config.json` `model_type` (a d3 package's
+`decision_config.json`) and picks the loader: `qwen3`, `embedding_gemma2`,
+`qwen3_5`, `gemma4` or `decision`. Use `--family <name>` to override (e.g. a
+plain generative Qwen3 checkpoint).
 
-| | graph | blob |
+The routes follow the loaded model — incompatible paths are not registered
+(404), and `/v1/models` reports a `capabilities` array:
+
+| | `qwen3` | `embeddinggemma` | `intent` | `gemma4` | `decision` |
+|---|---|---|---|---|---|
+| `/health`, `/v1/models` | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `/v1/embeddings` (OpenAI + OpenRouter: string/list, token ids, `content` blocks; media parts on Gemma only) | ✓ | ✓ | — | — | — |
+| `/embed` (text/image/video/audio, paths or data URIs) | — | ✓ | — | — | — |
+| `/v1/chat/completions` (OpenAI; `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, stream=false) | — | — | ✓ | ✓ | — |
+| `POST /v1/systemone` (d3 request object: `state`, typed `questions`, `images`/`videos` as `data:` URLs) | — | — | — | — | ✓ |
+| `/`, `/api/version`, `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` (Ollama) | — | — | ✓ | ✓ | — |
+
+```sh
+# embedding server (OpenAI): /v1/embeddings
+$B serve --model-dir ~/models/qwen3-embedding-0.6b --cpu-backend flex --dtype f32 \
+    --device npu --port 8383 --max-tokens 30000
+curl -s localhost:8383/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input":"Hello world","encoding_format":"float"}'
+
+# multimodal embedding server (OpenAI + native /embed)
+$B serve --model-dir ~/models/embeddinggemma-2 --device npu --defer-towers --port 8390
+curl -s localhost:8390/embed -H 'Content-Type: application/json' -d '{"image":"/path/to/cat.jpeg"}'
+
+# OpenRouter-style image input: one embedding per input block, images and text
+# joint in part order (URLs, data: URIs and local paths all work)
+curl -s localhost:8390/v1/embeddings -H 'Content-Type: application/json' -d '{
+  "input": [
+    {"content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]},
+    {"content": [{"type": "text", "text": "a scenic boardwalk"},
+                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}]}
+  ],
+  "encoding_format": "float",
+  "dimensions": 512
+}'
+
+# query-planner server (OpenAI chat + Ollama, litellm/OpenViking-compatible)
+$B serve --model-dir ~/models/ov-intent-analysis-sft --device auto --npu-threads 3 --port 11434 \
+    --model-name guoxuter/ov_intent_analysis_sft:v7_q8 --max-tokens 4096 --max-new-tokens 256
+curl -s localhost:11434/api/chat -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
+curl -s localhost:11434/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+
+# generation server (OpenAI chat + Ollama)
+$B serve --model-dir ~/models/gemma-4-E2B-it --device auto --defer-towers --port 8391
+curl -s localhost:8391/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":64}'
+
+# decision server (POST /v1/systemone): one typed answer per question
+$B serve --model-dir /root/models/d3-lite --device npu --defer-towers --port 8384 \
+    --max-tokens 8192
+curl -s localhost:8384/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "Customer asks for a refund of a duplicate card charge.",
+  "questions": {"route": {"type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {"returns": "Refunds, replacements and damaged deliveries",
+                 "billing": "Payments, invoices, charges and subscription price changes",
+                 "technical": "Product setup, firmware and connectivity faults"}}}
+}'
+# -> {"model": "d3-lite", "answers": {"route": {"type": "choice", "choice": "returns",
+#       "probabilities": {"returns": 0.705, "billing": 0.294, "technical": 0.001},
+#       "confidence": 0.442}}, "usage": {"input_tokens": 128, "output_tokens": 0}}
+```
+
+Serving flags: `--model-dir` (required; or `-hf`),
+`--family auto|qwen3|embeddinggemma|intent|gemma4|decision`, `--cpu-backend flex|cpu`,
+`--port` (default
+8383), `--model-name` (default: the model directory name), `--max-tokens`
+(prompt/context cap; **per question** on `decision`, default 32768),
+`--max-new-tokens` (default generation cap),
+`--temperature`, `--video-fps`/`--video-max-frames`, plus the shared load flags
+below. `rocket-inference help serve` lists all of them. A flag that does not
+apply to the detected model is rejected.
+
+### Device placement
+
+Every stage runs on the CPU unless it is placed on the NPU. The base flag is
+`--device auto|cpu|npu`; the per-stage flags override it:
+
+| flag | stage | families |
 |---|---|---|
-| **SAM ViT-Det** (`facebook/sam-vit-base`) | patch conv (k = stride = 16, with bias) → learned 2D position table → 12 pre-norm blocks (fused qkv → **windowed** attention on all but the periodic global layers → the decomposed **relative-position bias** added to the *unscaled* `QK^T` before the softmax → o-projection, then an erf-GELU MLP) → neck (1×1 conv → channels-first LayerNorm → 3×3 conv → LayerNorm) → `[1,256,64,64]` | 183.8 MB |
-| **SigLIP-B/16** (the SmolVLM-256M front-end) | patch conv (16, 16, with bias) → position table → 12 pre-norm blocks (q/k/v/o + GELU-tanh MLP) → post-LayerNorm → `[1024,768]` | 172.9 MB |
+| `--text-device` | text-backbone projections | all |
+| `--text-attn-device` | text-backbone attention | qwen3, embeddinggemma |
+| `--vision-device` | vision-tower projections | embeddinggemma |
+| `--vision-attn-device` | vision-tower attention | embeddinggemma |
+| `--decode-device` | single-token decode projections | intent, gemma4 |
 
-The host/NPU split is the C's: the big GEMMs (patch, qkv/o, fc1/fc2, the neck convs and
-the per-head `QK^T` / `P·V`) run on the NPU, and the `O(tokens·d)` glue (im2col, the
-position add, window partition/unpartition, the LayerNorms, the erf-GELU, the softmax and
-the decomposed rel-pos matmul+add) on the host. The rel-pos add is faithful in fp16 (the
-C measures cos ≥ 0.9999991/layer), so there is no host-f32 fallback for it. SAM's window
-grid is zero-padded up to a multiple of the window size, and — as in the C — the pad
-tokens *do* participate as keys/queries in the boundary windows; the real 64×64 grid with
-14×14 windows (70×70 padded, 25 windows) is exactly that case.
+`decision` is text-only in placement terms: `--text-device` is its one NPU
+stage, and `--text-attn-device`/`--vision-device`/`--vision-attn-device`/
+`--decode-device` are rejected for it (its vision tower, backbone attention and
+readout stay on the CPU). An explicit stage flag for a stage the family does not
+have is an error, on every command.
 
-`SiglipModel` also carries the C's plain-ViT variant knobs, honoured by the resident
-path only (as in C): a CLIP `cls` prefix row, a pre-encoder LayerNorm, quick-GELU instead
-of GELU-tanh, and DPT-style multi-tap exits. A v1 blob leaves them at the SigLIP
-defaults.
+`auto` (the default) places a stage on the NPU when the build has it (aarch64 +
+the `npu` feature) and on the CPU otherwise; under `auto`, decode stays on the
+CPU because NPU single-token matmuls pay the `M >= 256` padding. `--device cpu`
+is the explicit CPU path; `--device npu` sets every stage (including decode) on
+the NPU. The audio tower is CPU-only. Each run prints the resolved split before
+loading:
 
-**Validation.** The primary gate is the two host references against the C's: both are
-**bit-identical** to `rocket_sam_encode(-1, …)` / `rocket_siglip_encode(-1, …)` — the
-output *and* every intermediate token block — on the synthetic fixture (x86 and the
-board) and on the real checkpoints (x86). That pins the whole datapath (im2col ordering,
-SAM's f32-accumulate vs SigLIP's f64-accumulate patch matmul, the LayerNorm/softmax/GELU
-rounding, the windowed rel-pos bias, the neck) without needing a device. On the board the
-device arms are then scored against that reference: the synthetic fixture
-(d=64, 2 layers, grid 8/window 4) gives SAM one-shot **0.99999951** / resident
-**0.99999951** worst-layer, and SigLIP one-shot **0.99999724** / resident **0.99999724**;
-SAM's one-shot and resident outputs are **bit-identical to each other**, and repeats are
-bit-identical. On the real checkpoints — the board, cores 0-3, load average ~9-11
-(the live embedding service keeps 4-7) — the same comparison gives SAM one-shot worst
-layer **0.99999848** / neck **0.99999938** (150 s) and resident worst **0.99999842** /
-neck 0.99999936 (113 s after a 1.8 s pack), SigLIP one-shot output **0.99998189**
-(18.8 s, worst layer 0.99999144) and resident output **0.99993420**
-(4.4 s after a 0.8 s pack, worst layer 0.99998237; the
-per-head fallback `ROCKET_SIGLIP_FA=0` gives 0.99992939 in 13.3 s, so the flash-attention
-fan-out is 3× the per-head path on this shape). For
-scale on the same artifacts, the C library's own `sam_rocket` gate reports mean-layer
-0.999999 / neck 0.999999 with a 153.9 s one-shot, so the Rust one-shot is at parity
-with the C's and the SigLIP resident arm is 4.3× faster than its one-shot (it skips
-the per-call weight re-pack and the per-layer `mha_self` fd churn).
+```
+placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=CPU
+```
 
-`siglip_rocket`, the C library's own gate, passes on the board against the HF f32
-reference with mean-layer cosine 0.999985 and post-LN 0.999884, which is what makes the
-port's target meaningful. The C's erf-GELU (device one-shot) and GELU-tanh (resident)
-differ by ~1e-3 as its header says, so the resident arm carries that delta on top.
+Related flags: `--npu-threads` (default 5), `--npu-dtype fp16|int8` and
+`--int8-group` (the embeddinggemma and decision text projections; int8 is a
+memory/fidelity option, not a speed one), `--keep-cpu-weights auto|yes|no`
+(intent/gemma4: whether the packed projections keep their CPU copies; `auto`
+keeps them exactly when a stage runs on the CPU, so `--decode-device npu` alone
+drops them), `--attn-kernel fused|blocked` and `--vision-attn-kernel
+fused|blocked` (the CPU attention kernels used when that attention stage is not
+offloaded), `--chunk`/`--key-block` (qwen3 blocked tiles), `--attn-chunk`
+(chunked attention width, default 1024), `--dtype`, `--quant none|q8`
+(Q8-resident CPU weights; `--quant q8` does not touch NPU-packed weights) and
+`--defer-towers`.
 
-### Missing surface
+`--defer-towers` applies to `embeddinggemma` and `gemma4` (their vision/audio
+tower halves) and to `decision`, whose CPU vision tower otherwise loads with the
+backbone: the flag leaves it to the first media request, so a text-only d3
+service never allocates it.
 
-`rocket-npu` covers the RK3588 functional surface of `librocketnpu` (the 219
-RK3588-relevant entries; the remainder are RK3576-only). The C ABI, a few aliases and
-plane variants, performance mechanisms and every RK3576 entry are not reproduced.
-Implemented: fp16 one-shot/streaming/resident/segmented/multi-fd/
-fp32-out and batched matmul, dense and group-wise int8 (one-shot, resident per-channel
-and resident group-wise), dense and group-wise int4 (one-shot, resident `I4Context` in
-both modes, nibble-packed host pack/gather), `int16_exact`, the native bf16 stream (and
-the resident `Bf16Context`/`Bf16Weight` extension, which the C library does not have),
-the tf32 one-shot and its planner, the activation + elementwise family (all 19
-`ROCKET_ACTIVATION_*` kinds, LeakyReLU/ELU/SELU/PReLU, EW mul/add/sub/max/min, clip,
-divide, the LUT builder and the `*_ref` host references), the reduce + softmax family
-(the PPU global average/max/min pools with `global_avgpool_plan`/`reduce_factor_axis`
-and the exact host fallback, the feature-axis ones-matmul reduce, cumsum, row
-softmax/log-softmax/cross-entropy and the per-row scale, each with its `*_ref`), the
-transformer norms (`rmsnorm`/`layernorm` plus the shared `square_prescale_k` fp16-square
-guard), the vision norms (`batchnorm`/`groupnorm`/`instancenorm`/`l2norm`), the FFN
-family (`geglu`, `ffn`, the cube-resident pinned-tile `ffn_fused`/`mlp_fused`, the
-host-handoff `mlp`, and `ffn_ref`/`geglu_ref`/`mlp_ref`), the encoder block
-(`encoder_block`/`encoder_block_ref`), the fp16 convolution family
-(`conv2d`/`conv2d_act`/`conv1d`/`conv2d_ref` with `ConvContext`, `conv2d_plan`/
-`conv2d_plan_code`, the `conv2d_deconv`/`conv2d_deconv_fits` deconvolution route and
-the weight/feature cube index math; `conv_transpose2d`/`conv_transpose2d_ctx`/
-`conv_transpose2d_ref` with `conv_transpose2d_plan`/`_plan_code` and the route enum),
-the native int8 convolution (`conv2d_int8`/`conv2d_int8_ctx`/`conv2d_int8_mt` with
-`ConvInt8Pool`, `conv2d_ref_int8`, `conv_int8_tile_plan` and the int8 cube index
-helpers; `conv2d_dw_int8`/`conv2d_dw_int8_ctx` with the on-chip requant, its host
-model `conv2d_dw_int8_model` and the `requant_*` arithmetic), the PPU pooling family
-(`pool_fp16`/`pool_int8`/`pool_uint8` and their references, `pool_fp16_plan` with the
-C's `-3`..`-10` classes, `PoolDesc`), the upsample family
-(`upsample_nearest`/`upsample_bilinear` and the references, `build_kernel`,
-`bilinear_ksize`, the plans), the two model encoders (`ops::sam` and `ops::siglip`:
-the blob loaders, the device-free host references, the one-shot entries and the resident
-contexts, with the CLIP/DPT variant knobs), and
-masked GQA attention (the persistent
-`attn::Attention` context, the stateless `rocket_flash_attn_fp16` / `_mt` entries and
-the `rocket_mha_self_fp16` encoder sublayer) with chained per-head QK/AV batching, the
-selectable host / on-NPU softmax placement (`ROCKET_ATTN_HOST_SOFTMAX`) and
-the tiled long-context path (`ROCKET_FA_TILE_KV`: online softmax over key tiles, no
-`[Tp, Kn]` score matrix, at any `dk`/`dv` — MLA included), the two f64 host oracles
-(`flash_attn_ref`,
-`mha_self_ref`), the device/BO/submit primitives (including multi-job submit and the
-opt-in chained layout), and the dtype parity harness (`tools/c-oracle` + `parity.py`).
+Behavior notes: `/v1/chat/completions` is non-streaming (streaming is an error,
+as before); Ollama `stream: true` returns one NDJSON content line plus the final
+`done` line; the Ollama endpoints accept any request `Content-Type`
+(application/octet-stream included), while OpenAI chat parts accept
+`image_url` / `input_audio` (one of each per request). Requests serialize on the
+model; panicking forwards are contained (500) instead of poisoning the server.
 
-The activation family's own self-test (`crates/rocket-npu/src/bin/activation_selftest.rs`)
-runs every kind and EW op on the board against that model, and its `--dump-lut` /
-`--dump-gen` modes reproduce the C `rocket_lut_epilogue_build` dump and the generated
-program byte for byte. `crates/rocket-npu/src/bin/reduce_selftest.rs` does the same for
-the reduce/softmax families (`--pool`, `--feature`, `--cumsum`, `--softmax`, `--shape`,
-`--reps`), `crates/rocket-npu/src/bin/ops_selftest.rs` for the norm/vision/FFN/encoder
-families (`--norm`, `--vision`, `--ffn`, `--encoder`, the four per-family shape
-overrides, `--reps`), `crates/rocket-npu/src/bin/conv_selftest.rs` for the convolution
-family (`--conv`, `--dw`, `--act`, `--conv1d`, `--transpose`, `--int8`, `--int8-dw`,
-`--pool`, `--resize`, the per-family shape overrides, `--reps`), and
-`crates/rocket-npu/src/bin/encoders_selftest.rs` for the two model encoders (`--write-blob`,
-`sam`/`siglip` with `--ref`/`--npu`/`--ctx N`, `--ref-in`/`--ref-out` to move a host
-reference between machines, and a `--io` mode); their `--io` raw-file modes are the
-exchange format of `tools/c-oracle/ab_compare.py` for the C-vs-Rust A/B on the board
-(`--enc`, or `--enc-only` for just the M9 section). `attn_selftest` covers the attention
-side: the chained A/B by default, `--oneshot` for the stateless entries against the f64
-oracle, `--mha` for the encoder sublayer, `--host-sm 0|1` to pick the softmax placement,
-`--sm-ab` to run both placements and report the wall/CPU and the deviation, `--tile KBP`
-(`--tile-min`, `--tile-only`) for the tiled long-context A/B at any `dk`/`dv` — MLA
-included — and an `--io flash|mha` raw-file mode (`ab_compare.py --attn-only`).
-`crates/rocket-npu/src/bin/bf16_selftest.rs` is the bf16 matmul A/B: the streaming
-engine (`--stream`, the C shape), the same stream over the canonical tiling (`--canon`)
-and the resident-weight context (`--resident`) over an `M = 4, 64, 256, 512` ladder at
-the `K = 1024, N = 768` and `K = 4096, N = 1024` projection shapes, each scored against
-an f64 reference and against each other (the resident weight must be bit-identical to
-the canonical stream at every `M`; against the C-tiling stream it is only guaranteed to
-be, and is measured to be, bit-identical at `M >= max_tile` — below that the pinned
-`Kt` re-partitions the K sum), plus the fp16 resident context's cosine for scale.
+`/v1/embeddings` also accepts the OpenRouter multimodal shape: `input` may be an
+array of `{"content": [...]}` blocks with `text`, `image_url`, `input_audio` and
+`input_video` parts. One block produces one embedding; images may repeat within
+a block (each expands to its own soft-token count) and are encoded jointly with
+the block's text, while audio and video are limited to one each. `input_file` is
+rejected. An `image_url.url` or media `data` value may be a local path, a
+`data:` URI or an `http(s)` URL — remote media are fetched server-side (10 s
+timeout, 20 MiB cap, `ROCKET_MEDIA_FETCH=0` disables). Request bodies are capped
+at 32 MiB on the media routes (`/v1/embeddings`, `/embed`,
+`/v1/chat/completions`, the Ollama API), and `dimensions` is accepted as an
+alias of `dim`.
 
-`ROCKET_FA_TILE_KV` is opt-in (default 0 = off): it takes the materialized path below
-`ROCKET_FA_TILE_MIN_KV` padded keys (default 8192, where the small-GEMM dispatch floor
-rather than the score matrix dominates), tiles at any `dk`/`dv` (MLA included), and
-never chains. Set it to the tile width you want (`2048` is the tuned value) and the
-attention scratch stops growing with the key count; it trades more, smaller NPU
-submits for the flat footprint and the cache-resident score tile.
+`/v1/systemone` (the decision family) is stricter, matching the checkpoint's own
+`d3_server.py`: `images` and `videos` must be `data:` URLs (a local path or an
+`http(s)` URL is a 422), images are limited to 8,000,000 decoded bytes and
+16,000,000 pixels (PNG/JPEG/WebP), videos to 32,000,000 bytes, 8,294,400 pixels
+per frame and 300 s (MP4/WebM/QuickTime/Matroska, decoded at 2 fps), and all
+videos of one request together may not exceed 16,384 input tokens. Every refusal
+is the reference's `422 {"detail": "images[i]: ..."}` / `{"detail": "videos[i]:
+..."}`; a malformed question refuses the request with
+`422 {"detail": {"invalid_questions": {...}}}` and nothing runs. Because one
+request may carry a 32 MB video plus three 8 MB images, the route's transport
+limit is 96 MiB rather than the 32 MiB above.
 
-Not exposed yet: the `*_ref_fp16` host references of the remaining non-matmul families,
-the `_planes`/transposed variants, RK3576 entries (including the RK3576 int8 LUT
-activation), the public `rocket_stream_*`
-aliases, the non-fp16 batch wrappers, the RK3576-specific convolution and pooling
-entries (the part's own conv encoder, the packed-image datapath, the int8 pooling
-entry with its zero point and the prepacked/cube handles), and graph execution (the
-RK3576-only graph runner).
-The dtype surfaces themselves are complete: fp16, int8 and int4 have resident weights,
-bf16 has the stream *and* a resident-weight extension (which the C library does not
-have — its bf16 path only streams), tf32 is one-shot with no resident variant in C
-either, and `int16_exact` is one-shot in both libraries.
-The activation + elementwise, the reduce + softmax, the transformer and vision norms,
-the FFN/MLP (the fused entries are cube-resident: the projections leave their full
-output cubes, the bias/activation run over the cube bytes and the down/fc2 matmul reads
-the product cube directly, so no `[M,I]` intermediate is de-tiled and re-packed), the
-encoder block, the fp16 and int8 convolution families (direct/
-depthwise/1D, the conv→activation fusion, the transposed conv, the int8 requant, and the
-int8 direct conv's opt-in `ROCKET_CONV_BATCH` coalesced multi-task submit), the
-PPU pooling family, the upsample and the two model encoders (SAM ViT-Det and
-SigLIP-B/16) are implemented. See the `rocket-npu` crate docs for the full list.
+Every completed inference request is logged as one `tracing` line (level
+`info`, `RUST_LOG` controls it; default `info`). Embedding requests report the
+prompt token count, `compute_s`, `tok_s`, the model-lock wait `queue_s` and
+`rss_mib` (`RssAnon`); media requests add `encode_s` (the vision-tower forwards)
+and `vision_attn` (the tower's attention mode), and chat requests split the
+model's own timings into `prefill_s`/`prefill_tok_s` and
+`decode_s`/`decode_tok_s`. Failed requests are not logged (they keep their HTTP
+error), and `/health`/`/v1/models` never touch the model.
+`ROCKET_MEM_LOG=1` adds one `npu scratch` line after load and after every
+request with the driver's live split (weights / matmul BO+host / attention
+BO+host, top slots and worker shapes). The per-request lines look like:
 
-The int8 direct conv runs one job per independent OC/row/column tile by default.
-`ROCKET_CONV_BATCH=1` instead coalesces a run of tiles (up to 64 per job; larger tilings
-split into groups) into **one** multi-task job: one submit ioctl, one IOMMU attach and one
-fence wait for the whole run, with the tiles' programs in fixed 256-word regcmd slots and
-their feature/weight cubes in bank-aligned slots of one input/weight BO (the spare bank
-after each slot is the zeroed bytes the int8 `C2 = 16` feature DMA over-reads). It is
-bit-identical to the per-tile path (the same tile program against the same cube bytes)
-and, when `ROCKET_BATCH_SUBMIT=1` is also set on a kernel that honors
-`DRM_ROCKET_JOB_BATCHED` *and* every program is the same length, the run also goes
-contiguous and self-chained (one hardware kick). `ROCKET_CONV_BATCH_DEBUG=1` logs the
-layout it chose. Measured on the busy board (cores 0-3, `conv_selftest --int8-batch-ab`,
-medians of 7 interleaved samples per arm, three runs): 128x112x112 k3 oc128 (18 tiles)
-51-56 -> 39-41 ms serial (1.31-1.37x) and 18-23 -> 17.5-17.8 ms on the 3-device pool,
-128x224x224 k3 oc128 (74 tiles, two groups) 192.5 -> 148.4 ms, 32x112x112 k3 (2 tiles)
-5.4-6.8 -> 3.7-4.6 ms, and no change at one tile (the per-tile path is taken).
+```text
+INFO embedding request endpoint=embeddings model=qwen3-embedding-0.6b inputs=2 tokens=13 queue_s=0.0 compute_s=6.335 tok_s=2.1 rss_mib=968.7
+INFO chat request endpoint=chat.completions model=gemma-4-E2B-it-qat-mobile prompt_tokens=15 prefill_s=1.56 prefill_tok_s=9.6 gen_tokens=2 decode_s=0.194 decode_tok_s=10.3 queue_s=0.0 compute_s=1.754 rss_mib=6783.9
+```
 
-On the board the NPU boots at 200 MHz; the patched 600 MHz module
-(`/root/npu-poc/rocket-patched-600/rocket-npu600.ko`) is ~3× faster under load and
-reverts on reboot. Everything works at the stock clock.
+Set `RUST_LOG=warn` to silence the per-request lines.
 
-## Example
+### OpenTelemetry tracing
 
-[`examples/rocket-inference`](examples/rocket-inference) is a complete inference app
-built on this library: one binary with family-agnostic commands
-(`serve`, `embed`, `bench`, `gen`, `decide`, `tokenize`, `gemm`); the model family is
-detected from the checkpoint and `--family` overrides it. One `serve` command loads any of the
-models and exposes its compatible endpoints; the Qwen3-Embedding-0.6B and multimodal
-EmbeddingGemma 2 embedding models (`embed`/`bench`/`tokenize`), the Qwen3.5-0.8B
-intent/query-planner model and Gemma 4 E2B-it generation (`gen`), and the vllm-sr d3
-typed decision model (`decide`, `POST /v1/systemone`) are one-shot CLI paths. Per-stage
-NPU placement is selected with `--device` and the
-`--text-device`/`--text-attn-device`/`--vision-device`/`--vision-attn-device`/
-`--decode-device` flags; balanced/full-offload/speed recipes and measurements from the
-Rock 5B+ are in `examples/rocket-inference/docs/recipes/`, `.../docs/experiment-log.md`
-and `.../docs/experiment-log-gemma.md`.
+`serve` can export distributed traces over OTLP/HTTP (protobuf) to an
+OpenTelemetry collector. Tracing is off by default; `OTEL_SDK_ENABLED` is the
+master switch and everything else is configured with the standard OpenTelemetry
+environment variables:
 
-On the board the Qwen3 embedding NPU path runs the 3,633-token input at 45 tok/s while
-using ~51% fewer CPU-seconds than the CPU-only flex path (the CPU path remains ~2.3×
-slower than the production `ik_llama.cpp` Q8_0 server); the intent model is
-token-identical to the HF reference and runs a 166-token v7 planner prompt in 11.7 s
-with `--device auto` (89.9 s CPU-only, 7.7× wall). EmbeddingGemma 2 matches the HF f32 reference
-on every modality (cosine 1.0; `--quant q8` gives 0.9996-0.9999 at 1216 MiB resident,
-605 MiB anon idle in the deployed text-only `--defer-towers` configuration)
-and its text backbone runs on the NPU: 218 projections packed into 0.25 GiB of resident
-fp16 weights plus chunked sliding **and full** attention, for 1.61x wall and -33 %
-user CPU vs the CPU baseline (2587-token text). Its vision tower packs 65 resident
-projections and runs its attention on the NPU too (`--vision-attn-device
-npu`, the `--text-device npu` default): a 2394-patch image's tower is 10.6 s
-(15.2 s with the CPU attention kernel) at cosine 0.99999 vs the HF f32 reference in the f32 arm and
-0.99988 with the deployed q8 text backbone. Gemma 4 E2B-it greedily reproduces
-the HF reference token-for-token, and its QAT mobile checkpoints load bit-exactly.
-Long causal prompts run in query chunks on the NPU (`ROCKET_CAUSAL_CHUNK`, default
-1024): at 8k tokens the Qwen3 path is 246 → 181 s of compute (32.5 → 44.3 tok/s) and
-bit-identical to the dense causal op, and one 1024-row chunk against a 30k-key prefix
-keeps ~0.9 GiB of chunked attention scratch instead of the dense 1.8 GiB mask plus its
-`[n, n]` score matrices.
+| variable | meaning |
+|---|---|
+| `OTEL_SDK_ENABLED` | master switch (`true`/`1`/`yes`/`on`; unset or false = no exporter, no network) |
+| `OTEL_SDK_DISABLED` | standard kill switch; `true` wins over `OTEL_SDK_ENABLED` |
+| `OTEL_TRACES_EXPORTER` | `otlp` (default) or `none`; any other exporter disables tracing with a message |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | resource attributes; `service.name` defaults to `rocket-inference`, `service.version` to the crate version |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | collector base URL (default `http://localhost:4318`; a signal-specific endpoint is used verbatim) |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | request headers (`key=value,...`) |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | export timeout in milliseconds |
+| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` (the default is none; zstd is not compiled in) |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` only; `grpc` disables tracing with an error, `http/json` falls back to protobuf |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `parentbased_always_on` (the SDK default), `always_on`, `always_off`, `traceidratio`, `parentbased_*` |
+| `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | batch span processor |
+| `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | span limits |
+| `OTEL_PROPAGATORS` | `tracecontext,baggage` (default), either one alone, or `none` |
 
-## License
+```sh
+OTEL_SDK_ENABLED=true \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+OTEL_SERVICE_NAME=rocket-inference \
+$B serve --model-dir ~/models/qwen3-embedding-0.6b --port 8383
+```
 
-GPL-3.0-or-later, matching the upstream `librocketnpu` design this port follows.
+Each request gets one server span (`http.request`, `otel.kind=server`, named
+after the method and matched route) carrying the method, path, route, response
+status, `server.address`/`port` and the loaded model; 5xx responses set the span
+status to error. The model call is the child `inference` span with `queue_s`,
+`compute_s` and (for media requests) `encode_s`, and the per-request log line is
+exported as a span event with its usual fields. An incoming W3C
+`traceparent`/`tracestate` (and baggage when enabled) becomes the parent of the
+request span. `/health` is not traced, and prompts, headers and embeddings are
+never exported.
+
+The major time consumers of a request are children of `inference`:
+
+| span | covers | attributes |
+|---|---|---|
+| `prepare` | input assembly (media decode, placeholder expansion, tokenization) | `images`, `video`, `audio`, `tokens` |
+| `image.decode`, `image.resize` | one per image (mozjpeg decode, bicubic resize) | — |
+| `video.frames` | ffmpeg frame extraction | `frames` |
+| `media.fetch` | a remote (`http(s)`) media input | — |
+| `audio.decode`, `audio.features` | waveform decode, log-mel extraction | `samples`, `frames` |
+| `vision` | one vision-tower forward per image/frame | `patches`, `soft_tokens`, `patch_s`, `attn_s`, `kernel_s`, `mlp_s`, `pool_s` (plus `npu_s`/`convert_s` on the NPU) |
+| `audio` | one audio-tower forward | `frames`, `tokens` |
+| `towers.load` → `towers.half` | deferred vision/audio tower halves on the first media request | `vision`/`audio`; `half`, `tensors` |
+| `forward` | the text backbone of an embedding request | `tokens`, `attn_s`, `mlp_s`, `norms_s` (`ple_s` on the Gemma families) |
+| `prefill`, `decode` | chat prefill and the token-by-token loop | `prompt_tokens`; `gen_tokens`, `tok_s`, plus the stage durations |
+| `decision` | `/v1/systemone`: the whole decision compute (validation, media, one forward per question, readout) | `questions`, `images`, `videos`; `answers` and `tokens` when answered (`answers` = 0 on a refusal or failure) |
+
+Spans are declared with `#[telemetry::instrument(...)]` (the crate re-exports
+tracing's attribute under `server::telemetry`) and exist only while trace export
+is enabled: the stdout layer keeps events only, so with `OTEL_SDK_ENABLED` unset
+nothing is created. The request log lines look the same either way (no span
+scope prefixes); the tree exists only in the exported spans.
+
+The exporter uses a blocking HTTP client on the SDK's batch-export thread, so
+there is no Tokio-runtime coupling. Initialization errors (bad endpoint,
+unsupported protocol/compression, a subscriber already installed) are printed to
+stderr and `serve` continues without traces; an unreachable collector only
+affects exports. `RUST_LOG` filters stdout alone: the trace layer exports spans
+at INFO even when the log lines are silenced. SIGTERM
+and SIGINT drain in-flight requests and flush queued spans (Docker's own stop
+timeout still bounds a very long forward). Metrics and log exporters are not
+implemented (`OTEL_METRICS_EXPORTER`/`OTEL_LOGS_EXPORTER` are ignored).
+
+For a local capture without a collector, `tools/otel_capture.py` writes every
+OTLP/HTTP POST body to a directory and `protoc --decode_raw` prints the
+resource, spans and events:
+
+```sh
+python3 tools/otel_capture.py --port 4318 --out /tmp/otel-capture &
+OTEL_SDK_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+  ./rocket-inference serve --model-dir ...
+# ... send a request, stop the server, then:
+protoc --decode_raw < /tmp/otel-capture/*.bin
+```
+
+## Qwen3-Embedding-0.6B
+
+Embedding-only Qwen3 (no `lm_head`): 28 layers, hidden 1024, GQA 16/8 heads,
+head_dim 128, QK-RMSNorm, RoPE θ=1e6, SwiGLU, final RMSNorm, last-token
+pooling. Reference: production `ik_llama.cpp` Q8_0 (`--pooling last`).
+
+```sh
+M=~/models/qwen3-embedding-0.6b
+B=target/release/rocket-inference
+
+# single-core benchmark on a fixed text (CPU path)
+taskset -c 2 $B bench --model-dir $M --device cpu --cpu-backend flex --dtype f32 \
+    --tokens 3633 --reps 2 --attn-kernel blocked --chunk 256 --key-block 256
+
+# embed one text (writes a JSON float array)
+$B embed --model-dir $M --device cpu --dtype f32 --quant q8 --text "Hello world" --out out.json
+```
+
+`embed`/`bench`/`tokenize` detect the family; the Qwen3 flags are the shared
+load flags plus `--tokens`, `--text`, `--text-file`, `--out`. Placement:
+`--device npu` for text + attention on the NPU, or `--device cpu --text-device
+npu` for NPU projections with CPU attention. `gemm` takes `--m/--n/--k/--transb`
+and no model. See [`docs/recipes/qwen3.md`](docs/recipes/qwen3.md).
+
+Two attention paths, both causal and numerically identical: `fused` (default,
+flex's tiled flash-attention kernel; best for long inputs and multi-thread) and
+`blocked` (portable blocked online softmax; best single-threaded). Single-core
+runs are fastest with `--attn-kernel blocked --chunk 256 --key-block 256`.
+
+### Dev-host results
+
+AMD Ryzen 9 5950X (Zen3, AVX2+FMA), Burn 0.22.0, all rows Q8 weights:
+
+| Attention | Tokens | Threads | Time | Speed |
+|---|---|---|---|---|
+| blocked | 3633 | 1 | 51.7 s | **70.2 tok/s** |
+| fused | 3633 | 1 | 79.9 s | 45.5 tok/s |
+| blocked | 3633 | 4 | 25.6 s | 141.8 tok/s |
+| fused | 3633 | 4 | 25.6 s | 142.1 tok/s |
+| blocked | 6501 | 1 | 125.5 s | 51.8 tok/s |
+| fused | 6501 | 4 | 61.6 s | **105.6 tok/s** |
+| blocked (chunk 512/key 1024) | 30000 | 32 | 973.9 s | 30.8 tok/s |
+| fused | 30000 | 32 | 572.8 s | **52.4 tok/s** |
+| low-RAM `--quant q8` (blocked) | 3633 | 1 | 53.1 s | 68.5 tok/s |
+| low-RAM `--quant q8` (fused) | 3633 | 4 | 22.4 s | 162.3 tok/s |
+
+Numerical parity vs production (`ik_llama.cpp` Q8_0, last-token pooling,
+unnormalized), cosine on newline-free text: 0.999375 (f32, 82 tokens), 0.999280
+(Q8, 82), 0.999411/0.999126 (955), 0.999485/0.999209 (6501).
+
+### Board results (rock-5b-plus, 2026-10-05)
+
+Deployed and measured against the production server, both on cores 4-7 with
+4 threads:
+
+| Input | Production `ik_llama.cpp` | rocket-inference (flex f32, low-RAM) |
+|---|---|---|
+| 3,633 tokens | **46.7 s / 77.8 tok/s** | 106.2 s / 34.2 tok/s |
+| 6,501 tokens | 124.2 s / 52.3 tok/s | 262.2 s / 24.8 tok/s |
+
+- The 50 tok/s target is **not met** on the board; production is 2.28× faster
+  because it uses int8 kernels (flex has no int8 GEMM). Production stays on
+  `ik_llama.cpp`.
+- Memory: 771 MiB resident in low-RAM mode vs ~4 GB for the production server.
+- Numerics: board cosine 0.99928 at 82 tokens vs the unquantized reference,
+  identical to the dev host.
+
+### NPU offload
+
+The default `--dtype` is the checkpoint's native bf16: the projections stay
+host-native (the library has no resident bf16) and each matmul streams through
+`rocket_matmul_bf16_stream` with an f32 conversion per call; `--dtype f32` packs
+all 196 projections into resident fp16 NPU buffers (0.82 GiB; q|k|v and gate|up
+are each one segmented weight) and keeps only an f16 embedding table on the CPU
+(**298 MiB resident**).
+
+| Mode (3,633 tokens, cores 4-7, 4 threads) | Wall | Speed | CPU-seconds |
+|---|---|---|---|
+| CPU-only (f32) | 100.1 s | 36.3 tok/s | 622 |
+| `--device cpu --text-device npu` (CPU attention) | 86.9 s | 41.8 tok/s | 409 (-34%) |
+| `--device npu` (NPU attention) | 80.8 s | 45.0 tok/s | **302 (-51%)** |
+
+Numerics: cosine 0.999365 vs the production Q8_0 reference; the NPU attention
+run is 0.999997 vs the CPU-attention NPU run. Requirements: the 600 MHz-patched
+``rocket` module on the board (contained; reboot reverts). Native-bf16
+`--device npu` (the default dtype) packs the same resident fp16 weights via an
+exact bf16->f16 conversion: 2026-10-09 board A/B (log §17) 54.4 vs 57.8 tok/s
+(`--dtype f32`) at cosine 0.999845 vs f32 — a 6 % gap, down from 26 % when bf16
+used the library's stream; `--quant q8` applies to CPU-resident weights only.
+
+A Q8_0 checkpoint does not get an int8 projection path: Q8_0's 32-value blocks are
+layout-identical to the driver's resident W8A8 group-wise weight at `group = 32`, but
+the group-wise kernel reads back one int32 partial per K-group on the host, so the
+probe (`crates/rocket-npu/src/bin/q8_bench.rs`, log §20) measures it 1.64x slower at
+82x1024x1024 and 4.0-7.0x slower at the 2777-token q/k/v/o, gate/up and down shapes
+(numerics were fine, 0.9999929) — packing Q8_0 to resident fp16 at load stays the
+route (log §20).
+
+## Qwen3.5-0.8B intent
+
+`guoxuter/ov_intent_analysis_sft:v7_q8` is Qwen3.5-0.8B, a hybrid decoder
+(18 Gated DeltaNet linear-attention layers + 6 gated full-attention layers) —
+a different family from Qwen3. It serves OpenViking's query-planner role (both the
+Ollama API and OpenAI chat; see [Serving](#serving)). The HF safetensors (`model.language_model.*`; the
+vision tower is skipped) load through the family's loader; `--text-device npu`
+packs the projection groups into resident NPU weights for prefill and keeps f16
+CPU copies for single-token decode.
+
+```sh
+M=~/models/ov-intent-analysis-sft
+# one-shot greedy generation (raw prompt; drop --raw to wrap in the ChatML template)
+$B gen --model-dir $M --device auto --text "Hello!" --raw --max-new-tokens 32
+```
+
+Flags: the shared load flags plus `--text`, `--text-file`, `--raw`,
+`--max-tokens`, `--max-new-tokens`, `--temperature`, `--delta-chunk`,
+`--embed-f16`, `--dump-hidden`, `--dump-steps`. Placement: `--device auto`
+(prefill on the NPU, decode on the CPU) keeps the CPU copies; `--device npu`
+also places decode on the NPU and drops them (CPU relief, not speed); `--device
+auto --decode-device npu --keep-cpu-weights yes` is the old `--npu-decode`.
+See [`docs/recipes/intent.md`](docs/recipes/intent.md).
+
+The Ollama endpoints accept any request `Content-Type` (like Ollama itself):
+litellm's Ollama client posts its bodies as `application/octet-stream` (litellm
+1.83) and axum's `Json` extractor would otherwise reject them with 415. litellm
+routes `ollama/…` through `/api/generate` and `ollama_chat/…` through
+`/api/chat`.
+
+On the board (166-token v7 planner prompt, 32 greedy tokens, cores 4-7):
+
+| Mode | Prefill | Decode | Total | Anon RSS |
+|---|---|---|---|---|
+| CPU f32 | 7.91 s | 82.05 s (0.4 tok/s) | 89.96 s | ~2.4 GB |
+| `--device auto --npu-threads 3` | 2.94 s | 8.71 s (3.7 tok/s) | **11.65 s** | 2.06 GB |
+| `--device auto --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
+
+The CPU f32 and NPU f32-table outputs are token-identical to the HF transformers
+reference (32/32 greedy tokens; per-layer hidden-state cosine 1.0).
+`--embed-f16` is faster and smaller but its f16 LM head flips near-ties.
+`--device npu` drops the CPU copies entirely and runs decode on the NPU too
+(1.5 tok/s), useful only when CPU should be left alone.
+
+## EmbeddingGemma 2
+
+[EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2) is a
+multimodal embedding model built from the Gemma 4 family: a 270M-parameter
+bidirectional text decoder, a 170M vision tower and a 300M audio tower,
+projected into one 768-d embedding space (MRL: 128/256/512/768), with per-layer
+embeddings (PLE) and an 8192-token context. The full checkpoint — text, image,
+video and audio — is implemented, reproducing the HF reference numerics
+(`docs/experiment-log-gemma.md`).
+
+```sh
+M=~/models/embeddinggemma-2
+
+# text embedding (768-d, L2-normalized; --dim for MRL truncation, --prompt for task prefixes)
+$B embed --model-dir $M --device npu --text "what is the capital of france?" --out out.json
+$B embed --model-dir $M --device npu --prompt query --dim 256 --text-file data/one_long.txt --out out.json
+
+# low-RAM CPU mode: Q8-resident projections, dequantized per call
+$B embed --model-dir $M --device cpu --quant q8 --text-file data/one_long.txt --out out.json
+
+# image (the placeholder <|image|> is expanded to BOI + soft tokens + EOI)
+$B embed --model-dir $M --device npu --image data/cat.jpeg --out img.json
+# video (1 fps, max 32 frames; each frame expands to BOI + <|video|>*140 + EOI in
+# the shared context) and audio (16 kHz mono WAV; else ffmpeg)
+$B embed --model-dir $M --device npu --video data/test.mp4 --out vid.json
+$B embed --model-dir $M --device npu --audio data/speech5s.wav --out audio.json
+
+# timings and token ids
+$B bench --model-dir $M --device npu --text-file data/one_long.txt --reps 2
+$B tokenize --model-dir $M --text "hello"
+```
+
+The three deployment profiles with measured board numbers are in
+[`docs/recipes/embeddinggemma2.md`](docs/recipes/embeddinggemma2.md).
+
+Video decoding and non-WAV audio shell out to `ffmpeg`/`ffprobe`; the container
+image installs both (the Dockerfile gates the build on `-version`), so a bare
+host needs the packages (`apt-get install ffmpeg`).
+
+Flags: the shared load flags plus `--text`, `--text-file`, `--image`,
+`--video`, `--video-fps`, `--video-max-frames`, `--audio`, `--max-soft-tokens`,
+`--video-soft-tokens`, `--prompt`, `--dim`, `--no-normalize`, `--tokens`,
+`--reps`, `--out`, `--attn-chunk`, `--vision-attn-kernel fused|blocked` (the
+CPU vision-attention kernel, used when `--vision-attn-device cpu`) and the
+`--dump-*` debug hooks. `--dtype auto|f32|bf16` defaults to native bf16 (`f16`
+is rejected: RMSNorm/softmax/PLE need the f32/bf16 range). Placement:
+`--text-device`, `--text-attn-device`, `--vision-device` and
+`--vision-attn-device`; the vision attention is on the NPU exactly when that
+stage is offloaded, otherwise `--vision-attn-kernel` picks the CPU kernel.
+`--npu-dtype int8` + `--int8-group` pack the text projections as resident
+W8A8. `--defer-towers` loads each tower half on first use. On the NPU build,
+`ROCKET_CTX_CANONICAL=0` restores the legacy
+pad-to-256 tiling, `ROCKET_GLUE=0/1` toggles the fused host kernels
+(`--npu` enables them; `=1` forces them in CPU modes),
+`ROCKET_NPU_TOWERS=0` keeps the vision tower's projections on the CPU instead of
+packing them into resident NPU weights (`--npu` packs them by default),
+`ROCKET_NPU_FUSED=0` packs them one per projection instead of the fused
+q|k|v / gate|up groups (`--npu` fuses them by default), and
+`ROCKET_VISION_LOG=1` prints one vision-tower line per forward (plus the NPU
+split under `--npu`). `ROCKET_CAUSAL_CHUNK=<rows>` sets the query-chunk width of
+the causal NPU path (default 1024, `0` = the dense masked op): long prompts get
+per-chunk `[chunk, prefix]` causal masks and key slices instead of the whole
+`[n, n]` mask, which is what makes 8k+ prompts fit — the chunked op is
+bit-identical to the dense causal one, and only a *sliding* layer's chunks differ
+(≤ 6.1e-5 absolute, cosine ≥ 0.99999999, from where the band falls inside the K-tile
+grid).
+`ROCKET_FA_TILE_KV=<width>` switches the NPU attention
+op to its tiled long-context path (default 0 = off: the materialized
+`[tokens, keys]` score matrix; `2048` is the tuned width) and
+`ROCKET_FA_TILE_MIN_KV=<keys>` moves the crossover below which it stays
+materialized (default 8192) — the path keeps the attention scratch flat in the
+key count, so a 30k-token request that would need ~14 GiB of score matrix for
+two workers runs in ~1 GiB.
+
+Task prompts (`query`, `document`, `STS`, `classification`, `clustering`,
+`code`, ...) are read from `config_sentence_transformers.json`; omit `--prompt`
+for no prefix (`--prompt none` is also accepted).
+
+Server examples (and the `/embed` request shapes) are in
+[Serving](#serving). Every embedding is L2-normalized; `dim` applies MRL
+truncation before normalization.
+
+### Verification and memory
+
+> The measurements in this section were taken with the flags of their date
+> (`--npu`, `--npu-attn`, `--npu-int8`, `--vision-attn`, ...). They remain valid
+> for the equivalent placement; [`docs/recipes/README.md`](docs/recipes/README.md)
+> maps the old names to the current per-stage flags.
+
+Summary against the HF f32 reference (transformers 5.19; full table in the log):
+
+| input | cosine |
+|---|---|
+| text (9 tok, 2594 tok; dims 768/256) | 1.00000000 |
+| image (PNG/JPEG), video (4 frames), audio (5 s/30 s) | 1.00000000 |
+| text + image / text + audio | 1.00000000 |
+| text/image, native bf16 (default) | 0.99995 / 0.99989 (dev host); 0.999905 vs f32 on the board |
+| any modality, `--quant q8` | 0.9996-0.9999 |
+| any modality, `--quant q8 --npu` (board) | 0.9992-0.9999 |
+| image, packed NPU tower (`--npu`, board) | 0.9999963 (f32) / 0.9998836 (q8+npu) |
+| image, packed NPU tower + NPU attention (`--npu`, §20) | 0.9999900 (f32) / 0.9998844 (q8+npu) |
+
+Video is checked end to end against the same reference (`tools/video_parity.py`):
+the token ids, the sampled-frame count and the embedding for video-only (530 ids),
+the model card's interleaved text + image + video (817 ids) and a generated 40 s
+clip that exercises the uniform overflow to 32 frames (4226 ids) — ids identical
+and cosine 1.000000000 in all three (log §21).
+
+```sh
+/mnt/hub/venvs/emb2/bin/python tools/video_parity.py \
+    --bin $CARGO_TARGET_DIR/release/rocket-inference
+```
+
+Memory: f32 weights ~2.9 GB resident; `--quant q8` 1216 MiB; `--quant q8 --npu`
+1068 MiB; all share a ~4.2 GiB load peak. `--defer-towers` keeps the ~550 MiB of
+Q8 vision/audio towers out of the process (each half loads on the first request
+that uses it — image/video loads the ~170 MiB vision half, audio the ~300 MiB
+audio half, ~2.5 s / ~4.8 s, Q8), and `serve` returns its heap at startup and
+after every request (`ROCKET_TRIM=0` disables the latter), so a text-only q8
+process idles at ~754 MiB anon on the dev host (1694 before) and the board's
+deployed service at 605 MiB (2183 before; log §14). An image request grows the
+q8 process by ~275 MiB instead of ~640 MiB (log §22). The text backbone on the NPU packs 218
+projections into 0.25 GiB of resident fp16 weights with windowed attention: on
+the board (4 A76 threads, 2587-token text) `--quant q8` 34.5 s (75 tok/s, 94 s
+user CPU) -> `--quant q8 --npu` 21.4 s (121 tok/s, 63 s user CPU): 1.61× faster,
+33% less CPU. Native bf16 (the default) with `--npu` packs the same resident fp16
+weights via an exact bf16->f16 conversion: 15.8 s (163.4 tok/s, 1162 MiB anon) vs
+16.5 s (156.7 tok/s, 1893 MiB) for `--dtype f32` on the 2026-10-09 board A/B
+(log §17) — bf16 is faster than the f32 arm at ~60 % of the memory, cosine
+0.999939 vs f32. Against the deployed `--quant q8` arm, though, bf16 loses
+~20–25 % on the quiet board (log §18: 843 tok 4.5–5.0 s vs 3.6–4.0 s; 4203 tok
+29.3–30.8 s vs 24.5–26.5 s), so the production service keeps
+`--dtype f32 --quant q8 --device npu --attn-chunk 1024 --defer-towers`.
+The vision tower's projections are packed into resident NPU weights as well
+(§18.3); the audio tower, norms, RoPE and the embedding table stay on the CPU.
+
+NPU vision tower (2026-10-24, log §18.3/§18.5): `--npu` packs the 16 layers'
+linears and `embed_vision` into resident fp16 weights (pack-and-drop) and routes
+those GEMMs through the NPU; q|k|v and gate|up pack as fused groups, so a layer
+needs 4 matmuls instead of 7 and the whole tower **65** resident weights (0.28
+GiB), `113` with `ROCKET_NPU_FUSED=0`. `ROCKET_NPU_TOWERS=0` keeps them on the
+CPU. The tower is loaded in **f32** under `--npu` (the pack then carries
+full-precision weights) while the audio tower keeps its Q8 mapping: the q8+npu
+arm now reaches f32-pack parity. On the board a 2394-patch image's tower went
+24.8 s → 19.8 s (§18.3, -20 %) → **15.2-15.5 s** (§18.5, -22 % again, of which
+~4.2 s is the MLP gelu·up fused kernel and ~0.5 s the fused groups' NPU time)
+→ **10.6 s** (§20: the S1 fast host softmax put the tower's attention op on the
+NPU, -24 %, the default under `--npu`); the deferred tower
+load 30.4 → **24.8 s** (pack 6.2 → 4.3 s) at the same 908 MiB anon (1.18 GiB with
+a media request before S2's attention context vs 1.15 before). With the attention
+on the NPU the tower splits
+~0.2 s patch + 6.0 s attention (3.4 s op) + 4.4 s MLP on the image; the driver
+executes the ~723 GFLOP of tower GEMMs at ~183 GF/s, so what is left is the
+attention phase's ~2.5 s of CPU glue (axial RoPE, norms, o projection) and the
+MLP glue. Media `compute_s` through `serve` (steady image, same-window A/B):
+**13.5 s fused → 12.4 s npu** (-8 %; the warm fused kernel is faster than the
+cold CLI's, so the serve delta is smaller than the CLI's), +101 MiB anon for the
+attention context, text requests unchanged. Parity: 0.9999963 (f32+npu image),
+0.9998836 (q8+npu, the text Q8 path's floor), the npu attention 0.9999900 /
+0.9998844 — within 1e-5 of the fused kernel — and fused-vs-npu 0.9999864
+(image; 0.9999983 video), bit-identical repeats; f16/bf16 attention operands
+were measured and are slower (§18.5.3), so the kernel stays f32.
+`ROCKET_VISION_LOG=1` prints
+one tower line per forward (`patch`/`attn`/`kernel`/`mlp`/`pool`, plus the NPU
+split under `--npu`), and `serve` logs `encode_s` + `vision_attn` on media
+requests. Video frames are still encoded one at a time: batching same-geometry
+frames into one tower forward cut the attention op ~10 % but the MLP phase and
+the conversions ate it (net 0 to +3 %, §18.6), so the candidate code was
+reverted and only the `vision_attn_bench` probes remain.
+
+Performance round (2026-10-08, log §12; board timings in §12.5):
+canonical tiling (short requests no longer pad every matmul to 256 rows),
+resident int8 text projections (`--npu-int8`; cosine 0.99985 vs HF f32 — better
+than the q8 path's 0.99965 — at 0.11 GiB resident; readback-bound, so a
+numerics/memory option rather than a speed one), chunked banded attention
+for the 20 sliding layers (a 7764-token run sits at 1068 MiB anon and matches
+the full path's numerics, where the full-matrix path OOM-kills inside a 3 GB
+cgroup), and fused host kernels for gelu·up/RMSNorm/RoPE (`ROCKET_GLUE=0/1` A/B;
+q8 CPU glue on-vs-off cosine 1.0).
+
+Memory round (2026-10-21, log-gemma §15): the four **full** layers now chunk
+query blocks against the whole key axis (no `[s, s]` score matrix; same
+`--attn-chunk` as sliding, default 1024, so keep it below the 8k class), the
+engine keeps one attention context per `(heads, KV heads, head_dim)` geometry,
+and the matmul scratch is keyed by `M` capacity classes with lazy
+streaming/output BOs, a `ROCKET_SCRATCH_MB` budget and a per-request trim. The
+8k footprint is one request's working set (~1.3 GiB BO + ~0.6 GiB host); a
+following short request trims it to ~12 MiB. `ROCKET_MEM_LOG=1` prints the
+split, `ROCKET_M_BUCKET=0` restores exact-`M` slots.
+
+Known limits: audio resampling is exact for 16 kHz mono WAV (other rates go
+through ffmpeg, ~0.994 cosine vs librosa/soxr); batch inputs are processed one
+at a time.
+
+## Gemma 4 E2B-it
+
+`google/gemma-4-E2B-it` (10.25 GB BF16 checkpoint): the causal Gemma 4 decoder
+with KV sharing (layers 15-34 reuse the K/V of layer 13/14 and use double-wide
+MLPs), per-layer embeddings with the token table, proportional p-RoPE on the
+full layers and a soft-capped tied LM head. Greedy output is **token-identical**
+to the HF 5.19 reference (see the log).
+
+```sh
+G=/mnt/hub/models/gemma-4-E2B-it   # dev host; ~/models/gemma-4-E2B-it elsewhere
+
+# greedy generation (f32 parity mode)
+$B gen --model-dir $G --device auto --defer-towers --text "What is the capital of France?" --max-new-tokens 64
+# chat-style messages and sampling
+$B gen --model-dir $G --device auto --defer-towers \
+    --messages '[{"role":"system","content":"You are terse."},{"role":"user","content":"Hi"}]' \
+    --sample --temperature 0.7 --top-k 64 --top-p 0.95
+# image / audio input (the placeholder expands to the tower's soft tokens)
+$B gen --model-dir $G --device auto --defer-towers --text "What is in this image? <|image|>" --image data/cat.jpeg
+$B gen --model-dir $G --device auto --defer-towers --text "What do you hear? <|audio|>" --audio data/speech5s.wav
+```
+
+Flags: the shared load flags plus `--text`, `--text-file`, `--image`,
+`--audio`, `--max-soft-tokens`, `--video-fps`, `--video-max-frames`,
+`--messages`, `--max-new-tokens`, `--sample`, `--temperature`, `--top-k`,
+`--top-p`, `--enable-thinking`, `--dump-logits`, `--out`. Placement:
+`--device auto` packs the text projections and runs prefill on the NPU with
+decode on the CPU; `--device npu` also places decode on the NPU and drops the
+CPU copies (`--keep-cpu-weights yes` keeps them); `--defer-towers` loads each
+tower half on first use. The vision/audio towers are not NPU-packed for this
+family. See [`docs/recipes/gemma4.md`](docs/recipes/gemma4.md).
+
+Precision modes (`gen` and serving), measured on the dev host (32 threads,
+16-token prompt / 9-token answer):
+
+| mode | flags | resident | decode | notes |
+|---|---|---|---|---|
+| f32 | `--dtype f32` | 12494 MiB | 2.8 tok/s | token-identical to HF on every tested prompt |
+| bf16 (default) | - | 9889 MiB | 0.54 tok/s | native bf16 weights with the f32 body; 9/9 tokens identical to HF on the short prompt; **decode is 6.6x slower than f32** (flex's per-call bf16->f32 GEMM conversion) |
+| f16 | `--dtype f16` | 8923 MiB | 3.5 tok/s | token-identical on short/multi-turn; **can diverge on long prompts** |
+| Q8_0 | `--quant q8` | 7290 MiB | 0.09 tok/s | memory-only: `lin` dequantizes each weight per call |
+
+The served chat endpoints are non-streaming (OpenAI) / single-line NDJSON
+(Ollama); OpenAI content parts accept `image_url` (data URI or path) and
+`input_audio` (base64 + format) — one of each per request; the server inserts
+the `<|image|>` / `<|audio|>` placeholder tokens itself, so do not include them
+in the text part.
+
+### QAT mobile checkpoint
+
+`google/gemma-4-E2B-it-qat-mobile-transformers` (2.46 GB) is supported natively
+— no conversion step. Weights are packed INT2/INT4/INT8 with per-output-channel
+scales (per-row block scales for the token tables) and the checkpoint's SRQ
+activation rounding is applied around the affected linears. `--dtype f16` is
+the useful configuration:
+
+```sh
+$B gen --model-dir ~/models/gemma-4-E2B-it-qat-mobile --dtype f16 --defer-towers \
+    --device auto --text "What is the capital of France?" --max-new-tokens 16
+```
+
+| mode (text-only, `--defer-towers`) | peak anon | short decode | notes |
+|---|---|---|---|
+| f32 | 9.2 GiB | 3.9 tok/s | parity mode (f32 projections) |
+| `--dtype f16` | 4.7 GiB | 5.2 tok/s | 16/16 tokens identical to the HF bf16 reference on the 631-token prompt |
+| `--quant q8` | 3.7 GiB | 0.07 tok/s | memory-only |
+
+Both token tables stay packed in memory: the PLE table (as before) and the
+token table, whose rows are dequantized per gather with the LM head
+materialized from it once — the only full-size table copy. Both are file-backed
+views of the memory-mapped checkpoint, so their bytes are reclaimable page
+cache instead of anonymous memory. The tables are stubbed to `[1, 1]` *without
+forcing the lazy initializer* before loading (the old stub ran the f32 table
+init — an 8.75 GiB write — which was the real load peak and ~30 s of load
+time; f16 load is now ~22 s). `--defer-towers` skips the vision/audio towers at
+load (~1.9 GiB f32) and installs each half on the first request that uses it
+(image loads the 0.64 GiB vision half, audio the 1.16 GiB audio half, each ~1.6-2.5 s
+f32; log §22); `--dtype f16 --defer-towers` is the low-memory serving configuration
+(4.7 GiB peak anon text-only, 5.3 GiB with the vision half, 6.5 GiB with both).
+The towers always load f32 — the validated multimodal mode — while the text body
+keeps the selected dtype.
+
+The loaded weights are bit-exact vs HF 5.19 (verified for a 4-bit projection, a
+2-bit MLP and the 4-bit PLE table); short prompts are token-identical and the
+631-token prompt matched 16/16 with `--dtype f16` (HF bf16 reference). SRQ makes
+long-context near-ties sensitive; `NO_SRQ=1` / `DUMP_PARAM=<substr>` are debug
+hooks.
+
+### NPU prefill
+
+`--text-device npu` packs the used text projections into resident fp16 NPU
+weights and runs prefill matmuls + `attention_causal_window` on the NPU, while
+decode keeps the CPU f32 copies. `--device npu` also routes decode through the
+packed weights and drops the copies. Board measurement pending an idle board (the model needs
+~9.5 GB host + 2.1 GiB NPU; the 2026-10-07 attempt was OOM-killed on a busy
+board). Not yet done: streaming, video input.
+
+## Decision 3.0 (d3)
+
+[Decision 3.0](https://huggingface.co/vllm-sr/d3-lite) (`d3-code-readout-v1`) is
+the typed decision model: a Qwen3.5-0.8B backbone plus a 255-code readout head.
+A request is a `state` and typed `questions` (`choice`, `noul`, `score`); the
+answer is one **non-causal** forward per question and a softmax over the codes.
+Nothing is generated (`usage.output_tokens` is always 0), so the family is
+prefill-only. Both checkpoints work: `vllm-sr/d3-lite` (hidden 1024, 153 vision
+tensors) and `vllm-sr/d3-nano` (hidden 2048, 297), loaded from a local
+safetensors package (no GGUF/`-hf`).
+
+```sh
+M=/tmp/opencode/d3/models/d3-lite      # board: /root/models/d3-lite
+B=target/release/rocket-inference
+
+# a JSON array of cases: {"name", "state", "questions"[, "images", "videos"]}
+$B decide --model-dir $M --requests tools/decision_fixtures.json --out out.json
+# one request object as JSON (the /v1/systemone body, but with local media paths)
+$B decide --model-dir $M --request '{"state": "Refund request", "questions":
+  {"route": {"type": "choice", "instructions": "Which team?", "criteria":
+  {"returns": "refunds", "billing": "payments"}}}}'
+
+# CPU compute vs the packed text projections
+$B decide --model-dir $M --requests cases.json --device cpu --out cpu.json
+$B decide --model-dir $M --requests cases.json --device npu --out npu.json
+```
+
+`decide` takes `--requests <file>` (a JSON array of cases; the output is
+`{"schema": "d3-decision-v1", "model", "cases": [{"name", "response"}]}`) or
+`--request <json>` (one case; the bare `{"model", "answers", "usage"}` object),
+plus `--out`, `--model-name`, `--dump-prompts <dir>` and `--max-state-tokens`
+(per-question prompt cap, default 32768). `images`/`videos` entries are **local
+paths** in the CLI (the HTTP server takes `data:` URLs only, like the reference
+`d3_server.py`). Unlike the server, the CLI keeps per-question errors in the
+answer instead of refusing the batch.
+
+`serve` registers `POST /v1/systemone` for this family. The media contract is
+the reference one: images 8 MB / 16 MP, videos 32 MB / 8.29 MP per frame / 300 s
+at 2 fps, ≤ 16,384 video tokens per request, every refusal a 422 with the
+reference's `detail` string. `--max-tokens` is the same per-question cap as
+`--max-state-tokens` (default 32768); the body limit is 96 MiB. Placement:
+`--device npu` packs the text projections as resident fp16 (96 weights, 966.0
+MiB of BO); the tower, the backbone attention and the readout stay on the CPU in
+both configurations.
+
+The recommended board line, with every memory default implicit in it:
+
+```sh
+$B serve --model-dir /root/models/d3-lite --device npu --defer-towers \
+    --max-tokens 8192 --port 8384
+```
+
+The text body is stored in the checkpoint's **bf16** and widened per matmul
+(exact, half the resident bytes). The tied token table is **block-wise int8** by
+default (`--embed-int8`; `--embed-f16` keeps the exact table): one f32 scale per
+32 hidden value, so the table is half of f16 plus 30 MiB of scales on d3-lite
+(61 MiB on d3-nano) — 1,302 MiB resident against 1,273 for the per-row scheme
+and 1,513 for the f16 table, with top-1 unchanged and the largest option
+probability moving by up to 1.5e-3 on the bounded text subset and 1.66e-3 on the
+board's image case. `--defer-towers` leaves the tower to the first media request
+(it then costs +195.6 MiB; a package that declares `vision_config` but lacks
+`visual.*` therefore starts healthy and fails each media request with a 500
+instead of failing at startup); the attention/vision/decode stage flags are
+rejected. The approved bar is **max |Δp| ≤ 1e-2 with 100 % top-1**, and the
+block-32 table is inside it everywhere shipped. `--npu-dtype int8` (group-wise
+int8 text projections, 474.0 MiB of BO) exists but is **not recommended**:
++6.5 % wall and +18 % user CPU for text 3.4e-2 / image 4.4e-2 against that bar.
+
+Board (d3-lite, cores 4-7, 600 MHz NPU module). The 2026-11-01 window ran with
+the embedding service stopped: text 5 questions / 6,546 tokens 197 s (CPU f32) ->
+**113 s** (NPU fp16, 1.7x, ~3x less user CPU); image 56.7 -> 46.3 s; video 62.1
+-> 40.8 s. The 2026-11-02 memory window ran beside the live service on a busier
+board (load 15-21), so its walls are 25-35 % higher and only comparable within
+that window: text **147.3 s** compute / 160.2 s wall (CPU 265.6 / 270.1), image
+62.9 s, video 61.7 s. Memory in that window: a text-only service is **347 MiB**
+anon resident (317 on the per-row table, 559 with the f16 table) plus **966.0
+MiB** of weights BO — about 1.28 GiB together (1,313 MiB), against 1.90 GiB
+before the round (943.6 anon + 1,006.7 BO); the image arm's parity is
+**1.664e-3**. Parity against
+each checkpoint's **f32** reference (dev host, gate 2e-3): d3-lite text 67/67
+(2.36e-06), image 8/8 (7.70e-06), video 9/9 (3.97e-06); d3-nano 10/10
+(1.74e-06). Recipes, caps and the full tables:
+[`docs/recipes/decision.md`](docs/recipes/decision.md).
+
+## Cross-compiling for the board (aarch64)
+
+`--no-default-features` drops the CubeCL/LLVM `cpu` backend, whose prebuilt LLVM
+bundle is host-architecture and cannot link for aarch64; `flex` (NEON on
+aarch64) is always available. The linker is configured in `.cargo/config.toml`.
+`--features npu` enables the pure-Rust `rocket-npu` driver; there is no vendor
+archive, C toolchain or kernel-header step.
+
+## Notes
+
+- `Device::sync()` is required before reading wall-clock times; `to_data()`
+  alone does not wait for execution.
+- Tokenization uses the HF `tokenizer.json`; the qwen path uses
+  `add_special_tokens=true`, matching `llama-embedding` token counts.
+- All servers serialize requests on the model (flex already parallelizes
+  internally; the NPU engine is serialized by design), contain panicking
+  forwards instead of poisoning the server, and keep `/health`/`/v1/models`
+  lock-free.
+- `--quant q8` keeps projection weights Q8_0-quantized (symmetric int8,
+  32-value blocks, f16 block scales = llama.cpp's Q8_0) and dequantizes each
+  weight per forward; `libc::malloc_trim` releases the freed f32 pages.

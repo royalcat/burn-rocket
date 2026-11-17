@@ -481,7 +481,7 @@ fn usage() {
          \x20 reduce_selftest --io ce M N                 IN OUT\n\
          \x20 reduce_selftest --io scale_rows M N RFILE   IN OUT\n\
          Pools/cumsum/softmax read and write raw fp16, feature and ce raw f32 (MEAN, EXCL and\n\
-         REV are 0/1). This is the exchange format of tools/c-oracle/ab_board.c on the board."
+         REV are 0/1). This is the exchange format of crates/rocket-npu/tools/c-oracle/ab_board.c on the board."
     );
 }
 

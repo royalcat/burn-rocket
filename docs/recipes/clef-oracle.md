@@ -35,9 +35,9 @@ copy by explicit file path; do not use the model dir as CWD.
 
 ```sh
 cd /home/royalcat/projects/burn-rocket
-$CLEF_VENV/bin/python -I examples/rocket-inference/tools/clef_reference.py \
+$CLEF_VENV/bin/python -I tools/clef_reference.py \
     --model-dir $CLEF_MODEL_DIR \
-    --requests examples/rocket-inference/tools/clef_fixtures.json \
+    --requests tools/clef_fixtures.json \
     --out-dir /tmp/clef-dump --only checkout-errors,invoice --selfcheck
 ```
 
@@ -142,9 +142,9 @@ Determinism: two independent runs of `checkout-errors` give byte-identical array
 
 ```sh
 cd /home/royalcat/projects/burn-rocket
-$CLEF_VENV/bin/python -I examples/rocket-inference/tools/clef_reference.py \
+$CLEF_VENV/bin/python -I tools/clef_reference.py \
     --model-dir $CLEF_MODEL_DIR \
-    --requests examples/rocket-inference/tools/clef_fixtures_media.json \
+    --requests tools/clef_fixtures_media.json \
     --out-dir /tmp/opencode/clef/dump --only media-image-small --selfcheck --max-tokens 4096
 ```
 
@@ -349,7 +349,7 @@ over all nine fixtures (relative = max abs diff / peak of the HF output):
 
 ## 6. Fixtures (`tools/clef_fixtures_media.json`) and results
 
-Assets (all in `examples/rocket-inference/data/`): `clef-tiny.png` (96x64 synthetic, made with PIL: gradient,
+Assets (all in `data/`): `clef-tiny.png` (96x64 synthetic, made with PIL: gradient,
 white rectangle outline, red ellipse, diagonal line), `cat.jpeg` (960x686), `speech5s.wav` (5 s, 16 kHz mono),
 `test.mp4` (480x360, 8 fps, 4 s, AAC 44.1 kHz mono), `clef-video-silent.mp4` (192x144, 4 s, no audio, ffmpeg
 from test.mp4), `clef-video-audio-small.mp4` (240x180, 2 s, AAC 22.05 kHz, ffmpeg from test.mp4).

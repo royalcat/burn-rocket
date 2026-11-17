@@ -7,9 +7,9 @@
 # push because it holds the registry credentials.
 #
 # Usage:
-#   examples/rocket-inference/docker/build.sh                 # HEAD of this checkout
-#   examples/rocket-inference/docker/build.sh <git-ref>       # any commit/tag in this checkout
-#   COMMIT=<sha> TAG=<tag> examples/rocket-inference/docker/build.sh
+#   docker/build.sh                 # HEAD of this checkout
+#   docker/build.sh <git-ref>       # any commit/tag in this checkout
+#   COMMIT=<sha> TAG=<tag> docker/build.sh
 #
 # Env overrides:
 #   BOARD=root@rock-5b-plus.lan      ssh target for the build host
@@ -17,7 +17,7 @@
 #   CARGO_BUILD_JOBS=4               cargo parallelism inside the image build
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 
 COMMIT="${COMMIT:-${1:-HEAD}}"
 SHA="$(git -C "$REPO" rev-parse --short "$COMMIT")"
@@ -32,9 +32,12 @@ echo "==> staging source ${SHA} (${TAG}) -> ${STAGE}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 git -C "$REPO" archive "$COMMIT" | tar -C "$STAGE" -xf -
-# New refs keep the Dockerfile under examples/; stage it at the context root so
-# plain `docker build .` works. Old refs (root Dockerfile) pass through.
-[ -f "$STAGE/Dockerfile" ] || cp "$REPO/examples/rocket-inference/Dockerfile" "$STAGE/Dockerfile"
+# Refs from before the 2026-11-17 inversion keep the Dockerfile under
+# examples/rocket-inference/; stage it at the context root so plain `docker build .`
+# works. Newer refs have it at the root already.
+if [ ! -f "$STAGE/Dockerfile" ]; then
+    cp "$STAGE/examples/rocket-inference/Dockerfile" "$STAGE/Dockerfile"
+fi
 [ -f "$STAGE/.dockerignore" ] || cp "$REPO/.dockerignore" "$STAGE/.dockerignore"
 
 echo "==> shipping context -> ${BOARD}:${REMOTE_DIR}"

@@ -15,7 +15,7 @@ The reference runs through `tools/ref_embeddinggemma2.py mixed`, so this needs
 that script's venv (transformers 5.19 + torch + numpy), ffmpeg/ffprobe and a
 built rocket-inference binary:
 
-  /mnt/hub/venvs/emb2/bin/python examples/rocket-inference/tools/video_parity.py \
+  /mnt/hub/venvs/emb2/bin/python tools/video_parity.py \
       --bin $CARGO_TARGET_DIR/release/rocket-inference
 
 Exit status is non-zero if any case fails (ids differ or cosine below

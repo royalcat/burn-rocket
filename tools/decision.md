@@ -118,7 +118,7 @@ writes `{"schema": "d3-decision-v1", "model", "cases": [{"name", "response"}]}` 
 bare response. The parity script reads the answers either from that official shape or from
 `cases[].questions` (`options`/`codes`/`probabilities` in prompt order).
 
-Implementation: `examples/rocket-inference/src/decision/` (the `d3_format.py` contract, the
+Implementation: `src/decision/` (the `d3_format.py` contract, the
 readout head, the prompt/answer path) on the intent family's Qwen3.5 backbone
 (`src/qwen35_intent/`), with `IntentModel::full_attn_causal = false` for the checkpoint's
 `noncausal_full_attention` mode. Text, image and video requests are complete: the vision

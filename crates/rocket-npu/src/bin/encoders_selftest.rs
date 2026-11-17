@@ -21,10 +21,10 @@
 //! per layer and on the neck/final output, against the host reference.
 //!
 //! `--write-blob` also prints the blob and pixel sizes; the same files drive the C
-//! library through `tools/c-oracle/ab_board.c` (`sam` / `sam_ref` family), so the two
+//! library through `crates/rocket-npu/tools/c-oracle/ab_board.c` (`sam` / `sam_ref` family), so the two
 //! host references can be compared bit for bit.
 //!
-//! `--io` is the raw-file exchange of `tools/c-oracle/ab_board.c`: `OUT` receives the
+//! `--io` is the raw-file exchange of `crates/rocket-npu/tools/c-oracle/ab_board.c`: `OUT` receives the
 //! neck / final output and `OUT.hidden` the `(n_layers+1)` intermediate token blocks.
 //!
 //! Exit: 0 pass, 1 numeric failure, 2 no device (only when a device arm was asked for).

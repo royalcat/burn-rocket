@@ -1,8 +1,8 @@
 .git
 target
-examples/rocket-inference/docs
-examples/rocket-inference/data
-examples/rocket-inference/docker
+docs
+data
+docker
 AGENTS.md
 README.md
-examples/rocket-inference/README.md
+README.md

@@ -273,7 +273,7 @@ answer formats are `choice`/`confidence`/`probabilities`, `score`/`confidence`/
 into aligned expert files; the AutoRound checkpoint itself needs no pack.
 
 See `rocket-inference help` for the shared placement flags and
-examples/rocket-inference/tools/decision.md for the format contract.";
+tools/decision.md for the format contract.";
 
 const TOKENIZE_USAGE: &str = "\
 rocket-inference tokenize - tokenize text with the checkpoint's tokenizer

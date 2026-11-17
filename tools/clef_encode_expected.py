@@ -3,9 +3,9 @@
 Rust encoder (`src/clef/encode.rs`) can be checked for IDENTICAL ids.
 
     $CLEF_VENV/bin/python -I \
-        examples/rocket-inference/tools/clef_encode_expected.py \
+        tools/clef_encode_expected.py \
         --model-dir $CLEF_MODEL_DIR \
-        --out examples/rocket-inference/src/clef/testdata/encode_cases.json
+        --out src/clef/testdata/encode_cases.json
 
 Uses the verbatim `clef_joint_schema_model.py` next to this file (loaded by explicit path)
 and the checkpoint's own tokenizer through transformers' `AutoTokenizer` (no remote code).

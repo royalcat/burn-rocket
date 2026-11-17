@@ -1,0 +1,34 @@
+[package]
+name = "burn-rocket"
+version = "0.1.0"
+edition = "2024"
+description = "RK3588 NPU offload (mainline `rocket` driver) via the pure-Rust rocket-npu driver"
+license = "GPL-3.0-or-later"
+
+[features]
+# NPU offload is the first-class target: the pure-Rust `rocket-npu` driver
+# compiles on any host, so the default build is the real one. Secondary targets:
+# `--no-default-features` = helpers only (no Burn, no driver),
+# `--no-default-features --features flex` = Burn dependency without the extension
+# (feature-graph check).
+default = ["npu"]
+# Burn's `#[backend_extension(Flex)]` catalog cfg is evaluated in this crate, so
+# the feature selecting the `Flex` backend must be named exactly `flex`.
+flex = ["dep:burn", "dep:rayon"]
+# The NPU extension ops (`crate::ext`) on the pure-Rust `rocket-npu` driver.
+npu = ["flex", "dep:rocket-npu"]
+
+[dependencies]
+half = "2"
+rocket-npu = { path = "../rocket-npu", optional = true }
+rayon = { version = "1", optional = true }
+burn = { version = "=0.22.0", default-features = false, features = [
+    "std",
+    "flex",
+    "extension",
+], optional = true }
+
+# Low-level driver probe (device open, one-shot matmul vs CPU); needs `npu`.
+[[example]]
+name = "probe"
+required-features = ["npu"]

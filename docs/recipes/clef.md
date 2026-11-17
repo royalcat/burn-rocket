@@ -28,7 +28,7 @@ cargo build --release -p rocket-inference --no-default-features
 # batch: JSON arrays of cases like d3 (`name`, else `id`, is only the label; `model`
 # defaults to the model dir name)
 $B decide --model-dir $CLEF_MODEL_DIR \
-    --requests examples/rocket-inference/tools/clef_fixtures.json --out /tmp/clef-out.json
+    --requests tools/clef_fixtures.json --out /tmp/clef-out.json
 # one case
 $B decide --model-dir $CLEF_MODEL_DIR --request '{"model":"clef-omni",
   "state":"Our checkout started returning errors.","questions":{"outage":{"type":"noul"}}}'

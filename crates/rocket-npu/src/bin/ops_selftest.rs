@@ -61,7 +61,7 @@
 //!
 //! Every tensor is raw little-endian fp16, `KIND` is the `ROCKET_ACTIVATION_*` code and
 //! `-` means "no tensor" (the C `NULL`). This is the exchange format of
-//! `tools/c-oracle/ab_board.c` on the board.
+//! `crates/rocket-npu/tools/c-oracle/ab_board.c` on the board.
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -546,7 +546,7 @@ fn usage() {
          \x20 ops_selftest --io encoder T D H DFF EPS LN1G LN1B|- WQ BQ|- WK BK|- WV BV|-\n\
          \x20                          WO BO|- LN2G LN2B|- WF1 BF1|- WF2 BF2|- X OUT\n\
          Tensors are raw fp16, KIND is the ROCKET_ACTIVATION_* code and '-' means absent.\n\
-         This is the exchange format of tools/c-oracle/ab_board.c."
+         This is the exchange format of crates/rocket-npu/tools/c-oracle/ab_board.c."
     );
 }
 
