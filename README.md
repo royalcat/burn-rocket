@@ -56,10 +56,13 @@ Other commands: `embed` (one embedding), `bench`, `gen` (one chat reply), `decid
 
 ## Using the NPU
 
-`--device auto` (the default) puts the model's matrix multiplications on the NPU when
-the binary has NPU support and runs the rest on the CPU. `--device cpu` forces the CPU
-path. Individual stages can be placed separately; the program prints the resulting
-split before it loads the model:
+`--device auto` (the default) applies a **per-model preset**: the NPU for every stage where
+it is actually faster or smaller, the CPU where it is not (for example the token-by-token
+decode of the chat models), and lazily loaded towers. `--device cpu` forces the CPU path and
+`--device npu` the NPU for everything. Individual stages can be placed separately; the program
+prints the resulting split, and a hint for every stage it left on the CPU on purpose, before it
+loads the model. [`docs/recipes/`](docs/recipes/) explains each model's preset, what it trades
+away, and how to tune it:
 
 ```
 placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=CPU
@@ -82,7 +85,7 @@ Measured on a Rock 5B+, shared with other services:
 
 Numerics match the reference implementations: cosine ≥ 0.9999 for the embedding models
 in f32, token-identical greedy output for the chat models, and top-1 agreement with the
-reference for the decision models. Details, per-model deployment profiles and
+reference for the decision models. Per-model presets, tuning and
 benchmarks are in [`docs/`](docs/).
 
 ## Containers

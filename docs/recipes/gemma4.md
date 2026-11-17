@@ -1,59 +1,58 @@
-# Gemma 4 E2B-it recipes
+# Gemma 4 E2B-it
 
-Best-effort: the board has not completed a Gemma 4 run since the memory
-rounds (the checkpoint is 8.9 GiB at f16 / 12.5 GiB f32, and the board shares
-~15.8 GiB with its services). The numbers below are from
-`docs/experiments/experiment-log-gemma.md` §13 on the dev host; the command lines use the
-current unified flags. The QAT mobile checkpoint is the board-friendly one.
+Chat with text, image and audio input (OpenAI chat and Ollama endpoints). Best-effort model:
+see [`../experiments/experiment-log-gemma.md`](../experiments/experiment-log-gemma.md) and the
+root `AGENTS.md` section "Gemma 4 QAT on the NPU" for the measurements.
+
+## Run it
 
 ```sh
-M=/root/models/gemma-4-E2B-it-qat-mobile
-
-# balanced: prefill projections on the NPU, decode on the CPU, lazy towers
-rocket-inference serve --model-dir $M --device auto --dtype f16 --defer-towers --port 8391
-
-# full offload: prefill and decode on the NPU, CPU projection copies dropped
-rocket-inference serve --model-dir $M --device npu --dtype f16 --defer-towers --port 8391
-
-# speed: same as balanced for the board-safe QAT path (decode stays on the CPU)
-rocket-inference serve --model-dir $M --device auto --dtype f16 --defer-towers --port 8391
-
-# CPU-only, f32 parity (12.5 GiB: dev host only)
-rocket-inference serve --model-dir /mnt/hub/models/gemma-4-E2B-it --device cpu --port 8391
+rocket-inference serve --model-dir /root/models/gemma-4-E2B-it-qat-mobile --port 8391
 ```
 
-| profile | flags | known result |
+The preset depends on the checkpoint.
+
+### QAT checkpoint (`...-qat-mobile-transformers`, recommended on the board)
+
+| Stage | Where | Why |
 |---|---|---|
-| balanced | `--device auto --dtype f16 --defer-towers` | dev host text-only peak 4.7 GiB, 5.2 tok/s decode |
-| full offload | `--device npu --dtype f16 --defer-towers` | unmeasured on the board; decode matmuls on the NPU |
-| speed | `--device auto --dtype f16 --defer-towers` | 631-token prompt 16/16 ids vs HF bf16 with `--f16` |
-| CPU q8 | `--device cpu --quant q8` | 3.7 GiB but 0.09 tok/s (memory-only) |
+| all text projections, prefill **and** decode | NPU, per-channel int8 | the checkpoint is already int8 with one scale per channel, so the NPU math is exact |
+| towers | CPU, loaded on first use | not NPU-packed |
 
-Notes:
+E2B on the board: the model loads in 76 s with about 170 MiB of RAM and 2.5 GiB of NPU
+buffers (the f16 path took 119 s plus a 81 s pack and a 6.8 GiB peak). Decode is about
+1.45 tok/s (0.78 on the CPU), a 1,073-token prompt prefills in 41.5 s (49.5 s with f16).
+Greedy output matched the f16 CPU run for 32 of 32 tokens.
 
-- The NPU stage is the text prefill: `--device auto` packs 218 text
-  projections and runs prefill matmuls + causal attention on the NPU, decode on
-  the CPU. `--device npu` also routes decode to the packed weights and drops
-  the CPU copies (`--keep-cpu-weights yes` keeps them).
-- The vision/audio towers are not NPU-packed for Gemma 4; the CLI rejects
-  `--vision-device` on this family. `--defer-towers` loads each half on first
-  use.
-- `--dtype f16` is the QAT mobile mode; plain checkpoints use their native bf16
-  (`--dtype auto`) or `--dtype f32` for parity.
-- One-shot generation:
-  `rocket-inference gen --model-dir $M --device auto --dtype f16 --defer-towers --text "What is the capital of France?" --max-new-tokens 16`.
+### Other checkpoints (bf16 / f32 / GGUF)
 
+| Stage | Where |
+|---|---|
+| prefill projections and causal attention | NPU, packed to fp16 |
+| decode | CPU, with CPU copies of the weights |
+| towers | CPU, loaded on first use |
 
-## QAT-mobile on the NPU, per-channel int8 (2026-11-13)
+The program prints a `hint:` line explaining why decode stays on the CPU: NPU decode of fp16
+weights has not been shown to be faster. This path needs about 9 GiB for the f16 weights and
+has not been run end to end on the board.
 
-Applies to `google/gemma-4-E2B-it-qat-mobile-transformers` and `...-E4B-...` (the
-`quant_method: gemma` safetensors checkpoints). Text projections become resident int8
-(E4B 3.84 GiB BO, E2B 2.52 GiB), no CPU weight copies, prefill and decode on the NPU:
+## What it trades away
 
-```sh
-rocket-inference serve --model-dir /root/models/gemma-4-E4B-it-qat-mobile \
-    --device npu --npu-dtype int8 --defer-towers --port 8391
-```
+- QAT int8 changes the rounding slightly: long prompts can flip a near-tie token against the
+  f16 reference (SRQ activation rounding is sensitive).
+- Decode is slow on every path (about 0.5–1.5 tok/s on the board); the preset favours low RAM.
+- The first image or audio request pays the tower load (1.6–2.5 s).
 
-Stop the live `rocket-inference` containers before benchmarking (they share the NPU and
-cores 4-7). Measurements and caveats: AGENTS.md "Gemma 4 QAT on the NPU".
+## Tune it
+
+| You want | Flags | Cost |
+|---|---|---|
+| The f16 path on a QAT checkpoint | `--dtype f16` | 4.7 GiB peak RAM text-only, 5.2 tok/s decode on the dev host |
+| Everything on the CPU | `--device cpu` | no NPU; slow |
+| Towers loaded at startup | `--no-defer-towers` | about 1.9 GiB more RAM, no first-request delay |
+| Lowest RAM on the CPU | `--device cpu --quant q8` | 3.7 GiB but 0.09 tok/s |
+| Fewer NPU workers | `--npu-threads 3` (already the QAT default) | more workers only contend for the 3 cores |
+| Bit-exact f32 parity | `--device cpu --dtype f32` | 12.5 GiB; dev host only |
+
+One-shot: `rocket-inference gen --model-dir $M --text "What is the capital of France?" --max-new-tokens 16`.
+Stop other NPU services before benchmarking (they share the NPU and cores 4–7).

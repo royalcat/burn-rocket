@@ -36,6 +36,9 @@ fn resolve_with(load: LoadArgs, announce: bool) -> Result<ResolvedLoad> {
     let resolved = load.resolve(model_dir, family)?;
     if announce {
         println!("{}", resolved.placement_line());
+        for line in resolved.preset_lines() {
+            println!("{line}");
+        }
     }
     Ok(resolved)
 }

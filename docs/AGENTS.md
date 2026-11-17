@@ -10,6 +10,10 @@ Layout and rules for the documentation tree. Repo-wide notes are in the root
 
 ## Rules
 
+- **Every recipe has the same four parts**: the command, what the model's preset does (and why),
+  what it trades away, and a "tune it" table of flags per goal with measured costs. A new model
+  needs a preset in `src/cli.rs` (`Preset::for_family`) and a recipe with these parts; never claim a
+  cost that has no measurement behind it, say "not measured" instead.
 - **Recipes stay short and plain.** Commands, a sentence on what each flag buys, a few
   headline numbers. No dated measurement tables, phase numbers, board protocols or
   verification gates; link to `experiments/` instead.

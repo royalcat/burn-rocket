@@ -76,7 +76,7 @@ balanced/full-offload/speed command lines in `docs/recipes/`
 Placement is per stage: `--device auto|cpu|npu` sets the base, and
 `--text-device`, `--text-attn-device`, `--vision-device`,
 `--vision-attn-device`, `--decode-device` override individual stages. `auto` is
-NPU-first on aarch64 + the `npu` feature (decode stays on the CPU); `--device cpu`
+a per-model **preset** (below), NPU-first on aarch64 + the `npu` feature; `--device cpu`
 is the CPU path; `--device npu` includes decode. Other load flags:
 `--npu-threads`, `--npu-dtype fp16|int8` + `--int8-group` (emb2 text),
 `--keep-cpu-weights auto|yes|no` (intent/gemma4), `--dtype`, `--quant q8`
@@ -86,6 +86,23 @@ is the CPU path; `--device npu` includes decode. Other load flags:
 `--max-new-tokens`, `--temperature`, `--video-fps`, `--video-max-frames`. A flag
 that does not apply to the detected model is rejected, and every run prints the
 resolved `placement:` line before loading.
+
+**Presets (2026-11-17)**: `--device auto` is not "NPU wherever possible" but a per-model preset,
+`cli::Preset::for_family(family, qat_int8)` in `src/cli.rs`; every field is only a default that its
+flag overrides (stage flag > `--device cpu|npu` > preset). Values: qwen3 = text + text-attn NPU;
+embeddinggemma = all four stages NPU, `defer_towers` on, `attn_chunk` 512; intent = text NPU, decode
+CPU (CPU copies kept; reason string shown as a hint); gemma4 = text NPU, decode CPU, `defer_towers`
+on, and for a **QAT checkpoint** on an NPU build with no overriding flag (`--dtype`, `--quant`,
+`--npu-dtype`, `--keep-cpu-weights`, `--text-device`, `--decode-device`, non-auto `--device`) the
+per-channel int8 path: prefill + decode on the NPU, `npu_dtype` int8, 3 workers; decision = text NPU,
+`defer_towers` on; clef = text NPU when the checkpoint is int8 AutoRound/pack, else CPU (hint).
+`--no-defer-towers` is the opt-out for the lazy tower default (all tower families, one-shot commands
+included). Every run prints, after `placement:`, a `preset:` line (the flags that overrode the preset)
+and `hint:` lines for stages the preset left on the CPU on purpose (`ResolvedLoad::preset_lines`,
+`set_by_flags`, `hints`). Preset resolution is tested on a host without an NPU through
+`LoadArgs::resolve_for(.., avail = true)`. The intent decode reason (1.5 vs 3.7 tok/s) predates
+canonical tiling and was not re-measured; re-probe before changing it. A new family needs a `Preset`
+arm, a recipe with the four parts in `docs/AGENTS.md`, and tests.
 
 Cleanup + formatting (2026-10-08): commit `2301d3b` removed the dead code across
 the Gemma modules, cfg-gated the NPU-only helpers, annotated the checkpoint-config

@@ -16,7 +16,10 @@ are not meant to be read top to bottom. Deployment commands live in
 | [`clef-oracle.md`](clef-oracle.md) | the Python layer-streaming oracle and the media-record notes |
 | [`clef-phase0.md`](clef-phase0.md) | the expert-streaming format probe |
 
-## Measured profiles (recipes, 2026-10-31)
+## Measured profiles (2026-10-31)
+
+The profile names (balanced, full offload, speed) are historical: the recipes now describe
+one preset per model plus a tuning table. These are the measurements behind them.
 
 Board: Rock 5B+, 8 cores, 600 MHz patched `rocket` module, 2026-10-31,
 `taskset -c 4-7`, EmbeddingGemma 2 safetensors (native bf16) at

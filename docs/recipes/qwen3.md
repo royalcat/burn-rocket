@@ -1,44 +1,45 @@
-# Qwen3-Embedding-0.6B recipes
+# Qwen3-Embedding-0.6B
 
-Best-effort: the numbers below are derived from the dated experiment logs
-(`docs/experiments/experiment-log.md` §9/§17), not re-measured in the 2026-10-31 round.
-The command lines use the current unified flags.
+Text embeddings, served at `/v1/embeddings`. Best-effort model: the numbers come from the
+dated logs in [`../experiments/experiment-log.md`](../experiments/experiment-log.md) (§9, §17).
+
+## Run it
 
 ```sh
-M=/root/models/qwen3-embedding-0.6b
-
-# balanced: bf16 body, text + attention on the NPU
-rocket-inference serve --model-dir $M --device npu --dtype bf16 --port 8383
-
-# full offload: f32 resident fp16 NPU weights (the fastest and most accurate)
-rocket-inference serve --model-dir $M --device npu --dtype f32 --port 8383
-
-# speed: same as full offload (there is no decode or tower stage to trade)
-rocket-inference serve --model-dir $M --device npu --dtype f32 --port 8383
-
-# CPU low-RAM fallback
-rocket-inference serve --model-dir $M --device cpu --quant q8 --port 8383
+rocket-inference serve --model-dir /root/models/qwen3-embedding-0.6b --port 8383
 ```
 
-| profile | flags | board result (3,633 tokens) | resident |
-|---|---|---|---|
-| balanced | `--device npu --dtype bf16` | 54.4 tok/s | ~60 % of f32 |
-| full offload | `--device npu --dtype f32` | 57.8 tok/s | 298 MiB anon + 0.82 GiB NPU weights |
-| speed | `--device npu --dtype f32` | 57.8 tok/s | same |
-| CPU f32 | `--device cpu --dtype f32` | 36.3 tok/s / 622 CPU-s | ~2.4 GB |
-| CPU q8 | `--device cpu --quant q8` | 34.2 tok/s | 771 MiB |
+That is the whole recipe: `--device auto` picks the preset below.
 
-Notes:
+## What the preset does
 
-- Attention is a separately placeable stage. `--device cpu --text-device npu`
-  keeps the projections on the NPU but the attention on the CPU: 41.8 tok/s vs
-  45.0 with NPU attention in the 2026-10-05 round (CPU attention is within ~1 s
-  of wall but uses ~40 % more CPU).
-- The CPU attention kernel choice is `--attn-kernel fused|blocked`
-  (`--chunk`/`--key-block` tune the blocked kernel).
-- `--quant q8` applies to CPU-resident weights; it is not meaningful with
-  `--text-device npu` (the packed weights come from the model dtype).
-- Numerics: f32 NPU 0.999365 vs the production Q8_0 reference; bf16 NPU
-  0.999845 vs f32.
-- One-shot `embed`/`bench` are the same commands with the input flags, e.g.
-  `rocket-inference bench --model-dir $M --device npu --dtype f32 --text-file data/bench_text.txt --reps 2`.
+| Stage | Where | Why |
+|---|---|---|
+| projections (q|k|v, o, gate|up, down) | NPU | the bulk of the arithmetic |
+| attention | NPU | about the same wall time as the CPU kernel but roughly 40 % fewer CPU-seconds |
+| weights | the checkpoint's native bf16, packed to fp16 on the NPU | no extra conversion step to set up |
+
+Reference run, 3,633 tokens on a Rock 5B+ (cores 4–7): about 54 tok/s, with about a half
+of the CPU time of the CPU-only path.
+
+## What it trades away
+
+- bf16 is about 6 % slower than f32 (54.4 vs 57.8 tok/s) in exchange for a checkpoint that is
+  half the size to read and to hold while loading.
+- The CPU stays only lightly loaded, but the NPU is a single shared device: other NPU
+  services queue behind a long request.
+
+## Tune it
+
+| You want | Flags | Cost |
+|---|---|---|
+| Fastest and most accurate | `--dtype f32` | 57.8 tok/s; about 0.8 GiB of NPU weights plus a larger load peak |
+| Projections on the NPU, attention on the CPU | `--text-attn-device cpu` | 41.8 vs 45.0 tok/s, about 40 % more CPU time |
+| CPU only, little RAM | `--device cpu --quant q8` | 34.2 tok/s, 771 MiB resident |
+| CPU only, f32 | `--device cpu --dtype f32` | 36.3 tok/s, 622 CPU-seconds per 3,633 tokens |
+| Very long inputs | `ROCKET_CAUSAL_CHUNK=512` | lower attention memory; the default 1024 is bit-identical to the dense op |
+| Shrink the largest request | `ROCKET_MATMUL_CHUNK_M=1024` | smaller peak, wall time unchanged |
+
+`--quant q8` only applies to CPU-resident weights; with NPU projections the packed weights
+come from the model dtype. One-shot runs use the same flags:
+`rocket-inference bench --model-dir $M --text-file data/bench_text.txt --reps 2`.

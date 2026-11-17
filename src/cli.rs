@@ -33,18 +33,24 @@ decision_config.json readout head, or the GGUF architecture of a local *.gguf);
 --family overrides the detection.
 --model-dir <dir> is required (or `-hf <owner>/<name>:<quant>`).
 
-Every stage runs on the CPU unless it is placed on the NPU:
-  --device auto|cpu|npu        base placement for every stage (default auto)
+Each stage runs on the CPU or the NPU:
+  --device auto|cpu|npu        default placement (default auto)
   --text-device ...            text-backbone projections
   --text-attn-device ...       text-backbone attention (qwen3, embeddinggemma)
   --vision-device ...          vision-tower projections (embeddinggemma)
   --vision-attn-device ...     vision-tower attention (embeddinggemma)
   --decode-device ...          single-token decode projections (chat models)
-`auto` places a stage on the NPU when the build supports it (aarch64 + the
-`npu` feature) and the CPU otherwise; decode defaults to the CPU even when the
-NPU is available. `--device cpu` is the CPU path; `--device npu` places every
-stage (decode included) on the NPU. A `placement:` line reports the resolved
-split at load.
+`auto` is not just \"NPU where possible\": it is a per-model preset, NPU-first,
+chosen to avoid known speed penalties (for example decode of the intent and
+fp16 Gemma 4 models stays on the CPU; a Gemma 4 QAT checkpoint runs int8 on the
+NPU for prefill and decode; towers load on first use). It needs an NPU build
+(aarch64 + the `npu` feature); otherwise every stage is on the CPU. Any flag
+overrides the preset for its stage. `--device cpu` is the CPU path; `--device
+npu` places every stage (decode included) on the NPU. Each run prints a
+`placement:` line, a `preset:` line naming the flags that overrode the preset,
+and a `hint:` line for every stage the preset left on the CPU on purpose.
+`--no-defer-towers` loads the vision/audio towers at startup instead of on
+first use.
 
 Flags are documented per command (`rocket-inference help <command>`), in
 AGENTS.md (App reference section) and in docs/recipes/.";
@@ -99,7 +105,7 @@ placement:
 
 model and memory:
   --model-dir / -hf / --family auto|qwen3|embeddinggemma|intent|gemma4|decision|clef /
-  --cpu-backend / --dtype / --quant / --defer-towers /
+  --cpu-backend / --dtype / --quant / --defer-towers/--no-defer-towers /
   --embed-f16 / --embed-int8 / --attn-chunk / --chunk / --key-block
 
 See `rocket-inference help` for the shared placement flags and AGENTS.md for
@@ -139,7 +145,7 @@ placement / model / memory:
   --device / --text-device / --text-attn-device / --vision-device /
   --vision-attn-device auto|cpu|npu
   --model-dir / -hf / --family / --cpu-backend / --dtype / --quant /
-  --npu-threads / --npu-dtype / --int8-group / --defer-towers /
+  --npu-threads / --npu-dtype / --int8-group / --defer-towers/--no-defer-towers /
   --attn-kernel / --attn-chunk / --chunk / --key-block /
   --vision-attn-kernel
 
@@ -197,7 +203,7 @@ output and debug:
 placement / model / memory:
   --device / --text-device / --decode-device auto|cpu|npu
   --model-dir / -hf / --family / --cpu-backend / --dtype / --quant /
-  --npu-threads / --keep-cpu-weights / --defer-towers / --attn-chunk /
+  --npu-threads / --keep-cpu-weights / --defer-towers/--no-defer-towers / --attn-chunk /
   --embed-f16
 
 See `rocket-inference help` for the shared placement flags and docs/recipes/
@@ -240,12 +246,13 @@ output:
 placement / model:
   --device / --text-device auto|cpu|npu
   --model-dir / --family / --cpu-backend / --npu-threads / --npu-dtype /
-  --int8-group / --embed-int8 (default) / --embed-f16 / --defer-towers
+  --int8-group / --embed-int8 (default) / --embed-f16 / --defer-towers/--no-defer-towers
     --npu-dtype int8 packs the text projections as resident int8 (opt-in,
     `--int8-group` default 32); --embed-int8 keeps the tied token table as
     block-wise int8 (one scale per 32 values; the default); --embed-f16 keeps
     the exact table;
-    --defer-towers loads the vision tower on the first media request.
+    --defer-towers (the default) loads the vision tower on the first media request;
+    --no-defer-towers loads it with the backbone.
 
 Clef-Omni (Cloudflare, Qwen3-Omni-30B-A3B thinker + joint schema head; detected
 from a qwen3_omni_moe config.json with joint_head.safetensors, or `--family
@@ -510,6 +517,12 @@ impl LoadArgs {
             a.quant_q8 = Some(v == "q8");
         }
         a.defer_towers = f.take_flag("--defer-towers");
+        if f.take_bool("--no-defer-towers") {
+            if a.defer_towers == Some(true) {
+                bail!("--defer-towers and --no-defer-towers contradict each other");
+            }
+            a.defer_towers = Some(false);
+        }
         if let Some(v) = f.take_choice("--keep-cpu-weights", &["auto", "yes", "no"])? {
             a.keep_cpu = Some(match v.as_str() {
                 "yes" => KeepCpu::Yes,
@@ -588,6 +601,12 @@ impl LoadArgs {
 
     /// Validate against the detected family and resolve defaults.
     pub fn resolve(self, model_dir: PathBuf, family: Family) -> Result<ResolvedLoad> {
+        self.resolve_for(model_dir, family, npu_available())
+    }
+
+    /// [`LoadArgs::resolve`] with the build's NPU availability as a parameter (so the
+    /// presets can be tested on a host without the NPU backend).
+    fn resolve_for(self, model_dir: PathBuf, family: Family, avail: bool) -> Result<ResolvedLoad> {
         // ---- flags that only exist for some families ----
         if self.text_attn_device.is_some() && !family.supports_text_attn() {
             bail!(
@@ -691,53 +710,129 @@ impl LoadArgs {
         }
 
         // ---- placement ----
-        let avail = npu_available();
         let base = self.device.unwrap_or(Device::Auto);
         if base == Device::Npu && !avail {
             bail!("{}", npu_build_error("--device"));
         }
+        // `--device auto` is the per-model preset; it applies the QAT int8 path only when
+        // nothing in the command line already decides the Gemma 4 precision or placement.
+        let qat_int8 = family == Family::Gemma4
+            && avail
+            && base == Device::Auto
+            && self.dtype.is_none()
+            && self.quant_q8.is_none()
+            && self.npu_dtype.is_none()
+            && self.keep_cpu.is_none()
+            && self.text_device.is_none()
+            && self.decode_device.is_none()
+            && is_qat_dir(&model_dir);
+        let preset = Preset::for_family(family, qat_int8);
         let stage = |explicit: Option<Device>, auto_npu: bool, flag: &str| -> Result<bool> {
             stage_placement(explicit, base, auto_npu, avail)
                 .ok_or_else(|| anyhow::anyhow!("{}", npu_build_error(flag)))
         };
+        let clef_int8 = family == Family::Clef
+            && (crate::clef::pack::PackDir::is_pack(&model_dir)
+                || crate::clef::autoround_store::ShardStore::is_autoround(&model_dir));
         let placement = Placement {
             text: if family == Family::Clef {
                 // The int8 NPU path needs the AutoRound int8 checkpoint (or a clef pack from it); `auto` falls back to the CPU for
                 // a BF16 checkpoint, an explicit `npu` is an error.
                 clef_text_placement(
-                    stage(self.text_device, true, "--text-device")?,
+                    stage(self.text_device, preset.text, "--text-device")?,
                     self.text_device.unwrap_or(base) == Device::Npu,
-                    crate::clef::pack::PackDir::is_pack(&model_dir)
-                        || crate::clef::autoround_store::ShardStore::is_autoround(&model_dir),
+                    clef_int8,
                 )?
             } else {
-                stage(self.text_device, true, "--text-device")?
+                stage(self.text_device, preset.text, "--text-device")?
             },
             text_attn: if family.supports_text_attn() {
-                stage(self.text_attn_device, true, "--text-attn-device")?
+                stage(
+                    self.text_attn_device,
+                    preset.text_attn,
+                    "--text-attn-device",
+                )?
             } else {
                 false
             },
             vision: if family.supports_vision() {
-                stage(self.vision_device, true, "--vision-device")?
+                stage(self.vision_device, preset.vision, "--vision-device")?
             } else {
                 false
             },
             vision_attn: if family.supports_vision() {
-                stage(self.vision_attn_device, true, "--vision-attn-device")?
+                stage(
+                    self.vision_attn_device,
+                    preset.vision_attn,
+                    "--vision-attn-device",
+                )?
             } else {
                 false
             },
             decode: if family.supports_decode() {
-                stage(self.decode_device, false, "--decode-device")?
+                stage(self.decode_device, preset.decode, "--decode-device")?
             } else {
                 false
             },
         };
 
+        // ---- what the user decided vs what the preset did (for the run-time report) ----
+        let mut set_by_flags: Vec<&'static str> = Vec::new();
+        for (flag, given) in [
+            ("--device", self.device.is_some_and(|d| d != Device::Auto)),
+            ("--text-device", self.text_device.is_some()),
+            ("--text-attn-device", self.text_attn_device.is_some()),
+            ("--vision-device", self.vision_device.is_some()),
+            ("--vision-attn-device", self.vision_attn_device.is_some()),
+            ("--decode-device", self.decode_device.is_some()),
+            ("--npu-dtype", self.npu_dtype.is_some()),
+            ("--defer-towers", self.defer_towers.is_some()),
+            ("--attn-chunk", self.attn_chunk.is_some()),
+            ("--npu-threads", self.npu_threads.is_some()),
+            ("--keep-cpu-weights", self.keep_cpu.is_some()),
+        ] {
+            if given {
+                set_by_flags.push(flag);
+            }
+        }
+        let mut hints: Vec<String> = Vec::new();
+        if family.supports_decode()
+            && !placement.decode
+            && self.decode_device.is_none()
+            && base == Device::Auto
+            && let Some(why) = preset.decode_cpu_reason
+        {
+            hints.push(format!(
+                "decode runs on the CPU on purpose: {why}; `--decode-device npu` moves it to the NPU"
+            ));
+        }
+        if family == Family::Clef
+            && avail
+            && !placement.text
+            && self.text_device.is_none()
+            && base == Device::Auto
+        {
+            hints.push(
+                "the thinker runs on the CPU because this is the BF16 checkpoint; pass the int8 \
+                 AutoRound checkpoint (`-hf moeshawky/clef-omni-int8-autoround`) to use the NPU"
+                    .to_string(),
+            );
+        }
+        if qat_int8 {
+            hints.push(
+                "QAT checkpoint: per-channel int8 on the NPU for prefill and decode; \
+                 `--dtype f16 --decode-device cpu` selects the f16 path (more RAM, slower load)"
+                    .to_string(),
+            );
+        }
+
         // ---- NPU precision ----
-        let (npu_dtype, int8_group) =
-            resolve_npu_dtype(self.npu_dtype, self.int8_group, placement.text, avail)?;
+        let (npu_dtype, int8_group) = resolve_npu_dtype(
+            self.npu_dtype.or(preset.npu_dtype),
+            self.int8_group,
+            placement.text,
+            avail,
+        )?;
         if family == Family::Gemma4 && npu_dtype == NpuDtype::Int8 {
             // The QAT path packs per-channel int8 inside the checkpoint load and
             // keeps no float copies, so decode must run on the NPU too.
@@ -797,7 +892,7 @@ impl LoadArgs {
             dtype,
             dtype_explicit,
             quant_q8: self.quant_q8.unwrap_or(false),
-            defer_towers: self.defer_towers.unwrap_or(false),
+            defer_towers: self.defer_towers.unwrap_or(preset.defer_towers),
             keep_cpu_weights,
             placement,
             // Gemma 4 QAT int8 keeps one worker per NPU core: more workers only
@@ -806,7 +901,7 @@ impl LoadArgs {
                 if family == Family::Gemma4 && npu_dtype == NpuDtype::Int8 {
                     3
                 } else {
-                    5
+                    preset.npu_threads
                 },
             ),
             npu_dtype,
@@ -815,9 +910,11 @@ impl LoadArgs {
             chunk: self.chunk.unwrap_or(256),
             key_block: self.key_block.unwrap_or(256),
             vision_attn_kernel,
-            attn_chunk: self.attn_chunk.unwrap_or(1024),
+            attn_chunk: self.attn_chunk.unwrap_or(preset.attn_chunk),
             embed_f16,
             embed_int8,
+            set_by_flags,
+            hints,
         })
     }
 }
@@ -979,9 +1076,126 @@ pub struct ResolvedLoad {
     pub embed_f16: bool,
     /// Store the tied table as block-wise int8 (`--embed-int8`, the decision default).
     pub embed_int8: bool,
+    /// The placement/memory flags the user gave; everything else came from the preset.
+    pub set_by_flags: Vec<&'static str>,
+    /// One-line explanations of choices the preset made on purpose (CPU stages).
+    pub hints: Vec<String>,
+}
+
+/// The per-model defaults behind `--device auto`: a sane, NPU-first configuration for
+/// each model that avoids the known speed penalties. Every field is only a default; the
+/// matching flag always wins. See `docs/recipes/` for the tradeoffs and tuning of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Preset {
+    pub text: bool,
+    pub text_attn: bool,
+    pub vision: bool,
+    pub vision_attn: bool,
+    pub decode: bool,
+    /// Load the vision/audio tower halves on first use (`--defer-towers`).
+    pub defer_towers: bool,
+    /// `Some(Int8)` only for the QAT int8 path; `None` = the fp16 default.
+    pub npu_dtype: Option<NpuDtype>,
+    pub npu_threads: usize,
+    pub attn_chunk: usize,
+    /// Why decode stays on the CPU under this preset (shown as a run-time hint).
+    pub decode_cpu_reason: Option<&'static str>,
+}
+
+impl Preset {
+    /// `qat_int8`: a Gemma 4 QAT checkpoint on an NPU build with nothing overriding the
+    /// precision (see `LoadArgs::resolve_for`).
+    pub fn for_family(family: Family, qat_int8: bool) -> Self {
+        let base = Self {
+            text: true,
+            text_attn: false,
+            vision: false,
+            vision_attn: false,
+            decode: false,
+            defer_towers: false,
+            npu_dtype: None,
+            npu_threads: 5,
+            attn_chunk: 1024,
+            decode_cpu_reason: None,
+        };
+        match family {
+            Family::Qwen3Embed => Self {
+                text_attn: true,
+                ..base
+            },
+            // All four stages on the NPU. Lazy towers keep a text-only service small;
+            // the 512-wide attention chunk halves the full-layer scratch at the same wall
+            // (log-gemma §23).
+            Family::Emb2 => Self {
+                text_attn: true,
+                vision: true,
+                vision_attn: true,
+                defer_towers: true,
+                attn_chunk: 512,
+                ..base
+            },
+            Family::Intent => Self {
+                decode_cpu_reason: Some(
+                    "NPU decode measured 1.5 tok/s against 3.7 tok/s on the CPU copies \
+                     (experiment-log §14, taken before canonical tiling)",
+                ),
+                ..base
+            },
+            Family::Gemma4 if qat_int8 => Self {
+                decode: true,
+                defer_towers: true,
+                npu_dtype: Some(NpuDtype::Int8),
+                npu_threads: 3,
+                ..base
+            },
+            Family::Gemma4 => Self {
+                defer_towers: true,
+                decode_cpu_reason: Some(
+                    "NPU decode of the fp16 weights has not been shown faster than the CPU \
+                     copies",
+                ),
+                ..base
+            },
+            Family::Decision => Self {
+                defer_towers: true,
+                ..base
+            },
+            Family::Clef => base,
+        }
+    }
+}
+
+/// Whether `model_dir` holds a Gemma QAT checkpoint (`quantization_config` of the
+/// `gemma` method in its `config.json`).
+fn is_qat_dir(model_dir: &Path) -> bool {
+    std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|c| crate::gemma::qat::QatConfig::from_json(&c).ok().flatten())
+        .is_some()
 }
 
 impl ResolvedLoad {
+    /// The lines printed after `placement:`: where the settings came from and why a
+    /// stage was left on the CPU.
+    pub fn preset_lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(1 + self.hints.len());
+        lines.push(if self.set_by_flags.is_empty() {
+            format!(
+                "preset: {} defaults (no placement flags given)",
+                self.family.name()
+            )
+        } else {
+            format!(
+                "preset: {} defaults, overridden by {}",
+                self.family.name(),
+                self.set_by_flags.join(" ")
+            )
+        });
+        lines.extend(self.hints.iter().map(|h| format!("hint: {h}")));
+        lines
+    }
+
     /// The int8 K-group for the resident NPU text weights (`--npu-dtype int8`),
     /// else `None` (fp16). The decision loader takes it as
     /// `IntentLoadOptions::npu_int8`; the intent family has no int8 flag.
@@ -1388,5 +1602,114 @@ mod tests {
         ] {
             assert!(resolve(list, Family::Clef).is_err(), "{list:?}");
         }
+    }
+
+    /// Resolve as an NPU build would (the host test build has no NPU backend).
+    fn resolve_npu(list: &[&str], family: Family) -> Result<ResolvedLoad> {
+        let mut f = args(list);
+        let load = LoadArgs::parse(&mut f)?;
+        f.finish("test")?;
+        load.resolve_for(PathBuf::from("/models/test"), family, true)
+    }
+
+    #[test]
+    fn each_family_has_its_own_preset() {
+        let r = resolve_npu(&[], Family::Qwen3Embed).unwrap();
+        assert!(r.placement.text && r.placement.text_attn && !r.defer_towers);
+        let r = resolve_npu(&[], Family::Emb2).unwrap();
+        assert!(r.placement.text && r.placement.text_attn);
+        assert!(r.placement.vision && r.placement.vision_attn);
+        assert!(r.defer_towers, "towers load lazily by default");
+        assert_eq!(r.attn_chunk, 512);
+        let r = resolve_npu(&[], Family::Intent).unwrap();
+        assert!(r.placement.text && !r.placement.decode && r.keep_cpu_weights);
+        let r = resolve_npu(&[], Family::Gemma4).unwrap();
+        assert!(r.placement.text && !r.placement.decode && r.defer_towers);
+        assert_eq!(r.npu_dtype, NpuDtype::Fp16);
+        let r = resolve_npu(&[], Family::Decision).unwrap();
+        assert!(r.placement.text && r.defer_towers);
+    }
+
+    #[test]
+    fn presets_are_defaults_that_flags_override() {
+        let r = resolve_npu(&["--no-defer-towers", "--attn-chunk", "2048"], Family::Emb2).unwrap();
+        assert!(!r.defer_towers);
+        assert_eq!(r.attn_chunk, 2048);
+        let r = resolve_npu(&["--text-attn-device", "cpu"], Family::Emb2).unwrap();
+        assert!(!r.placement.text_attn && r.placement.text && r.placement.vision);
+        let r = resolve_npu(&["--decode-device", "npu"], Family::Intent).unwrap();
+        assert!(r.placement.decode && !r.keep_cpu_weights);
+        let r = resolve_npu(&["--device", "cpu"], Family::Emb2).unwrap();
+        assert!(!r.placement.any_npu());
+        assert!(resolve_npu(&["--defer-towers", "--no-defer-towers"], Family::Emb2).is_err());
+        assert!(resolve_npu(&["--no-defer-towers"], Family::Qwen3Embed).is_err());
+    }
+
+    #[test]
+    fn the_report_names_what_came_from_flags_and_why_decode_is_on_the_cpu() {
+        let r = resolve_npu(&[], Family::Intent).unwrap();
+        let lines = r.preset_lines();
+        assert!(lines[0].contains("no placement flags"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("hint:") && l.contains("--decode-device npu"))
+        );
+        let r = resolve_npu(
+            &["--text-attn-device", "cpu", "--attn-chunk", "256"],
+            Family::Emb2,
+        )
+        .unwrap();
+        let first = &r.preset_lines()[0];
+        assert!(
+            first.contains("--text-attn-device") && first.contains("--attn-chunk"),
+            "{first}"
+        );
+        // An explicit decode choice needs no explanation.
+        let r = resolve_npu(&["--decode-device", "cpu"], Family::Intent).unwrap();
+        assert!(!r.preset_lines().iter().any(|l| l.starts_with("hint:")));
+    }
+
+    #[test]
+    fn preset_values_per_family() {
+        let qat = Preset::for_family(Family::Gemma4, true);
+        assert!(qat.decode && qat.npu_dtype == Some(NpuDtype::Int8) && qat.npu_threads == 3);
+        let plain = Preset::for_family(Family::Gemma4, false);
+        assert!(!plain.decode && plain.npu_dtype.is_none() && plain.decode_cpu_reason.is_some());
+        assert!(
+            Preset::for_family(Family::Intent, false)
+                .decode_cpu_reason
+                .is_some()
+        );
+        assert!(!Preset::for_family(Family::Qwen3Embed, false).defer_towers);
+    }
+
+    #[test]
+    fn a_qat_checkpoint_gets_the_int8_preset_unless_flags_decide_otherwise() {
+        let dir = std::env::temp_dir().join(format!("ri-qat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = serde_json::json!({"quantization_config": {"quant_method": "gemma"}});
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let go = |list: &[&str]| {
+            let mut f = args(list);
+            let load = LoadArgs::parse(&mut f).unwrap();
+            load.resolve_for(dir.clone(), Family::Gemma4, true)
+        };
+        if crate::gemma::qat::QatConfig::from_json(&cfg)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let r = go(&[]).unwrap();
+            assert_eq!(r.npu_dtype, NpuDtype::Int8);
+            assert!(r.placement.text && r.placement.decode && !r.keep_cpu_weights);
+            assert_eq!(r.npu_threads, 3);
+            let r = go(&["--dtype", "f16"]).unwrap();
+            assert_eq!(r.npu_dtype, NpuDtype::Fp16);
+            assert!(!r.placement.decode);
+            let r = go(&["--decode-device", "cpu"]).unwrap();
+            assert_eq!(r.npu_dtype, NpuDtype::Fp16);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

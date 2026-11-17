@@ -1,43 +1,42 @@
-# Qwen3.5-0.8B intent recipes
+# Qwen3.5-0.8B intent (query planner)
 
-Best-effort: the numbers are from `docs/experiments/experiment-log.md` §14 (166-token v7
-planner prompt, 32 generated tokens, busy board), not re-measured in the
-2026-10-31 round. The command lines use the current unified flags.
+OpenAI chat and Ollama endpoints for the OpenViking query-planner model. Best-effort model:
+numbers are from [`../experiments/experiment-log.md`](../experiments/experiment-log.md) §14
+(a 166-token planner prompt, 32 generated tokens, on a busy board).
+
+## Run it
 
 ```sh
-M=/root/models/ov-intent-analysis-sft
-
-# balanced: prefill projections on the NPU, decode on the CPU
-# (`auto` is the default; the CPU copies of the projections are kept)
-rocket-inference serve --model-dir $M --device auto --port 11434
-
-# full offload: prefill and decode on the NPU; the CPU projection copies are
-# dropped (the old --pure-npu shape)
-rocket-inference serve --model-dir $M --device npu --port 11434
-
-# speed: prefill NPU, decode CPU, f16 embedding/LM-head table
-rocket-inference serve --model-dir $M --device auto --embed-f16 --port 11434
-
-# CPU fallback
-rocket-inference serve --model-dir $M --device cpu --port 11434
+rocket-inference serve --model-dir /root/models/ov-intent-analysis-sft --port 11434
 ```
 
-| profile | flags | prefill | decode | total | anon |
-|---|---|---|---|---|---|
-| balanced | `--device auto` | 2.94 s | 8.71 s (3.7 tok/s) | 11.65 s | 2.06 GB |
-| full offload | `--device npu` | — | ~1.5 tok/s | — | 1.29 GB |
-| speed | `--device auto --embed-f16` | 2.84 s | 6.45 s (5.0 tok/s) | 9.29 s | 1.57 GB |
-| CPU f32 | `--device cpu` | 7.91 s | 82.05 s (0.4 tok/s) | 89.96 s | ~2.4 GB |
+## What the preset does
 
-Notes:
+| Stage | Where | Why |
+|---|---|---|
+| prompt processing (prefill) | NPU | 7.9 s on the CPU, 2.9 s on the NPU |
+| token-by-token decode | **CPU**, using f16 copies of the weights | measured 3.7 tok/s vs 1.5 tok/s with NPU decode |
+| mixer attention | CPU | no NPU kernel for the delta rule |
 
-- `--device npu` deliberately includes `--decode-device npu`; NPU decode
-  single-token matmuls pay the `M >= 256` padding, so full offload is a
-  CPU-relief configuration, not a speed one. Use
-  `--decode-device npu --keep-cpu-weights yes` if you want NPU decode with the
-  CPU copies still resident (the old `--npu-decode`).
-- `--embed-f16` is faster and smaller but its f16 LM head can flip near-ties;
-  keep it off when token-identity matters.
-- `--delta-chunk` (default 64) is the delta-rule chunk width.
-- One-shot generation is the same command set:
-  `rocket-inference gen --model-dir $M --device auto --text "Hello!" --raw --max-new-tokens 32`.
+The 166-token prompt answers in 11.7 s (89.9 s on the CPU alone). The program prints a
+`hint:` line when it leaves decode on the CPU.
+
+## What it trades away
+
+- About 2 GB of RAM, because the CPU copies of the projections stay resident for decode.
+- A busy CPU during generation. The NPU is idle while tokens are generated.
+- The 1.5 tok/s NPU decode figure predates canonical tiling, so it may be better today; it
+  has not been re-measured.
+
+## Tune it
+
+| You want | Flags | Cost |
+|---|---|---|
+| Fastest | `--embed-f16` | 9.3 s instead of 11.7 s and 1.57 GB instead of 2.06 GB; the f16 LM head can flip near-ties, so skip it when token identity matters |
+| Leave the CPU free | `--device npu` | decode on the NPU, no CPU copies: 1.29 GB, about 1.5 tok/s |
+| NPU decode and CPU copies | `--decode-device npu --keep-cpu-weights yes` | the copies stay for a later switch |
+| No NPU | `--device cpu` | 90 s for the same prompt |
+| Fewer NPU workers | `--npu-threads 3` | used in the measured run; smaller scratch |
+
+`--delta-chunk` (default 64) is the delta-rule chunk width. One-shot:
+`rocket-inference gen --model-dir $M --text "Hello!" --raw --max-new-tokens 32`.

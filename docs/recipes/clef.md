@@ -38,6 +38,36 @@ rocket-inference decide --model-dir /path/to/clef-omni \
     --requests tools/clef_fixtures.json --out answers.json
 ```
 
+## What the preset does
+
+| Stage | Where | Why |
+|---|---|---|
+| thinker (48 MoE layers) | NPU with the int8 checkpoint, otherwise CPU (f32) | the 66 GiB model does not fit in memory, so experts are streamed from disk one layer at a time |
+| attention projections | NPU, int8, resident (about 0.9 GiB) | row-independent matmuls |
+| attention scores, router, norms, head | CPU | no NPU kernel yet |
+| vision / audio towers | opened on the first request that needs them | about 1 GiB and 1.2 GiB of NPU buffers |
+
+With a BF16 checkpoint the program runs on the CPU and prints a `hint:` line that says so.
+
+## What it trades away
+
+- Latency: every pass has a floor of about 30 s on the board, because every expert in a layer
+  gets used. A 300-token record takes about 52 s.
+- Exact weights: the int8 checkpoint is within about 0.01–0.03 of the BF16 probabilities, with
+  the same top choice on every checked question.
+- Memory is held low (under 1 GiB of RAM) by reading from the disk, so a slow disk slows
+  every request.
+
+## Tune it
+
+| You want | Flags | Cost |
+|---|---|---|
+| Better throughput | `--batch-window-ms 5000 --batch-max 8` | each request waits up to 5 s; 4 records took 107 s instead of 179 s |
+| Shorter prompts | `--max-tokens 4096` | longer states are cut to fit |
+| Free the tower memory between requests | `ROCKET_CLEF_TOWER_RELEASE=1` | the next media request reopens the tower (5–6 s) |
+| Attention projections on the CPU | `ROCKET_CLEF_ATTN_DEVICE=cpu` | −0.9 GiB of NPU buffers; one record measured 63.5 s with the same top choice |
+| Exact BF16 answers | `--device cpu` with the BF16 checkpoint | about 21 s per 300 tokens on an 8-thread dev host; not measured on the board |
+
 ## Timing and memory
 
 | | CPU (dev host, 8 threads) | NPU (Rock 5B+) |

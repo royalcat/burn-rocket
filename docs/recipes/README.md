@@ -1,46 +1,46 @@
 # Recipes
 
-Ready-to-run command lines for deploying each model on a Rock 5B+. Every recipe uses the
-unified `rocket-inference` CLI: the model family is detected from `--model-dir` (or
-`-hf`), and each stage can be placed on the NPU or the CPU.
+How to run each model on a Rock 5B+, what the defaults do, and how to change them for your task.
 
-## Pick a profile
+## One default per model
 
-| profile | good for | placement |
-|---|---|---|
-| **balanced** | saving RAM and CPU together | everything the model supports on the NPU, bf16 weights, towers load when first needed |
-| **full offload** | leaving the CPU free | everything on the NPU, highest-precision weights, towers loaded at startup |
-| **speed** | fastest steady-state requests | everything on the NPU, highest-precision weights, towers load when first needed |
+Every model has a **preset**: the placement and memory settings that `--device auto` (the default)
+picks for it. A preset puts as much of the model on the NPU as is actually faster, and keeps a
+stage on the CPU when the NPU would be slower or when it would use much more memory. Presets
+differ per model because the models differ.
 
-Models without a decode stage or towers have fewer distinct profiles; each recipe says so.
-For a CPU-only run pass `--device cpu` (on the NPU build the default `--device auto`
-prefers the NPU).
-
-## Placement flags
-
-```
---device auto|cpu|npu            default for every stage (default: auto)
---text-device ...                text-backbone projections
---text-attn-device ...           text-backbone attention (qwen3, embeddinggemma)
---vision-device ...              vision-tower projections (embeddinggemma)
---vision-attn-device ...         vision-tower attention (embeddinggemma)
---decode-device ...              single-token decode (chat models)
-```
-
-`auto` means "NPU when the build has one". `--device npu` is the one-flag full offload.
-The program prints the result before loading:
+Each run prints what was chosen:
 
 ```
 placement: text=NPU(fp16) text-attn=NPU vision=NPU(lazy) vision-attn=NPU audio=CPU
+preset: embeddinggemma defaults (no placement flags given)
 ```
 
-The audio tower always runs on the CPU.
+If a stage was left on the CPU on purpose, a `hint:` line says why and which flag changes it.
+If you passed flags, the `preset:` line lists the ones that overrode the preset.
+
+## How to change a preset
+
+| What you want | Use |
+|---|---|
+| Everything on the CPU | `--device cpu` |
+| Everything on the NPU, including decode | `--device npu` |
+| One stage elsewhere | `--text-device`, `--text-attn-device`, `--vision-device`, `--vision-attn-device`, `--decode-device` (each `auto`, `cpu` or `npu`) |
+| Towers loaded at startup, not on first use | `--no-defer-towers` |
+| Different precision | `--dtype`, `--npu-dtype`, `--quant` (see each recipe) |
+| Lower peak memory on long inputs | `--attn-chunk`, `ROCKET_MATMUL_CHUNK_M` |
+
+Without an NPU build (aarch64 with the `npu` feature), `auto` means the CPU everywhere.
+`--device npu` on such a build is an error.
 
 ## Recipes
 
-| model | recipe |
+Each recipe has the same parts: the command, what the preset does and why, what it trades
+away, and a table of changes for common goals with their measured costs.
+
+| Model | Recipe |
 |---|---|
-| EmbeddingGemma 2 (text, image, video, audio embeddings) | [`embeddinggemma2.md`](embeddinggemma2.md) |
+| EmbeddingGemma 2 (text, image, video and audio embeddings) | [`embeddinggemma2.md`](embeddinggemma2.md) |
 | Qwen3-Embedding-0.6B | [`qwen3.md`](qwen3.md) |
 | Qwen3.5-0.8B intent / query planner | [`intent.md`](intent.md) |
 | Gemma 4 E2B-it chat | [`gemma4.md`](gemma4.md) |
