@@ -1503,8 +1503,7 @@ impl<'m> SamContext<'m> {
         let w_patch = mm.pack_weight(gg, g.patch_dim, g.d, &model.patch_w)?;
         let w_neck_c1 = mm.pack_weight(gg, g.d, g.neck_out, &model.neck.c1)?;
         let mut layers = Vec::with_capacity(g.n_layers);
-        for l in 0..g.n_layers {
-            let w = &model.layers[l];
+        for w in model.layers.iter().take(g.n_layers) {
             // The fused qkv runs over the window partition (or the whole grid), so it is
             // packed at the M the attention will call it with (the resident layout needs
             // the pack-M and call-M plans to agree).

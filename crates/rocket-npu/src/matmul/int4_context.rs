@@ -142,7 +142,7 @@ impl I4Context {
         }
         let nstep = fanout_step(n, self.threads, 64);
         let mut workers = Vec::with_capacity(self.threads);
-        for t in 0..self.threads {
+        for (t, dev) in self.devs.iter().enumerate().take(self.threads) {
             let n0 = t * nstep;
             if n0 >= n {
                 break;
@@ -151,18 +151,17 @@ impl I4Context {
             let plan = plan_for(m, k, nsub, group)?;
             let tiles = plan.nmt * plan.nnt * plan.nkt;
             let slots = tiles.clamp(1, BATCH);
-            let guard = self.devs[t].alloc_bo(4096)?;
-            let regcmd = self.devs[t].alloc_bo(slots * RC_STRIDE * 8)?;
-            let in_all =
-                self.devs[t].alloc_bo(plan.nmt * plan.nkt * (plan.in_slot / 2) + CBUF_BANK_SIZE)?;
+            let guard = dev.alloc_bo(4096)?;
+            let regcmd = dev.alloc_bo(slots * RC_STRIDE * 8)?;
+            let in_all = dev.alloc_bo(plan.nmt * plan.nkt * (plan.in_slot / 2) + CBUF_BANK_SIZE)?;
             // The C leaves the output BO at I4_BATCH unconditionally: a right-sized one
             // is bit-exact but buys nothing measurable here, because this path syncs its
             // output once per job instead of once per K-tile (the sync-bound paths, like
             // fp16 KACC, are the ones that gain). Right-sizing is still what this port
             // does, matching the int8 engine's scratch policy.
-            let out_all = self.devs[t].alloc_bo(slots * plan.out_slot * 2 + CBUF_BANK_SIZE)?;
+            let out_all = dev.alloc_bo(slots * plan.out_slot * 2 + CBUF_BANK_SIZE)?;
             workers.push(Worker {
-                dev: self.devs[t].clone(),
+                dev: dev.clone(),
                 n0,
                 nsub,
                 plan,

@@ -227,8 +227,14 @@ fn siglip_score(
 
 fn print_siglip_arm(tag: &str, s: &Score, model: &SiglipModel) {
     println!("  [{tag}] layer  0 (embeddings)  cos={:.9}", s.layers[0]);
-    for k in 1..=model.geom.n_layers {
-        println!("  [{tag}] layer {k:2}              cos={:.9}", s.layers[k]);
+    for (k, cos) in s
+        .layers
+        .iter()
+        .enumerate()
+        .take(model.geom.n_layers + 1)
+        .skip(1)
+    {
+        println!("  [{tag}] layer {k:2}              cos={cos:.9}");
     }
     println!(
         "  [{tag}] encoder output       cos={:.9}  (exact {}/{}, max_abs {:.3e})",

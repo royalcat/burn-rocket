@@ -290,15 +290,15 @@ impl Bf16Context {
         let nstep = self.nstep(n);
         let mut bos_out = Vec::with_capacity(self.threads);
         let mut sig = Vec::with_capacity(self.threads);
-        for t in 0..self.threads {
+        for (t, dev) in self.devs.iter().enumerate().take(self.threads) {
             let n0 = t * nstep;
             if n0 >= n {
                 break;
             }
             let nsub = (n - n0).min(nstep);
             let wplan = Plan::canonical_geom(&BF16, plan.m, k, nsub)?;
-            let mut bo = self.devs[t]
-                .alloc_bo(wplan.nnt * wplan.nkt * wplan.wt_slot * 2 + CBUF_BANK_SIZE)?;
+            let mut bo =
+                dev.alloc_bo(wplan.nnt * wplan.nkt * wplan.wt_slot * 2 + CBUF_BANK_SIZE)?;
             bos::check_iova(&[&bo])?;
             bo.prep(0)?;
             {

@@ -446,9 +446,9 @@ fn qfloor_knob() -> i64 {
 /// sigmoid grid (`step = 32/index_scale` in x).
 fn build_lut_unit(kind: Activation, index_scale: f64, lut: &mut LutTable) {
     let step = 32.0 / index_scale;
-    for i in 0..=512 {
+    for (i, slot) in lut.0.iter_mut().enumerate().take(513) {
         let y = eval(kind, -((512 - i) as f64) * step);
-        lut.0[i] = q_word(y, 0);
+        *slot = q_word(y, 0);
     }
     for i in 0..=512 {
         let y = eval(kind, i as f64 * step);
@@ -461,9 +461,9 @@ fn build_lut_unit(kind: Activation, index_scale: f64, lut: &mut LutTable) {
 fn build_lut_affine(kind: Activation, index_scale: f64, lo: f64, hi: f64, lut: &mut LutTable) {
     let step = 32.0 / index_scale;
     let span = if hi - lo != 0.0 { hi - lo } else { 1.0 };
-    for i in 0..=512 {
+    for (i, slot) in lut.0.iter_mut().enumerate().take(513) {
         let g = (eval(kind, -((512 - i) as f64) * step) - lo) / span;
-        lut.0[i] = q_word(g, 0);
+        *slot = q_word(g, 0);
     }
     for i in 0..=512 {
         let g = (eval(kind, i as f64 * step) - lo) / span;
@@ -497,10 +497,10 @@ fn build_lut_shifted(
 /// branch) split of LeakyReLU over `[-R,R]`.
 fn build_lut_leaky(alpha: f64, index_scale: f64, out_lo: f64, s: f64, lut: &mut LutTable) {
     let step = 32.0 / index_scale;
-    for i in 0..=512 {
+    for (i, slot) in lut.0.iter_mut().enumerate().take(513) {
         let x = -((512 - i) as f64) * step;
         let f = if x >= 0.0 { x } else { alpha * x };
-        lut.0[i] = q_word((f - out_lo) / s, 0);
+        *slot = q_word((f - out_lo) / s, 0);
     }
     for i in 0..=512 {
         let x = i as f64 * step;
