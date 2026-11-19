@@ -910,6 +910,14 @@ pub(crate) fn temporary_file(bytes: &[u8], ext: &str) -> Result<ResolvedMedia, S
 mod tests {
     use super::*;
 
+    // Fixtures are embedded at compile time, resolved relative to THIS file's
+    // location.  Using `env!("CARGO_MANIFEST_DIR")` here instead bakes an absolute
+    // path into the binary, which goes stale when the repository is renamed
+    // (Cargo does not invalidate its build cache on a directory move).
+    const CAT_JPEG: &[u8] = include_bytes!("../../data/cat.jpeg");
+    const CMYK_JPEG: &[u8] = include_bytes!("../../data/cmyk-test.jpg");
+    const CMYK_RGB: &[u8] = include_bytes!("../../data/cmyk-test-rgb.raw");
+
     fn info(fps: f64, duration: f64, total_frames: usize) -> VideoInfo {
         VideoInfo {
             width: 480,
@@ -1090,15 +1098,19 @@ mod tests {
     /// `convert("RGB")` of `data/cmyk-test.jpg`; zune-jpeg agrees within one LSB.
     #[test]
     fn a_cmyk_jpeg_decodes_without_aborting() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
-        let expected = std::fs::read(dir.join("cmyk-test-rgb.raw")).expect("cmyk-test-rgb.raw");
-        let image = load_image(&dir.join("cmyk-test.jpg")).expect("a CMYK JPEG decodes");
+        let expected = CMYK_RGB;
+        // Exercise the file-path entry point too: write the embedded fixture to a
+        // temp file, the same way the malformed-JPEG test does below.
+        let path = std::env::temp_dir().join(format!("rocket-cmyk-{}.jpg", std::process::id()));
+        std::fs::write(&path, CMYK_JPEG).expect("write the cmyk jpeg");
+        let image = load_image(&path).expect("a CMYK JPEG decodes");
+        std::fs::remove_file(&path).ok();
         assert_eq!((image.width(), image.height()), (32, 24));
         let ours = image.as_raw();
         assert_eq!(ours.len(), expected.len());
         let worst = ours
             .iter()
-            .zip(&expected)
+            .zip(expected)
             .map(|(a, b)| a.abs_diff(*b))
             .max()
             .unwrap_or(0);
@@ -1146,9 +1158,8 @@ mod tests {
     /// otherwise accept a 12-bit frame or read past a nonsense segment length.
     #[test]
     fn a_malformed_jpeg_header_does_not_abort() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
-        let source = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
-        let markers = jpeg_markers(&source);
+        let source = CAT_JPEG;
+        let markers = jpeg_markers(source);
         let sof = markers
             .iter()
             .copied()
@@ -1166,12 +1177,12 @@ mod tests {
             .find(|&i| source[i + 1] == 0xE0)
             .expect("cat.jpeg has an APP0 segment");
 
-        let mut sof12 = source.clone();
+        let mut sof12 = source.to_vec();
         sof12[sof + 4] = 12;
-        let mut long_app0 = source.clone();
+        let mut long_app0 = source.to_vec();
         long_app0[app0 + 2..app0 + 4].copy_from_slice(&[0xFF, 0xFF]);
 
-        check_jpeg(&source).expect("cat.jpeg is structurally sound");
+        check_jpeg(source).expect("cat.jpeg is structurally sound");
 
         for (label, bytes, expected) in [
             (
@@ -1205,8 +1216,7 @@ mod tests {
     /// shapes an interrupted upload takes.
     #[test]
     fn a_truncated_jpeg_is_refused() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
-        let source = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
+        let source = CAT_JPEG;
         assert!(source.ends_with(&[0xFF, 0xD9]), "cat.jpeg ends with EOI");
         // The control's cut: the last 36 bytes (EOI + trailing scan) are gone.
         let no_eoi = &source[..source.len() - 36];
@@ -1219,20 +1229,19 @@ mod tests {
         assert!(decode_image(no_eoi).is_err());
         assert!(decode_image(half).is_err());
         // The intact file still decodes to the same pixels as before the check.
-        let intact = decode_image(&source).expect("cat.jpeg decodes");
+        let intact = decode_image(source).expect("cat.jpeg decodes");
         assert_eq!((intact.width(), intact.height()), (960, 686));
     }
 
     /// `decode_image` picks the decoder by content, not by what a caller claims.
     #[test]
     fn the_decoder_is_chosen_by_magic() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
-        let jpeg = std::fs::read(dir.join("cat.jpeg")).expect("cat.jpeg");
-        assert!(is_jpeg(&jpeg));
+        let jpeg = CAT_JPEG;
+        assert!(is_jpeg(jpeg));
         // The same bytes under a `.png` name and with no extension at all.
         for name in ["magic-lie.png", "magic-other.bin"] {
             let path = std::env::temp_dir().join(format!("rocket-{}-{name}", std::process::id()));
-            std::fs::write(&path, &jpeg).expect("write the jpeg");
+            std::fs::write(&path, jpeg).expect("write the jpeg");
             let image = load_image(&path).expect("a JPEG decodes whatever its name says");
             assert_eq!((image.width(), image.height()), (960, 686), "{name}");
             std::fs::remove_file(&path).ok();
