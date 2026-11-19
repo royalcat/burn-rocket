@@ -34,7 +34,7 @@ copy by explicit file path; do not use the model dir as CWD.
 ## Run
 
 ```sh
-cd /home/royalcat/projects/burn-rocket
+cd /home/royalcat/projects/rocket-inference
 $CLEF_VENV/bin/python -I tools/clef_reference.py \
     --model-dir $CLEF_MODEL_DIR \
     --requests tools/clef_fixtures.json \
@@ -141,7 +141,7 @@ Determinism: two independent runs of `checkout-errors` give byte-identical array
 > is `tools/clef_media.py`; the nine fixtures are `tools/clef_fixtures_media.json` (assets in `data/`).
 
 ```sh
-cd /home/royalcat/projects/burn-rocket
+cd /home/royalcat/projects/rocket-inference
 $CLEF_VENV/bin/python -I tools/clef_reference.py \
     --model-dir $CLEF_MODEL_DIR \
     --requests tools/clef_fixtures_media.json \
