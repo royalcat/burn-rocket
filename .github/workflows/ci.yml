@@ -18,11 +18,13 @@ jobs:
     name: fmt + clippy + tests (x86-64)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/checkout@v7
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Formatting
